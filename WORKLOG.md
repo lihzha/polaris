@@ -111,3 +111,33 @@
   `ghcr.io/lihzha/polaris-eval:cuda13-fd00a51`, digest
   `sha256:e32265e25ae2d61b88cf0c530d5561d3fd48e6b2655f48cb583d18fb18851006`,
   for import to the L40S cluster.
+
+## 2026-07-01 — Robust DLS containment for pathological simulation states
+
+- The first 50-reset reasoning-checkpoint BlockStackKitchen evaluation reached
+  reset 46, step 328, then Isaac Lab's DLS controller raised
+  `torch._C._LinAlgError` while directly inverting its float32 damped normal
+  matrix. The job was cancelled after the simulator exited but its policy
+  server kept the allocation alive. The failed run remains immutable as job
+  `1080837`, with 45 complete CSV/video episodes and one partial trace.
+- Isaac Lab 2.3 applies its default `lambda_val=0.01`; an ordinary finite,
+  moderate-scale Jacobian is therefore not singular. The failed trace showed
+  severe EEF dynamics excursions and a 56-step frozen pose before the error.
+  A rank-one float32 Jacobian of magnitude 100 reproduces the numerical mode:
+  adding `1e-4 I` to `J J^T` rounds away, leaving the direct inverse singular.
+- Added a custom task-space action/controller that preserves the upstream DLS
+  implementation exactly on healthy inputs. Only a linear-algebra exception
+  uses the same damped normal matrix with a float64 pseudo-inverse; non-finite
+  inputs return zero joint delta. Throttled warnings record damping, dtype,
+  Jacobian scale, finite-input count, and whether each environment recovered or
+  held. A zero delta assumes the current articulation joint state is finite; a
+  fallback event still flags that rollout for artifact review.
+- Validation in the exact `polaris-eval:cuda13` image: all 9 existing LAP client
+  tests passed; all 4 robust-controller tests passed after launching Isaac Sim.
+  The latter cover bitwise equality with healthy upstream DLS, production-scale
+  float32 damping loss, non-finite input containment, and action-config wiring.
+  Ruff formatting/lint and `git diff --check` also passed.
+- Recovery policy: do not resume job `1080837` in place. The evaluator would
+  resume CSV/video numbering correctly, but the client would append colliding
+  trace episode IDs and the launcher would overwrite attempt metadata. Launch a
+  fresh 50-reset run directory after staging this patch instead.

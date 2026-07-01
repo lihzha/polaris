@@ -3,7 +3,6 @@ from pathlib import Path
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from isaaclab.envs.mdp.actions.actions_cfg import (
     BinaryJointPositionActionCfg,
-    DifferentialInverseKinematicsActionCfg,
 )
 from isaaclab.envs.mdp.actions.binary_joint_actions import BinaryJointPositionAction
 import isaaclab.sim as sim_utils
@@ -13,6 +12,9 @@ import numpy as np
 from typing import Sequence
 
 from polaris.environments.robot_cfg import NVIDIA_DROID
+from polaris.robust_differential_ik import (
+    RobustDifferentialInverseKinematicsActionCfg,
+)
 
 from pxr import Usd, UsdGeom, UsdPhysics
 from isaaclab.utils import configclass, noise
@@ -260,7 +262,7 @@ class EefPoseActionCfg:
     the same ``panda_link0 -> base_link`` transform.
     """
 
-    arm = DifferentialInverseKinematicsActionCfg(
+    arm = RobustDifferentialInverseKinematicsActionCfg(
         asset_name="robot",
         joint_names=["panda_joint.*"],
         body_name="base_link",
@@ -270,7 +272,7 @@ class EefPoseActionCfg:
             ik_method="dls",
         ),
         scale=1.0,
-        body_offset=DifferentialInverseKinematicsActionCfg.OffsetCfg(
+        body_offset=RobustDifferentialInverseKinematicsActionCfg.OffsetCfg(
             pos=(0.0, 0.0, 0.0)
         ),
     )
