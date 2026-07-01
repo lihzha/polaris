@@ -141,3 +141,23 @@
   resume CSV/video numbering correctly, but the client would append colliding
   trace episode IDs and the launcher would overwrite attempt metadata. Launch a
   fresh 50-reset run directory after staging this patch instead.
+
+### Follow-up: fail-fast numerical rollouts
+
+- A later reasoning MoveLatteCup run (`1081586`) demonstrated that returning a
+  zero joint delta is insufficient when the entire Jacobian is already
+  non-finite. The controller logged `finite_inputs=0/1`, the EEF pose snapped to
+  `[0.088, 0, 0.907826]`, and the simulator stopped advancing after one more
+  traced action while consuming GPU/CPU. The job was cancelled with 15 durable
+  episodes; it is excluded from metrics.
+- Non-finite IK inputs now raise `DifferentialIKNumericalError` before the
+  physics step. The evaluator catches that error (and other Torch linear-algebra
+  failures), ends the affected rollout, records success/progress as zero plus
+  explicit `numerical_failure` columns, writes the partial diagnostic video,
+  and resets for the next official initial condition. Finite direct-inverse
+  failures still use the float64 damped pseudo-inverse and healthy DLS remains
+  bitwise unchanged.
+- Validation after this change: all 9 LAP client tests and all 4 Isaac-launched
+  robust-controller tests pass in `polaris-eval:cuda13`; Ruff formatting/lint
+  and `git diff --check` pass. A clean reasoning MoveLatteCup run is required to
+  validate per-episode abort/reset behavior in the full simulator.

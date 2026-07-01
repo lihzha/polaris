@@ -4,6 +4,7 @@ import pytest
 from isaaclab.controllers.differential_ik import DifferentialIKController
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from polaris.robust_differential_ik import (
+    DifferentialIKNumericalError,
     RobustDifferentialIKController,
     RobustDifferentialInverseKinematicsAction,
 )
@@ -50,17 +51,16 @@ def test_float32_damping_loss_uses_finite_pseudoinverse_fallback():
     assert controller.fallback_count == 1
 
 
-def test_nonfinite_input_holds_joint_target_after_inverse_failure():
+def test_nonfinite_input_aborts_rollout_before_physics_step():
     controller = _controller(RobustDifferentialIKController, damping=0.0)
     jacobian = torch.zeros(1, 6, 7)
     jacobian[0, 0, 0] = torch.nan
     delta_pose = torch.ones(1, 6)
 
-    actual = controller._compute_delta_joint_pos(delta_pose, jacobian)
+    with pytest.raises(DifferentialIKNumericalError, match="non-finite input"):
+        controller._compute_delta_joint_pos(delta_pose, jacobian)
 
-    torch.testing.assert_close(actual, torch.zeros(1, 7))
-    assert torch.isfinite(actual).all()
-    assert controller.fallback_count == 1
+    assert controller.fallback_count == 0
 
 
 def test_eef_pose_config_installs_robust_action_term():

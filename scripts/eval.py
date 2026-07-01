@@ -45,6 +45,7 @@ def main(eval_args: EvalArgs):
     from polaris.environments.droid_cfg import EefPoseActionCfg
     from polaris.utils import load_eval_initial_conditions
     from polaris.policy import InferenceClient
+    from polaris.robust_differential_ik import DifferentialIKNumericalError
     # from real2simeval.autoscoring import TASK_TO_SUCCESS_CHECKER
 
     env_cfg = parse_env_cfg(
@@ -87,8 +88,14 @@ def main(eval_args: EvalArgs):
                 "episode_length": pd.Series(dtype="int"),
                 "success": pd.Series(dtype="bool"),
                 "progress": pd.Series(dtype="float"),
+                "numerical_failure": pd.Series(dtype="bool"),
+                "numerical_failure_reason": pd.Series(dtype="str"),
             }
         )
+    if "numerical_failure" not in episode_df:
+        episode_df["numerical_failure"] = False
+    if "numerical_failure_reason" not in episode_df:
+        episode_df["numerical_failure_reason"] = ""
     episode = len(episode_df)
     if episode >= rollouts:
         print("All rollouts have been evaluated. Exiting.")
@@ -105,6 +112,7 @@ def main(eval_args: EvalArgs):
         obs, info = env.reset(object_positions=initial_conditions[episode])
         policy_client.reset()
         video = []
+        numerical_failure_reason = ""
         bar = tqdm.tqdm(total=horizon)
         print(f" >>> Starting eval job from episode {episode + 1} of {rollouts} <<< ")
 
@@ -116,10 +124,21 @@ def main(eval_args: EvalArgs):
                 # Request visualization every step so saved videos are complete,
                 # even when policy inference itself is open-loop chunked.
                 video.append(viz)
-            obs, rew, term, trunc, info = env.step(
-                torch.as_tensor(action, device=env.device).reshape(1, -1),
-                expensive=policy_client.rerender,
-            )
+            try:
+                obs, rew, term, trunc, info = env.step(
+                    torch.as_tensor(action, device=env.device).reshape(1, -1),
+                    expensive=policy_client.rerender,
+                )
+            except (DifferentialIKNumericalError, torch.linalg.LinAlgError) as error:
+                numerical_failure_reason = f"{type(error).__name__}: {error}"
+                print(
+                    f"Numerical failure in episode {episode} at action "
+                    f"{bar.n}: {numerical_failure_reason}"
+                )
+                # The policy visualization was already recorded for this
+                # attempted action, so include it in the episode length.
+                bar.update(1)
+                break
             bar.update(1)
             if term[0] or trunc[0]:
                 break
@@ -139,8 +158,14 @@ def main(eval_args: EvalArgs):
         episode_data = {
             "episode": episode,
             "episode_length": episode_length,
-            "success": info["rubric"]["success"],
-            "progress": info["rubric"]["progress"],
+            "success": (
+                False if numerical_failure_reason else info["rubric"]["success"]
+            ),
+            "progress": (
+                0.0 if numerical_failure_reason else info["rubric"]["progress"]
+            ),
+            "numerical_failure": bool(numerical_failure_reason),
+            "numerical_failure_reason": numerical_failure_reason,
         }
         episode_df = pd.concat(
             [episode_df, pd.DataFrame([episode_data])], ignore_index=True

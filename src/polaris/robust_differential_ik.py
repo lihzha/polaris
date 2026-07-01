@@ -23,6 +23,10 @@ from isaaclab.envs.mdp.actions.task_space_actions import (
 from isaaclab.utils import configclass
 
 
+class DifferentialIKNumericalError(RuntimeError):
+    """Raised when an invalid IK state requires aborting the current rollout."""
+
+
 class RobustDifferentialIKController(DifferentialIKController):
     """Isaac Lab DLS controller with an exception-only pseudo-inverse fallback."""
 
@@ -36,11 +40,19 @@ class RobustDifferentialIKController(DifferentialIKController):
         if self.cfg.ik_method == "dls" and (
             not torch.isfinite(jacobian).all() or not torch.isfinite(delta_pose).all()
         ):
-            return self._compute_dls_pinv_fallback(
-                delta_pose,
-                jacobian,
-                ValueError("non-finite DLS input"),
+            finite_jacobian_values = jacobian[torch.isfinite(jacobian)]
+            max_abs_jacobian = (
+                float(finite_jacobian_values.abs().max().item())
+                if finite_jacobian_values.numel() > 0
+                else float("nan")
             )
+            message = (
+                "PolaRiS DLS received non-finite input; aborting rollout "
+                f"(lambda={float(self.cfg.ik_params['lambda_val']):g}, "
+                f"dtype={jacobian.dtype}, max_abs_jacobian={max_abs_jacobian:g})"
+            )
+            omni.log.error(message)
+            raise DifferentialIKNumericalError(message)
         try:
             return super()._compute_delta_joint_pos(delta_pose, jacobian)
         except torch.linalg.LinAlgError as error:
@@ -57,9 +69,9 @@ class RobustDifferentialIKController(DifferentialIKController):
         """Recover from a failed DLS inverse without changing healthy steps.
 
         Finite environments use the same damped normal matrix as Isaac Lab,
-        evaluated in float64 with ``pinv``.  Environments with non-finite inputs,
-        or a second linear-algebra failure, hold their current joint targets by
-        returning a zero delta.
+        evaluated in float64 with ``pinv``. A second linear-algebra failure or
+        non-finite fallback result aborts the rollout instead of allowing an
+        invalid physics state to hang the simulator.
         """
 
         delta_joint_pos = torch.zeros(
@@ -104,10 +116,15 @@ class RobustDifferentialIKController(DifferentialIKController):
                     dtype=jacobian.dtype
                 )
                 recovered = int(candidate_is_finite.sum().item())
-            except torch.linalg.LinAlgError:
-                # Holding the current target is safer than propagating an invalid
-                # joint command. The throttled warning below records this event.
-                pass
+            except torch.linalg.LinAlgError as fallback_error:
+                raise DifferentialIKNumericalError(
+                    "PolaRiS damped pseudo-inverse fallback also failed"
+                ) from fallback_error
+
+        if recovered != jacobian.shape[0]:
+            raise DifferentialIKNumericalError(
+                "PolaRiS damped pseudo-inverse fallback returned a non-finite result"
+            )
 
         self.fallback_count += 1
         if self.fallback_count <= 5 or self.fallback_count % 100 == 0:
