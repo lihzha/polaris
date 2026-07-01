@@ -1,0 +1,65 @@
+# Local Ada-compatible PolaRiS image derived from the upstream dockerize branch.
+# CUDA extensions are built against the base image's exact Torch/CUDA pair,
+# while only the resulting wheels are copied into the final runtime layer.
+
+ARG BASE_IMAGE=polaris-isaaclab-base:cu130-isaaclab230-r1
+FROM ${BASE_IMAGE} AS isaaclab_base
+
+FROM nvidia/cuda:13.0.0-devel-ubuntu22.04 AS kernels
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git build-essential ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CUDA_HOME=/usr/local/cuda \
+    CUDA_PATH=/usr/local/cuda \
+    PATH=/.venv/bin:/usr/local/cuda/bin:$PATH \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH \
+    TORCH_CUDA_ARCH_LIST=8.9 \
+    FORCE_CUDA=1 \
+    MAX_JOBS=12
+
+ARG SPLAT_KERNELS_COMMIT=be51fb1ddc3618474c88fc3d2b529397700097f2
+RUN git clone --recursive https://github.com/arhanjain/splat_kernels.git /tmp/splat_kernels \
+    && git -C /tmp/splat_kernels checkout ${SPLAT_KERNELS_COMMIT}
+
+# Mount the large base environment read-only instead of copying it into the
+# build stage. Add wheel only as an ephemeral build dependency.
+RUN --mount=from=isaaclab_base,source=/.venv,target=/.venv,ro \
+    --mount=from=isaaclab_base,source=/root/.local/share/uv/python,target=/root/.local/share/uv/python,ro \
+    uv pip install --target /tmp/builddeps wheel \
+    && mkdir -p /wheels \
+    && cd /tmp/splat_kernels/diff-surfel-rasterization \
+    && PYTHONPATH=/tmp/builddeps python setup.py bdist_wheel -d /wheels \
+    && cd /tmp/splat_kernels/simple-knn \
+    && PYTHONPATH=/tmp/builddeps python setup.py bdist_wheel -d /wheels \
+    && mkdir -p /tmp/wheelcheck \
+    && for wheel_file in /wheels/*.whl; do python -m zipfile -e "$wheel_file" /tmp/wheelcheck; done \
+    && cuobjdump --list-elf $(find /tmp/wheelcheck -name '*.so' -print) | grep -q 'sm_89'
+
+FROM ${BASE_IMAGE}
+
+COPY --from=kernels /wheels /tmp/polaris-wheels
+COPY third_party/openpi/packages/openpi-client /tmp/openpi-client
+
+RUN uv pip install --python /.venv/bin/python /tmp/polaris-wheels/*.whl /tmp/openpi-client \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* /tmp/polaris-wheels /tmp/openpi-client
+
+ENV NVIDIA_VISIBLE_DEVICES=0 \
+    NVIDIA_DRIVER_CAPABILITIES=all \
+    OMNI_KIT_ALLOW_ROOT=1 \
+    OMNI_KIT_ACCEPT_EULA=YES \
+    ACCEPT_EULA=Y \
+    PRIVACY_CONSENT=Y \
+    VIRTUAL_ENV=/.venv \
+    PATH=/.venv/bin:$PATH \
+    UV_LINK_MODE=copy \
+    TORCH_CUDA_ARCH_LIST=8.9
+
+WORKDIR /workspace/polaris
+ENTRYPOINT []
+CMD ["/bin/bash"]

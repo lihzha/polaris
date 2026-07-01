@@ -98,6 +98,15 @@ uv run scripts/eval.py --environment DROID-FoodBussing --policy.port 8000 --run-
 ```
 Results include rollout videos, and a CSV summarizing success and normalized progress of each episode.
 
+### Run Ego-LAP with end-effector pose control
+
+PolaRiS also includes an `EgoLAPEefPose` client and selectable absolute
+end-effector pose controller. Existing evaluations continue to use
+joint-position control by default. See
+[ego_lap_eef_pose_eval.md](docs/ego_lap_eef_pose_eval.md) for the server command,
+action/state frame contract, trace output, bounded evaluation command, and
+controller smoke test.
+
 ### Off-the-shelf Evaluation Environments
 | Environment Name | Prompt | Image |
 | :--- | :--- | :--- | 

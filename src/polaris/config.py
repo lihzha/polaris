@@ -4,6 +4,7 @@ No heavy dependencies - safe to import anywhere.
 """
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass
@@ -40,6 +41,13 @@ class PolicyArgs:
     host: str = "0.0.0.0"
     port: int = 8000
     open_loop_horizon: int | None = 8
+    frame_description: str = "robot base frame"
+    action_frame: Literal["robot_base", "egocentric"] = "robot_base"
+    dataset_name: str = "droid"
+    state_type: str = "eef_pose"
+    rotate_wrist_180: bool = True
+    render_every_step: bool = True
+    trace_path: str | None = None
 
 
 @dataclass
@@ -53,6 +61,7 @@ class EvalArgs:
     initial_conditions_file: str | None = None  # Path to initial conditions file
     instruction: str | None = None  # Override language instruction
     rollouts: int | None = None  # Number of rollouts to evaluate
+    control_mode: Literal["joint-position", "eef-pose"] = "joint-position"
 
 
 @dataclass
