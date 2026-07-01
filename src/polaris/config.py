@@ -48,6 +48,8 @@ class PolicyArgs:
     rotate_wrist_180: bool = True
     render_every_step: bool = True
     trace_path: str | None = None
+    expected_action_horizon: int | None = None
+    expected_action_dim: int | None = None
 
 
 @dataclass
