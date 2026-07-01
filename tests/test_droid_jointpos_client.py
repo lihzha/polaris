@@ -10,6 +10,7 @@ import torch
 from polaris.config import PolicyArgs
 from polaris.policy.droid_jointpos_client import (
     DroidJointPosClient,
+    JointPositionObservationNumericalError,
     PI05_DROID_CONTRACT_MARKER,
     validate_joint_action_chunk,
 )
@@ -61,6 +62,37 @@ class JointActionValidationTest(unittest.TestCase):
 
 
 class DroidJointPosClientContractTest(unittest.TestCase):
+    def test_nonfinite_joint_observation_is_a_numerical_failure(self):
+        observation = {
+            "splat": {
+                "external_cam": np.zeros((224, 224, 3), dtype=np.uint8),
+                "wrist_cam": np.zeros((224, 224, 3), dtype=np.uint8),
+            },
+            "policy": {
+                "arm_joint_pos": torch.tensor(
+                    [[0.0, 0.0, 0.0, float("nan"), 0.0, 0.0, 0.0]]
+                ),
+                "gripper_pos": torch.tensor([[0.25]]),
+            },
+        }
+        args = PolicyArgs(
+            client="DroidJointPos",
+            open_loop_horizon=8,
+            expected_action_horizon=15,
+            expected_action_dim=8,
+            state_type="joint_position",
+        )
+        with mock.patch(
+            "polaris.policy.droid_jointpos_client.websocket_client_policy.WebsocketClientPolicy",
+            return_value=_FakePolicyServer(np.zeros((15, 8))),
+        ):
+            client = DroidJointPosClient(args)
+
+        with self.assertRaisesRegex(
+            JointPositionObservationNumericalError, "non-finite"
+        ):
+            client.infer(observation, "test instruction", return_viz=True)
+
     def test_official_pi05_request_execution_and_trace_contract(self):
         actions = np.arange(15 * 8, dtype=np.float32).reshape(15, 8) / 100.0
         actions[:, -1] = np.linspace(0.0, 1.0, 15)

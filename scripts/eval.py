@@ -45,6 +45,9 @@ def main(eval_args: EvalArgs):
     from polaris.environments.droid_cfg import EefPoseActionCfg
     from polaris.utils import load_eval_initial_conditions
     from polaris.policy import InferenceClient
+    from polaris.policy.droid_jointpos_client import (
+        JointPositionObservationNumericalError,
+    )
     from polaris.robust_differential_ik import DifferentialIKNumericalError
     # from real2simeval.autoscoring import TASK_TO_SUCCESS_CHECKER
 
@@ -117,9 +120,17 @@ def main(eval_args: EvalArgs):
         print(f" >>> Starting eval job from episode {episode + 1} of {rollouts} <<< ")
 
         while bar.n < horizon:
-            action, viz = policy_client.infer(
-                obs, language_instruction, return_viz=True
-            )
+            try:
+                action, viz = policy_client.infer(
+                    obs, language_instruction, return_viz=True
+                )
+            except JointPositionObservationNumericalError as error:
+                numerical_failure_reason = f"{type(error).__name__}: {error}"
+                print(
+                    f"Numerical failure in episode {episode} before action "
+                    f"{bar.n}: {numerical_failure_reason}"
+                )
+                break
             if viz is not None:
                 # Request visualization every step so saved videos are complete,
                 # even when policy inference itself is open-loop chunked.

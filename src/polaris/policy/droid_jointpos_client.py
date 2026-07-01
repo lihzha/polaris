@@ -12,6 +12,10 @@ from polaris.policy.abstract_client import InferenceClient, PolicyArgs
 PI05_DROID_CONTRACT_MARKER = "POLARIS_PI05_DROID_CONTRACT="
 
 
+class JointPositionObservationNumericalError(FloatingPointError):
+    """Raised when simulator corruption makes joint proprioception non-finite."""
+
+
 def _image_contract(image: np.ndarray) -> dict:
     image = np.ascontiguousarray(np.asarray(image))
     return {
@@ -269,7 +273,9 @@ class DroidJointPosClient(InferenceClient):
             not np.isfinite(joint_position).all()
             or not np.isfinite(gripper_position).all()
         ):
-            raise ValueError("Joint-position observation contains non-finite values")
+            raise JointPositionObservationNumericalError(
+                "Joint-position observation contains non-finite values"
+            )
 
         return {
             "right_image": right_image,
