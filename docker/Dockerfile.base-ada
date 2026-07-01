@@ -1,0 +1,60 @@
+# CUDA 13 / Isaac Lab 2.3 base used by the local PolaRiS evaluation image.
+#
+# The dependency environment is assembled in a builder and copied into a
+# lightweight OpenGL runtime.  BuildKit's uv cache keeps rebuilds bounded.
+
+FROM ghcr.io/astral-sh/uv:latest AS uv
+
+FROM nvidia/opengl:1.0-glvnd-runtime-ubuntu22.04 AS builder
+
+ENV UV_LINK_MODE=copy \
+    UV_PROJECT_ENVIRONMENT=/.venv
+
+COPY --from=uv /uv /uvx /bin/
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/requirements.txt /tmp/requirements.txt
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv venv --python 3.11 /.venv \
+    && uv pip install --python /.venv/bin/python setuptools==80.9.0 wheel wheel-stub \
+        --extra-index-url https://pypi.nvidia.com/ \
+        --index-strategy unsafe-best-match \
+    && uv pip sync --python /.venv/bin/python --no-build-isolation /tmp/requirements.txt \
+        --extra-index-url https://pypi.nvidia.com/ \
+        --extra-index-url https://download.pytorch.org/whl/cu130 \
+        --index-strategy unsafe-best-match
+
+FROM nvidia/opengl:1.0-glvnd-runtime-ubuntu22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates git libgl1 libgomp1 libxt6 libxmu6 libxrandr2 \
+        libxcursor1 libxinerama1 libxi6 libxrender1 libxcomposite1 \
+        libxdamage1 libxfixes3 libxkbcommon0 libxkbcommon-x11-0 \
+        libsm6 libice6 libglu1-mesa mesa-utils vulkan-tools \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=uv /uv /uvx /bin/
+COPY --from=builder /.venv /.venv
+# uv-created virtualenv interpreters are symlinks into the managed Python
+# directory. Copy that directory as well so ``/.venv/bin/python`` is valid in
+# the runtime stage.
+COPY --from=builder /root/.local/share/uv/python /root/.local/share/uv/python
+
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=all \
+    OMNI_KIT_ALLOW_ROOT=1 \
+    OMNI_KIT_ACCEPT_EULA=YES \
+    ACCEPT_EULA=Y \
+    PRIVACY_CONSENT=Y \
+    VIRTUAL_ENV=/.venv \
+    PATH=/.venv/bin:$PATH \
+    UV_LINK_MODE=copy
+
+WORKDIR /workspace
+ENTRYPOINT []
+CMD ["/bin/bash"]

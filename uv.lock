@@ -2658,6 +2658,7 @@ dependencies = [
     { name = "opencv-python" },
     { name = "openpi-client" },
     { name = "plyfile" },
+    { name = "scipy" },
     { name = "simple-knn" },
     { name = "tyro" },
 ]
@@ -2675,6 +2676,7 @@ requires-dist = [
     { name = "opencv-python", specifier = ">=4.11.0.86" },
     { name = "openpi-client", directory = "third_party/openpi/packages/openpi-client" },
     { name = "plyfile", specifier = ">=1.1.3" },
+    { name = "scipy", specifier = ">=1.11" },
     { name = "simple-knn", editable = "src/simple-knn" },
     { name = "tyro", specifier = ">=0.9.17" },
 ]
