@@ -161,3 +161,26 @@
   robust-controller tests pass in `polaris-eval:cuda13`; Ruff formatting/lint
   and `git diff --check` pass. A clean reasoning MoveLatteCup run is required to
   validate per-episode abort/reset behavior in the full simulator.
+
+### Final full-evaluation validation
+
+- Clean replacement job `1081819`, running commit `88aa4c0`, completed all 50
+  reasoning-checkpoint MoveLatteCup resets with Slurm `COMPLETED 0:0`. It
+  crossed the old episode-15/step-351 corruption window, completed every
+  rollout at 450 steps, and recorded zero numerical failures, DLS fallbacks,
+  non-finite policy values, or fatal signatures. Its task result is 0/50
+  success and mean normalized progress `0.0133333`.
+- The corresponding reasoning BlockStack clean retry (`1081412`) also completed
+  50/50 and crossed its former episode-45/step-328 failure point without a
+  fallback. Both incomplete first attempts remain preserved and excluded.
+- The final twelve accepted task/checkpoint cohorts pass the reusable strict
+  artifact auditor: 600/600 rows and videos, 34,200 policy queries, and 270,000
+  finite executed actions. Every video decodes to 450 frames/30 seconds at
+  15 fps; sampled midpoint/final and critical-window videos pass visual,
+  black-frame, and freeze checks. Accepted runs contain zero numerical failure,
+  DLS fallback, or unexpected traceback.
+- Official LAP-3B achieves 0/300 success and six-task mean progress `0.0665079`;
+  reasoning step 10000 achieves 0/300 and `0.0264286`. All evaluation jobs are
+  off queue and their isolated runtime caches were removed after checksum-copy
+  and audit. Full records live under
+  `/home/lzha/code/shared_artifacts/polaris-eef-eval-20260630`.
