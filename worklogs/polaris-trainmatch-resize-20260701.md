@@ -100,3 +100,8 @@ container, which is practical for two images at the policy query cadence.
   before accepting a rerun.
 - Remaining work is orchestration-owned integration, deployment, canary
   evaluation, and full rerun; this implementation agent launched none of them.
+- `git push -u origin codex/polaris-trainmatch-resize-20260701` was attempted
+  after validation but GitHub rejected it with HTTP 403 because authenticated
+  user `lihzha` cannot write to `arhanjain/PolaRiS`; `lihzha/PolaRiS` does not
+  exist. The clean local branch/worktree is available to the orchestrator in
+  the shared filesystem. No fork or other external repository was created.
