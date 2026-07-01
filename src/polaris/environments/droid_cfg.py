@@ -1,6 +1,10 @@
 import torch
 from pathlib import Path
-from isaaclab.envs.mdp.actions.actions_cfg import BinaryJointPositionActionCfg
+from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
+from isaaclab.envs.mdp.actions.actions_cfg import (
+    BinaryJointPositionActionCfg,
+    DifferentialInverseKinematicsActionCfg,
+)
 from isaaclab.envs.mdp.actions.binary_joint_actions import BinaryJointPositionAction
 import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math
@@ -229,11 +233,46 @@ class BinaryJointPositionZeroToOneActionCfg(BinaryJointPositionActionCfg):
 
 @configclass
 class ActionCfg:
+    """Default DROID joint-position actions (kept for backwards compatibility)."""
+
     arm = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=["panda_joint.*"],
         preserve_order=True,
         use_default_offset=False,
+    )
+
+    finger_joint = BinaryJointPositionZeroToOneActionCfg(
+        asset_name="robot",
+        joint_names=["finger_joint"],
+        open_command_expr={"finger_joint": 0.0},
+        close_command_expr={"finger_joint": np.pi / 4},
+    )
+
+
+@configclass
+class EefPoseActionCfg:
+    """Absolute ``base_link`` pose plus closed-positive gripper command.
+
+    Isaac Lab's absolute differential-IK controller consumes
+    ``[x, y, z, qw, qx, qy, qz]`` in the articulation root frame. The
+    :class:`SceneCfg` frame transformer and the policy observations below use
+    the same ``panda_link0 -> base_link`` transform.
+    """
+
+    arm = DifferentialInverseKinematicsActionCfg(
+        asset_name="robot",
+        joint_names=["panda_joint.*"],
+        body_name="base_link",
+        controller=DifferentialIKControllerCfg(
+            command_type="pose",
+            use_relative_mode=False,
+            ik_method="dls",
+        ),
+        scale=1.0,
+        body_offset=DifferentialInverseKinematicsActionCfg.OffsetCfg(
+            pos=(0.0, 0.0, 0.0)
+        ),
     )
 
     finger_joint = BinaryJointPositionZeroToOneActionCfg(
@@ -285,6 +324,28 @@ def gripper_pos(
     return joint_pos
 
 
+def eef_pos(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+):
+    """Return ``base_link`` position relative to the robot root frame."""
+
+    frames = env.scene[asset_cfg.name]
+    frame_idx = frames.data.target_frame_names.index("end_effector")
+    return frames.data.target_pos_source[:, frame_idx, :]
+
+
+def eef_quat(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("ee_frame"),
+):
+    """Return ``base_link`` quaternion relative to root, in Isaac ``wxyz`` order."""
+
+    frames = env.scene[asset_cfg.name]
+    frame_idx = frames.data.target_frame_names.index("end_effector")
+    return frames.data.target_quat_source[:, frame_idx, :]
+
+
 @configclass
 class ObservationCfg:
     @configclass
@@ -295,6 +356,8 @@ class ObservationCfg:
         gripper_pos = ObsTerm(
             func=gripper_pos, noise=noise.GaussianNoiseCfg(std=0.05), clip=(0, 1)
         )
+        eef_pos = ObsTerm(func=eef_pos)
+        eef_quat = ObsTerm(func=eef_quat)
 
         def __post_init__(self) -> None:
             self.enable_corruption = False
