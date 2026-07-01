@@ -8,10 +8,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
 from openpi_client import websocket_client_policy
 from scipy.spatial.transform import Rotation
-from torch.nn import functional as F
 
 from polaris.config import PolicyArgs
 from polaris.policy.abstract_client import InferenceClient
@@ -21,7 +19,7 @@ LAP_IMAGE_SIZE = 224
 LAP_IMAGE_PREPROCESSOR_MARKER = (
     "POLARIS_LAP_IMAGE_PREPROCESSOR="
     "tf_bilinear_half_pixel_antialias_false_uint8_round_"
-    "symmetric_zero_pad_224x224_v1"
+    "symmetric_zero_pad_224x224_numpy_float32_exact_v2"
 )
 
 
@@ -256,10 +254,11 @@ def resize_lap_image(
     """Match Ego-LAP's training-time uint8 ``_tf_resize_with_pad`` path.
 
     TensorFlow's default bilinear resize uses half-pixel centers and no
-    antialiasing. Torch's CPU bilinear kernel with ``align_corners=False`` and
-    ``antialias=False`` has the same sampling contract without adding
-    TensorFlow to the PolaRiS runtime. Keep the float32 dimension calculation,
-    uint8 rounding, and asymmetric remainder placement aligned with training.
+    antialiasing. Reproduce its float32 coordinate and interpolation operation
+    order directly with NumPy so rounding-edge outputs are bit-exact without
+    adding TensorFlow to the PolaRiS runtime. Keep the float32 dimension
+    calculation, uint8 rounding, and asymmetric remainder placement aligned
+    with training.
     """
 
     image = np.asarray(image)
@@ -289,30 +288,31 @@ def resize_lap_image(
             f"resized={(resized_h, resized_w)}"
         )
 
-    contiguous_image = np.ascontiguousarray(image)
-    if not contiguous_image.flags.writeable:
-        contiguous_image = contiguous_image.copy()
-    image_tensor = (
-        torch.from_numpy(contiguous_image)
-        .permute(2, 0, 1)
-        .unsqueeze(0)
-        .to(dtype=torch.float32)
-    )
-    with torch.inference_mode():
-        resized_tensor = F.interpolate(
-            image_tensor,
-            size=(resized_h, resized_w),
-            mode="bilinear",
-            align_corners=False,
-            antialias=False,
-        )
-        resized = (
-            torch.round(resized_tensor)
-            .clamp_(0, 255)
-            .to(dtype=torch.uint8)[0]
-            .permute(1, 2, 0)
-            .numpy()
-        )
+    def half_pixel_indices_and_lerp(
+        input_size: int, output_size: int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        output_indices = np.arange(output_size, dtype=np.float32)
+        input_positions = (output_indices + np.float32(0.5)) * np.float32(
+            input_size / output_size
+        ) - np.float32(0.5)
+        lower_unclipped = np.floor(input_positions).astype(np.int64)
+        lerp = input_positions - lower_unclipped.astype(np.float32)
+        lower = np.clip(lower_unclipped, 0, input_size - 1)
+        upper = np.clip(lower_unclipped + 1, 0, input_size - 1)
+        return lower, upper, lerp
+
+    y0, y1, y_lerp = half_pixel_indices_and_lerp(in_h, resized_h)
+    x0, x1, x_lerp = half_pixel_indices_and_lerp(in_w, resized_w)
+    top_left = image[y0[:, None], x0[None, :]].astype(np.float32)
+    top_right = image[y0[:, None], x1[None, :]].astype(np.float32)
+    bottom_left = image[y1[:, None], x0[None, :]].astype(np.float32)
+    bottom_right = image[y1[:, None], x1[None, :]].astype(np.float32)
+    x_lerp = x_lerp[None, :, None]
+    y_lerp = y_lerp[:, None, None]
+    top = top_left + (top_right - top_left) * x_lerp
+    bottom = bottom_left + (bottom_right - bottom_left) * x_lerp
+    resized_f32 = top + (bottom - top) * y_lerp
+    resized = np.clip(np.rint(resized_f32), 0.0, 255.0).astype(np.uint8)
 
     pad_h_total = target_h - resized_h
     pad_w_total = target_w - resized_w
