@@ -13,7 +13,9 @@ from polaris.policy.lap_eef_pose_client import (
     EgoLAPEefPoseClient,
     anchor_action_chunk,
     build_lap_state,
+    egocentric_action_chunk_to_base,
     quaternion_wxyz_to_rot6d,
+    resolve_action_frame,
     rotate_image_180,
     validate_action_chunk,
 )
@@ -41,8 +43,15 @@ class PoseConversionTest(unittest.TestCase):
         )
         np.testing.assert_allclose(
             state,
-            np.array([0.4, -0.2, 0.3, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.75]),
+            np.array([0.4, -0.2, 0.3, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0]),
         )
+
+    def test_state_gripper_matches_official_half_threshold(self):
+        identity = np.array([1.0, 0.0, 0.0, 0.0])
+        open_state = build_lap_state(np.zeros(3), identity, np.array([0.49]))
+        closed_state = build_lap_state(np.zeros(3), identity, np.array([0.5]))
+        self.assertEqual(open_state[-1], 1.0)
+        self.assertEqual(closed_state[-1], 0.0)
 
     def test_entire_chunk_uses_one_anchor_and_right_relative_rotations(self):
         anchor_position = np.array([0.5, -0.1, 0.2])
@@ -66,6 +75,50 @@ class PoseConversionTest(unittest.TestCase):
             actual_rotation.as_matrix(), expected_rotation.as_matrix(), atol=1e-6
         )
         np.testing.assert_allclose(actions[:, 7], np.array([0.0, 0.2]), atol=1e-7)
+
+    def test_egocentric_droid_chunk_is_inverted_before_anchoring(self):
+        anchor_position = np.array([0.5, -0.1, 0.2])
+        anchor_rotation = Rotation.from_euler("z", 90, degrees=True)
+        anchor_wxyz = _xyzw_to_wxyz(anchor_rotation.as_quat())
+        semantic_eef_actions = np.array([[0.1, 0.2, -0.3, 0.1, -0.2, 0.3, 0.75]])
+
+        base_deltas = egocentric_action_chunk_to_base(
+            semantic_eef_actions,
+            anchor_wxyz,
+            dataset_name="droid",
+            rotation_applied=True,
+        )
+        expected_geometric_eef_position = np.array([0.1, -0.2, 0.3])
+        np.testing.assert_allclose(
+            base_deltas[0, :3],
+            anchor_rotation.apply(expected_geometric_eef_position),
+            atol=1e-7,
+        )
+
+        actions = anchor_action_chunk(
+            semantic_eef_actions,
+            anchor_position,
+            anchor_wxyz,
+            action_frame="egocentric",
+            dataset_name="droid",
+            rotation_applied=True,
+        )
+        np.testing.assert_allclose(
+            actions[0, :3], anchor_position + base_deltas[0, :3], atol=1e-7
+        )
+        expected_target = anchor_rotation * Rotation.from_euler(
+            "xyz", base_deltas[0, 3:6]
+        )
+        actual_target = Rotation.from_quat(actions[0, [4, 5, 6, 3]])
+        np.testing.assert_allclose(
+            actual_target.as_matrix(), expected_target.as_matrix(), atol=1e-6
+        )
+
+    def test_frame_description_resolution_is_strict(self):
+        self.assertEqual(resolve_action_frame("robot_base"), "robot_base")
+        self.assertEqual(resolve_action_frame("egocentric"), "egocentric")
+        with self.assertRaisesRegex(ValueError, "Unsupported action_frame"):
+            resolve_action_frame("world frame")
 
     def test_action_validation_is_strict(self):
         with self.assertRaisesRegex(ValueError, r"\(T, 7\)"):

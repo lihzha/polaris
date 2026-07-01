@@ -42,6 +42,7 @@ class PolicyArgs:
     port: int = 8000
     open_loop_horizon: int | None = 8
     frame_description: str = "robot base frame"
+    action_frame: Literal["robot_base", "egocentric"] = "robot_base"
     dataset_name: str = "droid"
     state_type: str = "eef_pose"
     rotate_wrist_180: bool = True

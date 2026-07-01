@@ -88,3 +88,26 @@
   ffmpeg found no black or >=2-second frozen interval. No fatal, CUDA, OOM, or
   Python runtime error was found. Artifacts:
   `/home/lzha/code/shared_artifacts/polaris-eef-eval-20260630/e2e/lap3b-foodbussing-eef-20260701T012711Z`.
+
+## 2026-06-30 — Official-contract audit and dual-checkpoint preparation
+
+- Compared the public LAP-3B request/transform stack against official LAP
+  commit `3958d1466d5b92445b67de7d4202c19608ad4d56`. Matching non-dropout
+  inputs produced identical model-facing image tensors/masks, normalized
+  state, and prompt tokens. Corrected the remaining state mismatch by
+  binarizing the open-positive gripper observation at the official 0.5
+  threshold.
+- Added an explicit numeric `action_frame`, separate from the language prompt's
+  `frame_description`. This matters for the OXE magic-soup reasoning checkpoint:
+  its prompt target says `egocentric frame`, but its flow action target is the
+  unchanged base-frame dataset action. The production setting is therefore
+  `frame_description=egocentric frame`, `action_frame=robot_base`.
+- Added a guarded inverse for genuinely egocentric DROID numeric action chunks.
+  A cross-repository randomized check against Ego-LAP's authoritative forward
+  transform recovered 200/200 base-frame chunks within `1e-7`; this path is
+  not enabled for either current evaluation cohort.
+- Validation in `polaris-eval:cuda13`: all 9 client tests passed. The exact
+  Pyxis dependency image was published privately as
+  `ghcr.io/lihzha/polaris-eval:cuda13-fd00a51`, digest
+  `sha256:e32265e25ae2d61b88cf0c530d5561d3fd48e6b2655f48cb583d18fb18851006`,
+  for import to the L40S cluster.

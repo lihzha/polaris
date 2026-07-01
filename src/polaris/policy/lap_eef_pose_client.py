@@ -80,7 +80,9 @@ def build_lap_state(
     position = _finite_vector(eef_position, name="end-effector position", size=3)
     rot6d = quaternion_wxyz_to_rot6d(eef_quaternion_wxyz)
     closed = _finite_vector(closed_gripper, name="closed gripper", size=1)[0]
-    open_gripper = 1.0 - np.clip(closed, 0.0, 1.0)
+    # Match the official DROID runner: invert the normalized observation and
+    # binarize at 0.5 before building the policy state.
+    open_gripper = float((1.0 - np.clip(closed, 0.0, 1.0)) > 0.5)
     state = np.concatenate([position, rot6d, np.array([open_gripper])])
     if state.shape != (10,) or not np.isfinite(state).all():
         raise ValueError(f"Invalid Ego-LAP state with shape {state.shape}")
@@ -106,10 +108,68 @@ def validate_action_chunk(response: Any) -> np.ndarray:
     return actions
 
 
+def resolve_action_frame(action_frame: str) -> str:
+    """Normalize the explicit numeric frame used by LAP's flow actions."""
+
+    normalized = " ".join(action_frame.lower().replace("_", " ").split())
+    if normalized in {"robot base", "robot base frame", "base", "base frame"}:
+        return "robot_base"
+    if normalized in {"egocentric", "egocentric frame", "eef", "eef frame"}:
+        return "egocentric"
+    raise ValueError(
+        "Unsupported action_frame. Expected robot_base or egocentric; "
+        f"got {action_frame!r}"
+    )
+
+
+def egocentric_action_chunk_to_base(
+    delta_actions: Any,
+    anchor_quaternion_wxyz: Any,
+    *,
+    dataset_name: str,
+    rotation_applied: bool,
+) -> np.ndarray:
+    """Invert Ego-LAP's single-arm DROID semantic EEF-frame transform."""
+
+    actions = np.asarray(delta_actions, dtype=np.float64)
+    if actions.ndim != 2 or actions.shape[0] < 1 or actions.shape[1] != 7:
+        raise ValueError(
+            f"Ego-LAP delta actions must have shape (T, 7), T >= 1; got {actions.shape}"
+        )
+    if dataset_name not in {"droid", "droid_100"}:
+        raise ValueError(
+            "Egocentric action decoding currently supports the DROID convention; "
+            f"got dataset_name={dataset_name!r}"
+        )
+
+    anchor_wxyz = _unit_quaternion_wxyz(
+        anchor_quaternion_wxyz, name="anchor quaternion"
+    )
+    eef_to_base = Rotation.from_quat(anchor_wxyz[[1, 2, 3, 0]]).as_matrix()
+
+    base_actions = actions.copy()
+    geometric_eef_positions = actions[:, :3] * np.array([1.0, -1.0, -1.0])
+    base_actions[:, :3] = geometric_eef_positions @ eef_to_base.T
+
+    geometric_eef_euler = actions[:, 3:6].copy()
+    if not rotation_applied:
+        geometric_eef_euler *= np.array([1.0, -1.0, -1.0])
+    eef_delta_matrices = Rotation.from_euler("xyz", geometric_eef_euler).as_matrix()
+    base_delta_matrices = (
+        eef_to_base[None, :, :] @ eef_delta_matrices @ eef_to_base.T[None, :, :]
+    )
+    base_actions[:, 3:6] = Rotation.from_matrix(base_delta_matrices).as_euler("xyz")
+    return base_actions
+
+
 def anchor_action_chunk(
     delta_actions: Any,
     anchor_position: Any,
     anchor_quaternion_wxyz: Any,
+    *,
+    action_frame: str = "robot_base",
+    dataset_name: str = "droid",
+    rotation_applied: bool = True,
 ) -> np.ndarray:
     """Anchor one full Ego-LAP delta chunk to one query-time EEF pose.
 
@@ -136,6 +196,15 @@ def anchor_action_chunk(
         anchor_quaternion_wxyz, name="anchor quaternion"
     )
     anchor_xyzw = anchor_wxyz[[1, 2, 3, 0]]
+
+    action_frame = resolve_action_frame(action_frame)
+    if action_frame == "egocentric":
+        delta_actions = egocentric_action_chunk_to_base(
+            delta_actions,
+            anchor_wxyz,
+            dataset_name=dataset_name,
+            rotation_applied=rotation_applied,
+        )
 
     target_positions = anchor_position[None, :] + delta_actions[:, :3]
     anchor_rotation = Rotation.from_quat(anchor_xyzw)
@@ -180,6 +249,7 @@ class EgoLAPEefPoseClient(InferenceClient):
             raise ValueError("open_loop_horizon must be positive or None")
         if not args.frame_description.strip():
             raise ValueError("frame_description must not be empty")
+        resolve_action_frame(args.action_frame)
 
         self.args = args
         self.client = websocket_client_policy.WebsocketClientPolicy(
@@ -259,6 +329,20 @@ class EgoLAPEefPoseClient(InferenceClient):
                 raw_delta_chunk,
                 current["eef_position"],
                 current["eef_quaternion_wxyz"],
+                action_frame=self.args.action_frame,
+                dataset_name=self.args.dataset_name,
+                rotation_applied=self.args.rotate_wrist_180,
+            )
+            action_frame = resolve_action_frame(self.args.action_frame)
+            base_delta_chunk = (
+                raw_delta_chunk
+                if action_frame == "robot_base"
+                else egocentric_action_chunk_to_base(
+                    raw_delta_chunk,
+                    current["eef_quaternion_wxyz"],
+                    dataset_name=self.args.dataset_name,
+                    rotation_applied=self.args.rotate_wrist_180,
+                )
             )
             self.raw_delta_chunk = raw_delta_chunk
             self.pred_action_chunk = anchored_chunk
@@ -273,10 +357,12 @@ class EgoLAPEefPoseClient(InferenceClient):
                     "step": self.step_index,
                     "instruction": instruction,
                     "frame_description": self.args.frame_description,
+                    "numeric_action_frame": action_frame,
                     "anchor_position": current["eef_position"].tolist(),
                     "anchor_quaternion_wxyz": current["eef_quaternion_wxyz"].tolist(),
                     "state": request["observation"]["state"].tolist(),
                     "raw_delta_chunk": raw_delta_chunk.tolist(),
+                    "base_delta_chunk": base_delta_chunk.tolist(),
                     "anchored_action_chunk": anchored_chunk.tolist(),
                     "execution_horizon": execution_horizon,
                     "reasoning": response.get("reasoning"),

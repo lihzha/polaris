@@ -41,9 +41,12 @@ directly so uv does not attempt to create or synchronize a second environment.
 - Ego-LAP responses must be finite, non-empty `T x 7` arrays containing
   `[dx, dy, dz, droll, dpitch, dyaw, gripper_open]`. Invalid responses stop the
   rollout instead of silently substituting an action.
-- Every pose delta in a returned chunk is anchored once to the query-time pose:
-  `p_target = p_anchor + dp` and `R_target = R_anchor * R_delta`. Targets are
-  not accumulated against the robot pose at each execution step.
+- Every pose delta in a returned chunk is anchored once to the query-time pose.
+  `--policy.action-frame robot_base` anchors the numeric flow delta directly.
+  `--policy.action-frame egocentric` first applies the exact inverse of Ego-LAP's single-arm
+  DROID semantic EEF transform (including its wrist-view axis convention and
+  rotation conjugation), then anchors the recovered base-frame delta. Targets
+  are not accumulated against the robot pose at each execution step.
 
 ## Start the Ego-LAP server
 
@@ -85,7 +88,12 @@ uv run scripts/eval.py \
 new query. It must not exceed the returned chunk length. Pass
 `--policy.open-loop-horizon None` to execute the complete chunk. The optional
 JSONL trace records each query anchor, raw delta chunk, anchored absolute
-chunk, and executed action. Omit `--policy.trace-path` to disable it.
+chunk, decoded base-frame delta chunk, numeric action frame, and executed
+action. Omit `--policy.trace-path` to disable it. Prompt wording and numeric
+flow-action coordinates are intentionally configured separately: current
+reasoning checkpoints use `--policy.frame-description "egocentric frame"`, but
+their flow targets remain the unmodified base-frame dataset actions and thus
+use `--policy.action-frame robot_base`.
 
 Use `--instruction "..."` to override the instruction stored with an
 environment's initial conditions. Evaluation videos contain one visualization
