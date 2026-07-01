@@ -93,6 +93,28 @@ class DroidJointPosClientContractTest(unittest.TestCase):
         ):
             client.infer(observation, "test instruction", return_viz=True)
 
+    def test_existing_trace_advances_the_next_reset_index(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trace_path = Path(temporary_directory) / "trace.jsonl"
+            trace_path.write_text(json.dumps({"reset_index": 15}) + "\n")
+            args = PolicyArgs(
+                client="DroidJointPos",
+                open_loop_horizon=8,
+                trace_path=str(trace_path),
+                expected_action_horizon=15,
+                expected_action_dim=8,
+                state_type="joint_position",
+            )
+            with mock.patch(
+                "polaris.policy.droid_jointpos_client.websocket_client_policy.WebsocketClientPolicy",
+                return_value=_FakePolicyServer(np.zeros((15, 8))),
+            ):
+                client = DroidJointPosClient(args)
+
+            self.assertEqual(client.reset_index, 15)
+            client.reset()
+            self.assertEqual(client.reset_index, 16)
+
     def test_official_pi05_request_execution_and_trace_contract(self):
         actions = np.arange(15 * 8, dtype=np.float32).reshape(15, 8) / 100.0
         actions[:, -1] = np.linspace(0.0, 1.0, 15)

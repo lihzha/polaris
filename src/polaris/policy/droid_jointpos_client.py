@@ -16,6 +16,30 @@ class JointPositionObservationNumericalError(FloatingPointError):
     """Raised when simulator corruption makes joint proprioception non-finite."""
 
 
+def _latest_trace_reset_index(trace_path: Path) -> int:
+    """Return the greatest reset index in an existing resumable trace."""
+    if not trace_path.exists():
+        return -1
+    latest_reset_index = -1
+    with trace_path.open(encoding="utf-8") as trace_file:
+        for line_number, line in enumerate(trace_file, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"Invalid existing trace JSON at line {line_number}: {error}"
+                ) from error
+            reset_index = record.get("reset_index")
+            if not isinstance(reset_index, int) or reset_index < 0:
+                raise ValueError(
+                    f"Invalid existing trace reset_index at line {line_number}"
+                )
+            latest_reset_index = max(latest_reset_index, reset_index)
+    return latest_reset_index
+
+
 def _image_contract(image: np.ndarray) -> dict:
     image = np.ascontiguousarray(np.asarray(image))
     return {
@@ -84,12 +108,14 @@ class DroidJointPosClient(InferenceClient):
         self.actions_from_chunk_completed = 0
         self.pred_action_chunk = None
         self.open_loop_horizon = args.open_loop_horizon
-        self.reset_index = -1
         self.query_index = 0
         self.active_query_index = None
         self.trace_path = Path(args.trace_path) if args.trace_path else None
         if self.trace_path is not None:
             self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+            self.reset_index = _latest_trace_reset_index(self.trace_path)
+        else:
+            self.reset_index = -1
 
         contract = {
             "client": "DroidJointPos",
@@ -105,6 +131,7 @@ class DroidJointPosClient(InferenceClient):
             "open_loop_horizon": self.open_loop_horizon,
             "expected_action_horizon": args.expected_action_horizon,
             "expected_action_dim": args.expected_action_dim,
+            "initial_reset_index": self.reset_index,
             "server_metadata": self.client.get_server_metadata(),
         }
         print(

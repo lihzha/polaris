@@ -34,6 +34,7 @@ RUN_LABEL="${RUN_LABEL:-pi05-polaris}"
 PORT="${PORT:-$((20000 + ${SLURM_JOB_ID:-1} % 20000))}"
 SERVER_START_TIMEOUT_SECS="${SERVER_START_TIMEOUT_SECS:-2400}"
 DRY_RUN="${DRY_RUN:-0}"
+RESUME_FROM_TASK_DIR="${RESUME_FROM_TASK_DIR:-}"
 
 die() {
   echo "ERROR: $*" >&2
@@ -100,8 +101,20 @@ METADATA_FILE="${RUN_DIR}/run_metadata.env"
 SERVER_PID=""
 
 mkdir -p "${TASK_DIR}" "${POLARIS_CACHE_DIR}"
-[[ ! -e "${TASK_DIR}/eval_results.csv" && ! -e "${TRACE_PATH}" ]] \
-  || die "Run directory already contains metrics or traces; use a new job/run directory"
+if [[ -n "${RESUME_FROM_TASK_DIR}" ]]; then
+  [[ ! -e "${TASK_DIR}/eval_results.csv" && ! -e "${TRACE_PATH}" ]] \
+    || die "Resume destination already contains metrics or traces"
+  python3 "${SCRIPT_DIR}/prepare_pi05_resume.py" \
+    "${RESUME_FROM_TASK_DIR}" "${TASK_DIR}" --expected-rollouts "${ROLLOUTS}" \
+    --output "${RUN_DIR}/resume_manifest.json"
+  python3 "${SCRIPT_DIR}/validate_pi05_trace.py" \
+    "${TRACE_PATH}" --metrics-csv "${TASK_DIR}/eval_results.csv" \
+    --expected-prompt "${EXPECTED_PROMPT}" \
+    --output "${RUN_DIR}/resume_trace_summary.json"
+else
+  [[ ! -e "${TASK_DIR}/eval_results.csv" && ! -e "${TRACE_PATH}" ]] \
+    || die "Run directory already contains metrics or traces; use a new job/run directory"
+fi
 rm -f "${RUN_DIR}/SUCCESS" "${RUN_DIR}/FAILED"
 printf 'started_at=%s\n' "$(date -Iseconds)" > "${RUN_DIR}/RUNNING"
 
@@ -178,6 +191,7 @@ PYXIS_IMAGE_SHA256="$(sha256sum "${POLARIS_PYXIS_IMAGE}" | awk '{print $1}')"
   printf 'POLARIS_PYXIS_IMAGE_SHA256=%q\n' "${PYXIS_IMAGE_SHA256}"
   printf 'POLARIS_ENVIRONMENT=%q\n' "${POLARIS_ENVIRONMENT}"
   printf 'EXPECTED_PROMPT=%q\n' "${EXPECTED_PROMPT}"
+  printf 'RESUME_FROM_TASK_DIR=%q\n' "${RESUME_FROM_TASK_DIR}"
   printf 'ROLLOUTS=%q\n' "${ROLLOUTS}"
   printf 'CONTROL_MODE=joint-position\n'
   printf 'STATE_CONTRACT=7_joint_radians_plus_closed_positive_gripper\n'
