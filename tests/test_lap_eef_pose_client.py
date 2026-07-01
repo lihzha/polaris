@@ -11,6 +11,7 @@ from polaris.config import PolicyArgs
 from polaris.policy.abstract_client import InferenceClient
 from polaris.policy.lap_eef_pose_client import (
     EgoLAPEefPoseClient,
+    LAP_IMAGE_PREPROCESSOR_MARKER,
     anchor_action_chunk,
     build_lap_state,
     egocentric_action_chunk_to_base,
@@ -178,9 +179,10 @@ class ClientContractTest(unittest.TestCase):
                 return_value=fake_server,
             ),
             mock.patch(
-                "polaris.policy.lap_eef_pose_client.image_tools.resize_with_pad",
+                "polaris.policy.lap_eef_pose_client.resize_lap_image",
                 side_effect=lambda image, *_: np.asarray(image),
             ),
+            mock.patch("builtins.print") as print_mock,
         ):
             args.trace_path = str(Path(temporary_directory) / "trace.jsonl")
             client = EgoLAPEefPoseClient(args)
@@ -200,6 +202,23 @@ class ClientContractTest(unittest.TestCase):
                 for line in Path(args.trace_path).read_text().splitlines()
             ]
 
+        self.assertEqual(
+            print_mock.call_args_list[0],
+            mock.call(LAP_IMAGE_PREPROCESSOR_MARKER, flush=True),
+        )
+        image_io_marker = print_mock.call_args_list[1].args[0]
+        self.assertTrue(image_io_marker.startswith("POLARIS_LAP_IMAGE_IO="))
+        image_io = json.loads(image_io_marker.split("=", maxsplit=1)[1])
+        self.assertEqual(
+            image_io,
+            {
+                "external_input": {"shape": [2, 2, 3], "dtype": "uint8"},
+                "wrist_input": {"shape": [2, 2, 3], "dtype": "uint8"},
+                "external_output": {"shape": [2, 2, 3], "dtype": "uint8"},
+                "wrist_output": {"shape": [2, 2, 3], "dtype": "uint8"},
+            },
+        )
+        self.assertEqual(len(print_mock.call_args_list), 2)
         self.assertIs(
             InferenceClient.REGISTERED_CLIENTS["EgoLAPEefPose"], EgoLAPEefPoseClient
         )

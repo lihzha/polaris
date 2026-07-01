@@ -8,11 +8,21 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from openpi_client import image_tools, websocket_client_policy
+import torch
+from openpi_client import websocket_client_policy
 from scipy.spatial.transform import Rotation
+from torch.nn import functional as F
 
 from polaris.config import PolicyArgs
 from polaris.policy.abstract_client import InferenceClient
+
+
+LAP_IMAGE_SIZE = 224
+LAP_IMAGE_PREPROCESSOR_MARKER = (
+    "POLARIS_LAP_IMAGE_PREPROCESSOR="
+    "tf_bilinear_half_pixel_antialias_false_uint8_round_"
+    "symmetric_zero_pad_224x224_v1"
+)
 
 
 def _json_default(value: Any) -> Any:
@@ -240,6 +250,82 @@ def _rgb_uint8(image: Any, *, name: str) -> np.ndarray:
     return np.clip(image, 0.0, 255.0).astype(np.uint8)
 
 
+def resize_lap_image(
+    image: np.ndarray, target_h: int = LAP_IMAGE_SIZE, target_w: int = LAP_IMAGE_SIZE
+) -> np.ndarray:
+    """Match Ego-LAP's training-time uint8 ``_tf_resize_with_pad`` path.
+
+    TensorFlow's default bilinear resize uses half-pixel centers and no
+    antialiasing. Torch's CPU bilinear kernel with ``align_corners=False`` and
+    ``antialias=False`` has the same sampling contract without adding
+    TensorFlow to the PolaRiS runtime. Keep the float32 dimension calculation,
+    uint8 rounding, and asymmetric remainder placement aligned with training.
+    """
+
+    image = np.asarray(image)
+    if image.ndim != 3 or image.shape[2] < 1:
+        raise ValueError(f"image must have shape (H, W, C>=1); got {image.shape}")
+    if image.dtype != np.uint8:
+        raise TypeError(f"image must have dtype uint8; got {image.dtype}")
+    if image.shape[0] < 1 or image.shape[1] < 1:
+        raise ValueError(f"image dimensions must be nonzero; got {image.shape[:2]}")
+    if target_h < 1 or target_w < 1:
+        raise ValueError(
+            f"target dimensions must be positive; got {(target_h, target_w)}"
+        )
+
+    in_h, in_w = image.shape[:2]
+    # Use float32 explicitly: this reproduces the TensorFlow graph's dimension
+    # arithmetic, including floor behavior at nearly integral boundaries.
+    h_f = np.float32(in_h)
+    w_f = np.float32(in_w)
+    ratio = np.maximum(w_f / np.float32(target_w), h_f / np.float32(target_h))
+    resized_h = int(np.floor(h_f / ratio))
+    resized_w = int(np.floor(w_f / ratio))
+    if resized_h < 1 or resized_w < 1:
+        raise ValueError(
+            "aspect-preserving resize produced an empty dimension: "
+            f"input={(in_h, in_w)}, target={(target_h, target_w)}, "
+            f"resized={(resized_h, resized_w)}"
+        )
+
+    contiguous_image = np.ascontiguousarray(image)
+    if not contiguous_image.flags.writeable:
+        contiguous_image = contiguous_image.copy()
+    image_tensor = (
+        torch.from_numpy(contiguous_image)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .to(dtype=torch.float32)
+    )
+    with torch.inference_mode():
+        resized_tensor = F.interpolate(
+            image_tensor,
+            size=(resized_h, resized_w),
+            mode="bilinear",
+            align_corners=False,
+            antialias=False,
+        )
+        resized = (
+            torch.round(resized_tensor)
+            .clamp_(0, 255)
+            .to(dtype=torch.uint8)[0]
+            .permute(1, 2, 0)
+            .numpy()
+        )
+
+    pad_h_total = target_h - resized_h
+    pad_w_total = target_w - resized_w
+    pad_h0 = pad_h_total // 2
+    pad_w0 = pad_w_total // 2
+    padded = np.zeros((target_h, target_w, image.shape[2]), dtype=np.uint8)
+    padded[
+        pad_h0 : pad_h0 + resized_h,
+        pad_w0 : pad_w0 + resized_w,
+    ] = resized
+    return padded
+
+
 @InferenceClient.register(client_name="EgoLAPEefPose")
 class EgoLAPEefPoseClient(InferenceClient):
     """Websocket Ego-LAP client that emits absolute PolaRiS EEF targets."""
@@ -255,6 +341,7 @@ class EgoLAPEefPoseClient(InferenceClient):
         self.client = websocket_client_policy.WebsocketClientPolicy(
             host=args.host, port=args.port
         )
+        print(LAP_IMAGE_PREPROCESSOR_MARKER, flush=True)
         self.open_loop_horizon = args.open_loop_horizon
         self.trace_path = Path(args.trace_path) if args.trace_path else None
         if self.trace_path is not None:
@@ -267,6 +354,7 @@ class EgoLAPEefPoseClient(InferenceClient):
         self.episode_index = -1
         self.query_index = 0
         self.step_index = 0
+        self._image_io_logged = False
 
     @property
     def rerender(self) -> bool:
@@ -424,13 +512,35 @@ class EgoLAPEefPoseClient(InferenceClient):
     def _model_images(
         self, current: dict[str, np.ndarray]
     ) -> tuple[np.ndarray, np.ndarray]:
-        exterior_image = image_tools.resize_with_pad(
-            current["external_image"], 224, 224
-        )
+        exterior_image = resize_lap_image(current["external_image"])
         wrist_image = current["wrist_image"]
         if self.args.rotate_wrist_180:
             wrist_image = rotate_image_180(wrist_image)
-        wrist_image = image_tools.resize_with_pad(wrist_image, 224, 224)
+        wrist_image = resize_lap_image(wrist_image)
+        if not self._image_io_logged:
+            image_io = {
+                "external_input": {
+                    "shape": list(current["external_image"].shape),
+                    "dtype": str(current["external_image"].dtype),
+                },
+                "wrist_input": {
+                    "shape": list(current["wrist_image"].shape),
+                    "dtype": str(current["wrist_image"].dtype),
+                },
+                "external_output": {
+                    "shape": list(exterior_image.shape),
+                    "dtype": str(exterior_image.dtype),
+                },
+                "wrist_output": {
+                    "shape": list(wrist_image.shape),
+                    "dtype": str(wrist_image.dtype),
+                },
+            }
+            print(
+                "POLARIS_LAP_IMAGE_IO=" + json.dumps(image_io, separators=(",", ":")),
+                flush=True,
+            )
+            self._image_io_logged = True
         return exterior_image, wrist_image
 
     def _build_request(
