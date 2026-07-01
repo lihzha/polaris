@@ -4,6 +4,31 @@ PolaRiS can evaluate an Ego-LAP websocket policy with absolute differential-IK
 control while retaining joint-position control as the default for existing
 policies.
 
+## Local Ada Docker runtime
+
+The checked-in Docker recipes isolate the CUDA 13 compiler used for the splat
+kernels from the host CUDA toolkit and compile the kernels for Ada GPUs
+(`TORCH_CUDA_ARCH_LIST=8.9`). From the repository root:
+
+```bash
+docker build --progress=plain \
+  -f docker/Dockerfile.base-ada \
+  -t polaris-isaaclab-base:cu130-isaaclab230-r1 .
+docker build --progress=plain \
+  -f docker/Dockerfile.polaris-ada \
+  -t polaris-eval:cuda13 .
+```
+
+The final image has an empty entrypoint and `python` from its isolated virtual
+environment on `PATH`, so it is compatible with the ego-lap launcher described
+below. Restrict runtime access to the RTX 6000 Ada with `--gpus device=0` and
+`CUDA_VISIBLE_DEVICES=0` on this two-GPU workstation.
+
+The image contains dependencies, not the PolaRiS checkout or Hub assets. A
+bind-mounted source checkout must therefore set `PYTHONPATH` to its `src`
+directory. Do not use `uv run` inside this image: invoke its isolated `python`
+directly so uv does not attempt to create or synchronize a second environment.
+
 ## Interface contract
 
 - The controlled frame is the Robotiq `base_link`, expressed relative to the
@@ -76,7 +101,15 @@ checks final pose error. It launches Isaac Sim and therefore requires a working
 GPU installation and downloaded PolaRiS assets:
 
 ```bash
-uv run scripts/smoke_eef_pose_controller.py --headless
+mkdir -p runs/eef_pose_controller_smoke
+docker run --rm --gpus device=0 --network host --ipc host --shm-size=16g \
+  -e PYTHONPATH=/workspace/polaris/src \
+  -e POLARIS_DATA_PATH=/workspace/polaris/PolaRiS-Hub \
+  -v "$PWD:/workspace/polaris:ro" \
+  -v "$PWD/runs/eef_pose_controller_smoke:/outputs:rw" \
+  -w /workspace/polaris polaris-eval:cuda13 \
+  python scripts/smoke_eef_pose_controller.py \
+    --headless --device cuda:0 --output-json /outputs/results.json
 ```
 
 This smoke is intentionally separate from the CPU unit tests. Run it before a
