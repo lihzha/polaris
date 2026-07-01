@@ -113,9 +113,7 @@ class LAPImageResizeTest(unittest.TestCase):
             with self.subTest(name=name, shape=image.shape):
                 expected = _tensorflow_training_resize(image)
                 actual = resize_lap_image(image)
-                difference = np.abs(expected.astype(np.int16) - actual.astype(np.int16))
-                self.assertLessEqual(int(difference.max()), 1)
-                self.assertLess(float(difference.mean()), 1e-3)
+                np.testing.assert_array_equal(actual, expected)
 
 
 if __name__ == "__main__":
