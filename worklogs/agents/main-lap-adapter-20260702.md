@@ -203,3 +203,29 @@
   bind the max-raw diagnostic to aggregate maxima. Float32 state/action casts
   and JSONL writes are rechecked so huge finite inputs cannot become Inf/NaN
   artifacts.
+
+## 2026-07-02 — pinned Isaac robust-IK test audit
+
+- Tested code commit: `4f1ce3c7c95ee298291bb6860f2c67f8015a2abc` in pinned
+  Pyxis image SHA-256
+  `ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d556b324a`.
+- Infra attempt `1097385` failed before collection because `sbatch --wrap`
+  generated `/bin/sh` and rejected `set -o pipefail`. Attempt `1097391`
+  reached collection but exposed only the outer IsaacLab CLI namespace and was
+  cancelled after `isaaclab.controllers` was missing. Explicit-Bash attempt
+  `1097393` reproduced that missing nested source-root failure. Bounded
+  preflight `1097396` then showed that adding the core source root still leaves
+  `omni` unavailable until Isaac Sim starts.
+- Final tests-only job `1097402` used an immutable external bootstrap (SHA-256
+  `836cf8131b42165b8525d0c673e76f570ed057f8d5f2e5172a2eba6879c063f8`),
+  all three nested Isaac source roots, and `AppLauncher(headless=True)` before
+  pytest collection. It completed `17 passed`, exit `0:0`, on `pool0-00005`.
+  JUnit:
+  `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris_eval/controller_safety_v3_review/4f1ce3c/pytest-1097402.xml`
+  (SHA-256 `88f0a47d53cc0456808a6b9772d586c7d76654831cbc72b6567347bb79ee07b2`).
+  Full log:
+  `/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris_eval/pol_ik_v3_test-1097402.out`
+  (SHA-256 `0a0c55214d597a7d9c0e9ca55ed5decfe0e141530e2f1cc2dceacd046829bbaa`).
+  Isaac emitted headless Vulkan/display warnings, including an incompatible
+  Vulkan-driver message, but the CPU-focused unit suite and JUnit were clean.
+  No standalone controller smoke or checkpoint evaluation was chained.
