@@ -14,6 +14,7 @@ from scipy.spatial.transform import Rotation
 
 from polaris.config import LAP_EEF_FRAME, PolicyArgs
 from polaris.policy.abstract_client import InferenceClient
+from polaris.policy.ego_lap_contract import GRIPPER_EXECUTION_THRESHOLD
 from polaris.policy.ego_lap_contract import R6_COLUMNS_STATE_LAYOUT
 from polaris.policy.ego_lap_contract import R6_ROWS_STATE_LAYOUT
 from polaris.policy.ego_lap_contract import persist_ego_lap_contract
@@ -144,13 +145,15 @@ def validate_action_chunk(
     return actions
 
 
-def interpolate_ar_endpoint(endpoint_chunk: Any, *, steps: int = 16) -> np.ndarray:
+def interpolate_ar_endpoint(endpoint_chunk: Any, *, steps: int = 8) -> np.ndarray:
     """Expand one AR total-delta endpoint into cumulative delta targets.
 
-    Translation and Euler deltas advance linearly from the zero-motion anchor
-    to the endpoint, matching LAP's inclusive ``np.linspace`` interpolation.
-    The endpoint gripper command is a target state and is therefore held for
-    every interpolated action rather than fractionally scaled.
+    Translation advances linearly from the zero-motion anchor. Orientation
+    follows the SO(3) geodesic from identity to the endpoint rotation, matching
+    LAP's training-time right-multiplied relative-rotation definition even for
+    coupled Euler axes. This intentionally differs from the legacy real-robot
+    helper's Euler-add endpoint. The endpoint gripper command is held rather
+    than fractionally scaled.
     """
 
     endpoint = np.asarray(endpoint_chunk, dtype=np.float64)
@@ -163,7 +166,11 @@ def interpolate_ar_endpoint(endpoint_chunk: Any, *, steps: int = 16) -> np.ndarr
 
     fractions = np.linspace(0.0, 1.0, steps, endpoint=True, dtype=np.float64)[:, None]
     interpolated = np.repeat(endpoint, steps, axis=0)
-    interpolated[:, :6] *= fractions
+    interpolated[:, :3] *= fractions
+    endpoint_rotvec = Rotation.from_euler("xyz", endpoint[0, 3:6]).as_rotvec()
+    interpolated[:, 3:6] = Rotation.from_rotvec(fractions * endpoint_rotvec).as_euler(
+        "xyz"
+    )
     return interpolated
 
 
@@ -272,8 +279,10 @@ def anchor_action_chunk(
     target_wxyz = target_xyzw[:, [3, 0, 1, 2]]
 
     # Ego-LAP and DROID use open-positive gripper values; PolaRiS is
-    # closed-positive. Clipping keeps the binary action term well-defined.
-    closed_gripper = 1.0 - np.clip(delta_actions[:, 6:7], 0.0, 1.0)
+    # closed-positive. Apply the contracted binary boundary here so traces and
+    # controller inputs both contain the exact command that will execute.
+    gripper_open = np.clip(delta_actions[:, 6:7], 0.0, 1.0)
+    closed_gripper = (gripper_open <= GRIPPER_EXECUTION_THRESHOLD).astype(np.float64)
     actions = np.concatenate([target_positions, target_wxyz, closed_gripper], axis=1)
     if actions.shape != (len(delta_actions), 8) or not np.isfinite(actions).all():
         raise ValueError(f"Invalid anchored PolaRiS actions with shape {actions.shape}")
@@ -466,6 +475,10 @@ class EgoLAPEefPoseClient(InferenceClient):
             f"{self.contract.ar_stop_at_eos};"
             f"response={self.contract.response_horizon}x7/{self.contract.response_semantics};"
             f"execute={self.open_loop_horizon};"
+            f"ar_interpolation={self.contract.ar_endpoint_interpolation_profile}/"
+            f"{self.contract.interpolation_steps};"
+            f"gripper={self.contract.gripper_execution_profile}/"
+            f"{self.contract.gripper_threshold};"
             f"normalization={self.contract.normalization_scope}/"
             f"{self.contract.normalization_stats_sha256};"
             f"normalization_profile={self.contract.normalization_profile};"
@@ -603,7 +616,7 @@ class EgoLAPEefPoseClient(InferenceClient):
             raw_delta_chunk = (
                 interpolate_ar_endpoint(
                     server_delta_chunk,
-                    steps=self.contract.interpolation_steps,
+                    steps=int(self.contract.interpolation_steps),
                 )
                 if self.policy_type == "ar"
                 else server_delta_chunk
@@ -652,6 +665,13 @@ class EgoLAPEefPoseClient(InferenceClient):
                     "contract_sha256": self.contract.contract_sha256,
                     "policy_type": self.policy_type,
                     "response_semantics": self.contract.response_semantics,
+                    "execution_horizon": self.contract.execution_horizon,
+                    "ar_endpoint_interpolation_profile": (
+                        self.contract.ar_endpoint_interpolation_profile
+                    ),
+                    "ar_endpoint_interpolation_steps": self.contract.interpolation_steps,
+                    "gripper_execution_profile": self.contract.gripper_execution_profile,
+                    "gripper_threshold": self.contract.gripper_threshold,
                     "action_sampler_profile": self.contract.action_sampler_profile,
                     "flow_num_steps": self.contract.flow_num_steps,
                     "initial_rng_seed": self.contract.initial_rng_seed,
@@ -678,7 +698,6 @@ class EgoLAPEefPoseClient(InferenceClient):
                     "raw_delta_chunk": raw_delta_chunk.tolist(),
                     "base_delta_chunk": base_delta_chunk.tolist(),
                     "anchored_action_chunk": anchored_chunk.tolist(),
-                    "execution_horizon": execution_horizon,
                     "reasoning": response.get("reasoning"),
                 }
             )

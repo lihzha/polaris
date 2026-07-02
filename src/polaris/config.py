@@ -55,7 +55,7 @@ class PolicyArgs:
     render_every_step: bool = True
     trace_dir: str | None = None
     trace_path: str | None = None
-    ar_interpolation_steps: int = 16
+    ar_interpolation_steps: int = 8
     contract_output: str | None = None
     checkpoint_profile: str | None = None
     checkpoint_path: str | None = None

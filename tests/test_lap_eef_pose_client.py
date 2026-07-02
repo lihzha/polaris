@@ -101,7 +101,7 @@ def _serving_metadata(
             "profile": (
                 "flow_explicit_euler_t1_to_t0_v1"
                 if policy_type == "flow"
-                else "autoregressive_v1"
+                else "autoregressive_max500_temp0_eos_v1"
             ),
             "flow_num_steps": 10 if policy_type == "flow" else None,
             "initial_rng_seed": 0,
@@ -139,6 +139,7 @@ def _serving_metadata(
             "dataset_name": "droid",
             "request_state_type": "eef_pose",
             "request_state_dim": 10,
+            "state_dtype": "float32",
             "is_bimanual": False,
             "state_encoding": "EEF_R6",
             "state_layout": state_layout,
@@ -155,6 +156,13 @@ def _serving_metadata(
             "model_action_horizon": 16,
             "response_horizon": response_horizon,
             "response_semantics": response_semantics,
+            "execution_horizon": 8,
+            "ar_endpoint_interpolation_profile": (
+                "so3_right_multiply_slerp_identity_to_delta_inclusive_0_1_8_v1"
+                if policy_type == "ar"
+                else None
+            ),
+            "ar_endpoint_interpolation_steps": 8 if policy_type == "ar" else None,
             "action_layout": "delta_xyz+delta_extrinsic_xyz_euler+gripper_open",
             "translation_frame": "robot_base",
             "translation_units": "meters",
@@ -163,6 +171,8 @@ def _serving_metadata(
             "rotation_units": "radians",
             "gripper_open_value": 1.0,
             "gripper_closed_value": 0.0,
+            "gripper_execution_profile": "binary_model_open_gt_0p5_else_closed_v1",
+            "gripper_threshold": 0.5,
         },
         "normalization": {
             "source": "checkpoint_assets",
@@ -334,7 +344,7 @@ def _validate_metadata(metadata, **overrides):
         "expected_dataset_name": "droid",
         "expected_state_type": "eef_pose",
         "expected_open_loop_horizon": 8,
-        "ar_interpolation_steps": 16,
+        "ar_interpolation_steps": 8,
     }
     arguments.update(overrides)
     return validate_ego_lap_server_metadata(metadata, **arguments)
@@ -346,6 +356,8 @@ class ServingMetadataContractTest(unittest.TestCase):
         self.assertEqual(native.serving_profile, FRANKA_DROID_SINGLE_ARM_PROFILE)
         self.assertEqual((native.native_action_dim, native.native_state_dim), (7, 10))
         self.assertEqual((native.request_state_dim, native.served_action_dim), (10, 7))
+        self.assertIsNone(native.interpolation_steps)
+        self.assertIsNone(native.ar_endpoint_interpolation_profile)
         self.assertIsNone(native.state_adapter)
         self.assertIsNone(native.action_projection)
 
@@ -634,6 +646,19 @@ class ServingMetadataContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "polaris.compatible"):
             _validate_metadata(incompatible)
 
+    def test_contract_rejects_gripper_execution_drift(self):
+        for field, value in (
+            ("gripper_execution_profile", "continuous_v1"),
+            ("gripper_threshold", 0.49),
+        ):
+            with self.subTest(field=field):
+                metadata = _serving_metadata()
+                document = metadata["ego_lap_serving_contract"]
+                document["policy_output"][field] = value
+                document["sha256"] = ego_lap_contract_digest(document)
+                with self.assertRaisesRegex(ValueError, field):
+                    _validate_metadata(metadata)
+
     def test_normalization_formula_profile_is_fail_closed(self):
         metadata = _serving_metadata()
 
@@ -857,16 +882,16 @@ class ServingMetadataContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires.*q99_train_matched_v1"):
             _validate_metadata(mixed_metadata)
 
-    def test_ar_contract_derives_one_to_sixteen_to_four_protocol(self):
+    def test_ar_contract_derives_one_to_eight_to_eight_protocol(self):
         contract = _validate_metadata(
             _serving_metadata(policy_type="ar"),
             expected_policy_type="ar",
-            expected_open_loop_horizon=4,
+            expected_open_loop_horizon=8,
         )
 
         self.assertEqual(contract.response_horizon, 1)
-        self.assertEqual(contract.interpolation_steps, 16)
-        self.assertEqual(contract.execution_horizon, 4)
+        self.assertEqual(contract.interpolation_steps, 8)
+        self.assertEqual(contract.execution_horizon, 8)
 
     def test_persisted_contract_refuses_resume_drift(self):
         document = _serving_metadata()["ego_lap_serving_contract"]
@@ -957,7 +982,19 @@ class PoseConversionTest(unittest.TestCase):
         np.testing.assert_allclose(
             actual_rotation.as_matrix(), expected_rotation.as_matrix(), atol=1e-6
         )
-        np.testing.assert_allclose(actions[:, 7], np.array([0.0, 0.2]), atol=1e-7)
+        np.testing.assert_array_equal(actions[:, 7], np.array([0.0, 0.0]))
+
+    def test_anchored_gripper_is_binary_at_training_boundary(self):
+        deltas = np.zeros((3, 7), dtype=float)
+        deltas[:, 6] = [0.49, 0.5, 0.51]
+
+        actions = anchor_action_chunk(
+            deltas,
+            np.zeros(3),
+            np.array([1.0, 0.0, 0.0, 0.0]),
+        )
+
+        np.testing.assert_array_equal(actions[:, 7], np.array([1.0, 1.0, 0.0]))
 
     def test_egocentric_droid_chunk_is_inverted_before_anchoring(self):
         anchor_position = np.array([0.5, -0.1, 0.2])
@@ -1025,14 +1062,30 @@ class PoseConversionTest(unittest.TestCase):
     def test_ar_endpoint_interpolation_scales_motion_and_holds_gripper(self):
         endpoint = np.array([[0.16, -0.32, 0.48, 0.8, -1.6, 0.4, 1.0]])
 
-        chunk = interpolate_ar_endpoint(endpoint, steps=16)
+        chunk = interpolate_ar_endpoint(endpoint, steps=8)
 
-        self.assertEqual(chunk.shape, (16, 7))
+        self.assertEqual(chunk.shape, (8, 7))
         np.testing.assert_array_equal(chunk[0, :6], np.zeros(6))
-        np.testing.assert_allclose(chunk[1, :6], endpoint[0, :6] / 15)
-        np.testing.assert_allclose(chunk[3, :6], endpoint[0, :6] * (3 / 15))
-        np.testing.assert_allclose(chunk[-1, :6], endpoint[0, :6])
-        np.testing.assert_array_equal(chunk[:, 6], np.ones(16))
+        np.testing.assert_allclose(chunk[1, :3], endpoint[0, :3] / 7)
+        np.testing.assert_allclose(chunk[3, :3], endpoint[0, :3] * (3 / 7))
+        np.testing.assert_allclose(chunk[-1, :3], endpoint[0, :3])
+        endpoint_rotvec = Rotation.from_euler("xyz", endpoint[0, 3:6]).as_rotvec()
+        expected_rotations = Rotation.from_rotvec(
+            np.linspace(0.0, 1.0, 8)[:, None] * endpoint_rotvec
+        )
+        actual_rotations = Rotation.from_euler("xyz", chunk[:, 3:6])
+        np.testing.assert_allclose(
+            actual_rotations.as_matrix(),
+            expected_rotations.as_matrix(),
+            atol=1e-10,
+        )
+        self.assertFalse(np.allclose(chunk[3, 3:6], endpoint[0, 3:6] * (3 / 7)))
+        np.testing.assert_allclose(
+            actual_rotations[-1].as_matrix(),
+            Rotation.from_euler("xyz", endpoint[0, 3:6]).as_matrix(),
+            atol=1e-10,
+        )
+        np.testing.assert_array_equal(chunk[:, 6], np.ones(8))
 
 
 class _FakePolicyServer:
@@ -1157,6 +1210,15 @@ class ClientContractTest(unittest.TestCase):
             request["observation"]["left_wrist_0_rgb"], wrist[::-1, ::-1]
         )
         self.assertEqual(request["observation"]["state"].shape, (10,))
+        self.assertEqual(request["observation"]["state"].dtype, np.float32)
+        self.assertEqual(
+            request["observation"]["cartesian_position"].dtype,
+            np.float32,
+        )
+        self.assertEqual(
+            request["observation"]["gripper_position"].dtype,
+            np.float32,
+        )
         np.testing.assert_array_equal(
             request["observation"]["state"][3:9],
             np.array([0.0, 0.0, 1.0, 1.0, 0.0, 0.0], dtype=np.float32),
@@ -1287,7 +1349,7 @@ class ClientContractTest(unittest.TestCase):
         self.assertEqual(client.contract.native_state_dim, 20)
         self.assertEqual(client.contract.served_action_dim, 7)
 
-    def test_ar_client_interpolates_endpoint_and_executes_first_four(self):
+    def test_ar_client_interpolates_endpoint_and_executes_all_eight(self):
         fake_server = _FakePolicyServer(
             {"actions": np.array([[0.16, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])},
             metadata=_serving_metadata(policy_type="ar"),
@@ -1303,7 +1365,7 @@ class ClientContractTest(unittest.TestCase):
         }
         args = PolicyArgs(
             client="EgoLAPEefPose",
-            open_loop_horizon=4,
+            open_loop_horizon=8,
             policy_type="ar",
             frame_description="robot base frame",
             action_frame="robot_base",
@@ -1325,7 +1387,7 @@ class ClientContractTest(unittest.TestCase):
             args.contract_output = str(Path(temporary_directory) / "contract.json")
             client = EgoLAPEefPoseClient(args)
             client.reset()
-            actions = [client.infer(observation, "move")[0] for _ in range(4)]
+            actions = [client.infer(observation, "move")[0] for _ in range(8)]
             records = [
                 json.loads(line)
                 for line in Path(args.trace_path).read_text().splitlines()
@@ -1334,19 +1396,19 @@ class ClientContractTest(unittest.TestCase):
         self.assertEqual(len(fake_server.requests), 1)
         np.testing.assert_allclose(
             np.asarray(actions)[:, 0],
-            np.array([0.4, 0.4 + 0.16 / 15, 0.4 + 0.32 / 15, 0.432]),
+            0.4 + np.linspace(0.0, 0.16, 8),
             atol=1e-7,
         )
-        np.testing.assert_array_equal(np.asarray(actions)[:, 7], np.zeros(4))
+        np.testing.assert_array_equal(np.asarray(actions)[:, 7], np.zeros(8))
         query = records[1]
         self.assertEqual(query["response_semantics"], "total_delta_endpoint")
         self.assertEqual(len(query["server_delta_chunk"]), 1)
-        self.assertEqual(len(query["raw_delta_chunk"]), 16)
+        self.assertEqual(len(query["raw_delta_chunk"]), 8)
         np.testing.assert_array_equal(
             query["raw_delta_chunk"][0], np.array([0.0] * 6 + [1.0])
         )
         self.assertEqual(query["raw_delta_chunk"][-1][0], 0.16)
-        self.assertEqual(query["execution_horizon"], 4)
+        self.assertEqual(query["execution_horizon"], 8)
 
     def test_per_episode_trace_uses_global_id_and_reconciles_partial_retry(self):
         fake_server = _FakePolicyServer(

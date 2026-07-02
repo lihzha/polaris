@@ -136,3 +136,26 @@
   `1096052`, `1096057`, `1096062`, and `1096065` are flow canaries. No live
   flow job, watcher, simulator, registry record, or external checkout was
   modified or relaunched for this AR-only fix.
+
+## 2026-07-02 — final shared-contract parity audit
+
+- Corrected the prior AR timing assumption after checking the official LAP
+  runner end to end: one AR endpoint is expanded to 8 inclusive targets and
+  all 8 are executed before replanning. The prior 16-target/4-action profile
+  reached only 20% of the endpoint and is no longer accepted.
+- The named AR profile now uses SO(3) identity-to-delta interpolation followed
+  by query-anchor right multiplication. This matches the training definition
+  `R(anchor) @ R(delta)` and is explicitly distinct from the legacy official
+  real-robot helper's coupled-axis-incorrect Euler-add endpoint.
+- Added fail-closed policy-input float32 state metadata and request dtype
+  assertions. Flow traces now record null AR interpolation metadata instead of
+  the confusing internal model horizon.
+- The server handshake now binds the binary model-open `>0.5` gripper execution
+  profile and threshold. This is cross-checked with the existing PolaRiS
+  closed-positive `>=0.5` runtime profile. The client itself now emits only
+  binary closed-positive values, including equality-close boundary coverage,
+  so anchored chunks, traces, and controller inputs all agree.
+- Final non-Isaac validation: `60 passed, 2 skipped`; Ruff format/check and
+  `git diff --check` pass. The two skips and the uncollected robust-IK module
+  require the pinned Isaac/Pyxis cluster runtime and remain part of the clean
+  deployment canary gate.

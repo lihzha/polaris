@@ -25,9 +25,14 @@ NORMALIZATION_FORMULA_SCHEMA_VERSION = 1
 POLARIS_EEF_PROFILE = "panda_link8_eef_pose_single_arm_v1"
 FRANKA_DROID_SINGLE_ARM_PROFILE = "franka_droid_single_arm_v2"
 FLOW_SAMPLER_PROFILE = "flow_explicit_euler_t1_to_t0_v1"
-AR_SAMPLER_PROFILE = "autoregressive_v1"
+AR_SAMPLER_PROFILE = "autoregressive_max500_temp0_eos_v1"
+AR_ENDPOINT_INTERPOLATION_PROFILE = (
+    "so3_right_multiply_slerp_identity_to_delta_inclusive_0_1_8_v1"
+)
 POLARIS_FLOW_NUM_STEPS = 10
 POLICY_INITIAL_RNG_SEED = 0
+GRIPPER_EXECUTION_PROFILE = "binary_model_open_gt_0p5_else_closed_v1"
+GRIPPER_EXECUTION_THRESHOLD = 0.5
 POLARIS_AR_MAX_DECODING_STEPS = 500
 POLARIS_AR_TEMPERATURE = 0.0
 POLARIS_AR_STOP_AT_EOS = True
@@ -96,7 +101,10 @@ class ValidatedEgoLAPContract:
     response_horizon: int
     response_semantics: str
     execution_horizon: int
-    interpolation_steps: int
+    interpolation_steps: int | None
+    ar_endpoint_interpolation_profile: str | None
+    gripper_execution_profile: str
+    gripper_threshold: float
     frame_description: str
     action_frame: Literal["robot_base"]
     dataset_name: str
@@ -456,6 +464,11 @@ def validate_ego_lap_server_metadata(
         10,
         field="policy_input.request_state_dim",
     )
+    _require_equal(
+        policy_input.get("state_dtype"),
+        "float32",
+        field="policy_input.state_dtype",
+    )
     expected_state_adapter = (
         {
             "type": "normalize_then_zero_pad",
@@ -586,6 +599,16 @@ def validate_ego_lap_server_metadata(
         0.0,
         field="policy_output.gripper_closed_value",
     )
+    _require_equal(
+        policy_output.get("gripper_execution_profile"),
+        GRIPPER_EXECUTION_PROFILE,
+        field="policy_output.gripper_execution_profile",
+    )
+    _require_equal(
+        policy_output.get("gripper_threshold"),
+        GRIPPER_EXECUTION_THRESHOLD,
+        field="policy_output.gripper_threshold",
+    )
 
     response_horizon = policy_output.get("response_horizon")
     response_semantics = policy_output.get("response_semantics")
@@ -597,7 +620,8 @@ def validate_ego_lap_server_metadata(
             field="policy_output.response_semantics",
         )
         execution_horizon = 8
-        interpolation_steps = 16
+        interpolation_steps = None
+        ar_endpoint_interpolation_profile = None
     else:
         _require_equal(response_horizon, 1, field="policy_output.response_horizon")
         _require_equal(
@@ -605,13 +629,29 @@ def validate_ego_lap_server_metadata(
             AR_RESPONSE_SEMANTICS,
             field="policy_output.response_semantics",
         )
-        if ar_interpolation_steps != 16:
+        if ar_interpolation_steps != 8:
             raise ValueError(
-                "Ego-LAP AR evaluation requires ar_interpolation_steps=16; "
+                "Ego-LAP AR evaluation requires ar_interpolation_steps=8; "
                 f"got {ar_interpolation_steps}"
             )
-        execution_horizon = 4
+        execution_horizon = 8
         interpolation_steps = ar_interpolation_steps
+        ar_endpoint_interpolation_profile = AR_ENDPOINT_INTERPOLATION_PROFILE
+    _require_equal(
+        policy_output.get("execution_horizon"),
+        execution_horizon,
+        field="policy_output.execution_horizon",
+    )
+    _require_equal(
+        policy_output.get("ar_endpoint_interpolation_profile"),
+        ar_endpoint_interpolation_profile,
+        field="policy_output.ar_endpoint_interpolation_profile",
+    )
+    _require_equal(
+        policy_output.get("ar_endpoint_interpolation_steps"),
+        interpolation_steps,
+        field="policy_output.ar_endpoint_interpolation_steps",
+    )
     if expected_open_loop_horizon is not None:
         _require_equal(
             expected_open_loop_horizon, execution_horizon, field="open_loop_horizon"
@@ -1176,6 +1216,9 @@ def validate_ego_lap_server_metadata(
         response_semantics=str(response_semantics),
         execution_horizon=execution_horizon,
         interpolation_steps=interpolation_steps,
+        ar_endpoint_interpolation_profile=ar_endpoint_interpolation_profile,
+        gripper_execution_profile=GRIPPER_EXECUTION_PROFILE,
+        gripper_threshold=GRIPPER_EXECUTION_THRESHOLD,
         frame_description=frame_description,
         action_frame=action_frame,
         dataset_name=dataset_name,
