@@ -23,7 +23,7 @@ POLARIS_CACHE_DIR="${POLARIS_CACHE_DIR:-${NFS_ROOT}/cache/polaris/runtime/${SLUR
 
 : "${EXPECTED_POLARIS_COMMIT:?Set EXPECTED_POLARIS_COMMIT}"
 : "${EXPECTED_PYXIS_SHA256:?Set EXPECTED_PYXIS_SHA256}"
-: "${ENVIRONMENT:?Set ENVIRONMENT}"
+: "${POLARIS_ENVIRONMENT:?Set POLARIS_ENVIRONMENT}"
 : "${REPLAY_TRACE_PATH:?Set REPLAY_TRACE_PATH}"
 : "${REPLAY_EPISODE:?Set REPLAY_EPISODE}"
 : "${INITIAL_CONDITIONS_FILE:?Set INITIAL_CONDITIONS_FILE}"
@@ -68,7 +68,7 @@ export NVIDIA_DRIVER_CAPABILITIES="${NVIDIA_DRIVER_CAPABILITIES:-all}"
   printf 'polaris_commit=%q\n' "${EXPECTED_POLARIS_COMMIT}"
   printf 'pyxis_image=%q\n' "${POLARIS_PYXIS_IMAGE}"
   printf 'pyxis_sha256=%q\n' "${actual_pyxis_sha}"
-  printf 'environment=%q\n' "${ENVIRONMENT}"
+  printf 'environment=%q\n' "${POLARIS_ENVIRONMENT}"
   printf 'replay_trace=%q\n' "${REPLAY_TRACE_PATH}"
   printf 'replay_episode=%q\n' "${REPLAY_EPISODE}"
   printf 'initial_conditions=%q\n' "${INITIAL_CONDITIONS_FILE}"
@@ -99,7 +99,7 @@ command+=(
   "POLARIS_DATA_PATH=${POLARIS_DATA_DIR}"
   XDG_CACHE_HOME=/cache HF_HOME=/cache/huggingface HOME=/cache/home
   "${POLARIS_CONTAINER_PYTHON}" scripts/eval.py
-  --environment "${ENVIRONMENT}"
+  --environment "${POLARIS_ENVIRONMENT}"
   --control-mode eef-pose
   --policy.client ReplayEefPose
   --policy.eef-frame panda_link8
@@ -117,18 +117,20 @@ printf '\n' >> "${RESULT_DIR}/command.argv"
 
 set +e
 "${command[@]}" 2>&1 | tee "${RESULT_DIR}/eval.log"
-pipeline_codes=("${PIPESTATUS[@]}")
+exit_code=$?
 set -e
-exit_code="${pipeline_codes[0]}"
-if (( exit_code == 0 && pipeline_codes[1] != 0 )); then
-  exit_code="${pipeline_codes[1]}"
-fi
+for required_artifact in \
+  "${RESULT_DIR}/eval_results.csv" \
+  "${RESULT_DIR}/episode_0.mp4" \
+  "${RESULT_DIR}/replay_observation_trace.jsonl"; do
+  if (( exit_code == 0 )) && [[ ! -s "${required_artifact}" ]]; then
+    echo "Missing replay artifact: ${required_artifact}" >&2
+    exit_code=3
+  fi
+done
 printf 'exit_code=%s\ncompleted_at=%q\n' "${exit_code}" "$(date -Iseconds)" >> "${RESULT_DIR}/run_record.env"
 if (( exit_code != 0 )); then
   exit "${exit_code}"
 fi
 
-[[ -s "${RESULT_DIR}/eval_results.csv" ]]
-[[ -s "${RESULT_DIR}/episode_0.mp4" ]]
-[[ -s "${RESULT_DIR}/replay_observation_trace.jsonl" ]]
 printf 'completed_at=%s\n' "$(date -Iseconds)" > "${RESULT_DIR}/SUCCESS"
