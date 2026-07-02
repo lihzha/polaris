@@ -16,11 +16,8 @@ from polaris.config import LAP_EEF_FRAME, EvalArgs
 
 
 def main(eval_args: EvalArgs):
-    if (
-        eval_args.policy.client == "EgoLAPEefPose"
-        and eval_args.control_mode != "eef-pose"
-    ):
-        raise ValueError("EgoLAPEefPose requires --control-mode eef-pose")
+    if eval_args.policy.client in {"EgoLAPEefPose", "ReplayEefPose"} and eval_args.control_mode != "eef-pose":
+        raise ValueError(f"{eval_args.policy.client} requires --control-mode eef-pose")
     if (
         eval_args.policy.client == "DroidJointPos"
         and eval_args.control_mode != "joint-position"

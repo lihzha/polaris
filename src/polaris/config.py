@@ -52,6 +52,10 @@ class PolicyArgs:
     rotate_wrist_180: bool = True
     render_every_step: bool = True
     trace_path: str | None = None
+    # Diagnostic-only absolute-action replay. ``replay_trace_path`` points to
+    # an Ego-LAP JSONL trace and ``replay_episode`` selects its source episode.
+    replay_trace_path: str | None = None
+    replay_episode: int | None = None
 
 
 @dataclass
