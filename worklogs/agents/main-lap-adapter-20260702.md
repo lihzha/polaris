@@ -19,7 +19,7 @@
 - Added authoritative websocket metadata validation and exact contract
   persistence before rollout. CLI values are assertions only.
 - Added distinct mode protocols: flow `16x7 -> execute 8`; AR `1x7` total
-  endpoint -> 16 cumulative targets -> execute 4.
+  endpoint -> 8 inclusive cumulative targets -> execute all 8.
 - Kept `DroidJointPos` plus `joint-position` as defaults and added pure
   regression tests for that path.
 - Added only the direct SciPy dependency edges required by the pose adapter;
@@ -38,7 +38,7 @@
   implementation and passed them through the PolaRiS validator: public LAP
   train-matched and legacy-Q99 profiles, plus a modern manifest profile, each
   in flow and AR mode. Their response/execution horizons validated as `16/8`
-  and `1/4`, respectively, including recomputed top-level identities.
+  and `1/8`, respectively, including recomputed top-level identities.
 - Ruff format/check, Python byte compilation, and `git diff --check` passed for
   the changed Python/source files.
 - `uv lock --check` reaches the known upstream `flatdict==4.0.1` source-build
