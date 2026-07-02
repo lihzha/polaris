@@ -51,3 +51,10 @@
   before production rollouts.
 - No simulator, GPU, cluster, policy-server, monitor, shared-registry, or
   external repository process was launched. No branch was pushed or merged.
+
+### Handoff
+
+- Implementation commit: `b2654c379d8c1d04ebfb6a7ae7c122de101bd3e3`.
+- The orchestrator can review and integrate the branch
+  `codex/main-lap-adapter-20260702`; this agent intentionally did not push,
+  merge, or modify the canonical PolaRiS checkout.
