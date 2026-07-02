@@ -55,3 +55,165 @@
   workstation environment; that test is deferred to the validated L40S
   container/canary.
 - No cluster job has been launched yet.
+
+## 2026-07-01 — deployment, setup, and canary
+
+- Immutable launch commit: `b02decad1d9abb7518755e7667a058085f464462`.
+- GitHub push to the upstream PolaRiS repository was rejected with the expected
+  permission error. The tracked source was therefore deployed with a complete
+  Git bundle rather than an untracked copy:
+  `polaris-b02deca.bundle`, SHA-256
+  `bd4dd770a2d4c72f723326663473a05e4816c697a2fb174e273cf92e259cda22`.
+- Frozen remote checkout:
+  `/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-pi05-polaris-v1-20260701T222047Z`.
+  It was detached and clean at `b02deca`, with OpenPI detached at `bd70b8f`.
+- Run namespace: `pi05-polaris-v1-20260701T222047Z`.
+- One-time setup installed the 242-package pinned OpenPI environment and fully
+  verified all 27 checkpoint objects (12,434,530,837 bytes). Checkpoint object
+  manifest SHA-256:
+  `7abd0c2294d442d429a77655783232206b2b30d95c508d435503135a5523a11c`.
+  Pyxis image SHA-256:
+  `ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d556b324a`.
+- FoodBussing canary job `1090783` completed `0:0` on one L40S. Its single
+  rollout was a strict failure but achieved `2/3` progress with no numerical
+  failure. Trace validation passed with 57 queries, 450 emitted actions, and
+  SHA-256
+  `1dd6616c19be1890ffc772d952640069cb52f69977f61c328a36532db2738a96`.
+- Visual inspection found two sharp, correctly oriented camera streams and
+  coherent multi-object grasp/place behavior. Canary video:
+  `/home/lzha/code/shared_artifacts/polaris-pi05-20260701/canary/DROID-FoodBussing/episode_0.mp4`.
+
+## 2026-07-01 — full sweep launch and recovery
+
+- Six ordinary one-L40S jobs were launched in parallel, 50 rollouts each:
+  `1090805` BlockStack, `1090806` FoodBussing, `1090807` PanClean,
+  `1090808` MoveLatteCup, `1090809` OrganizeTools, and `1090810` Tape.
+- Every worker independently passed the full 27-object checkpoint MD5 audit,
+  restored the 6.2-GiB Orbax parameters, loaded checkpoint-local `assets/droid`
+  normalization, and emitted the exact joint/image contract marker.
+- BlockStack attempt `1090805` completed four rows, then a finite-to-nonfinite
+  PhysX state divergence caused an uncaught observation exception and hung
+  teardown. The allocation was canceled after preserving its artifacts.
+- Commit `edc399141714fb3fd62734f4b155ba22b8f5534b` introduced a typed
+  `JointPositionObservationNumericalError` and records such simulator failures
+  in CSV/video/trace rather than aborting. The 50-seed BlockStack task was
+  rerun from seed zero as job `1090902` in namespace
+  `pi05-polaris-blockstack-retry-v2-20260701T230527Z`. Its deployment bundle
+  SHA-256 was
+  `45cad8e9f8baa6de6ee6c1853e9745ca8234686f7f470c55d082b2c42b9fcdd1`.
+- OrganizeTools attempt `1090809` preserved 16 complete rows/videos, then Isaac
+  hung inside episode 16 with a live process/GPU but no trace progress. It was
+  canceled and its process/server cleanup was verified.
+- Commit `40df043ccf5d57eefb108e32c56294ddf345f10c` added fail-closed prefix
+  resume. It retained exactly 16 rows/videos and 8,112 completed trace records,
+  discarded 440 records from the hung partial reset, independently validated
+  the prefix, initialized the next reset at 16, and continued in fresh job
+  `1091046`. Deployment bundle SHA-256:
+  `4bb8daa7dd4c88b7318ed18354954db5274631c6333c123bbef73e879d6d862f`.
+- Resume continuity was verified before continuing: the first appended reset
+  contained 57 queries and 450 actions, produced row/video 16, and the final
+  reconstructed trace contained 50 contiguous resets.
+- Focused validation after both fixes: 14 tests pass in the exact remote OpenPI
+  environment; Ruff, `bash -n`, ShellCheck, and `git diff --check` pass.
+
+## 2026-07-01 — final official metrics
+
+All six authoritative jobs completed with top-level Slurm state `COMPLETED`,
+exit `0:0`, task/run `SUCCESS` markers, exact CSV/video counts, and final trace
+validator status `pass`.
+
+| Task | Success | Mean progress | Recorded numerical | State-OOB lower bound | State-valid success |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| BlockStack | 4/50 (8%) | 0.5114 | 5 | 12 | 3/50 (6%) |
+| FoodBussing | 12/50 (24%) | 0.6333 | 0 | 1 | 12/50 (24%) |
+| PanClean | 24/50 (48%) | 0.7800 | 0 | 1 | 24/50 (48%) |
+| MoveLatteCup | 4/50 (8%) | 0.1933 | 0 | 0 | 4/50 (8%) |
+| OrganizeTools | 1/50 (2%) | 0.3667 | 0 | 1 | 1/50 (2%) |
+| TapeIntoContainer | 8/50 (16%) | 0.2067 | 0 | 0 | 8/50 (16%) |
+
+- Official aggregate: `53/300 = 17.6667%` success; mean progress `0.44857`.
+- Recorded numerical failures: `5/300`, all in BlockStack. They are included
+  as failures; their videos and exact truncated action counts are preserved.
+- State-bound audit: 15 episodes have at least one query state outside standard
+  Panda limits (lower bound because state is sampled every eight actions).
+  Ten were not caught by the original numerical-failure predicate. One nominal
+  BlockStack success (episode 30) was state-invalid.
+- State-valid aggregate, keeping invalid seeds in the denominator as failures:
+  `52/300 = 17.3333%`.
+- Aggregate accounting: 300 metrics rows, 300 nonempty videos, 16,947 policy
+  queries, and 133,798 emitted actions.
+- Per-task trace SHA-256:
+  - BlockStack:
+    `814adb09e94360a421438d7db131e9e2825f8be36b5863154059bebdd6858146`
+  - FoodBussing:
+    `06e577fc56d8317fd6c22e77eb941e912ff7114a2402b8e8a5079945ae1e6f9d`
+  - PanClean:
+    `6183722b6e2e6fcae8a3d1888963268e8cb9e6449aa8bef9b37193ae91e202df`
+  - MoveLatteCup:
+    `8543ed0257b15e646839a4f1c22a52f952c31fdfcfa1411e212a264b8c5cc98b`
+  - OrganizeTools:
+    `11e2b618320b8fbcb753707b43252b68337249f917a41e7336dc9a104fd8a01d`
+  - TapeIntoContainer:
+    `4ec5de14ac0bf2e62c1f4fe8bff61f91301f6d95eef8671516b1f72b9f4318f6`
+
+## 2026-07-01 — train/eval and physical-contract audit
+
+- No static normalization, image-order, resolution, wrist-rotation, state, or
+  action-semantic mismatch was found. Training and inference both use the
+  checkpoint-local DROID quantile statistics, delta-first-seven joint training,
+  absolute-action reconstruction from current state, 15x8 output, eight-action
+  execution, external/wrist/masked-third image order, unrotated 224x224 RGB,
+  and closed-positive gripper semantics.
+- There is no explicit seven-joint target clipping in the pinned OpenPI output
+  transforms, PolaRiS client, or Isaac Lab `JointPositionAction` path. PhysX
+  receives raw targets and constrains realized state only through articulation
+  limits and effort saturation. This is a real actuation/safety gap; real robot
+  hardware clipping must not be assumed.
+- The severe state divergences were not initiated by infeasible immediately
+  preceding chunks. Every first BlockStack divergence, the Food divergence, and
+  the Organize divergence followed an eight-action chunk within Panda limits.
+  This implicates simulator/controller/contact behavior rather than a decoding
+  or normalization error.
+- State-OOB lower-bound episode sets:
+  - BlockStack: `3,5,6,16,21,24,25,28,30,34,40,49`
+  - FoodBussing: `3`
+  - PanClean: `36`
+  - MoveLatteCup: none
+  - OrganizeTools: `12`
+  - TapeIntoContainer: none
+- Target-only excursions are logged separately and do not reduce the primary
+  state-valid metric because the simulated articulation may saturate them.
+  They do, however, require explicit bounds/slew enforcement before any real
+  hardware deployment.
+
+## 2026-07-01 — local artifacts and visualization
+
+- Final local root:
+  `/home/lzha/code/shared_artifacts/polaris-pi05-20260701/final`.
+- Aggregate JSON SHA-256:
+  `7168f1362dfed5eb9df063c0ee1b69bae5c94efdf8cfd9e1a635ea850c70ce49`.
+- Aggregate TSV SHA-256:
+  `e7c3ea338232d162bad05bacd202a7069a36fcdefeb16163aa24146030abf00d`.
+- One visually inspected, state-valid success from every task:
+  `final/gallery/successes`. Storyboard SHA-256:
+  `d0daf5ad97baa67782b1847ba74421528d73375e8047db9624569b0b46d9e421`.
+- Diagnostic finite-divergence videos and boundary storyboards:
+  `final/gallery/diagnostics`. Combined boundary storyboard SHA-256:
+  `143c010ad1ac3bf50189c58c86cd3d415208092c34a51ce29aac45ce01c5226e`.
+- Success gallery URL:
+  `http://localhost:8765/view?path=shared_artifacts/polaris-pi05-20260701/final/gallery/successes`.
+- Diagnostic gallery URL:
+  `http://localhost:8765/view?path=shared_artifacts/polaris-pi05-20260701/final/gallery/diagnostics`.
+
+## 2026-07-01 — cleanup
+
+- No listed canary/full/retry/resume job remains in `squeue`.
+- Authoritative jobs `1090806`, `1090807`, `1090808`, `1090810`, `1090902`,
+  and `1091046` all report `COMPLETED 0:0` in `sacct`.
+- Superseded attempts `1090805` and `1090809` remain preserved as canceled
+  evidence; neither contributes rows to the authoritative aggregate.
+- Policy-server processes and job ports were gone after allocation cleanup.
+- Deleted only the nine job-scoped Isaac runtime caches for this evaluation
+  (`1090783`, `1090805`–`1090810`, `1090902`, `1091046`), reclaiming about
+  274 MiB. Checkpoint cache, frozen source, logs, metrics, traces, and videos
+  remain intact.
