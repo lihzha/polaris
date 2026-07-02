@@ -47,12 +47,13 @@ class PolicyArgs:
     # When omitted, the client derives them from the validated serving contract.
     open_loop_horizon: int | None = 8
     frame_description: str | None = None
-    action_frame: Literal["robot_base", "egocentric"] | None = None
+    action_frame: Literal["robot_base"] | None = None
     dataset_name: str = "droid"
     state_type: str = "eef_pose"
     eef_frame: Literal["panda_link8"] = LAP_EEF_FRAME
     rotate_wrist_180: bool | None = None
     render_every_step: bool = True
+    trace_dir: str | None = None
     trace_path: str | None = None
     ar_interpolation_steps: int = 16
     contract_output: str | None = None

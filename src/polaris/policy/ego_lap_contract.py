@@ -21,6 +21,35 @@ TRAIN_MATCHED_INPUT_FORMULA = "q99_input_eps1e-8_clip_zero0_v1"
 TRAIN_MATCHED_OUTPUT_FORMULA = "q99_output_eps1e-8_zeroq01_extrapolate_v1"
 LEGACY_INPUT_FORMULA = "q99_input_eps1e-6_no_clip_zero0_v1"
 LEGACY_OUTPUT_FORMULA = "q99_output_eps1e-6_no_zero_override_extrapolate_v1"
+NORMALIZATION_FORMULA_SCHEMA_VERSION = 1
+POLARIS_EEF_PROFILE = "panda_link8_eef_pose_single_arm_v1"
+
+Q99_FORMULA_CONTRACTS: dict[str, dict[str, Any]] = {
+    "q99_train_matched_v1": {
+        "profile": "q99_train_matched_v1",
+        "input_formula_id": TRAIN_MATCHED_INPUT_FORMULA,
+        "input_epsilon": 1e-8,
+        "input_clip": [-1.0, 1.0],
+        "input_zero_range_value": 0.0,
+        "output_formula_id": TRAIN_MATCHED_OUTPUT_FORMULA,
+        "output_epsilon": 1e-8,
+        "output_clip": None,
+        "output_zero_range_value": "q01",
+        "output_extrapolates_beyond_unit_interval": True,
+    },
+    "q99_legacy_upstream_v1": {
+        "profile": "q99_legacy_upstream_v1",
+        "input_formula_id": LEGACY_INPUT_FORMULA,
+        "input_epsilon": 1e-6,
+        "input_clip": None,
+        "input_zero_range_value": 0.0,
+        "output_formula_id": LEGACY_OUTPUT_FORMULA,
+        "output_epsilon": 1e-6,
+        "output_clip": None,
+        "output_zero_range_value": "formula_result",
+        "output_extrapolates_beyond_unit_interval": True,
+    },
+}
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
@@ -39,7 +68,7 @@ class ValidatedEgoLAPContract:
     execution_horizon: int
     interpolation_steps: int
     frame_description: str
-    action_frame: Literal["robot_base", "egocentric"]
+    action_frame: Literal["robot_base"]
     dataset_name: str
     state_type: str
     rotate_wrist_180: bool
@@ -96,8 +125,8 @@ def _require_sequence(value: Any, expected: Sequence[Any], *, field: str) -> Non
     _require_equal(list(value), list(expected), field=field)
 
 
-def ego_lap_contract_digest(document: Mapping[str, Any]) -> str:
-    """Return the serving contract identity, excluding its identity field."""
+def ego_lap_nested_digest(document: Mapping[str, Any]) -> str:
+    """Hash one canonical contract block while excluding its ``sha256`` field."""
 
     payload = dict(document)
     payload.pop("sha256", None)
@@ -113,6 +142,26 @@ def ego_lap_contract_digest(document: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def ego_lap_contract_digest(document: Mapping[str, Any]) -> str:
+    """Return the serving contract identity, excluding its identity field."""
+
+    return ego_lap_nested_digest(document)
+
+
+def _require_sha256(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not _SHA256_PATTERN.fullmatch(value):
+        raise ValueError(
+            f"Ego-LAP serving contract field {field} must be a lowercase SHA-256"
+        )
+    return value
+
+
+def _verify_nested_digest(document: Mapping[str, Any], *, field: str) -> str:
+    recorded = _require_sha256(document.get("sha256"), field=f"{field}.sha256")
+    _require_equal(recorded, ego_lap_nested_digest(document), field=f"{field}.sha256")
+    return recorded
+
+
 def validate_ego_lap_server_metadata(
     server_metadata: Mapping[str, Any],
     *,
@@ -125,7 +174,7 @@ def validate_ego_lap_server_metadata(
     expected_normalization_input_formula: str | None,
     expected_normalization_output_formula: str | None,
     expected_frame_description: str | None,
-    expected_action_frame: Literal["robot_base", "egocentric"] | None,
+    expected_action_frame: Literal["robot_base"] | None,
     expected_dataset_name: str,
     expected_state_type: str,
     expected_open_loop_horizon: int | None,
@@ -290,8 +339,16 @@ def validate_ego_lap_server_metadata(
     action_frame = _required_string(
         policy_output, "translation_frame", field="policy_output"
     )
-    if action_frame not in {"robot_base", "egocentric"}:
-        raise ValueError(f"Unsupported Ego-LAP numeric action frame: {action_frame!r}")
+    # Ego-LAP's live output transform returns numeric robot-base deltas for both
+    # policy modes. Flow actions are trained in that frame, while AR language
+    # actions are decoded back to it before the websocket response is emitted.
+    # Accepting an ``egocentric`` label here would rotate those deltas a second
+    # time in the evaluator—the historical PolaRiS integration bug.
+    _require_equal(
+        action_frame,
+        "robot_base",
+        field="policy_output.translation_frame",
+    )
     if expected_action_frame is not None:
         _require_equal(
             action_frame, expected_action_frame, field="policy_output.translation_frame"
@@ -399,15 +456,28 @@ def validate_ego_lap_server_metadata(
             "single_arm",
             field="normalization.policy_category",
         )
+    else:
+        # This is configured checkpoint metadata, not the effective selection.
+        # Global checkpoints commonly retain ``single_arm`` here even though no
+        # category lookup occurs. Only ``polaris.normalization_category`` below
+        # represents the selected category and must remain null for global stats.
+        configured_category = normalization.get("policy_category")
+        if configured_category is not None and (
+            not isinstance(configured_category, str) or not configured_category
+        ):
+            raise ValueError(
+                "Ego-LAP serving contract field normalization.policy_category "
+                "must be null or a nonempty configured-category string"
+            )
     normalization_stats_sha256 = _required_string(
         normalization,
         "selected_stats_sha256",
         field="normalization",
     )
-    if not _SHA256_PATTERN.fullmatch(normalization_stats_sha256):
-        raise ValueError(
-            "Ego-LAP selected normalization digest must be a lowercase SHA-256"
-        )
+    _require_sha256(
+        normalization_stats_sha256,
+        field="normalization.selected_stats_sha256",
+    )
     if expected_normalization_stats_sha256 is not None:
         _require_equal(
             normalization_stats_sha256,
@@ -424,10 +494,11 @@ def validate_ego_lap_server_metadata(
             "normalization.selected_stats_keys must be a nonempty sequence"
         )
     formula_schema_version = normalization.get("formula_schema_version")
-    if not isinstance(formula_schema_version, int) or formula_schema_version < 1:
-        raise ValueError(
-            "normalization.formula_schema_version must be a positive integer"
-        )
+    _require_equal(
+        formula_schema_version,
+        NORMALIZATION_FORMULA_SCHEMA_VERSION,
+        field="normalization.formula_schema_version",
+    )
     normalization_profile = _required_string(
         normalization,
         "formula_profile",
@@ -443,21 +514,30 @@ def validate_ego_lap_server_metadata(
         "output_formula_id",
         field="normalization",
     )
-    formula_pair = (normalization_input_formula, normalization_output_formula)
-    if formula_pair not in {
-        (TRAIN_MATCHED_INPUT_FORMULA, TRAIN_MATCHED_OUTPUT_FORMULA),
-        (LEGACY_INPUT_FORMULA, LEGACY_OUTPUT_FORMULA),
-    }:
-        raise ValueError(f"Unsupported Ego-LAP Q99 formula pair: {formula_pair!r}")
+    expected_formula_contract = Q99_FORMULA_CONTRACTS.get(normalization_profile)
+    if expected_formula_contract is None:
+        raise ValueError(
+            f"Unsupported Ego-LAP Q99 formula profile: {normalization_profile!r}"
+        )
+    _require_equal(
+        normalization_input_formula,
+        expected_formula_contract["input_formula_id"],
+        field="normalization.input_formula_id",
+    )
+    _require_equal(
+        normalization_output_formula,
+        expected_formula_contract["output_formula_id"],
+        field="normalization.output_formula_id",
+    )
     normalization_formula_probe_sha256 = _required_string(
         normalization,
         "formula_probe_sha256",
         field="normalization",
     )
-    if not _SHA256_PATTERN.fullmatch(normalization_formula_probe_sha256):
-        raise ValueError(
-            "normalization.formula_probe_sha256 must be a lowercase SHA-256"
-        )
+    _require_sha256(
+        normalization_formula_probe_sha256,
+        field="normalization.formula_probe_sha256",
+    )
     for actual, expected, field in (
         (
             normalization_profile,
@@ -485,6 +565,7 @@ def validate_ego_lap_server_metadata(
         field="execution.live_pipeline_validated",
     )
     _require_equal(execution.get("schema_version"), 2, field="execution.schema_version")
+    _verify_nested_digest(execution, field="execution")
     inference_config = _mapping(
         execution.get("inference_data_config"), field="execution.inference_data_config"
     )
@@ -565,6 +646,31 @@ def validate_ego_lap_server_metadata(
         normalization_formula_probe_sha256,
         field="execution.normalization_formula.sha256",
     )
+    for key, expected in expected_formula_contract.items():
+        _require_equal(
+            formula_execution.get(key),
+            expected,
+            field=f"execution.normalization_formula.{key}",
+        )
+    _require_equal(
+        formula_execution.get("applicable"),
+        True,
+        field="execution.normalization_formula.applicable",
+    )
+    _require_equal(
+        formula_execution.get("transform_strategy"),
+        "standard",
+        field="execution.normalization_formula.transform_strategy",
+    )
+    _require_equal(
+        formula_execution.get("training_input_formula_id"),
+        TRAIN_MATCHED_INPUT_FORMULA,
+        field="execution.normalization_formula.training_input_formula_id",
+    )
+    _verify_nested_digest(
+        formula_execution,
+        field="execution.normalization_formula",
+    )
     input_probe = _mapping(
         formula_execution.get("training_policy_input_probe"),
         field="execution.normalization_formula.training_policy_input_probe",
@@ -598,8 +704,41 @@ def validate_ego_lap_server_metadata(
             field="execution.normalization_formula.output_extrapolation_probe.zero_range_is_exact_q01",
         )
 
+    execution_stats = _mapping(
+        execution.get("normalization_stats"),
+        field="execution.normalization_stats",
+    )
+    execution_stats_sha256 = _verify_nested_digest(
+        execution_stats,
+        field="execution.normalization_stats",
+    )
+    _require_equal(
+        execution_stats_sha256,
+        normalization_stats_sha256,
+        field="normalization.selected_stats_sha256",
+    )
+    _require_sequence(
+        execution_stats.get("keys"),
+        list(selected_stats_keys),
+        field="execution.normalization_stats.keys",
+    )
+    stats_arrays = _mapping(
+        execution_stats.get("arrays"),
+        field="execution.normalization_stats.arrays",
+    )
+    _require_sequence(
+        sorted(str(key) for key in stats_arrays),
+        sorted(str(key) for key in selected_stats_keys),
+        field="execution.normalization_stats.arrays.keys",
+    )
+
     polaris = _mapping(document.get("polaris"), field="polaris")
     polaris_profile = _required_string(polaris, "profile", field="polaris")
+    _require_equal(
+        polaris_profile,
+        POLARIS_EEF_PROFILE,
+        field="polaris.profile",
+    )
     _require_equal(polaris.get("compatible"), True, field="polaris.compatible")
     _require_sequence(
         polaris.get("incompatibilities"),
@@ -627,13 +766,12 @@ def validate_ego_lap_server_metadata(
     )
     _require_equal(
         polaris.get("numeric_action_frame"),
-        action_frame,
+        "robot_base",
         field="polaris.numeric_action_frame",
     )
 
     contract_sha256 = _required_string(document, "sha256", field="contract")
-    if not _SHA256_PATTERN.fullmatch(contract_sha256):
-        raise ValueError("Ego-LAP serving contract sha256 must be a lowercase SHA-256")
+    _require_sha256(contract_sha256, field="contract.sha256")
     _require_equal(
         contract_sha256,
         ego_lap_contract_digest(document),

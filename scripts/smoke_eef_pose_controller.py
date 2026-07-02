@@ -45,11 +45,11 @@ def main() -> int:
     import numpy as np
     import torch
     from isaaclab_tasks.utils import parse_env_cfg
-    from isaaclab.utils import math as math_utils
     from scipy.spatial.transform import Rotation
 
     import polaris.environments  # noqa: F401
     from polaris.config import LAP_EEF_FRAME
+    from polaris.eef_runtime_contract import validate_eef_runtime_frame
     from polaris.environments.droid_cfg import EefPoseActionCfg
     from polaris.policy.lap_eef_pose_client import anchor_action_chunk
 
@@ -61,41 +61,17 @@ def main() -> int:
     )
     env_cfg.actions = EefPoseActionCfg()
     env = gym.make(args_cli.environment, cfg=env_cfg)
-    robot = env.unwrapped.scene["robot"]
-    link0_index = robot.data.body_names.index("panda_link0")
-    link8_index = robot.data.body_names.index(LAP_EEF_FRAME)
-
-    def direct_link8_pose():
-        position, quaternion = math_utils.subtract_frame_transforms(
-            robot.data.body_pos_w[:, link0_index],
-            robot.data.body_quat_w[:, link0_index],
-            robot.data.body_pos_w[:, link8_index],
-            robot.data.body_quat_w[:, link8_index],
-        )
-        return (
-            position[0].detach().cpu().numpy(),
-            quaternion[0].detach().cpu().numpy(),
-        )
 
     def validate_observation_frame(observation):
-        observed_position = observation["policy"]["eef_pos"][0].detach().cpu().numpy()
-        observed_quaternion = (
-            observation["policy"]["eef_quat"][0].detach().cpu().numpy()
+        result = validate_eef_runtime_frame(
+            env,
+            observation,
+            position_tolerance=args_cli.frame_position_tolerance,
+            rotation_tolerance_radians=math.radians(
+                args_cli.frame_rotation_tolerance_degrees
+            ),
         )
-        direct_position, direct_quaternion = direct_link8_pose()
-        position_error = float(np.linalg.norm(observed_position - direct_position))
-        observed_rotation = Rotation.from_quat(_wxyz_to_xyzw(observed_quaternion))
-        direct_rotation = Rotation.from_quat(_wxyz_to_xyzw(direct_quaternion))
-        rotation_error = float((direct_rotation.inv() * observed_rotation).magnitude())
-        if (
-            position_error > args_cli.frame_position_tolerance
-            or rotation_error > math.radians(args_cli.frame_rotation_tolerance_degrees)
-        ):
-            raise RuntimeError(
-                "LAP EEF observation is not the articulation's direct panda_link8 "
-                f"pose: position_error={position_error}, rotation_error={rotation_error}"
-            )
-        return position_error, rotation_error
+        return result["position_error_m"], result["rotation_error_rad"]
 
     angle = math.radians(args_cli.rotation_degrees)
     delta = args_cli.position_delta

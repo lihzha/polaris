@@ -45,10 +45,19 @@ Validation covers:
   extrapolation probes;
 - zero wrist-image, zero-image-mask, and state-token dropout at inference;
 - language/prompt frame separately from the numeric action frame;
+- an unconditional robot-base numeric action frame (an egocentric language
+  frame does not change the server's decoded numeric output frame);
 - response horizon and semantics, right-multiplied extrinsic-XYZ rotation
   deltas, and the exact action layout.
 - `polaris.compatible=true`, an empty incompatibility list, `panda_link8`, and
   consistency of the PolaRiS profile with the Q99 and numeric-frame fields.
+
+The validator recomputes the top-level, live-execution, normalization-stats,
+and normalization-formula SHA-256 identities with the same canonical JSON
+rules as Ego-LAP. It also binds every Q99 profile to its exact versioned
+constants and formula IDs. `normalization.policy_category` is configured
+checkpoint metadata; for global stats the effective
+`polaris.normalization_category` remains null.
 
 CLI fields are assertions, not alternate sources of truth. Omit an optional
 assertion to derive it from metadata. Production jobs should provide exact
@@ -90,7 +99,7 @@ uv run scripts/eval.py \
   --policy.state-type eef_pose \
   --policy.eef-frame panda_link8 \
   --policy.contract-output runs/lap-flow-food-bussing/serving_contract.json \
-  --policy.trace-path runs/lap-flow-food-bussing/policy_traces.jsonl
+  --policy.trace-dir runs/lap-flow-food-bussing/policy_traces
 ```
 
 For a manifest-backed modern checkpoint, use the profile and exact checkpoint
@@ -115,9 +124,14 @@ not `1x7`, and any non-finite value.
 
 ## Rollout durability and numerical containment
 
-`scripts/eval.py` appends one CSV row per completed official initial condition,
-uses the row count to resume at the next condition, and writes one full-step
-MP4 per episode. EEF evaluations use the robust DLS action term:
+`scripts/eval.py` atomically publishes one video, finalized per-episode policy
+trace, and then one CSV row per completed official initial condition. Resume is
+allowed only from a contiguous CSV prefix whose videos decode with the recorded
+frame counts and whose `episode_XXXXXX.jsonl` traces contain the same global
+episode ID, action count, and terminal `episode_complete` record. A preempted
+episode's hidden temporary trace is replaced on retry, so Slurm requeue does not
+duplicate or renumber trace records. EEF evaluations use the robust DLS action
+term:
 
 - healthy finite inputs call Isaac Lab's implementation unchanged;
 - a finite direct-inverse failure retries the same damped system with a
@@ -125,6 +139,12 @@ MP4 per episode. EEF evaluations use the robust DLS action term:
 - non-finite IK inputs abort only the affected rollout before another physics
   step and are recorded as `numerical_failure=True`, success false, progress
   zero.
+
+Before rollout, the evaluator also requires the live environment to expose
+exactly 450 policy steps at 15 Hz. After the first reset it compares the policy
+observation to the articulation's direct `panda_link0 -> panda_link8` transform
+and verifies that the installed 7-D action term is absolute-pose differential
+IK on `panda_link8` with an identity body offset.
 
 Run a one-rollout canary and inspect its contract JSON, trace, CSV, and complete
 video before scaling out.

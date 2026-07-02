@@ -1,5 +1,4 @@
 import tyro
-import mediapy
 
 # import wandb
 import tqdm
@@ -13,10 +12,16 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 from polaris.config import LAP_EEF_FRAME, EvalArgs, validate_policy_control_mode
+from polaris.eef_runtime_contract import validate_eef_runtime_frame
+from polaris.eef_runtime_contract import validate_ego_lap_runtime_protocol
+from polaris.eval_artifacts import atomic_write_episode_video
+from polaris.eval_artifacts import atomic_write_results
+from polaris.eval_artifacts import load_resume_results
 
 
 def main(eval_args: EvalArgs):
     validate_policy_control_mode(eval_args)
+    is_ego_lap = eval_args.policy.client == "EgoLAPEefPose"
 
     # This must be done before importing anything from IsaacLab
     # Inside main function to avoid launching IsaacLab in global scope
@@ -100,6 +105,15 @@ def main(eval_args: EvalArgs):
     env: ManagerBasedRLSplatEnv = gym.make(  # type: ignore[assignment]
         eval_args.environment, cfg=env_cfg
     )
+    if is_ego_lap:
+        runtime_protocol = validate_ego_lap_runtime_protocol(env)
+        print(
+            "POLARIS_LAP_RUNTIME_PROTOCOL="
+            f"steps={runtime_protocol['episode_steps']};"
+            f"policy_hz={runtime_protocol['policy_hz']};"
+            f"step_dt={runtime_protocol['step_dt']}",
+            flush=True,
+        )
 
     default_instruction, initial_conditions = load_eval_initial_conditions(
         usd=env.usd_file,
@@ -115,46 +129,70 @@ def main(eval_args: EvalArgs):
     # Resume CSV logging
     run_folder = Path(eval_args.run_folder)
     run_folder.mkdir(parents=True, exist_ok=True)
-    if (
-        eval_args.policy.client == "EgoLAPEefPose"
-        and eval_args.policy.contract_output is None
-    ):
+    if is_ego_lap and eval_args.policy.contract_output is None:
         eval_args.policy.contract_output = str(
             run_folder / "ego_lap_serving_contract.json"
         )
+    if (
+        is_ego_lap
+        and eval_args.policy.trace_dir is None
+        and eval_args.policy.trace_path is None
+    ):
+        eval_args.policy.trace_dir = str(run_folder / "policy_traces")
     csv_path = run_folder / "eval_results.csv"
-    if csv_path.exists():
-        episode_df = pd.read_csv(csv_path)
-    else:
-        episode_df = pd.DataFrame(
-            {
-                "episode": pd.Series(dtype="int"),
-                "episode_length": pd.Series(dtype="int"),
-                "success": pd.Series(dtype="bool"),
-                "progress": pd.Series(dtype="float"),
-                "numerical_failure": pd.Series(dtype="bool"),
-                "numerical_failure_reason": pd.Series(dtype="str"),
-            }
-        )
-    if "numerical_failure" not in episode_df:
-        episode_df["numerical_failure"] = False
-    if "numerical_failure_reason" not in episode_df:
-        episode_df["numerical_failure_reason"] = ""
+    episode_df = load_resume_results(
+        csv_path,
+        run_folder=run_folder,
+        expected_rollouts=rollouts,
+        expected_horizon=env.max_episode_length,
+        require_episode_artifacts=is_ego_lap,
+        trace_dir=(
+            Path(eval_args.policy.trace_dir)
+            if eval_args.policy.trace_dir is not None
+            else None
+        ),
+        trace_path=(
+            Path(eval_args.policy.trace_path)
+            if eval_args.policy.trace_path is not None
+            else None
+        ),
+    )
     episode = len(episode_df)
+    policy_client: InferenceClient | None = None
+    if is_ego_lap:
+        # Validate and persist the live serving contract even when a resumed task
+        # already contains every rollout artifact.
+        policy_client = InferenceClient.get_client(eval_args.policy)
     if episode >= rollouts:
         print("All rollouts have been evaluated. Exiting.")
         env.close()
         simulation_app.close()
         return
 
-    policy_client: InferenceClient = InferenceClient.get_client(eval_args.policy)
+    if policy_client is None:
+        policy_client = InferenceClient.get_client(eval_args.policy)
 
     horizon = env.max_episode_length
+    runtime_frame_validated = False
     while episode < rollouts:
         # Index the initial condition with the episode being started. The old
         # loop reset before incrementing ``episode``, repeating condition zero.
         obs, info = env.reset(object_positions=initial_conditions[episode])
-        policy_client.reset()
+        if is_ego_lap and not runtime_frame_validated:
+            runtime_frame = validate_eef_runtime_frame(env, obs)
+            print(
+                "POLARIS_LAP_RUNTIME_EEF="
+                f"frame={runtime_frame['eef_frame']};"
+                f"reference={runtime_frame['reference_frame']};"
+                f"position_error_m={runtime_frame['position_error_m']};"
+                f"rotation_error_rad={runtime_frame['rotation_error_rad']}",
+                flush=True,
+            )
+            runtime_frame_validated = True
+        if is_ego_lap:
+            policy_client.reset(episode_index=episode)
+        else:
+            policy_client.reset()
         video = []
         numerical_failure_reason = ""
         bar = tqdm.tqdm(total=horizon)
@@ -192,12 +230,13 @@ def main(eval_args: EvalArgs):
 
         if video:
             filename = run_folder / f"episode_{episode}.mp4"
-            mediapy.write_video(filename, video, fps=15)
+            atomic_write_episode_video(filename, video, fps=15)
         else:
-            print(
-                f"Warning: policy returned no visualization for episode {episode}; "
-                "no video was written."
-            )
+            if is_ego_lap:
+                raise RuntimeError(
+                    f"Ego-LAP returned no visualization for episode {episode}"
+                )
+            print(f"Warning: policy returned no visualization for episode {episode}")
 
         episode_data = {
             "episode": episode,
@@ -211,10 +250,17 @@ def main(eval_args: EvalArgs):
             "numerical_failure": bool(numerical_failure_reason),
             "numerical_failure_reason": numerical_failure_reason,
         }
+        if is_ego_lap:
+            policy_client.finalize_episode(
+                episode_length=episode_length,
+                success=bool(episode_data["success"]),
+                progress=float(episode_data["progress"]),
+                numerical_failure_reason=numerical_failure_reason,
+            )
         episode_df = pd.concat(
             [episode_df, pd.DataFrame([episode_data])], ignore_index=True
         )
-        episode_df.to_csv(csv_path, index=False)
+        atomic_write_results(episode_df, csv_path)
         print(f"Episode {episode} finished. Episode length: {episode_length}")
         episode += 1
 

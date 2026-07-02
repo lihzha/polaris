@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -432,9 +433,17 @@ class EgoLAPEefPoseClient(InferenceClient):
             f"polaris_profile={self.contract.polaris_profile}",
             flush=True,
         )
+        if args.trace_dir is not None and args.trace_path is not None:
+            raise ValueError("Configure either trace_dir or trace_path, not both")
+        self.trace_dir = Path(args.trace_dir) if args.trace_dir else None
         self.trace_path = Path(args.trace_path) if args.trace_path else None
+        if self.trace_dir is not None:
+            self.trace_dir.mkdir(parents=True, exist_ok=True)
         if self.trace_path is not None:
             self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+        self._active_trace_path: Path | None = None
+        self._active_trace_final_path: Path | None = None
+        self._legacy_trace_reconciled = False
 
         self.pred_action_chunk: np.ndarray | None = None
         self.server_delta_chunk: np.ndarray | None = None
@@ -457,16 +466,66 @@ class EgoLAPEefPoseClient(InferenceClient):
             or self.actions_from_chunk_completed >= self.current_execution_horizon
         )
 
-    def reset(self):
+    def reset(self, episode_index: int | None = None):
         self.pred_action_chunk = None
         self.server_delta_chunk = None
         self.raw_delta_chunk = None
         self.actions_from_chunk_completed = 0
         self.current_execution_horizon = 0
-        self.episode_index += 1
+        if episode_index is None:
+            episode_index = self.episode_index + 1
+        if not isinstance(episode_index, int) or episode_index < 0:
+            raise ValueError(
+                f"episode_index must be a nonnegative integer; got {episode_index!r}"
+            )
+        self.episode_index = episode_index
         self.query_index = 0
         self.step_index = 0
+        self._begin_episode_trace()
         self._write_trace({"event": "reset", "episode": self.episode_index})
+
+    def finalize_episode(
+        self,
+        *,
+        episode_length: int,
+        success: bool,
+        progress: float,
+        numerical_failure_reason: str = "",
+    ) -> Path | None:
+        """Atomically publish the active episode trace after rollout artifacts exist."""
+
+        if self.episode_index < 0:
+            raise RuntimeError("Cannot finalize an Ego-LAP trace before reset")
+        if episode_length != self.step_index:
+            raise ValueError(
+                "Episode trace length does not match emitted action records: "
+                f"episode_length={episode_length}, actions={self.step_index}"
+            )
+        numerical_failure = bool(numerical_failure_reason)
+        self._write_trace(
+            {
+                "event": "episode_complete",
+                "episode": self.episode_index,
+                "episode_length": episode_length,
+                "status": "numerical_failure" if numerical_failure else "completed",
+                "success": bool(success),
+                "progress": float(progress),
+                "numerical_failure": numerical_failure,
+                "numerical_failure_reason": numerical_failure_reason,
+            }
+        )
+        if self.trace_dir is None:
+            return self.trace_path
+        if self._active_trace_path is None or self._active_trace_final_path is None:
+            raise RuntimeError("No active per-episode trace is available to finalize")
+        with self._active_trace_path.open("a", encoding="utf-8") as trace_file:
+            trace_file.flush()
+            os.fsync(trace_file.fileno())
+        os.replace(self._active_trace_path, self._active_trace_final_path)
+        finalized = self._active_trace_final_path
+        self._active_trace_path = None
+        self._active_trace_final_path = None
+        return finalized
 
     def visualize(self, observation: dict) -> np.ndarray:
         """Return the external and rotated wrist images exactly as LAP sees them."""
@@ -685,10 +744,54 @@ class EgoLAPEefPoseClient(InferenceClient):
         return request, exterior_image, wrist_image
 
     def _write_trace(self, record: dict[str, Any]) -> None:
-        if self.trace_path is None:
+        path = (
+            self._active_trace_path if self.trace_dir is not None else self.trace_path
+        )
+        if path is None:
             return
         payload = {"timestamp": time.time(), **record}
-        with self.trace_path.open("a", encoding="utf-8") as trace_file:
+        with path.open("a", encoding="utf-8") as trace_file:
             trace_file.write(
                 json.dumps(payload, separators=(",", ":"), default=_json_default) + "\n"
             )
+
+    def _begin_episode_trace(self) -> None:
+        if self.trace_dir is not None:
+            filename = f"episode_{self.episode_index:06d}.jsonl"
+            self._active_trace_final_path = self.trace_dir / filename
+            self._active_trace_path = self.trace_dir / f".{filename}.tmp"
+            # Requeue reconciliation: an unfinished episode never owns a final
+            # marker, and its stable hidden temporary is replaced from scratch.
+            self._active_trace_path.write_text("", encoding="utf-8")
+            return
+        if self.trace_path is not None and not self._legacy_trace_reconciled:
+            self._reconcile_legacy_trace(self.episode_index)
+            self._legacy_trace_reconciled = True
+
+    def _reconcile_legacy_trace(self, resume_episode: int) -> None:
+        """Drop a partial legacy JSONL suffix before resuming a global episode."""
+
+        if self.trace_path is None or not self.trace_path.exists():
+            return
+        retained: list[str] = []
+        for line in self.trace_path.read_text(encoding="utf-8").splitlines():
+            try:
+                record = json.loads(line)
+                record_episode = (
+                    record.get("episode") if isinstance(record, dict) else None
+                )
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record_episode, int) and record_episode < resume_episode:
+                retained.append(line)
+        temporary = self.trace_path.with_name(
+            f".{self.trace_path.name}.{os.getpid()}.tmp"
+        )
+        try:
+            temporary.write_text(
+                "" if not retained else "\n".join(retained) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.trace_path)
+        finally:
+            temporary.unlink(missing_ok=True)
