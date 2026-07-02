@@ -105,3 +105,34 @@
   Python byte compilation, and `git diff --check` passed. The unfiltered suite
   still cannot collect the Isaac-only robust-IK test in the local non-Isaac
   environment; no simulator or cluster job was launched by this scoped fix.
+
+## 2026-07-02 — official AR endpoint interpolation parity
+
+- Agent: `ar-parity-audit`.
+- Audit evidence: official LAP commit
+  `3958d1466d5b92445b67de7d4202c19608ad4d56` constructs a single-action
+  translation chunk with inclusive `np.linspace(current, target, steps)` and
+  samples rotation SLERP at inclusive `np.linspace(0, 1, steps)`. The PolaRiS
+  implementation instead used `1 / steps .. 1`, so its first four targets
+  reached `4/16 = 25%` of an AR endpoint instead of the official-style
+  `3/15 = 20%` on a 16-target grid.
+- Implementation commit `0907409d3215263f3c2cfe30a31b70d84e05331a`
+  changes only the AR interpolation fractions to inclusive `0..1`. The first
+  target is now the unchanged query-time anchor and the last remains the full
+  endpoint. Existing one-time anchoring and `R_anchor * R_delta`
+  right-multiplication are unchanged, and the endpoint gripper target remains
+  held across all targets.
+- Focused client assertions now cover the zero-motion first target, `1/15` and
+  `3/15` intermediate fractions, full endpoint, held gripper, and the four
+  absolute actions actually emitted before replanning. Documentation records
+  the inclusive grid and retained rotation composition.
+- Validation at `2026-07-02T11:28:59-07:00`: the complete non-Isaac PolaRiS
+  adapter/contract/artifact suite passed with `50 passed, 23 subtests passed`;
+  Ruff check passed; Ruff format check reported both Python files formatted;
+  Python byte compilation and `git diff --check` passed.
+- Live-impact audit of the shared Ego-LAP registry found every requested or
+  active evaluation in flow mode: 129 planned, 4 queued, and 2 running, with
+  zero AR evaluations. The four live queued PolaRiS children
+  `1096052`, `1096057`, `1096062`, and `1096065` are flow canaries. No live
+  flow job, watcher, simulator, registry record, or external checkout was
+  modified or relaunched for this AR-only fix.
