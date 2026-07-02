@@ -25,6 +25,7 @@ from polaris.policy.lap_eef_pose_client import (
 )
 from polaris.policy.ego_lap_contract import (
     ego_lap_contract_digest,
+    ego_lap_nested_digest,
     persist_ego_lap_contract,
     validate_ego_lap_server_metadata,
 )
@@ -86,13 +87,13 @@ def _serving_metadata(*, policy_type="flow", frame_description="robot base frame
             "type": "bounds_q99",
             "scope": "global",
             "policy_category": "single_arm",
-            "selected_stats_sha256": "a" * 64,
+            "selected_stats_sha256": "",
             "selected_stats_keys": ["actions", "state"],
             "formula_schema_version": 1,
             "formula_profile": "q99_train_matched_v1",
             "input_formula_id": "q99_input_eps1e-8_clip_zero0_v1",
             "output_formula_id": "q99_output_eps1e-8_zeroq01_extrapolate_v1",
-            "formula_probe_sha256": "b" * 64,
+            "formula_probe_sha256": "",
         },
         "language_action": {
             "format": "verbose_eef_with_rotation",
@@ -123,14 +124,27 @@ def _serving_metadata(*, policy_type="flow", frame_description="robot base frame
                 "schema_version": 1,
                 "profile": "q99_train_matched_v1",
                 "input_formula_id": "q99_input_eps1e-8_clip_zero0_v1",
+                "input_epsilon": 1e-8,
+                "input_clip": [-1.0, 1.0],
+                "input_zero_range_value": 0.0,
                 "output_formula_id": "q99_output_eps1e-8_zeroq01_extrapolate_v1",
-                "sha256": "b" * 64,
+                "output_epsilon": 1e-8,
+                "output_clip": None,
+                "output_zero_range_value": "q01",
+                "output_extrapolates_beyond_unit_interval": True,
+                "applicable": True,
+                "transform_strategy": "standard",
+                "training_input_formula_id": "q99_input_eps1e-8_clip_zero0_v1",
                 "training_policy_input_probe": {"matches": True},
                 "training_policy_roundtrip_probe": {"matches": True},
                 "output_extrapolation_probe": {
                     "extrapolates_beyond_q01_q99": True,
                     "zero_range_is_exact_q01": True,
                 },
+            },
+            "normalization_stats": {
+                "keys": ["actions", "state"],
+                "arrays": {"actions": {}, "state": {}},
             },
         },
         "polaris": {
@@ -144,8 +158,27 @@ def _serving_metadata(*, policy_type="flow", frame_description="robot base frame
             "numeric_action_frame": "robot_base",
         },
     }
+    formula = contract["execution"]["normalization_formula"]
+    formula["sha256"] = ego_lap_nested_digest(formula)
+    stats = contract["execution"]["normalization_stats"]
+    stats["sha256"] = ego_lap_nested_digest(stats)
+    contract["normalization"]["formula_probe_sha256"] = formula["sha256"]
+    contract["normalization"]["selected_stats_sha256"] = stats["sha256"]
+    contract["execution"]["sha256"] = ego_lap_nested_digest(contract["execution"])
     contract["sha256"] = ego_lap_contract_digest(contract)
     return {"ego_lap_serving_contract": contract}
+
+
+def _rehash_contract(metadata):
+    contract = metadata["ego_lap_serving_contract"]
+    formula = contract["execution"]["normalization_formula"]
+    formula["sha256"] = ego_lap_nested_digest(formula)
+    stats = contract["execution"]["normalization_stats"]
+    stats["sha256"] = ego_lap_nested_digest(stats)
+    contract["normalization"]["formula_probe_sha256"] = formula["sha256"]
+    contract["normalization"]["selected_stats_sha256"] = stats["sha256"]
+    contract["execution"]["sha256"] = ego_lap_nested_digest(contract["execution"])
+    contract["sha256"] = ego_lap_contract_digest(contract)
 
 
 def _xyzw_to_wxyz(quaternion):
@@ -184,8 +217,15 @@ class ServingMetadataContractTest(unittest.TestCase):
 
         self.assertEqual(contract.normalization_scope, "global")
         self.assertEqual(
+            metadata["ego_lap_serving_contract"]["normalization"]["policy_category"],
+            "single_arm",
+        )
+        self.assertEqual(
             metadata["ego_lap_serving_contract"]["polaris"]["normalization_scope"],
             "global",
+        )
+        self.assertIsNone(
+            metadata["ego_lap_serving_contract"]["polaris"]["normalization_category"]
         )
 
     def test_category_scope_requires_single_arm(self):
@@ -207,9 +247,7 @@ class ServingMetadataContractTest(unittest.TestCase):
         metadata["ego_lap_serving_contract"]["polaris"]["normalization_category"] = (
             "single_arm"
         )
-        metadata["ego_lap_serving_contract"]["sha256"] = ego_lap_contract_digest(
-            metadata["ego_lap_serving_contract"]
-        )
+        _rehash_contract(metadata)
         contract = _validate_metadata(
             metadata,
             expected_normalization_scope="category",
@@ -236,7 +274,7 @@ class ServingMetadataContractTest(unittest.TestCase):
             "external",
             "blank",
         ]
-        document["sha256"] = ego_lap_contract_digest(document)
+        _rehash_contract(metadata)
 
         contract = _validate_metadata(
             metadata,
@@ -265,6 +303,7 @@ class ServingMetadataContractTest(unittest.TestCase):
         drifted["ego_lap_serving_contract"]["execution"]["inference_data_config"][
             "state_dropout"
         ] = 0.1
+        _rehash_contract(drifted)
         with self.assertRaisesRegex(ValueError, "state_dropout"):
             _validate_metadata(drifted)
 
@@ -299,8 +338,113 @@ class ServingMetadataContractTest(unittest.TestCase):
         metadata["ego_lap_serving_contract"]["execution"]["normalization_formula"][
             "training_policy_roundtrip_probe"
         ]["matches"] = False
+        _rehash_contract(metadata)
         with self.assertRaisesRegex(ValueError, "training_policy_roundtrip_probe"):
             _validate_metadata(metadata)
+
+    def test_numeric_action_frame_is_unconditionally_robot_base(self):
+        metadata = _serving_metadata(frame_description="egocentric frame")
+        document = metadata["ego_lap_serving_contract"]
+        document["policy_output"]["translation_frame"] = "egocentric"
+        document["polaris"]["numeric_action_frame"] = "egocentric"
+        _rehash_contract(metadata)
+
+        with self.assertRaisesRegex(ValueError, "translation_frame"):
+            _validate_metadata(metadata)
+
+    def test_nested_formula_hash_rejects_unchecked_probe_tampering(self):
+        metadata = _serving_metadata()
+        document = metadata["ego_lap_serving_contract"]
+        document["execution"]["normalization_formula"]["training_policy_input_probe"][
+            "unvalidated_value"
+        ] = 17
+        # Keep the stale formula identity while making both enclosing identities
+        # self-consistent. The nested formula check must catch the mutation.
+        document["execution"]["sha256"] = ego_lap_nested_digest(document["execution"])
+        document["sha256"] = ego_lap_contract_digest(document)
+
+        with self.assertRaisesRegex(ValueError, "normalization_formula.sha256"):
+            _validate_metadata(metadata)
+
+    def test_nested_stats_hash_and_top_level_link_are_fail_closed(self):
+        metadata = _serving_metadata()
+        document = metadata["ego_lap_serving_contract"]
+        document["execution"]["normalization_stats"]["arrays"]["state"] = {
+            "q01": {"sha256": "f" * 64}
+        }
+        document["execution"]["sha256"] = ego_lap_nested_digest(document["execution"])
+        document["sha256"] = ego_lap_contract_digest(document)
+        with self.assertRaisesRegex(ValueError, "normalization_stats.sha256"):
+            _validate_metadata(metadata)
+
+        metadata = _serving_metadata()
+        document = metadata["ego_lap_serving_contract"]
+        document["normalization"]["selected_stats_sha256"] = "f" * 64
+        document["sha256"] = ego_lap_contract_digest(document)
+        with self.assertRaisesRegex(ValueError, "selected_stats_sha256"):
+            _validate_metadata(metadata)
+
+    def test_execution_hash_rejects_unchecked_field_tampering(self):
+        metadata = _serving_metadata()
+        document = metadata["ego_lap_serving_contract"]
+        document["execution"]["unchecked_field"] = {"drift": True}
+        document["sha256"] = ego_lap_contract_digest(document)
+
+        with self.assertRaisesRegex(ValueError, "execution.sha256"):
+            _validate_metadata(metadata)
+
+    def test_formula_profile_constants_and_polaris_profile_are_exact(self):
+        metadata = _serving_metadata()
+        document = metadata["ego_lap_serving_contract"]
+        document["execution"]["normalization_formula"]["input_epsilon"] = 1e-6
+        _rehash_contract(metadata)
+        with self.assertRaisesRegex(ValueError, "input_epsilon"):
+            _validate_metadata(metadata)
+
+        metadata = _serving_metadata()
+        document = metadata["ego_lap_serving_contract"]
+        document["polaris"]["profile"] = "another_link8_profile"
+        document["sha256"] = ego_lap_contract_digest(document)
+        with self.assertRaisesRegex(ValueError, "polaris.profile"):
+            _validate_metadata(metadata)
+
+    def test_legacy_formula_profile_is_exact_but_supported_for_public_lap(self):
+        metadata = _serving_metadata()
+        document = metadata["ego_lap_serving_contract"]
+        normalization = document["normalization"]
+        normalization.update(
+            {
+                "formula_profile": "q99_legacy_upstream_v1",
+                "input_formula_id": "q99_input_eps1e-6_no_clip_zero0_v1",
+                "output_formula_id": "q99_output_eps1e-6_no_zero_override_extrapolate_v1",
+            }
+        )
+        formula = document["execution"]["normalization_formula"]
+        formula.update(
+            {
+                "profile": "q99_legacy_upstream_v1",
+                "input_formula_id": "q99_input_eps1e-6_no_clip_zero0_v1",
+                "input_epsilon": 1e-6,
+                "input_clip": None,
+                "input_zero_range_value": 0.0,
+                "output_formula_id": "q99_output_eps1e-6_no_zero_override_extrapolate_v1",
+                "output_epsilon": 1e-6,
+                "output_clip": None,
+                "output_zero_range_value": "formula_result",
+                "output_extrapolates_beyond_unit_interval": True,
+            }
+        )
+        formula["training_policy_input_probe"]["matches"] = False
+        formula["training_policy_roundtrip_probe"]["matches"] = False
+        formula["output_extrapolation_probe"]["zero_range_is_exact_q01"] = False
+        document["polaris"]["q99_formula_profile"] = "q99_legacy_upstream_v1"
+        _rehash_contract(metadata)
+
+        contract = _validate_metadata(
+            metadata,
+            expected_normalization_profile="q99_legacy_upstream_v1",
+        )
+        self.assertEqual(contract.normalization_profile, "q99_legacy_upstream_v1")
 
     def test_ar_contract_derives_one_to_sixteen_to_four_protocol(self):
         contract = _validate_metadata(
@@ -478,6 +622,9 @@ class ClientContractTest(unittest.TestCase):
                 )
             }
         )
+        expected_stats_sha256 = fake_server.metadata["ego_lap_serving_contract"][
+            "normalization"
+        ]["selected_stats_sha256"]
         external = np.arange(12, dtype=np.uint8).reshape(2, 2, 3)
         wrist = np.arange(12, 24, dtype=np.uint8).reshape(2, 2, 3)
         observation = {
@@ -497,7 +644,7 @@ class ClientContractTest(unittest.TestCase):
             checkpoint_path="/checkpoints/LAP-3B",
             policy_type="flow",
             normalization_scope="global",
-            normalization_stats_sha256="a" * 64,
+            normalization_stats_sha256=expected_stats_sha256,
         )
 
         with (
@@ -647,6 +794,58 @@ class ClientContractTest(unittest.TestCase):
         self.assertEqual(len(query["server_delta_chunk"]), 1)
         self.assertEqual(len(query["raw_delta_chunk"]), 16)
         self.assertEqual(query["execution_horizon"], 4)
+
+    def test_per_episode_trace_uses_global_id_and_reconciles_partial_retry(self):
+        fake_server = _FakePolicyServer(
+            {"actions": np.zeros((16, 7))},
+        )
+        image = np.zeros((2, 2, 3), dtype=np.uint8)
+        observation = {
+            "splat": {"external_cam": image, "wrist_cam": image},
+            "policy": {
+                "eef_pos": np.array([[0.4, 0.0, 0.2]]),
+                "eef_quat": np.array([[1.0, 0.0, 0.0, 0.0]]),
+                "gripper_pos": np.array([[0.0]]),
+            },
+        }
+        args = PolicyArgs(client="EgoLAPEefPose", open_loop_horizon=8)
+
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            mock.patch(
+                "polaris.policy.lap_eef_pose_client.websocket_client_policy.WebsocketClientPolicy",
+                return_value=fake_server,
+            ),
+            mock.patch(
+                "polaris.policy.lap_eef_pose_client.resize_lap_image",
+                side_effect=lambda value, *_: np.asarray(value),
+            ),
+            mock.patch("builtins.print"),
+        ):
+            trace_dir = Path(temporary_directory) / "policy_traces"
+            args.trace_dir = str(trace_dir)
+            args.contract_output = str(Path(temporary_directory) / "contract.json")
+            client = EgoLAPEefPoseClient(args)
+
+            # Simulate a preempted attempt, then reset the same global episode.
+            client.reset(episode_index=7)
+            client.infer(observation, "move")
+            client.reset(episode_index=7)
+            client.infer(observation, "move")
+            finalized = client.finalize_episode(
+                episode_length=1,
+                success=False,
+                progress=0.25,
+            )
+            records = [json.loads(line) for line in finalized.read_text().splitlines()]
+
+        self.assertEqual(finalized.name, "episode_000007.jsonl")
+        self.assertEqual(records[0]["event"], "reset")
+        self.assertEqual(records[-1]["event"], "episode_complete")
+        self.assertTrue(all(record["episode"] == 7 for record in records))
+        self.assertEqual(sum(record["event"] == "action" for record in records), 1)
+        self.assertEqual(records[-1]["episode_length"], 1)
+        self.assertEqual(records[-1]["status"], "completed")
 
     def test_client_rejects_non_droid_eef_frame(self):
         args = PolicyArgs(client="EgoLAPEefPose")

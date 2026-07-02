@@ -58,3 +58,28 @@
 - The orchestrator can review and integrate the branch
   `codex/main-lap-adapter-20260702`; this agent intentionally did not push,
   merge, or modify the canonical PolaRiS checkout.
+
+## 2026-07-02 — independent production-hardening review
+
+- Agent: `polaris-adapter-review`.
+- Reviewed implementation commits `b2654c3` and `cf9b505` against the strict
+  checkpoint parity, EEF-control, and requeue artifact contracts.
+- Made PolaRiS numeric actions unconditionally robot-base so an egocentric
+  language frame can never trigger a second EEF-to-base conversion.
+- Bound Q99 profiles to exact formula IDs/constants and recomputed the nested
+  normalization-formula, normalization-stats, live-execution, and top-level
+  canonical JSON digests. Global normalization preserves configured category
+  metadata while keeping the effective PolaRiS category null.
+- Added atomic episode video/trace/CSV publication, contiguous artifact-aware
+  resume validation, global episode IDs, and partial-trace reconciliation for
+  Slurm requeue.
+- Added automatic 450-step/15-Hz checks and a first-reset live articulation
+  check against physical `panda_link8`, the installed action term, and identity
+  controller offset.
+- Pure validation after the changes: `42 passed, 5 subtests passed` across the
+  adapter, contract, image oracle, eval mode, artifact, and runtime suites.
+  Six live contracts built from the paired Ego-LAP implementation also passed:
+  public LAP train-matched and legacy-Q99 plus modern manifest train-matched,
+  each in flow and AR mode. Ruff check/format and `git diff --check` passed.
+  Isaac-only controller smoke remains a required cluster canary; no simulator
+  or cluster job was launched in this scoped implementation task.
