@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from typing import Literal
 
 
+LAP_EEF_FRAME = "panda_link8"
+
+
 @dataclass
 class PolicyServer:
     """
@@ -45,6 +48,7 @@ class PolicyArgs:
     action_frame: Literal["robot_base", "egocentric"] = "robot_base"
     dataset_name: str = "droid"
     state_type: str = "eef_pose"
+    eef_frame: Literal["panda_link8"] = LAP_EEF_FRAME
     rotate_wrist_180: bool = True
     render_every_step: bool = True
     trace_path: str | None = None

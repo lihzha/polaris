@@ -1,5 +1,16 @@
 # PolaRiS development worklog
 
+## 2026-07-01 — Correct LAP Cartesian frame
+
+- The prior LAP evaluator used the Robotiq `base_link` pose for state,
+  anchoring, and differential IK. DROID/LAP uses Franka `panda_link8`; the two
+  frames differ by 18.174 mm and approximately 180 degrees in the shipped USD.
+- The corrected evaluator observes and directly controls `panda_link8`, emits
+  separate policy/controller frame markers, records the frame in requests and
+  traces, and fails closed on drift. The original Robotiq `ee_frame` remains
+  unchanged for benchmark rubric scoring; LAP uses a separate sensor. Detailed
+  validation and rerun status are in `worklogs/lap-link8-rerun-20260701.md`.
+
 ## 2026-06-30 — Ego-LAP absolute EEF-pose evaluation integration
 
 - Agent: `implement_polaris_eef`; branch

@@ -64,8 +64,24 @@ def test_nonfinite_input_aborts_rollout_before_physics_step():
 
 
 def test_eef_pose_config_installs_robust_action_term():
-    from polaris.environments.droid_cfg import EefPoseActionCfg
+    from polaris.config import LAP_EEF_FRAME
+    from polaris.environments.droid_cfg import EefPoseActionCfg, SceneCfg
 
     cfg = EefPoseActionCfg()
+    scene_cfg = SceneCfg()
 
     assert cfg.arm.class_type is RobustDifferentialInverseKinematicsAction
+    assert cfg.arm.body_name == LAP_EEF_FRAME == "panda_link8"
+    frame_cfg = scene_cfg.lap_ee_frame
+    target_cfg = frame_cfg.target_frames[0]
+    assert frame_cfg.prim_path.endswith("/robot/panda_link0")
+    assert tuple(frame_cfg.source_frame_offset.pos) == (0.0, 0.0, 0.0)
+    assert tuple(frame_cfg.source_frame_offset.rot) == (1.0, 0.0, 0.0, 0.0)
+    assert target_cfg.prim_path.endswith(f"/robot/{LAP_EEF_FRAME}")
+    assert tuple(target_cfg.offset.pos) == (0.0, 0.0, 0.0)
+    assert tuple(target_cfg.offset.rot) == (1.0, 0.0, 0.0, 0.0)
+    assert tuple(cfg.arm.body_offset.pos) == (0.0, 0.0, 0.0)
+    assert tuple(cfg.arm.body_offset.rot) == (1.0, 0.0, 0.0, 0.0)
+    assert scene_cfg.ee_frame.target_frames[0].prim_path.endswith(
+        "/robot/Gripper/Robotiq_2F_85/base_link"
+    )

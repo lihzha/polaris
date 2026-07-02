@@ -31,9 +31,15 @@ directly so uv does not attempt to create or synchronize a second environment.
 
 ## Interface contract
 
-- The controlled frame is the Robotiq `base_link`, expressed relative to the
-  robot root (`panda_link0`). Isaac Lab receives absolute actions as
-  `[x, y, z, qw, qx, qy, qz, gripper_closed]`.
+- The observed and controlled Cartesian frame is Franka `panda_link8`,
+  expressed relative to the robot root (`panda_link0`). This matches DROID's
+  recorded `cartesian_position` contract. The attached Robotiq `base_link`
+  differs by a fixed 18.174 mm / approximately 180-degree transform and must
+  not be used as the LAP state or action anchor. Isaac Lab receives absolute
+  actions as `[x, y, z, qw, qx, qy, qz, gripper_closed]`.
+- The benchmark's pre-existing Robotiq `ee_frame` sensor remains unchanged for
+  rubric scoring. LAP observations use a separate `lap_ee_frame`, so correcting
+  the policy contract does not shift PolaRiS success thresholds.
 - The policy state is `[x, y, z, R[:, 0], R[:, 1], gripper_open]` (10 values).
   Isaac quaternions are `wxyz`; SciPy conversion is performed in `xyzw`.
 - The external image is sent as `base_0_rgb`. The wrist image is rotated 180

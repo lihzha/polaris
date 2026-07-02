@@ -12,7 +12,7 @@ import pandas as pd
 from pathlib import Path
 from isaaclab.app import AppLauncher
 
-from polaris.config import EvalArgs
+from polaris.config import LAP_EEF_FRAME, EvalArgs
 
 
 def main(eval_args: EvalArgs):
@@ -58,6 +58,52 @@ def main(eval_args: EvalArgs):
         # Action managers are constructed by gym.make, so select the controller
         # on the config before creating the environment.
         env_cfg.actions = EefPoseActionCfg()
+        frame_cfg = env_cfg.scene.lap_ee_frame
+        target_cfg = frame_cfg.target_frames[0]
+        observed_source = frame_cfg.prim_path
+        observed_prim = target_cfg.prim_path
+        controlled_body = env_cfg.actions.arm.body_name
+        source_offset_is_identity = tuple(frame_cfg.source_frame_offset.pos) == (
+            0.0,
+            0.0,
+            0.0,
+        ) and tuple(frame_cfg.source_frame_offset.rot) == (1.0, 0.0, 0.0, 0.0)
+        target_offset_is_identity = tuple(target_cfg.offset.pos) == (
+            0.0,
+            0.0,
+            0.0,
+        ) and tuple(target_cfg.offset.rot) == (1.0, 0.0, 0.0, 0.0)
+        control_offset = env_cfg.actions.arm.body_offset
+        control_offset_is_identity = control_offset is not None and (
+            tuple(control_offset.pos) == (0.0, 0.0, 0.0)
+            and tuple(control_offset.rot) == (1.0, 0.0, 0.0, 0.0)
+        )
+        if not observed_source.endswith("/robot/panda_link0"):
+            raise ValueError(
+                "EEF observation source does not match the DROID/LAP contract: "
+                f"{observed_source!r}"
+            )
+        if not observed_prim.endswith(f"/robot/{LAP_EEF_FRAME}"):
+            raise ValueError(
+                "EEF observation frame does not match the DROID/LAP contract: "
+                f"{observed_prim!r}"
+            )
+        if controlled_body != LAP_EEF_FRAME:
+            raise ValueError(
+                "EEF controller frame does not match the DROID/LAP contract: "
+                f"{controlled_body!r}"
+            )
+        if not source_offset_is_identity or not target_offset_is_identity:
+            raise ValueError("EEF observation source/target offsets must be identity")
+        if not control_offset_is_identity:
+            raise ValueError("EEF controller body offset must be identity")
+        print(
+            "POLARIS_LAP_EEF_FRAME="
+            f"{LAP_EEF_FRAME};reference={observed_source};"
+            f"observation={observed_prim};frame_offsets=identity;"
+            f"control={controlled_body};control_offset=identity",
+            flush=True,
+        )
     elif eval_args.control_mode != "joint-position":
         raise ValueError(f"Unsupported control mode: {eval_args.control_mode}")
     env: ManagerBasedRLSplatEnv = gym.make(  # type: ignore[assignment]

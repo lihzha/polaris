@@ -7,10 +7,11 @@ from unittest import mock
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from polaris.config import PolicyArgs
+from polaris.config import LAP_EEF_FRAME, PolicyArgs
 from polaris.policy.abstract_client import InferenceClient
 from polaris.policy.lap_eef_pose_client import (
     EgoLAPEefPoseClient,
+    LAP_EEF_FRAME_MARKER,
     LAP_IMAGE_PREPROCESSOR_MARKER,
     anchor_action_chunk,
     build_lap_state,
@@ -206,7 +207,11 @@ class ClientContractTest(unittest.TestCase):
             print_mock.call_args_list[0],
             mock.call(LAP_IMAGE_PREPROCESSOR_MARKER, flush=True),
         )
-        image_io_marker = print_mock.call_args_list[1].args[0]
+        self.assertEqual(
+            print_mock.call_args_list[1],
+            mock.call(LAP_EEF_FRAME_MARKER, flush=True),
+        )
+        image_io_marker = print_mock.call_args_list[2].args[0]
         self.assertTrue(image_io_marker.startswith("POLARIS_LAP_IMAGE_IO="))
         image_io = json.loads(image_io_marker.split("=", maxsplit=1)[1])
         self.assertEqual(
@@ -218,7 +223,7 @@ class ClientContractTest(unittest.TestCase):
                 "wrist_output": {"shape": [2, 2, 3], "dtype": "uint8"},
             },
         )
-        self.assertEqual(len(print_mock.call_args_list), 2)
+        self.assertEqual(len(print_mock.call_args_list), 3)
         self.assertIs(
             InferenceClient.REGISTERED_CLIENTS["EgoLAPEefPose"], EgoLAPEefPoseClient
         )
@@ -230,6 +235,7 @@ class ClientContractTest(unittest.TestCase):
         )
         self.assertEqual(request["observation"]["state"].shape, (10,))
         self.assertEqual(request["frame_description"], "robot base frame")
+        self.assertEqual(request["eef_frame"], LAP_EEF_FRAME)
         np.testing.assert_allclose(first_action[:3], np.array([0.5, 0.0, 0.2]))
         np.testing.assert_allclose(second_action[:3], np.array([0.6, 0.0, 0.2]))
         self.assertEqual(first_action[7], 0.0)
@@ -241,6 +247,13 @@ class ClientContractTest(unittest.TestCase):
             [record["event"] for record in trace_records],
             ["reset", "query", "action", "action"],
         )
+        self.assertEqual(trace_records[1]["eef_frame"], LAP_EEF_FRAME)
+
+    def test_client_rejects_non_droid_eef_frame(self):
+        args = PolicyArgs(client="EgoLAPEefPose")
+        args.eef_frame = "base_link"  # type: ignore[assignment]
+        with self.assertRaisesRegex(ValueError, "panda_link8"):
+            EgoLAPEefPoseClient(args)
 
 
 if __name__ == "__main__":

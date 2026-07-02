@@ -20,6 +20,8 @@ parser.add_argument("--position-delta", type=float, default=0.04)
 parser.add_argument("--rotation-degrees", type=float, default=15.0)
 parser.add_argument("--position-tolerance", type=float, default=0.01)
 parser.add_argument("--rotation-tolerance-degrees", type=float, default=5.0)
+parser.add_argument("--frame-position-tolerance", type=float, default=1e-5)
+parser.add_argument("--frame-rotation-tolerance-degrees", type=float, default=0.01)
 parser.add_argument(
     "--output-json",
     type=Path,
@@ -43,9 +45,11 @@ def main() -> int:
     import numpy as np
     import torch
     from isaaclab_tasks.utils import parse_env_cfg
+    from isaaclab.utils import math as math_utils
     from scipy.spatial.transform import Rotation
 
     import polaris.environments  # noqa: F401
+    from polaris.config import LAP_EEF_FRAME
     from polaris.environments.droid_cfg import EefPoseActionCfg
     from polaris.policy.lap_eef_pose_client import anchor_action_chunk
 
@@ -57,6 +61,41 @@ def main() -> int:
     )
     env_cfg.actions = EefPoseActionCfg()
     env = gym.make(args_cli.environment, cfg=env_cfg)
+    robot = env.unwrapped.scene["robot"]
+    link0_index = robot.data.body_names.index("panda_link0")
+    link8_index = robot.data.body_names.index(LAP_EEF_FRAME)
+
+    def direct_link8_pose():
+        position, quaternion = math_utils.subtract_frame_transforms(
+            robot.data.body_pos_w[:, link0_index],
+            robot.data.body_quat_w[:, link0_index],
+            robot.data.body_pos_w[:, link8_index],
+            robot.data.body_quat_w[:, link8_index],
+        )
+        return (
+            position[0].detach().cpu().numpy(),
+            quaternion[0].detach().cpu().numpy(),
+        )
+
+    def validate_observation_frame(observation):
+        observed_position = observation["policy"]["eef_pos"][0].detach().cpu().numpy()
+        observed_quaternion = (
+            observation["policy"]["eef_quat"][0].detach().cpu().numpy()
+        )
+        direct_position, direct_quaternion = direct_link8_pose()
+        position_error = float(np.linalg.norm(observed_position - direct_position))
+        observed_rotation = Rotation.from_quat(_wxyz_to_xyzw(observed_quaternion))
+        direct_rotation = Rotation.from_quat(_wxyz_to_xyzw(direct_quaternion))
+        rotation_error = float((direct_rotation.inv() * observed_rotation).magnitude())
+        if (
+            position_error > args_cli.frame_position_tolerance
+            or rotation_error > math.radians(args_cli.frame_rotation_tolerance_degrees)
+        ):
+            raise RuntimeError(
+                "LAP EEF observation is not the articulation's direct panda_link8 "
+                f"pose: position_error={position_error}, rotation_error={rotation_error}"
+            )
+        return position_error, rotation_error
 
     angle = math.radians(args_cli.rotation_degrees)
     delta = args_cli.position_delta
@@ -75,6 +114,9 @@ def main() -> int:
     try:
         for label, pose_delta in test_cases:
             observation, _ = env.reset(expensive=False)
+            reset_frame_position_error, reset_frame_rotation_error = (
+                validate_observation_frame(observation)
+            )
             anchor_position = observation["policy"]["eef_pos"][0].detach().cpu().numpy()
             anchor_quaternion = (
                 observation["policy"]["eef_quat"][0].detach().cpu().numpy()
@@ -95,6 +137,9 @@ def main() -> int:
             actual_position = observation["policy"]["eef_pos"][0].detach().cpu().numpy()
             actual_quaternion = (
                 observation["policy"]["eef_quat"][0].detach().cpu().numpy()
+            )
+            final_frame_position_error, final_frame_rotation_error = (
+                validate_observation_frame(observation)
             )
             position_error = float(np.linalg.norm(actual_position - target[:3]))
             target_rotation = Rotation.from_quat(_wxyz_to_xyzw(target[3:7]))
@@ -117,6 +162,10 @@ def main() -> int:
                     "actual_position": actual_position.tolist(),
                     "target_quaternion_wxyz": target[3:7].tolist(),
                     "actual_quaternion_wxyz": actual_quaternion.tolist(),
+                    "reset_frame_position_error_m": reset_frame_position_error,
+                    "reset_frame_rotation_error_rad": reset_frame_rotation_error,
+                    "final_frame_position_error_m": final_frame_position_error,
+                    "final_frame_rotation_error_rad": final_frame_rotation_error,
                 }
             )
             print(
@@ -134,11 +183,14 @@ def main() -> int:
             json.dumps(
                 {
                     "environment": args_cli.environment,
+                    "eef_frame": LAP_EEF_FRAME,
                     "hold_steps": args_cli.hold_steps,
                     "position_delta_m": args_cli.position_delta,
                     "rotation_delta_deg": args_cli.rotation_degrees,
                     "position_tolerance_m": args_cli.position_tolerance,
                     "rotation_tolerance_deg": args_cli.rotation_tolerance_degrees,
+                    "frame_position_tolerance_m": args_cli.frame_position_tolerance,
+                    "frame_rotation_tolerance_deg": args_cli.frame_rotation_tolerance_degrees,
                     "passed": failures == 0,
                     "results": results,
                 },

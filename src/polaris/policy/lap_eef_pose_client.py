@@ -11,7 +11,7 @@ import numpy as np
 from openpi_client import websocket_client_policy
 from scipy.spatial.transform import Rotation
 
-from polaris.config import PolicyArgs
+from polaris.config import LAP_EEF_FRAME, PolicyArgs
 from polaris.policy.abstract_client import InferenceClient
 
 
@@ -21,6 +21,7 @@ LAP_IMAGE_PREPROCESSOR_MARKER = (
     "tf_bilinear_half_pixel_antialias_false_uint8_round_"
     "symmetric_zero_pad_224x224_numpy_float32_exact_v2"
 )
+LAP_EEF_FRAME_MARKER = f"POLARIS_LAP_POLICY_EEF_FRAME={LAP_EEF_FRAME}"
 
 
 def _json_default(value: Any) -> Any:
@@ -335,6 +336,11 @@ class EgoLAPEefPoseClient(InferenceClient):
             raise ValueError("open_loop_horizon must be positive or None")
         if not args.frame_description.strip():
             raise ValueError("frame_description must not be empty")
+        if args.eef_frame != LAP_EEF_FRAME:
+            raise ValueError(
+                "EgoLAPEefPose requires the DROID/LAP Cartesian frame "
+                f"{LAP_EEF_FRAME!r}; got {args.eef_frame!r}"
+            )
         resolve_action_frame(args.action_frame)
 
         self.args = args
@@ -342,6 +348,7 @@ class EgoLAPEefPoseClient(InferenceClient):
             host=args.host, port=args.port
         )
         print(LAP_IMAGE_PREPROCESSOR_MARKER, flush=True)
+        print(LAP_EEF_FRAME_MARKER, flush=True)
         self.open_loop_horizon = args.open_loop_horizon
         self.trace_path = Path(args.trace_path) if args.trace_path else None
         if self.trace_path is not None:
@@ -445,6 +452,7 @@ class EgoLAPEefPoseClient(InferenceClient):
                     "step": self.step_index,
                     "instruction": instruction,
                     "frame_description": self.args.frame_description,
+                    "eef_frame": self.args.eef_frame,
                     "numeric_action_frame": action_frame,
                     "anchor_position": current["eef_position"].tolist(),
                     "anchor_quaternion_wxyz": current["eef_quaternion_wxyz"].tolist(),
@@ -562,6 +570,7 @@ class EgoLAPEefPoseClient(InferenceClient):
             },
             "prompt": instruction,
             "frame_description": self.args.frame_description,
+            "eef_frame": self.args.eef_frame,
             "dataset_name": self.args.dataset_name,
             "state_type": self.args.state_type,
             "has_wrist_image": True,
