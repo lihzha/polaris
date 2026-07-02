@@ -1,9 +1,13 @@
+import json
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
+from polaris.eef_runtime_contract import atomic_write_runtime_contract
 from polaris.eef_runtime_contract import validate_eef_runtime_frame
 from polaris.eef_runtime_contract import validate_ego_lap_runtime_protocol
 
@@ -74,6 +78,36 @@ def test_runtime_frame_matches_direct_link8_and_absolute_action_term():
     assert result["eef_frame"] == "panda_link8"
     assert result["position_error_m"] < 1e-12
     assert result["rotation_error_rad"] < 1e-12
+    assert result["reference_frame"] == "panda_link0"
+    assert result["controlled_body"] == "panda_link8"
+    assert result["body_offset"] == "identity"
+    assert result["command_type"] == "pose"
+    assert result["use_relative_mode"] is False
+    assert result["action_dim"] == 7
+
+
+def test_runtime_contract_is_atomic_and_has_exact_evidence_schema():
+    env, observation = _runtime_fixture()
+    protocol = validate_ego_lap_runtime_protocol(env)
+    frame = validate_eef_runtime_frame(env, observation)
+
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        path = Path(temporary_directory) / "nested" / "runtime.json"
+        path.parent.mkdir(parents=True)
+        path.write_text('{"stale": true}\n', encoding="utf-8")
+        atomic_write_runtime_contract(path, protocol=protocol, frame=frame)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+
+        assert payload == {
+            "schema_version": 1,
+            "protocol": {
+                "episode_steps": 450,
+                "policy_hz": 15.0,
+                "step_dt": 1.0 / 15.0,
+            },
+            "frame": frame,
+        }
+        assert not list(path.parent.glob(".*.tmp"))
 
 
 def test_runtime_frame_rejects_observation_and_controller_drift():

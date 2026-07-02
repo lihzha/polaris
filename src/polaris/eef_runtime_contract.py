@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import json
 import math
+import os
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -98,7 +101,7 @@ def validate_eef_runtime_frame(
     *,
     position_tolerance: float = 1e-5,
     rotation_tolerance_radians: float = math.radians(0.01),
-) -> dict[str, float | str]:
+) -> dict[str, bool | float | int | str]:
     """Verify observed and controlled Cartesian frames on the live articulation."""
 
     runtime = _unwrapped(env)
@@ -192,4 +195,35 @@ def validate_eef_runtime_frame(
         "reference_frame": "panda_link0",
         "position_error_m": position_error,
         "rotation_error_rad": rotation_error,
+        "controlled_body": LAP_EEF_FRAME,
+        "body_offset": "identity",
+        "command_type": "pose",
+        "use_relative_mode": False,
+        "action_dim": 7,
     }
+
+
+def atomic_write_runtime_contract(
+    path: Path,
+    *,
+    protocol: Mapping[str, Any],
+    frame: Mapping[str, Any],
+) -> None:
+    """Atomically persist the live simulator/controller contract for this attempt."""
+
+    payload = {
+        "schema_version": 1,
+        "protocol": dict(protocol),
+        "frame": dict(frame),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as output:
+            json.dump(payload, output, indent=2, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)

@@ -83,3 +83,25 @@
   each in flow and AR mode. Ruff check/format and `git diff --check` passed.
   Isaac-only controller smoke remains a required cluster canary; no simulator
   or cluster job was launched in this scoped implementation task.
+
+## 2026-07-02 — checkpoint-specific R6 and runtime evidence fix
+
+- The public `original_lap_public_3b_v1` profile now fails closed unless both
+  contract locations select `xyz+r6_first_two_rows+gripper_open` with mode
+  `public_lap_train_matched_rows_v1`, matching the public checkpoint's training
+  implementation. Manifest-backed profiles require the newer first-two-column
+  layout and `manifest_train_matched_columns_v1` mode.
+- The client builds state from the validated layout rather than a fixed helper
+  convention and records the layout plus mode in every policy-query trace.
+  An asymmetric cyclic rotation regression proves the exact, distinct six-value
+  row and column order; client tests prove public and manifest profiles send the
+  corresponding state bytes.
+- `scripts/eval.py` now atomically writes schema-1 runtime evidence containing
+  the exact 450-step/15-Hz protocol and live `panda_link0 -> panda_link8`
+  observation/controller facts. A fully resumed task resets and validates the
+  live controller, writes the evidence, and only then takes its early return.
+- Pure validation: `45 passed, 7 subtests passed` across the adapter/contract,
+  resize oracle, eval mode, artifact, and runtime suites. Ruff format/check,
+  Python byte compilation, and `git diff --check` passed. The unfiltered suite
+  still cannot collect the Isaac-only robust-IK test in the local non-Isaac
+  environment; no simulator or cluster job was launched by this scoped fix.

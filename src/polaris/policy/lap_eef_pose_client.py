@@ -14,6 +14,8 @@ from scipy.spatial.transform import Rotation
 
 from polaris.config import LAP_EEF_FRAME, PolicyArgs
 from polaris.policy.abstract_client import InferenceClient
+from polaris.policy.ego_lap_contract import R6_COLUMNS_STATE_LAYOUT
+from polaris.policy.ego_lap_contract import R6_ROWS_STATE_LAYOUT
 from polaris.policy.ego_lap_contract import persist_ego_lap_contract
 from polaris.policy.ego_lap_contract import validate_ego_lap_server_metadata
 
@@ -71,26 +73,39 @@ def rotate_image_180(image: np.ndarray) -> np.ndarray:
     return np.asarray(image)[::-1, ::-1].copy()
 
 
-def quaternion_wxyz_to_rot6d(quaternion_wxyz: Any) -> np.ndarray:
-    """Encode an Isaac ``wxyz`` quaternion as Ego-LAP's two-column R6 state."""
+def quaternion_wxyz_to_rot6d(
+    quaternion_wxyz: Any,
+    *,
+    state_layout: str,
+) -> np.ndarray:
+    """Encode an Isaac ``wxyz`` quaternion using the contracted R6 ordering."""
 
     quaternion_wxyz = _unit_quaternion_wxyz(
         quaternion_wxyz, name="end-effector quaternion"
     )
     quaternion_xyzw = quaternion_wxyz[[1, 2, 3, 0]]
     rotation_matrix = Rotation.from_quat(quaternion_xyzw).as_matrix()
-    return np.concatenate([rotation_matrix[:, 0], rotation_matrix[:, 1]])
+    if state_layout == R6_ROWS_STATE_LAYOUT:
+        return np.concatenate([rotation_matrix[0, :], rotation_matrix[1, :]])
+    if state_layout == R6_COLUMNS_STATE_LAYOUT:
+        return np.concatenate([rotation_matrix[:, 0], rotation_matrix[:, 1]])
+    raise ValueError(f"Unsupported Ego-LAP R6 state layout: {state_layout!r}")
 
 
 def build_lap_state(
     eef_position: Any,
     eef_quaternion_wxyz: Any,
     closed_gripper: Any,
+    *,
+    state_layout: str,
 ) -> np.ndarray:
     """Build ``[xyz, rot6d, open_gripper]`` for Ego-LAP."""
 
     position = _finite_vector(eef_position, name="end-effector position", size=3)
-    rot6d = quaternion_wxyz_to_rot6d(eef_quaternion_wxyz)
+    rot6d = quaternion_wxyz_to_rot6d(
+        eef_quaternion_wxyz,
+        state_layout=state_layout,
+    )
     closed = _finite_vector(closed_gripper, name="closed gripper", size=1)[0]
     # Match the official DROID runner: invert the normalized observation and
     # binarize at 0.5 before building the policy state.
@@ -412,6 +427,8 @@ class EgoLAPEefPoseClient(InferenceClient):
         self.action_frame = self.contract.action_frame
         self.dataset_name = self.contract.dataset_name
         self.state_type = self.contract.state_type
+        self.state_layout = self.contract.state_layout
+        self.state_layout_mode = self.contract.state_layout_mode
         self.rotate_wrist_180 = self.contract.rotate_wrist_180
         self.open_loop_horizon = self.contract.execution_horizon
         print(LAP_IMAGE_PREPROCESSOR_MARKER, flush=True)
@@ -430,6 +447,8 @@ class EgoLAPEefPoseClient(InferenceClient):
             f"input_formula={self.contract.normalization_input_formula};"
             f"output_formula={self.contract.normalization_output_formula};"
             f"formula_probe={self.contract.normalization_formula_probe_sha256};"
+            f"state_layout={self.state_layout};"
+            f"state_layout_mode={self.state_layout_mode};"
             f"polaris_profile={self.contract.polaris_profile}",
             flush=True,
         )
@@ -616,6 +635,8 @@ class EgoLAPEefPoseClient(InferenceClient):
                     "normalization_input_formula": self.contract.normalization_input_formula,
                     "normalization_output_formula": self.contract.normalization_output_formula,
                     "normalization_formula_probe_sha256": self.contract.normalization_formula_probe_sha256,
+                    "state_layout": self.state_layout,
+                    "state_layout_mode": self.state_layout_mode,
                     "polaris_profile": self.contract.polaris_profile,
                     "anchor_position": current["eef_position"].tolist(),
                     "anchor_quaternion_wxyz": current["eef_quaternion_wxyz"].tolist(),
@@ -723,6 +744,7 @@ class EgoLAPEefPoseClient(InferenceClient):
             current["eef_position"],
             current["eef_quaternion_wxyz"],
             current["closed_gripper"],
+            state_layout=self.state_layout,
         )
         request = {
             "observation": {

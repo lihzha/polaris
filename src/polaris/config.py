@@ -79,6 +79,7 @@ class EvalArgs:
     instruction: str | None = None  # Override language instruction
     rollouts: int | None = None  # Number of rollouts to evaluate
     control_mode: Literal["joint-position", "eef-pose"] = "joint-position"
+    runtime_contract_output: str | None = None
 
 
 def validate_policy_control_mode(eval_args: EvalArgs) -> None:

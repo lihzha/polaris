@@ -6,8 +6,12 @@ control mode remain the defaults.
 
 ## Physical and action contract
 
-- The policy state is the 10-D DROID state
-  `[xyz, rotation-6D first two columns, gripper-open]`.
+- The policy state is the 10-D DROID state `[xyz, rotation-6D, gripper-open]`.
+  The state layout is checkpoint-specific and versioned in serving metadata:
+  `original_lap_public_3b_v1` uses the first two rotation-matrix rows with
+  mode `public_lap_train_matched_rows_v1`, matching its training code, while
+  manifest-backed checkpoints use the first two columns with mode
+  `manifest_train_matched_columns_v1`.
 - State, chunk anchoring, and absolute differential IK all use Franka
   `panda_link8` relative to `panda_link0`, with identity frame offsets.
 - LAP returns 7-D deltas
@@ -39,6 +43,8 @@ Validation covers:
 - schema, checkpoint profile/path, and flow versus AR mode;
 - 10-D state, 7-D action, 16-step model horizon, 224x224 RGB uint8 images,
   legacy or canonical image routing, and 180-degree wrist rotation;
+- the checkpoint-specific R6 layout and mode in both `policy_input` and
+  `polaris`; disagreement or an opposite-profile layout fails closed;
 - checkpoint normalization digest, Q99 type, and global/category scope;
   category scope must select `single_arm`, while global scope stays global;
 - versioned Q99 input/output formula IDs plus passing input, round-trip, and
@@ -84,6 +90,7 @@ uv run scripts/eval.py \
   --environment DROID-FoodBussing \
   --control-mode eef-pose \
   --run-folder runs/lap-flow-food-bussing \
+  --runtime-contract-output runs/lap-flow-food-bussing/polaris_runtime_contract.json \
   --policy.client EgoLAPEefPose \
   --policy.host 127.0.0.1 \
   --policy.port 8000 \
@@ -144,7 +151,11 @@ Before rollout, the evaluator also requires the live environment to expose
 exactly 450 policy steps at 15 Hz. After the first reset it compares the policy
 observation to the articulation's direct `panda_link0 -> panda_link8` transform
 and verifies that the installed 7-D action term is absolute-pose differential
-IK on `panda_link8` with an identity body offset.
+IK on `panda_link8` with an identity body offset. These protocol, frame,
+controller-body, offset, command-mode, and action-dimension facts are written
+atomically to `--runtime-contract-output` (defaulting to
+`RUN_FOLDER/polaris_runtime_contract.json`). A fully resumed task performs the
+same live reset, validation, and write before its completed-path early return.
 
 Run a one-rollout canary and inspect its contract JSON, trace, CSV, and complete
 video before scaling out.

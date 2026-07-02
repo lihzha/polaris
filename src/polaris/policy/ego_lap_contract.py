@@ -23,6 +23,10 @@ LEGACY_INPUT_FORMULA = "q99_input_eps1e-6_no_clip_zero0_v1"
 LEGACY_OUTPUT_FORMULA = "q99_output_eps1e-6_no_zero_override_extrapolate_v1"
 NORMALIZATION_FORMULA_SCHEMA_VERSION = 1
 POLARIS_EEF_PROFILE = "panda_link8_eef_pose_single_arm_v1"
+R6_ROWS_STATE_LAYOUT = "xyz+r6_first_two_rows+gripper_open"
+R6_COLUMNS_STATE_LAYOUT = "xyz+r6_first_two_columns+gripper_open"
+PUBLIC_LAP_TRAIN_MATCHED_R6_MODE = "public_lap_train_matched_rows_v1"
+MANIFEST_TRAIN_MATCHED_R6_MODE = "manifest_train_matched_columns_v1"
 
 Q99_FORMULA_CONTRACTS: dict[str, dict[str, Any]] = {
     "q99_train_matched_v1": {
@@ -71,6 +75,14 @@ class ValidatedEgoLAPContract:
     action_frame: Literal["robot_base"]
     dataset_name: str
     state_type: str
+    state_layout: Literal[
+        "xyz+r6_first_two_rows+gripper_open",
+        "xyz+r6_first_two_columns+gripper_open",
+    ]
+    state_layout_mode: Literal[
+        "public_lap_train_matched_rows_v1",
+        "manifest_train_matched_columns_v1",
+    ]
     rotate_wrist_180: bool
     normalization_scope: Literal["global", "category"]
     normalization_stats_sha256: str
@@ -242,9 +254,13 @@ def validate_ego_lap_server_metadata(
     if checkpoint_profile == ORIGINAL_LAP_PROFILE:
         expected_image_keys = ["base_0_rgb", "left_wrist_0_rgb"]
         expected_image_order = ["external", "wrist"]
+        expected_state_layout = R6_ROWS_STATE_LAYOUT
+        expected_state_layout_mode = PUBLIC_LAP_TRAIN_MATCHED_R6_MODE
     else:
         expected_image_keys = ["camera_0_rgb", "camera_1_rgb", "camera_2_rgb"]
         expected_image_order = ["wrist", "external", "blank"]
+        expected_state_layout = R6_COLUMNS_STATE_LAYOUT
+        expected_state_layout_mode = MANIFEST_TRAIN_MATCHED_R6_MODE
     _require_sequence(
         model.get("model_image_keys"),
         expected_image_keys,
@@ -305,8 +321,13 @@ def validate_ego_lap_server_metadata(
     )
     _require_equal(
         policy_input.get("state_layout"),
-        "xyz+r6_first_two_columns+gripper_open",
+        expected_state_layout,
         field="policy_input.state_layout",
+    )
+    _require_equal(
+        policy_input.get("state_layout_mode"),
+        expected_state_layout_mode,
+        field="policy_input.state_layout_mode",
     )
     _require_equal(
         policy_input.get("gripper_open_value"),
@@ -769,6 +790,16 @@ def validate_ego_lap_server_metadata(
         "robot_base",
         field="polaris.numeric_action_frame",
     )
+    _require_equal(
+        polaris.get("state_layout"),
+        expected_state_layout,
+        field="polaris.state_layout",
+    )
+    _require_equal(
+        polaris.get("state_layout_mode"),
+        expected_state_layout_mode,
+        field="polaris.state_layout_mode",
+    )
 
     contract_sha256 = _required_string(document, "sha256", field="contract")
     _require_sha256(contract_sha256, field="contract.sha256")
@@ -792,6 +823,8 @@ def validate_ego_lap_server_metadata(
         action_frame=action_frame,
         dataset_name=dataset_name,
         state_type=state_type,
+        state_layout=expected_state_layout,
+        state_layout_mode=expected_state_layout_mode,
         rotate_wrist_180=True,
         normalization_scope=normalization_scope,
         normalization_stats_sha256=normalization_stats_sha256,

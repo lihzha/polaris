@@ -12,6 +12,7 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 from polaris.config import LAP_EEF_FRAME, EvalArgs, validate_policy_control_mode
+from polaris.eef_runtime_contract import atomic_write_runtime_contract
 from polaris.eef_runtime_contract import validate_eef_runtime_frame
 from polaris.eef_runtime_contract import validate_ego_lap_runtime_protocol
 from polaris.eval_artifacts import atomic_write_episode_video
@@ -105,6 +106,7 @@ def main(eval_args: EvalArgs):
     env: ManagerBasedRLSplatEnv = gym.make(  # type: ignore[assignment]
         eval_args.environment, cfg=env_cfg
     )
+    runtime_protocol = None
     if is_ego_lap:
         runtime_protocol = validate_ego_lap_runtime_protocol(env)
         print(
@@ -129,6 +131,10 @@ def main(eval_args: EvalArgs):
     # Resume CSV logging
     run_folder = Path(eval_args.run_folder)
     run_folder.mkdir(parents=True, exist_ok=True)
+    if is_ego_lap and eval_args.runtime_contract_output is None:
+        eval_args.runtime_contract_output = str(
+            run_folder / "polaris_runtime_contract.json"
+        )
     if is_ego_lap and eval_args.policy.contract_output is None:
         eval_args.policy.contract_output = str(
             run_folder / "ego_lap_serving_contract.json"
@@ -163,7 +169,29 @@ def main(eval_args: EvalArgs):
         # Validate and persist the live serving contract even when a resumed task
         # already contains every rollout artifact.
         policy_client = InferenceClient.get_client(eval_args.policy)
+
+    def validate_runtime_frame_and_persist(observation):
+        if runtime_protocol is None or eval_args.runtime_contract_output is None:
+            raise RuntimeError("Ego-LAP runtime contract output was not configured")
+        runtime_frame = validate_eef_runtime_frame(env, observation)
+        atomic_write_runtime_contract(
+            Path(eval_args.runtime_contract_output),
+            protocol=runtime_protocol,
+            frame=runtime_frame,
+        )
+        print(
+            "POLARIS_LAP_RUNTIME_EEF="
+            f"frame={runtime_frame['eef_frame']};"
+            f"reference={runtime_frame['reference_frame']};"
+            f"position_error_m={runtime_frame['position_error_m']};"
+            f"rotation_error_rad={runtime_frame['rotation_error_rad']}",
+            flush=True,
+        )
+
     if episode >= rollouts:
+        if is_ego_lap:
+            resumed_observation, _ = env.reset(object_positions=initial_conditions[0])
+            validate_runtime_frame_and_persist(resumed_observation)
         print("All rollouts have been evaluated. Exiting.")
         env.close()
         simulation_app.close()
@@ -179,15 +207,7 @@ def main(eval_args: EvalArgs):
         # loop reset before incrementing ``episode``, repeating condition zero.
         obs, info = env.reset(object_positions=initial_conditions[episode])
         if is_ego_lap and not runtime_frame_validated:
-            runtime_frame = validate_eef_runtime_frame(env, obs)
-            print(
-                "POLARIS_LAP_RUNTIME_EEF="
-                f"frame={runtime_frame['eef_frame']};"
-                f"reference={runtime_frame['reference_frame']};"
-                f"position_error_m={runtime_frame['position_error_m']};"
-                f"rotation_error_rad={runtime_frame['rotation_error_rad']}",
-                flush=True,
-            )
+            validate_runtime_frame_and_persist(obs)
             runtime_frame_validated = True
         if is_ego_lap:
             policy_client.reset(episode_index=episode)

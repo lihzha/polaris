@@ -24,6 +24,11 @@ from polaris.policy.lap_eef_pose_client import (
     validate_action_chunk,
 )
 from polaris.policy.ego_lap_contract import (
+    MANIFEST_TRAIN_MATCHED_R6_MODE,
+    ORIGINAL_LAP_PROFILE,
+    PUBLIC_LAP_TRAIN_MATCHED_R6_MODE,
+    R6_COLUMNS_STATE_LAYOUT,
+    R6_ROWS_STATE_LAYOUT,
     ego_lap_contract_digest,
     ego_lap_nested_digest,
     persist_ego_lap_contract,
@@ -31,23 +36,43 @@ from polaris.policy.ego_lap_contract import (
 )
 
 
-def _serving_metadata(*, policy_type="flow", frame_description="robot base frame"):
+def _serving_metadata(
+    *,
+    policy_type="flow",
+    frame_description="robot base frame",
+    checkpoint_profile=ORIGINAL_LAP_PROFILE,
+):
     response_horizon = 16 if policy_type == "flow" else 1
     response_semantics = (
         "cumulative_delta_targets" if policy_type == "flow" else "total_delta_endpoint"
     )
+    is_public_lap = checkpoint_profile == ORIGINAL_LAP_PROFILE
+    model_image_keys = (
+        ["base_0_rgb", "left_wrist_0_rgb"]
+        if is_public_lap
+        else ["camera_0_rgb", "camera_1_rgb", "camera_2_rgb"]
+    )
+    model_image_order = (
+        ["external", "wrist"] if is_public_lap else ["wrist", "external", "blank"]
+    )
+    state_layout = R6_ROWS_STATE_LAYOUT if is_public_lap else R6_COLUMNS_STATE_LAYOUT
+    state_layout_mode = (
+        PUBLIC_LAP_TRAIN_MATCHED_R6_MODE
+        if is_public_lap
+        else MANIFEST_TRAIN_MATCHED_R6_MODE
+    )
     contract = {
         "schema_version": 2,
-        "checkpoint_profile": "original_lap_public_3b_v1",
+        "checkpoint_profile": checkpoint_profile,
         "checkpoint_path": "/checkpoints/LAP-3B",
-        "checkpoint_manifest_validated": False,
+        "checkpoint_manifest_validated": not is_public_lap,
         "policy_type": policy_type,
         "model": {
             "action_dim": 7,
             "action_horizon": 16,
             "state_dim": 10,
             "image_resolution": [224, 224],
-            "model_image_keys": ["base_0_rgb", "left_wrist_0_rgb"],
+            "model_image_keys": model_image_keys,
             "prompt_format": "lap",
             "enable_langact_training": True,
         },
@@ -57,13 +82,14 @@ def _serving_metadata(*, policy_type="flow", frame_description="robot base frame
             "image_color_space": "RGB",
             "image_dtype": "uint8",
             "image_resolution": [224, 224],
-            "model_image_order": ["external", "wrist"],
+            "model_image_order": model_image_order,
             "wrist_rotation_degrees": 180,
             "dataset_name": "droid",
             "request_state_type": "eef_pose",
             "is_bimanual": False,
             "state_encoding": "EEF_R6",
-            "state_layout": "xyz+r6_first_two_columns+gripper_open",
+            "state_layout": state_layout,
+            "state_layout_mode": state_layout_mode,
             "gripper_open_value": 1.0,
             "gripper_closed_value": 0.0,
         },
@@ -107,7 +133,7 @@ def _serving_metadata(*, policy_type="flow", frame_description="robot base frame
                 "mask_zero_img_prob": 0.0,
                 "state_dropout": 0.0,
             },
-            "image_routing": {"model_image_order": ["external", "wrist"]},
+            "image_routing": {"model_image_order": model_image_order},
             "droid_image_preprocessing": {
                 "dataset_name": "droid",
                 "registry_requires_wrist_rotation": True,
@@ -156,6 +182,8 @@ def _serving_metadata(*, policy_type="flow", frame_description="robot base frame
             "normalization_category": None,
             "q99_formula_profile": "q99_train_matched_v1",
             "numeric_action_frame": "robot_base",
+            "state_layout": state_layout,
+            "state_layout_mode": state_layout_mode,
         },
     }
     formula = contract["execution"]["normalization_formula"]
@@ -255,26 +283,10 @@ class ServingMetadataContractTest(unittest.TestCase):
         self.assertEqual(contract.normalization_scope, "category")
 
     def test_modern_manifest_image_routing_is_accepted(self):
-        metadata = _serving_metadata(frame_description="egocentric frame")
-        document = metadata["ego_lap_serving_contract"]
-        document["checkpoint_profile"] = "manifest_execution_v2"
-        document["checkpoint_manifest_validated"] = True
-        document["model"]["model_image_keys"] = [
-            "camera_0_rgb",
-            "camera_1_rgb",
-            "camera_2_rgb",
-        ]
-        document["policy_input"]["model_image_order"] = [
-            "wrist",
-            "external",
-            "blank",
-        ]
-        document["execution"]["image_routing"]["model_image_order"] = [
-            "wrist",
-            "external",
-            "blank",
-        ]
-        _rehash_contract(metadata)
+        metadata = _serving_metadata(
+            frame_description="egocentric frame",
+            checkpoint_profile="manifest_execution_v2",
+        )
 
         contract = _validate_metadata(
             metadata,
@@ -283,6 +295,35 @@ class ServingMetadataContractTest(unittest.TestCase):
         )
 
         self.assertEqual(contract.frame_description, "egocentric frame")
+        self.assertEqual(contract.state_layout, R6_COLUMNS_STATE_LAYOUT)
+        self.assertEqual(
+            contract.state_layout_mode,
+            MANIFEST_TRAIN_MATCHED_R6_MODE,
+        )
+
+    def test_state_layout_is_checkpoint_specific_and_redundantly_bound(self):
+        public_contract = _validate_metadata(_serving_metadata())
+        self.assertEqual(public_contract.state_layout, R6_ROWS_STATE_LAYOUT)
+        self.assertEqual(
+            public_contract.state_layout_mode,
+            PUBLIC_LAP_TRAIN_MATCHED_R6_MODE,
+        )
+
+        for field in ("policy_input", "polaris"):
+            with self.subTest(field=field):
+                metadata = _serving_metadata()
+                document = metadata["ego_lap_serving_contract"]
+                document[field]["state_layout"] = R6_COLUMNS_STATE_LAYOUT
+                document["sha256"] = ego_lap_contract_digest(document)
+                with self.assertRaisesRegex(ValueError, rf"{field}\.state_layout"):
+                    _validate_metadata(metadata)
+
+        metadata = _serving_metadata(checkpoint_profile="manifest_execution_v2")
+        document = metadata["ego_lap_serving_contract"]
+        document["polaris"]["state_layout_mode"] = PUBLIC_LAP_TRAIN_MATCHED_R6_MODE
+        document["sha256"] = ego_lap_contract_digest(document)
+        with self.assertRaisesRegex(ValueError, "polaris.state_layout_mode"):
+            _validate_metadata(metadata)
 
     def test_contract_identity_rejects_tampering(self):
         metadata = _serving_metadata()
@@ -471,20 +512,37 @@ class ServingMetadataContractTest(unittest.TestCase):
 
 
 class PoseConversionTest(unittest.TestCase):
-    def test_rot6d_uses_first_two_rotation_matrix_columns(self):
-        quaternion = _xyzw_to_wxyz(Rotation.from_euler("z", 90, degrees=True).as_quat())
-        actual = quaternion_wxyz_to_rot6d(quaternion)
-        np.testing.assert_allclose(
-            actual,
-            np.array([0.0, 1.0, 0.0, -1.0, 0.0, 0.0]),
-            atol=1e-7,
+    def test_rot6d_row_and_column_layouts_have_exact_asymmetric_order(self):
+        # This quaternion produces the asymmetric cyclic permutation matrix
+        # [[0, 0, 1], [1, 0, 0], [0, 1, 0]], so rows and columns cannot pass
+        # accidentally through symmetry.
+        quaternion = np.array([0.5, 0.5, 0.5, 0.5])
+        rows = quaternion_wxyz_to_rot6d(
+            quaternion,
+            state_layout=R6_ROWS_STATE_LAYOUT,
         )
+        columns = quaternion_wxyz_to_rot6d(
+            quaternion,
+            state_layout=R6_COLUMNS_STATE_LAYOUT,
+        )
+        np.testing.assert_array_equal(
+            rows,
+            np.array([0.0, 0.0, 1.0, 1.0, 0.0, 0.0]),
+        )
+        np.testing.assert_array_equal(
+            columns,
+            np.array([0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+        )
+
+        with self.assertRaisesRegex(ValueError, "Unsupported Ego-LAP R6"):
+            quaternion_wxyz_to_rot6d(quaternion, state_layout="ambiguous_r6")
 
     def test_state_is_xyz_rot6d_and_open_positive_gripper(self):
         state = build_lap_state(
             np.array([0.4, -0.2, 0.3]),
             np.array([1.0, 0.0, 0.0, 0.0]),
             np.array([0.25]),
+            state_layout=R6_COLUMNS_STATE_LAYOUT,
         )
         np.testing.assert_allclose(
             state,
@@ -493,8 +551,18 @@ class PoseConversionTest(unittest.TestCase):
 
     def test_state_gripper_matches_official_half_threshold(self):
         identity = np.array([1.0, 0.0, 0.0, 0.0])
-        open_state = build_lap_state(np.zeros(3), identity, np.array([0.49]))
-        closed_state = build_lap_state(np.zeros(3), identity, np.array([0.5]))
+        open_state = build_lap_state(
+            np.zeros(3),
+            identity,
+            np.array([0.49]),
+            state_layout=R6_ROWS_STATE_LAYOUT,
+        )
+        closed_state = build_lap_state(
+            np.zeros(3),
+            identity,
+            np.array([0.5]),
+            state_layout=R6_ROWS_STATE_LAYOUT,
+        )
         self.assertEqual(open_state[-1], 1.0)
         self.assertEqual(closed_state[-1], 0.0)
 
@@ -631,7 +699,7 @@ class ClientContractTest(unittest.TestCase):
             "splat": {"external_cam": external, "wrist_cam": wrist},
             "policy": {
                 "eef_pos": np.array([[0.4, 0.0, 0.2]]),
-                "eef_quat": np.array([[1.0, 0.0, 0.0, 0.0]]),
+                "eef_quat": np.array([[0.5, 0.5, 0.5, 0.5]]),
                 "gripper_pos": np.array([[0.0]]),
             },
         }
@@ -717,6 +785,10 @@ class ClientContractTest(unittest.TestCase):
             request["observation"]["left_wrist_0_rgb"], wrist[::-1, ::-1]
         )
         self.assertEqual(request["observation"]["state"].shape, (10,))
+        np.testing.assert_array_equal(
+            request["observation"]["state"][3:9],
+            np.array([0.0, 0.0, 1.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        )
         self.assertEqual(request["frame_description"], "robot base frame")
         self.assertEqual(request["eef_frame"], LAP_EEF_FRAME)
         np.testing.assert_allclose(first_action[:3], np.array([0.5, 0.0, 0.2]))
@@ -732,10 +804,67 @@ class ClientContractTest(unittest.TestCase):
         )
         self.assertEqual(trace_records[1]["eef_frame"], LAP_EEF_FRAME)
         self.assertEqual(trace_records[1]["policy_type"], "flow")
+        self.assertEqual(trace_records[1]["state_layout"], R6_ROWS_STATE_LAYOUT)
+        self.assertEqual(
+            trace_records[1]["state_layout_mode"],
+            PUBLIC_LAP_TRAIN_MATCHED_R6_MODE,
+        )
         self.assertEqual(len(trace_records[1]["server_delta_chunk"]), 16)
         self.assertEqual(
             persisted_contract,
             fake_server.metadata["ego_lap_serving_contract"],
+        )
+
+    def test_manifest_client_uses_contracted_column_r6_layout(self):
+        fake_server = _FakePolicyServer(
+            {"actions": np.zeros((16, 7))},
+            metadata=_serving_metadata(checkpoint_profile="manifest_execution_v2"),
+        )
+        image = np.zeros((2, 2, 3), dtype=np.uint8)
+        observation = {
+            "splat": {"external_cam": image, "wrist_cam": image},
+            "policy": {
+                "eef_pos": np.array([[0.4, 0.0, 0.2]]),
+                "eef_quat": np.array([[0.5, 0.5, 0.5, 0.5]]),
+                "gripper_pos": np.array([[0.0]]),
+            },
+        }
+        args = PolicyArgs(
+            client="EgoLAPEefPose",
+            checkpoint_profile="manifest_execution_v2",
+        )
+
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            mock.patch(
+                "polaris.policy.lap_eef_pose_client.websocket_client_policy.WebsocketClientPolicy",
+                return_value=fake_server,
+            ),
+            mock.patch(
+                "polaris.policy.lap_eef_pose_client.resize_lap_image",
+                side_effect=lambda value, *_: np.asarray(value),
+            ),
+            mock.patch("builtins.print"),
+        ):
+            args.trace_path = str(Path(temporary_directory) / "trace.jsonl")
+            args.contract_output = str(Path(temporary_directory) / "contract.json")
+            client = EgoLAPEefPoseClient(args)
+            client.reset()
+            client.infer(observation, "move")
+            records = [
+                json.loads(line)
+                for line in Path(args.trace_path).read_text().splitlines()
+            ]
+
+        request_state = fake_server.requests[0]["observation"]["state"]
+        np.testing.assert_array_equal(
+            request_state[3:9],
+            np.array([0.0, 1.0, 0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+        )
+        self.assertEqual(records[1]["state_layout"], R6_COLUMNS_STATE_LAYOUT)
+        self.assertEqual(
+            records[1]["state_layout_mode"],
+            MANIFEST_TRAIN_MATCHED_R6_MODE,
         )
 
     def test_ar_client_interpolates_endpoint_and_executes_first_four(self):
