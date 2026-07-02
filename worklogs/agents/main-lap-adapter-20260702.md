@@ -194,7 +194,8 @@
   phase must record exactly eight apply calls, at least one slew event, finite
   state/strict-JSON evidence, no abort/post-clamp violations, and per-joint
   applied maxima no larger than `velocity/120 + 1e-6`, followed immediately by
-  reset.
+  reset. The final gate now also captures live Panda arm joint position and
+  velocity values/masks and requires both joint and EEF state to remain finite.
 - The controller now rejects finite but non-unit current or desired EEF
   quaternions before pose-error computation using the profile-bound `1e-3`
   norm tolerance. Strict evidence validation closes the sidecar, aggregate,

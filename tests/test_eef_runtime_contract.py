@@ -805,6 +805,14 @@ def test_one_step_adversarial_smoke_requires_bounded_active_slew_guard():
         assert f'"translate -{axis}"' in smoke_source
         assert f'"rotate +{axis}"' in smoke_source
         assert f'"rotate -{axis}"' in smoke_source
+    assert "robot.data.joint_pos[:, arm_term._joint_ids]" in smoke_source
+    assert "robot.data.joint_vel[:, arm_term._joint_ids]" in smoke_source
+    assert '"joint_state_is_finite"' in smoke_source
+    assert '"joint_pos_rad"' in smoke_source
+    assert '"joint_vel_rad_s"' in smoke_source
+    assert '"max_abs"' in smoke_source
+    assert '"position_within_captured_soft_limits"' in smoke_source
+    assert "CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD" in smoke_source
 
 
 @pytest.mark.parametrize(

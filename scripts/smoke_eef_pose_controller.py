@@ -40,6 +40,25 @@ def _wxyz_to_xyzw(quaternion):
     return quaternion[[1, 2, 3, 0]]
 
 
+def _strict_vector_evidence(tensor):
+    raw_values = [float(value) for value in tensor.detach().cpu().reshape(-1).tolist()]
+    finite_mask = [math.isfinite(value) for value in raw_values]
+    finite_values = [
+        abs(value)
+        for value, finite in zip(raw_values, finite_mask, strict=True)
+        if finite
+    ]
+    return {
+        "values": [
+            value if finite else None
+            for value, finite in zip(raw_values, finite_mask, strict=True)
+        ],
+        "finite_mask": finite_mask,
+        "finite_count": sum(finite_mask),
+        "max_abs": max(finite_values, default=None),
+    }
+
+
 def main() -> int:
     import gymnasium as gym
     import numpy as np
@@ -52,6 +71,7 @@ def main() -> int:
     from polaris.eef_runtime_contract import validate_eef_runtime_frame
     from polaris.eef_runtime_contract import validate_eef_runtime_safety
     from polaris.eef_ik_safety import validate_one_step_adversarial_report
+    from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
     from polaris.eef_runtime_contract import begin_eef_safety_episode
     from polaris.eef_runtime_contract import eef_episode_safety_report
     from polaris.environments.droid_cfg import EefPoseActionCfg
@@ -198,10 +218,42 @@ def main() -> int:
             torch.as_tensor(oversized_target, device=env.device).reshape(1, -1),
             expensive=False,
         )
-        state_is_finite = bool(
+        robot = env.unwrapped.scene["robot"]
+        joint_pos = robot.data.joint_pos[:, arm_term._joint_ids]
+        joint_vel = robot.data.joint_vel[:, arm_term._joint_ids]
+        eef_state_is_finite = bool(
             torch.isfinite(adversarial_observation["policy"]["eef_pos"]).all()
             and torch.isfinite(adversarial_observation["policy"]["eef_quat"]).all()
         )
+        joint_state_is_finite = bool(
+            torch.isfinite(joint_pos).all() and torch.isfinite(joint_vel).all()
+        )
+        captured_soft_limits = torch.as_tensor(
+            initial_capture["soft_joint_pos_limits_rad"],
+            dtype=joint_pos.dtype,
+            device=joint_pos.device,
+        ).unsqueeze(0)
+        joint_soft_limit_violation = torch.maximum(
+            torch.clamp(captured_soft_limits[..., 0] - joint_pos, min=0.0),
+            torch.clamp(joint_pos - captured_soft_limits[..., 1], min=0.0),
+        )
+        joint_pos_within_soft_limits = bool(
+            torch.isfinite(joint_soft_limit_violation).all()
+            and (
+                joint_soft_limit_violation <= CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
+            ).all()
+        )
+        state_is_finite = eef_state_is_finite and joint_state_is_finite
+        joint_state_evidence = {
+            "joint_names": list(arm_term._joint_names),
+            "joint_pos_rad": _strict_vector_evidence(joint_pos[0]),
+            "joint_vel_rad_s": _strict_vector_evidence(joint_vel[0]),
+            "soft_limit_violation_rad": _strict_vector_evidence(
+                joint_soft_limit_violation[0]
+            ),
+            "soft_limit_tolerance_rad": CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD,
+            "position_within_captured_soft_limits": (joint_pos_within_soft_limits),
+        }
         adversarial_safety = eef_episode_safety_report(env, adversarial_index)
         json.dumps(adversarial_safety, allow_nan=False)
         counters = adversarial_safety["counters"]
@@ -215,12 +267,17 @@ def main() -> int:
             not bool(terminated[0])
             and not bool(truncated[0])
             and state_is_finite
+            and joint_pos_within_soft_limits
             and guard_evidence is not None
         )
         adversarial_result = {
             "case": "oversized absolute +x target for one policy step",
             "passed": adversarial_passed,
             "state_is_finite": state_is_finite,
+            "eef_state_is_finite": eef_state_is_finite,
+            "joint_state_is_finite": joint_state_is_finite,
+            "joint_pos_within_captured_soft_limits": (joint_pos_within_soft_limits),
+            "joint_state": joint_state_evidence,
             "terminated": bool(terminated[0]),
             "truncated": bool(truncated[0]),
             "guard_evidence": guard_evidence,
@@ -233,6 +290,8 @@ def main() -> int:
             f"{'PASS' if adversarial_passed else 'FAIL'} "
             f"apply_calls={counters['apply_calls']} "
             f"slew_events={counters['slew_limit_events']} "
+            f"joint_finite={joint_state_is_finite} "
+            f"joint_in_limits={joint_pos_within_soft_limits} "
             f"guard_error={guard_error or 'none'}",
             flush=True,
         )

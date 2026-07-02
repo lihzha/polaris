@@ -192,7 +192,12 @@ transform. A dedicated final phase resets, sends one deliberately oversized
 absolute +X target for exactly one policy step/eight physics substeps, captures
 the report, and resets immediately. It passes only when the state/report stay
 finite, the slew guard activates, all applied maxima remain within
-`velocity/120 + 1e-6` rad, and abort/post-clamp violation counts remain zero:
+`velocity/120 + 1e-6` rad, and abort/post-clamp violation counts remain zero.
+The post-step finiteness gate reads both the EEF observation and live
+`panda_joint1..7` position/velocity tensors, recording strict value/mask
+and maximum-absolute-value evidence for the joint state before the immediate
+reset. Final joint positions must also remain inside the exact captured soft
+limits with only the named `1e-5` float allowance.
 
 Before any DLS pose-error computation, both the measured and commanded EEF
 quaternions must be finite and have norm within exactly `1e-3` of one. Current

@@ -204,7 +204,15 @@ def test_current_limit_and_slew_invariants_abort_before_physx_target_setter():
     assert source.index(
         '_require_finite(current_state, field="current EEF/joint state")'
     ) < source.index("self._max_current_joint_soft_limit_violation")
-    assert source.index("if current_invalid:") < setter
+    current_guard = source.index("if not current_joint_valid:")
+    current_counter = source.index(
+        "self._current_joint_limit_abort_count += current_joint_invalid.sum()"
+    )
+    current_diagnostic = source.index('kind="current_joint_limit_abort"')
+    jacobian_compute = source.index("jacobian = self._compute_frame_jacobian()")
+    assert (
+        current_guard < current_counter < current_diagnostic < jacobian_compute < setter
+    )
     assert source.index("if target_invalid:") < setter
     assert source.index("if slew_invalid:") < setter
 
