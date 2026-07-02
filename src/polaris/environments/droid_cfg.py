@@ -13,6 +13,8 @@ from typing import Sequence
 
 from polaris.environments.robot_cfg import NVIDIA_DROID
 from polaris.config import LAP_EEF_FRAME
+from polaris.gripper_semantics import closed_positive_gripper_mask
+from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
 from polaris.robust_differential_ik import (
     RobustDifferentialInverseKinematicsActionCfg,
 )
@@ -215,17 +217,15 @@ class SceneCfg(InteractiveSceneCfg):
 
 ### ActionCfg ###
 class BinaryJointPositionZeroToOneAction(BinaryJointPositionAction):
+    gripper_threshold_profile = GRIPPER_THRESHOLD_PROFILE
+
     # override
     def process_actions(self, actions: torch.Tensor):
         # store the raw actions
         self._raw_actions[:] = actions
-        # compute the binary mask
-        if actions.dtype == torch.bool:
-            # true: close, false: open
-            binary_mask = actions == 0
-        else:
-            # true: close, false: open
-            binary_mask = actions > 0.5
+        # Training uses an open-positive ``> 0.5`` rule, so its exact inverse
+        # is closed-positive ``>= 0.5`` (including the equality boundary).
+        binary_mask = closed_positive_gripper_mask(actions)
         # compute the command
         self._processed_actions = torch.where(
             binary_mask, self._close_command, self._open_command

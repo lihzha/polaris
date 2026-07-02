@@ -13,10 +13,15 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from polaris.config import LAP_EEF_FRAME
+from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
 
 
 CANONICAL_EPISODE_STEPS = 450
 CANONICAL_POLICY_HZ = 15.0
+CANONICAL_IK_METHOD = "dls"
+CANONICAL_DLS_DAMPING = 0.01
+CANONICAL_ARM_SCALE = 1.0
+CANONICAL_ARM_JOINTS = tuple(f"panda_joint{index}" for index in range(1, 8))
 
 
 def _unwrapped(env: Any) -> Any:
@@ -93,6 +98,14 @@ def _arm_action_term(runtime: Any) -> Any:
     if not isinstance(terms, Mapping) or "arm" not in terms:
         raise ValueError("Live Ego-LAP environment has no installed arm action term")
     return terms["arm"]
+
+
+def _finger_action_term(runtime: Any) -> Any:
+    action_manager = getattr(runtime, "action_manager", None)
+    terms = getattr(action_manager, "_terms", None)
+    if not isinstance(terms, Mapping) or "finger_joint" not in terms:
+        raise ValueError("Live Ego-LAP environment has no installed finger action term")
+    return terms["finger_joint"]
 
 
 def validate_eef_runtime_frame(
@@ -176,6 +189,35 @@ def validate_eef_runtime_frame(
         or bool(getattr(controller_cfg, "use_relative_mode", True))
     ):
         raise ValueError("Live Ego-LAP controller is not absolute pose differential IK")
+    ik_method = getattr(controller_cfg, "ik_method", None)
+    if ik_method != CANONICAL_IK_METHOD:
+        raise ValueError(
+            "Live Ego-LAP controller must use damped least-squares IK; "
+            f"got {ik_method!r}"
+        )
+    ik_params = getattr(controller_cfg, "ik_params", None)
+    damping = ik_params.get("lambda_val") if isinstance(ik_params, Mapping) else None
+    if damping is None or not math.isclose(
+        float(damping), CANONICAL_DLS_DAMPING, rel_tol=0.0, abs_tol=0.0
+    ):
+        raise ValueError(
+            "Live Ego-LAP DLS damping must be exactly "
+            f"{CANONICAL_DLS_DAMPING}; got {damping!r}"
+        )
+    arm_scale = getattr(arm_cfg, "scale", None)
+    if (
+        not isinstance(arm_scale, (int, float))
+        or float(arm_scale) != CANONICAL_ARM_SCALE
+    ):
+        raise ValueError(
+            f"Live Ego-LAP arm action scale must be {CANONICAL_ARM_SCALE}; got {arm_scale!r}"
+        )
+    resolved_joint_names = tuple(getattr(arm_term, "_joint_names", ()))
+    if resolved_joint_names != CANONICAL_ARM_JOINTS:
+        raise ValueError(
+            "Live Ego-LAP controller joint order must be panda_joint1..panda_joint7; "
+            f"got {resolved_joint_names!r}"
+        )
     action_dim = getattr(arm_term, "action_dim", 7)
     if int(action_dim) != 7:
         raise ValueError(
@@ -189,6 +231,13 @@ def validate_eef_runtime_frame(
                 "Live Ego-LAP controller resolved a body index other than panda_link8: "
                 f"{body_index!r}"
             )
+    finger_term = _finger_action_term(runtime)
+    gripper_threshold_profile = getattr(finger_term, "gripper_threshold_profile", None)
+    if gripper_threshold_profile != GRIPPER_THRESHOLD_PROFILE:
+        raise ValueError(
+            "Live Ego-LAP gripper threshold semantics do not match training: "
+            f"got {gripper_threshold_profile!r}"
+        )
 
     return {
         "eef_frame": LAP_EEF_FRAME,
@@ -199,6 +248,11 @@ def validate_eef_runtime_frame(
         "body_offset": "identity",
         "command_type": "pose",
         "use_relative_mode": False,
+        "ik_method": CANONICAL_IK_METHOD,
+        "dls_damping": CANONICAL_DLS_DAMPING,
+        "arm_scale": CANONICAL_ARM_SCALE,
+        "arm_joint_names": list(CANONICAL_ARM_JOINTS),
+        "gripper_threshold_profile": GRIPPER_THRESHOLD_PROFILE,
         "action_dim": 7,
     }
 

@@ -24,6 +24,17 @@ LEGACY_OUTPUT_FORMULA = "q99_output_eps1e-6_no_zero_override_extrapolate_v1"
 NORMALIZATION_FORMULA_SCHEMA_VERSION = 1
 POLARIS_EEF_PROFILE = "panda_link8_eef_pose_single_arm_v1"
 FRANKA_DROID_SINGLE_ARM_PROFILE = "franka_droid_single_arm_v2"
+FLOW_SAMPLER_PROFILE = "flow_explicit_euler_t1_to_t0_v1"
+AR_SAMPLER_PROFILE = "autoregressive_v1"
+POLARIS_FLOW_NUM_STEPS = 10
+POLICY_INITIAL_RNG_SEED = 0
+POLARIS_AR_MAX_DECODING_STEPS = 500
+POLARIS_AR_TEMPERATURE = 0.0
+POLARIS_AR_STOP_AT_EOS = True
+IMAGE_RESIZE_PROFILE = (
+    "tf_bilinear_half_pixel_antialias_false_uint8_round_symmetric_zero_pad_v1"
+)
+WRIST_PREPROCESSING_ORDER = ("resize_with_pad", "rotate_180")
 MANIFEST_V1_PROFILE = "manifest_v1_canonical"
 R6_ROWS_STATE_LAYOUT = "xyz+r6_first_two_rows+gripper_open"
 R6_COLUMNS_STATE_LAYOUT = "xyz+r6_first_two_columns+gripper_open"
@@ -76,6 +87,12 @@ class ValidatedEgoLAPContract:
     served_action_dim: int
     state_adapter: Mapping[str, Any] | None
     action_projection: Mapping[str, Any] | None
+    action_sampler_profile: str
+    flow_num_steps: int | None
+    initial_rng_seed: int
+    ar_max_decoding_steps: int | None
+    ar_temperature: float | None
+    ar_stop_at_eos: bool | None
     response_horizon: int
     response_semantics: str
     execution_horizon: int
@@ -94,6 +111,7 @@ class ValidatedEgoLAPContract:
     ]
     rotate_wrist_180: bool
     normalization_scope: Literal["global", "category"]
+    normalization_compute_dtype: Literal["float32", "float64"]
     normalization_stats_sha256: str
     normalization_profile: str
     normalization_input_formula: str
@@ -253,6 +271,41 @@ def validate_ego_lap_server_metadata(
         raise ValueError(
             f"Unsupported Ego-LAP policy type in serving contract: {policy_type!r}"
         )
+    action_sampling = _mapping(document.get("action_sampling"), field="action_sampling")
+    expected_sampler_profile = (
+        FLOW_SAMPLER_PROFILE if policy_type == "flow" else AR_SAMPLER_PROFILE
+    )
+    expected_flow_num_steps = POLARIS_FLOW_NUM_STEPS if policy_type == "flow" else None
+    expected_ar_max_decoding_steps = (
+        None if policy_type == "flow" else POLARIS_AR_MAX_DECODING_STEPS
+    )
+    expected_ar_temperature = None if policy_type == "flow" else POLARIS_AR_TEMPERATURE
+    expected_ar_stop_at_eos = None if policy_type == "flow" else POLARIS_AR_STOP_AT_EOS
+    _require_equal(
+        action_sampling.get("profile"),
+        expected_sampler_profile,
+        field="action_sampling.profile",
+    )
+    _require_equal(
+        action_sampling.get("flow_num_steps"),
+        expected_flow_num_steps,
+        field="action_sampling.flow_num_steps",
+    )
+    _require_equal(
+        action_sampling.get("initial_rng_seed"),
+        POLICY_INITIAL_RNG_SEED,
+        field="action_sampling.initial_rng_seed",
+    )
+    for key, expected in (
+        ("ar_max_decoding_steps", expected_ar_max_decoding_steps),
+        ("ar_temperature", expected_ar_temperature),
+        ("ar_stop_at_eos", expected_ar_stop_at_eos),
+    ):
+        _require_equal(
+            action_sampling.get(key),
+            expected,
+            field=f"action_sampling.{key}",
+        )
 
     if expected_checkpoint_profile is not None:
         _require_equal(
@@ -293,6 +346,29 @@ def validate_ego_lap_server_metadata(
         model.get("image_resolution"), [224, 224], field="model.image_resolution"
     )
     _require_equal(model.get("prompt_format"), "lap", field="model.prompt_format")
+    _require_equal(model.get("dtype"), "bfloat16", field="model.dtype")
+    _require_equal(
+        model.get("legacy_image_order"),
+        checkpoint_profile == ORIGINAL_LAP_PROFILE,
+        field="model.legacy_image_order",
+    )
+    stop_action_to_vlm_grad = model.get("stop_action_to_vlm_grad")
+    if not isinstance(stop_action_to_vlm_grad, bool):
+        raise ValueError(
+            "Ego-LAP serving contract field model.stop_action_to_vlm_grad must be boolean"
+        )
+    if checkpoint_profile == ORIGINAL_LAP_PROFILE:
+        _require_equal(
+            stop_action_to_vlm_grad,
+            False,
+            field="model.stop_action_to_vlm_grad",
+        )
+    if policy_type == "flow":
+        _require_equal(
+            model.get("action_objective"),
+            "flow",
+            field="model.action_objective",
+        )
     if policy_type == "ar":
         _require_equal(
             model.get("enable_langact_training"),
@@ -349,6 +425,20 @@ def validate_ego_lap_server_metadata(
         policy_input.get("wrist_rotation_degrees"),
         180,
         field="policy_input.wrist_rotation_degrees",
+    )
+    image_preprocessing = _mapping(
+        policy_input.get("image_preprocessing"),
+        field="policy_input.image_preprocessing",
+    )
+    _require_equal(
+        image_preprocessing.get("resize_profile"),
+        IMAGE_RESIZE_PROFILE,
+        field="policy_input.image_preprocessing.resize_profile",
+    )
+    _require_sequence(
+        image_preprocessing.get("wrist_operation_order"),
+        list(WRIST_PREPROCESSING_ORDER),
+        field="policy_input.image_preprocessing.wrist_operation_order",
     )
     dataset_name = _required_string(policy_input, "dataset_name", field="policy_input")
     state_type = _required_string(
@@ -632,6 +722,14 @@ def validate_ego_lap_server_metadata(
         raise ValueError(
             f"Unsupported Ego-LAP Q99 formula profile: {normalization_profile!r}"
         )
+    normalization_compute_dtype = (
+        "float64" if normalization_profile == "q99_legacy_upstream_v1" else "float32"
+    )
+    _require_equal(
+        normalization.get("compute_dtype"),
+        normalization_compute_dtype,
+        field="normalization.compute_dtype",
+    )
     if (
         checkpoint_profile != ORIGINAL_LAP_PROFILE
         and normalization_profile != "q99_train_matched_v1"
@@ -744,6 +842,11 @@ def validate_ego_lap_server_metadata(
     inference_config = _mapping(
         execution.get("inference_data_config"), field="execution.inference_data_config"
     )
+    _require_equal(
+        execution.get("normalization_compute_dtype"),
+        normalization_compute_dtype,
+        field="execution.normalization_compute_dtype",
+    )
     _require_zero(
         inference_config.get("wrist_image_dropout_prob"),
         field="wrist_image_dropout_prob",
@@ -777,6 +880,28 @@ def validate_ego_lap_server_metadata(
             expected,
             field=f"execution.droid_image_preprocessing.{key}",
         )
+    operation_order_probe = _mapping(
+        droid_preprocessing.get("operation_order_probe"),
+        field="execution.droid_image_preprocessing.operation_order_probe",
+    )
+    _require_sequence(
+        operation_order_probe.get("wrist_operation_order"),
+        list(WRIST_PREPROCESSING_ORDER),
+        field=(
+            "execution.droid_image_preprocessing.operation_order_probe."
+            "wrist_operation_order"
+        ),
+    )
+    _require_equal(
+        operation_order_probe.get("distinguished"),
+        True,
+        field="execution.droid_image_preprocessing.operation_order_probe.distinguished",
+    )
+    _require_sequence(
+        operation_order_probe.get("input_wrist_shape"),
+        [17, 29, 3],
+        field="execution.droid_image_preprocessing.operation_order_probe.input_wrist_shape",
+    )
     ar_roundtrip = _mapping(
         execution.get("ar_training_roundtrip_probe"),
         field="execution.ar_training_roundtrip_probe",
@@ -877,6 +1002,56 @@ def validate_ego_lap_server_metadata(
             extrapolation_probe.get("zero_range_is_exact_q01"),
             True,
             field="execution.normalization_formula.output_extrapolation_probe.zero_range_is_exact_q01",
+        )
+    actual_stats_probe = _mapping(
+        formula_execution.get("actual_stats_probe"),
+        field="execution.normalization_formula.actual_stats_probe",
+    )
+    _require_equal(
+        actual_stats_probe.get("compute_dtype"),
+        normalization_compute_dtype,
+        field="execution.normalization_formula.actual_stats_probe.compute_dtype",
+    )
+    actual_stats_dtypes = _mapping(
+        actual_stats_probe.get("stats_dtypes"),
+        field="execution.normalization_formula.actual_stats_probe.stats_dtypes",
+    )
+    for stats_group in ("state", "actions"):
+        group_dtypes = _mapping(
+            actual_stats_dtypes.get(stats_group),
+            field=(
+                "execution.normalization_formula.actual_stats_probe."
+                f"stats_dtypes.{stats_group}"
+            ),
+        )
+        if not group_dtypes:
+            raise ValueError(
+                "Ego-LAP serving contract actual-stat dtype probe must include "
+                f"{stats_group!r} fields"
+            )
+        for field_name, dtype in group_dtypes.items():
+            _require_equal(
+                dtype,
+                normalization_compute_dtype,
+                field=(
+                    "execution.normalization_formula.actual_stats_probe."
+                    f"stats_dtypes.{stats_group}.{field_name}"
+                ),
+            )
+    for key in ("policy_input_reference_exact", "policy_output_reference_exact"):
+        _require_equal(
+            actual_stats_probe.get(key),
+            True,
+            field=f"execution.normalization_formula.actual_stats_probe.{key}",
+        )
+    if normalization_profile == "q99_train_matched_v1":
+        _require_equal(
+            actual_stats_probe.get("training_policy_input_exact"),
+            True,
+            field=(
+                "execution.normalization_formula.actual_stats_probe."
+                "training_policy_input_exact"
+            ),
         )
 
     execution_stats = _mapping(
@@ -991,6 +1166,12 @@ def validate_ego_lap_server_metadata(
         served_action_dim=int(served_action_dim),
         state_adapter=expected_state_adapter,
         action_projection=expected_action_projection,
+        action_sampler_profile=expected_sampler_profile,
+        flow_num_steps=expected_flow_num_steps,
+        initial_rng_seed=POLICY_INITIAL_RNG_SEED,
+        ar_max_decoding_steps=expected_ar_max_decoding_steps,
+        ar_temperature=expected_ar_temperature,
+        ar_stop_at_eos=expected_ar_stop_at_eos,
         response_horizon=int(response_horizon),
         response_semantics=str(response_semantics),
         execution_horizon=execution_horizon,
@@ -1003,6 +1184,7 @@ def validate_ego_lap_server_metadata(
         state_layout_mode=expected_state_layout_mode,
         rotate_wrist_180=True,
         normalization_scope=normalization_scope,
+        normalization_compute_dtype=normalization_compute_dtype,
         normalization_stats_sha256=normalization_stats_sha256,
         normalization_profile=normalization_profile,
         normalization_input_formula=normalization_input_formula,

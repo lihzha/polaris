@@ -3,7 +3,9 @@ from pathlib import Path
 
 import numpy as np
 
+from polaris.policy.lap_eef_pose_client import preprocess_lap_wrist_image
 from polaris.policy.lap_eef_pose_client import resize_lap_image
+from polaris.policy.lap_eef_pose_client import rotate_image_180
 
 try:
     import tensorflow as tf
@@ -47,6 +49,15 @@ def _tensorflow_training_resize(
         ],
         constant_values=0,
     ).numpy()
+
+
+def _tensorflow_training_wrist(
+    image: np.ndarray, target_h: int = 224, target_w: int = 224
+) -> np.ndarray:
+    """Match ``make_decode_images_fn``: resize/pad first, then rotate 180."""
+
+    resized = _tensorflow_training_resize(image, target_h, target_w)
+    return tf.reverse(resized, axis=[0, 1]).numpy()
 
 
 class LAPImageResizeTest(unittest.TestCase):
@@ -114,6 +125,27 @@ class LAPImageResizeTest(unittest.TestCase):
                 expected = _tensorflow_training_resize(image)
                 actual = resize_lap_image(image)
                 np.testing.assert_array_equal(actual, expected)
+
+    @unittest.skipIf(tf is None, "TensorFlow is only needed as the golden test oracle")
+    def test_composed_wrist_pipeline_matches_training_order(self):
+        rng = np.random.default_rng(42)
+        images = {
+            "polaris_720p": rng.integers(0, 256, size=(720, 1280, 3), dtype=np.uint8),
+            "odd_padding": rng.integers(0, 256, size=(17, 29, 3), dtype=np.uint8),
+            "odd_portrait": rng.integers(0, 256, size=(29, 17, 3), dtype=np.uint8),
+        }
+
+        for name, image in images.items():
+            with self.subTest(name=name, shape=image.shape):
+                expected = _tensorflow_training_wrist(image)
+                actual = preprocess_lap_wrist_image(image, rotate_180=True)
+                np.testing.assert_array_equal(actual, expected)
+
+                wrong_order = resize_lap_image(rotate_image_180(image))
+                self.assertFalse(
+                    np.array_equal(wrong_order, expected),
+                    msg=f"probe {name} does not distinguish the operation order",
+                )
 
 
 if __name__ == "__main__":

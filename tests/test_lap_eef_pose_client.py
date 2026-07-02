@@ -97,7 +97,23 @@ def _serving_metadata(
         "checkpoint_manifest_validated": not is_public_lap,
         "serving_profile": FRANKA_DROID_SINGLE_ARM_PROFILE,
         "policy_type": policy_type,
+        "action_sampling": {
+            "profile": (
+                "flow_explicit_euler_t1_to_t0_v1"
+                if policy_type == "flow"
+                else "autoregressive_v1"
+            ),
+            "flow_num_steps": 10 if policy_type == "flow" else None,
+            "initial_rng_seed": 0,
+            "ar_max_decoding_steps": 500 if policy_type == "ar" else None,
+            "ar_temperature": 0.0 if policy_type == "ar" else None,
+            "ar_stop_at_eos": True if policy_type == "ar" else None,
+        },
         "model": {
+            "action_objective": "flow",
+            "stop_action_to_vlm_grad": not is_public_lap,
+            "dtype": "bfloat16",
+            "legacy_image_order": is_public_lap,
             "action_dim": native_action_dim,
             "action_horizon": 16,
             "state_dim": native_state_dim,
@@ -114,6 +130,12 @@ def _serving_metadata(
             "image_resolution": [224, 224],
             "model_image_order": model_image_order,
             "wrist_rotation_degrees": 180,
+            "image_preprocessing": {
+                "resize_profile": (
+                    "tf_bilinear_half_pixel_antialias_false_uint8_round_symmetric_zero_pad_v1"
+                ),
+                "wrist_operation_order": ["resize_with_pad", "rotate_180"],
+            },
             "dataset_name": "droid",
             "request_state_type": "eef_pose",
             "request_state_dim": 10,
@@ -144,6 +166,7 @@ def _serving_metadata(
         },
         "normalization": {
             "source": "checkpoint_assets",
+            "compute_dtype": "float32",
             "type": "bounds_q99",
             "scope": "global",
             "policy_category": "single_arm",
@@ -162,6 +185,7 @@ def _serving_metadata(
         "execution": {
             "schema_version": 2,
             "live_pipeline_validated": True,
+            "normalization_compute_dtype": "float32",
             "inference_data_config": {
                 "wrist_image_dropout_prob": 0.0,
                 "mask_zero_img_prob": 0.0,
@@ -175,6 +199,11 @@ def _serving_metadata(
                 "resize_resolution": [224, 224],
                 "rotation_applied": True,
                 "wrist_rotation_degrees": 180,
+                "operation_order_probe": {
+                    "wrist_operation_order": ["resize_with_pad", "rotate_180"],
+                    "distinguished": True,
+                    "input_wrist_shape": [17, 29, 3],
+                },
             },
             "ar_training_roundtrip_probe": {
                 "dataset_name": "droid",
@@ -211,6 +240,28 @@ def _serving_metadata(
                 "output_extrapolation_probe": {
                     "extrapolates_beyond_q01_q99": True,
                     "zero_range_is_exact_q01": True,
+                },
+                "actual_stats_probe": {
+                    "compute_dtype": "float32",
+                    "stats_dtypes": {
+                        "state": {
+                            "mean": "float32",
+                            "std": "float32",
+                            "q01": "float32",
+                            "q99": "float32",
+                        },
+                        "actions": {
+                            "mean": "float32",
+                            "std": "float32",
+                            "q01": "float32",
+                            "q99": "float32",
+                        },
+                    },
+                    "training_policy_input_exact": True,
+                    "policy_input_reference_exact": True,
+                    "policy_output_reference_exact": True,
+                    "state_probe_sha256": "0" * 64,
+                    "action_probe_sha256": "1" * 64,
                 },
             },
             "normalization_stats": {
@@ -601,6 +652,76 @@ class ServingMetadataContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "training_policy_roundtrip_probe"):
             _validate_metadata(metadata)
 
+    def test_image_preprocessing_order_is_fail_closed(self):
+        metadata = _serving_metadata()
+        document = metadata["ego_lap_serving_contract"]
+        document["policy_input"]["image_preprocessing"]["wrist_operation_order"] = [
+            "rotate_180",
+            "resize_with_pad",
+        ]
+        _rehash_contract(metadata)
+
+        with self.assertRaisesRegex(ValueError, "wrist_operation_order"):
+            _validate_metadata(metadata)
+
+    def test_action_sampler_is_fail_closed(self):
+        metadata = _serving_metadata()
+        metadata["ego_lap_serving_contract"]["action_sampling"]["flow_num_steps"] = 9
+        _rehash_contract(metadata)
+
+        with self.assertRaisesRegex(ValueError, "action_sampling.flow_num_steps"):
+            _validate_metadata(metadata)
+
+        metadata = _serving_metadata(policy_type="ar")
+        metadata["ego_lap_serving_contract"]["action_sampling"][
+            "ar_max_decoding_steps"
+        ] = 499
+        _rehash_contract(metadata)
+        with self.assertRaisesRegex(
+            ValueError, "action_sampling.ar_max_decoding_steps"
+        ):
+            _validate_metadata(metadata)
+
+    def test_public_model_path_is_exact_and_modern_value_is_manifest_bound(self):
+        metadata = _serving_metadata()
+        metadata["ego_lap_serving_contract"]["model"]["stop_action_to_vlm_grad"] = True
+        _rehash_contract(metadata)
+        with self.assertRaisesRegex(ValueError, "model.stop_action_to_vlm_grad"):
+            _validate_metadata(metadata)
+
+        metadata = _serving_metadata(checkpoint_profile="manifest_execution_v2")
+        metadata["ego_lap_serving_contract"]["model"]["stop_action_to_vlm_grad"] = False
+        _rehash_contract(metadata)
+        _validate_metadata(metadata)
+
+    def test_execution_image_operation_order_probe_is_fail_closed(self):
+        metadata = _serving_metadata()
+        metadata["ego_lap_serving_contract"]["execution"]["droid_image_preprocessing"][
+            "operation_order_probe"
+        ]["wrist_operation_order"] = ["rotate_180", "resize_with_pad"]
+        _rehash_contract(metadata)
+        with self.assertRaisesRegex(
+            ValueError, "operation_order_probe.wrist_operation_order"
+        ):
+            _validate_metadata(metadata)
+
+    def test_normalization_compute_dtype_is_fail_closed(self):
+        metadata = _serving_metadata()
+        document = metadata["ego_lap_serving_contract"]
+        document["normalization"]["compute_dtype"] = "float64"
+        _rehash_contract(metadata)
+        with self.assertRaisesRegex(ValueError, "normalization.compute_dtype"):
+            _validate_metadata(metadata)
+
+        metadata = _serving_metadata()
+        document = metadata["ego_lap_serving_contract"]
+        document["execution"]["normalization_formula"]["actual_stats_probe"][
+            "stats_dtypes"
+        ]["state"]["q01"] = "float64"
+        _rehash_contract(metadata)
+        with self.assertRaisesRegex(ValueError, "stats_dtypes.state.q01"):
+            _validate_metadata(metadata)
+
     def test_numeric_action_frame_is_unconditionally_robot_base(self):
         metadata = _serving_metadata(frame_description="egocentric frame")
         document = metadata["ego_lap_serving_contract"]
@@ -673,6 +794,7 @@ class ServingMetadataContractTest(unittest.TestCase):
         normalization = document["normalization"]
         normalization.update(
             {
+                "compute_dtype": "float64",
                 "formula_profile": "q99_legacy_upstream_v1",
                 "input_formula_id": "q99_input_eps1e-6_no_clip_zero0_v1",
                 "output_formula_id": "q99_output_eps1e-6_no_zero_override_extrapolate_v1",
@@ -696,6 +818,13 @@ class ServingMetadataContractTest(unittest.TestCase):
         formula["training_policy_input_probe"]["matches"] = False
         formula["training_policy_roundtrip_probe"]["matches"] = False
         formula["output_extrapolation_probe"]["zero_range_is_exact_q01"] = False
+        actual_stats_probe = formula["actual_stats_probe"]
+        actual_stats_probe["compute_dtype"] = "float64"
+        actual_stats_probe["training_policy_input_exact"] = False
+        for group_dtypes in actual_stats_probe["stats_dtypes"].values():
+            for field_name in group_dtypes:
+                group_dtypes[field_name] = "float64"
+        document["execution"]["normalization_compute_dtype"] = "float64"
         document["polaris"]["q99_formula_profile"] = "q99_legacy_upstream_v1"
         _rehash_contract(metadata)
 
@@ -714,12 +843,14 @@ class ServingMetadataContractTest(unittest.TestCase):
             {
                 key: copy.deepcopy(normalization[key])
                 for key in (
+                    "compute_dtype",
                     "formula_profile",
                     "input_formula_id",
                     "output_formula_id",
                 )
             }
         )
+        mixed_document["execution"]["normalization_compute_dtype"] = "float64"
         mixed_document["execution"]["normalization_formula"] = copy.deepcopy(formula)
         mixed_document["polaris"]["q99_formula_profile"] = "q99_legacy_upstream_v1"
         _rehash_contract(mixed_metadata)

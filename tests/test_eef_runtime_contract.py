@@ -10,6 +10,7 @@ from scipy.spatial.transform import Rotation
 from polaris.eef_runtime_contract import atomic_write_runtime_contract
 from polaris.eef_runtime_contract import validate_eef_runtime_frame
 from polaris.eef_runtime_contract import validate_ego_lap_runtime_protocol
+from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
 
 
 def _wxyz(rotation: Rotation) -> np.ndarray:
@@ -31,21 +32,31 @@ def _runtime_fixture():
         )
     )
     offset = SimpleNamespace(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0))
-    controller = SimpleNamespace(command_type="pose", use_relative_mode=False)
+    controller = SimpleNamespace(
+        command_type="pose",
+        use_relative_mode=False,
+        ik_method="dls",
+        ik_params={"lambda_val": 0.01},
+    )
     arm_term = SimpleNamespace(
         cfg=SimpleNamespace(
             body_name="panda_link8",
             body_offset=offset,
             controller=controller,
+            scale=1.0,
         ),
         action_dim=7,
         _body_idx=1,
+        _joint_names=[f"panda_joint{index}" for index in range(1, 8)],
     )
+    finger_term = SimpleNamespace(gripper_threshold_profile=GRIPPER_THRESHOLD_PROFILE)
     runtime = SimpleNamespace(
         max_episode_length=450,
         step_dt=1.0 / 15.0,
         scene={"robot": robot},
-        action_manager=SimpleNamespace(_terms={"arm": arm_term}),
+        action_manager=SimpleNamespace(
+            _terms={"arm": arm_term, "finger_joint": finger_term}
+        ),
     )
     env = SimpleNamespace(unwrapped=runtime, max_episode_length=450)
     observation = {
@@ -83,6 +94,11 @@ def test_runtime_frame_matches_direct_link8_and_absolute_action_term():
     assert result["body_offset"] == "identity"
     assert result["command_type"] == "pose"
     assert result["use_relative_mode"] is False
+    assert result["ik_method"] == "dls"
+    assert result["dls_damping"] == 0.01
+    assert result["arm_scale"] == 1.0
+    assert result["arm_joint_names"] == [f"panda_joint{index}" for index in range(1, 8)]
+    assert result["gripper_threshold_profile"] == GRIPPER_THRESHOLD_PROFILE
     assert result["action_dim"] == 7
 
 
@@ -132,4 +148,38 @@ def test_runtime_frame_rejects_nonidentity_offset_and_relative_mode():
     env, observation = _runtime_fixture()
     env.unwrapped.action_manager._terms["arm"].cfg.controller.use_relative_mode = True
     with pytest.raises(ValueError, match="not absolute pose"):
+        validate_eef_runtime_frame(env, observation)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("ik_method", "pinv", "damped least-squares"),
+        ("damping", 0.1, "DLS damping"),
+        ("scale", 0.5, "action scale"),
+        (
+            "joint_names",
+            list(reversed([f"panda_joint{i}" for i in range(1, 8)])),
+            "joint order",
+        ),
+        ("gripper_profile", "closed_positive_gt_0p5", "gripper threshold semantics"),
+    ],
+)
+def test_runtime_frame_rejects_controller_semantics_drift(field, value, match):
+    env, observation = _runtime_fixture()
+    arm = env.unwrapped.action_manager._terms["arm"]
+    if field == "ik_method":
+        arm.cfg.controller.ik_method = value
+    elif field == "damping":
+        arm.cfg.controller.ik_params["lambda_val"] = value
+    elif field == "scale":
+        arm.cfg.scale = value
+    elif field == "joint_names":
+        arm._joint_names = value
+    else:
+        env.unwrapped.action_manager._terms[
+            "finger_joint"
+        ].gripper_threshold_profile = value
+
+    with pytest.raises(ValueError, match=match):
         validate_eef_runtime_frame(env, observation)

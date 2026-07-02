@@ -24,7 +24,7 @@ LAP_IMAGE_SIZE = 224
 LAP_IMAGE_PREPROCESSOR_MARKER = (
     "POLARIS_LAP_IMAGE_PREPROCESSOR="
     "tf_bilinear_half_pixel_antialias_false_uint8_round_"
-    "symmetric_zero_pad_224x224_numpy_float32_exact_v2"
+    "symmetric_zero_pad_224x224_then_wrist_rot180_numpy_float32_exact_v3"
 )
 LAP_EEF_FRAME_MARKER = f"POLARIS_LAP_POLICY_EEF_FRAME={LAP_EEF_FRAME}"
 
@@ -377,6 +377,25 @@ def resize_lap_image(
     return padded
 
 
+def preprocess_lap_wrist_image(
+    image: np.ndarray,
+    *,
+    rotate_180: bool,
+    target_h: int = LAP_IMAGE_SIZE,
+    target_w: int = LAP_IMAGE_SIZE,
+) -> np.ndarray:
+    """Apply the exact training-time wrist pipeline: resize/pad, then rotate.
+
+    Ego-LAP's dataset decoder performs aspect-preserving resize and symmetric
+    padding before applying the DROID 180-degree wrist transform. These
+    operations do not commute at interpolation and asymmetric-padding edges,
+    so their order is part of the model input contract.
+    """
+
+    wrist_image = resize_lap_image(image, target_h, target_w)
+    return rotate_image_180(wrist_image) if rotate_180 else wrist_image
+
+
 @InferenceClient.register(client_name="EgoLAPEefPose")
 class EgoLAPEefPoseClient(InferenceClient):
     """Websocket Ego-LAP client that emits absolute PolaRiS EEF targets."""
@@ -440,11 +459,17 @@ class EgoLAPEefPoseClient(InferenceClient):
             f"profile={self.contract.checkpoint_profile};"
             f"checkpoint={self.contract.checkpoint_path};"
             f"policy_type={self.policy_type};"
+            f"sampler={self.contract.action_sampler_profile}/"
+            f"{self.contract.flow_num_steps}/seed{self.contract.initial_rng_seed};"
+            f"ar_sampler={self.contract.ar_max_decoding_steps}/"
+            f"{self.contract.ar_temperature}/"
+            f"{self.contract.ar_stop_at_eos};"
             f"response={self.contract.response_horizon}x7/{self.contract.response_semantics};"
             f"execute={self.open_loop_horizon};"
             f"normalization={self.contract.normalization_scope}/"
             f"{self.contract.normalization_stats_sha256};"
             f"normalization_profile={self.contract.normalization_profile};"
+            f"normalization_compute_dtype={self.contract.normalization_compute_dtype};"
             f"input_formula={self.contract.normalization_input_formula};"
             f"output_formula={self.contract.normalization_output_formula};"
             f"formula_probe={self.contract.normalization_formula_probe_sha256};"
@@ -627,12 +652,19 @@ class EgoLAPEefPoseClient(InferenceClient):
                     "contract_sha256": self.contract.contract_sha256,
                     "policy_type": self.policy_type,
                     "response_semantics": self.contract.response_semantics,
+                    "action_sampler_profile": self.contract.action_sampler_profile,
+                    "flow_num_steps": self.contract.flow_num_steps,
+                    "initial_rng_seed": self.contract.initial_rng_seed,
+                    "ar_max_decoding_steps": self.contract.ar_max_decoding_steps,
+                    "ar_temperature": self.contract.ar_temperature,
+                    "ar_stop_at_eos": self.contract.ar_stop_at_eos,
                     "frame_description": self.frame_description,
                     "eef_frame": self.args.eef_frame,
                     "numeric_action_frame": action_frame,
                     "normalization_scope": self.contract.normalization_scope,
                     "normalization_stats_sha256": self.contract.normalization_stats_sha256,
                     "normalization_profile": self.contract.normalization_profile,
+                    "normalization_compute_dtype": self.contract.normalization_compute_dtype,
                     "normalization_input_formula": self.contract.normalization_input_formula,
                     "normalization_output_formula": self.contract.normalization_output_formula,
                     "normalization_formula_probe_sha256": self.contract.normalization_formula_probe_sha256,
@@ -707,10 +739,10 @@ class EgoLAPEefPoseClient(InferenceClient):
         self, current: dict[str, np.ndarray]
     ) -> tuple[np.ndarray, np.ndarray]:
         exterior_image = resize_lap_image(current["external_image"])
-        wrist_image = current["wrist_image"]
-        if self.rotate_wrist_180:
-            wrist_image = rotate_image_180(wrist_image)
-        wrist_image = resize_lap_image(wrist_image)
+        wrist_image = preprocess_lap_wrist_image(
+            current["wrist_image"],
+            rotate_180=self.rotate_wrist_180,
+        )
         if not self._image_io_logged:
             image_io = {
                 "external_input": {
