@@ -13,10 +13,18 @@ from isaaclab.app import AppLauncher
 
 from polaris.config import LAP_EEF_FRAME, EvalArgs, validate_policy_control_mode
 from polaris.eef_runtime_contract import atomic_write_runtime_contract
+from polaris.eef_runtime_contract import atomic_write_episode_safety
+from polaris.eef_runtime_contract import aggregate_episode_safety
+from polaris.eef_runtime_contract import begin_eef_safety_episode
+from polaris.eef_runtime_contract import eef_episode_safety_report
+from polaris.eef_runtime_contract import load_episode_safety_sidecars
+from polaris.eef_runtime_contract import reconcile_episode_safety_transactions
 from polaris.eef_runtime_contract import validate_eef_runtime_frame
+from polaris.eef_runtime_contract import validate_eef_runtime_safety
 from polaris.eef_runtime_contract import validate_ego_lap_runtime_protocol
 from polaris.eval_artifacts import atomic_write_episode_video
 from polaris.eval_artifacts import atomic_write_results
+from polaris.eval_artifacts import build_episode_artifact_identity
 from polaris.eval_artifacts import load_resume_results
 
 
@@ -40,6 +48,7 @@ def main(eval_args: EvalArgs):
         ManagerBasedRLSplatEnv,
     )
     from polaris.environments.droid_cfg import EefPoseActionCfg
+    from polaris.environments.robot_cfg import configure_eef_pose_joint_safety
     from polaris.utils import load_eval_initial_conditions
     from polaris.policy import InferenceClient
     from polaris.robust_differential_ik import DifferentialIKNumericalError
@@ -55,6 +64,7 @@ def main(eval_args: EvalArgs):
         # Action managers are constructed by gym.make, so select the controller
         # on the config before creating the environment.
         env_cfg.actions = EefPoseActionCfg()
+        configure_eef_pose_joint_safety(env_cfg.scene.robot)
         frame_cfg = env_cfg.scene.lap_ee_frame
         target_cfg = frame_cfg.target_frames[0]
         observed_source = frame_cfg.prim_path
@@ -113,7 +123,10 @@ def main(eval_args: EvalArgs):
             "POLARIS_LAP_RUNTIME_PROTOCOL="
             f"steps={runtime_protocol['episode_steps']};"
             f"policy_hz={runtime_protocol['policy_hz']};"
-            f"step_dt={runtime_protocol['step_dt']}",
+            f"step_dt={runtime_protocol['step_dt']};"
+            f"physics_hz={runtime_protocol['physics_hz']};"
+            f"physics_dt={runtime_protocol['physics_dt']};"
+            f"decimation={runtime_protocol['decimation']}",
             flush=True,
         )
 
@@ -145,7 +158,22 @@ def main(eval_args: EvalArgs):
         and eval_args.policy.trace_path is None
     ):
         eval_args.policy.trace_dir = str(run_folder / "policy_traces")
+    if is_ego_lap and (
+        eval_args.policy.trace_dir is None or eval_args.policy.trace_path is not None
+    ):
+        raise ValueError(
+            "Transactional Ego-LAP evaluation requires trace_dir with one "
+            "immutable finalized trace per episode"
+        )
+    if is_ego_lap and Path(eval_args.policy.trace_dir).resolve() != (
+        run_folder / "policy_traces"
+    ).resolve():
+        raise ValueError(
+            "Transactional Ego-LAP evaluation requires trace_dir inside the "
+            "run folder at policy_traces/"
+        )
     csv_path = run_folder / "eval_results.csv"
+    safety_dir = run_folder / "ik_safety"
     episode_df = load_resume_results(
         csv_path,
         run_folder=run_folder,
@@ -163,6 +191,31 @@ def main(eval_args: EvalArgs):
             else None
         ),
     )
+    if is_ego_lap:
+        trace_dir = Path(eval_args.policy.trace_dir)
+        episode_df, recovered_row = reconcile_episode_safety_transactions(
+            episode_df,
+            directory=safety_dir,
+            run_folder=run_folder,
+            trace_dir=trace_dir,
+            expected_rollouts=rollouts,
+            expected_horizon=env.max_episode_length,
+        )
+        if recovered_row:
+            atomic_write_results(episode_df, csv_path)
+            print(
+                "Recovered the next CSV row from its immutable episode "
+                "safety transaction.",
+                flush=True,
+            )
+        episode_df = load_resume_results(
+            csv_path,
+            run_folder=run_folder,
+            expected_rollouts=rollouts,
+            expected_horizon=env.max_episode_length,
+            require_episode_artifacts=True,
+            trace_dir=trace_dir,
+        )
     episode = len(episode_df)
     policy_client: InferenceClient | None = None
     if is_ego_lap:
@@ -170,21 +223,56 @@ def main(eval_args: EvalArgs):
         # already contains every rollout artifact.
         policy_client = InferenceClient.get_client(eval_args.policy)
 
-    def validate_runtime_frame_and_persist(observation):
-        if runtime_protocol is None or eval_args.runtime_contract_output is None:
-            raise RuntimeError("Ego-LAP runtime contract output was not configured")
-        runtime_frame = validate_eef_runtime_frame(env, observation)
+    runtime_frame_evidence = None
+
+    def persist_runtime_contract():
+        if (
+            runtime_protocol is None
+            or runtime_frame_evidence is None
+            or eval_args.runtime_contract_output is None
+        ):
+            raise RuntimeError("Ego-LAP runtime contract evidence is incomplete")
+        runtime_safety = validate_eef_runtime_safety(env)
+        committed_episode_indices = (
+            [int(value) for value in episode_df["episode"].tolist()]
+            if "episode" in episode_df
+            else []
+        )
+        sidecars = load_episode_safety_sidecars(
+            safety_dir, committed_episode_indices
+        )
+        aggregate_safety = aggregate_episode_safety(runtime_safety, sidecars)
         atomic_write_runtime_contract(
             Path(eval_args.runtime_contract_output),
             protocol=runtime_protocol,
-            frame=runtime_frame,
+            frame=runtime_frame_evidence,
+            ik_safety=aggregate_safety,
         )
+        return runtime_safety
+
+    def validate_runtime_frame_and_persist(observation):
+        nonlocal runtime_frame_evidence
+        if runtime_protocol is None or eval_args.runtime_contract_output is None:
+            raise RuntimeError("Ego-LAP runtime contract output was not configured")
+        runtime_frame_evidence = validate_eef_runtime_frame(env, observation)
+        runtime_safety = persist_runtime_contract()
         print(
             "POLARIS_LAP_RUNTIME_EEF="
-            f"frame={runtime_frame['eef_frame']};"
-            f"reference={runtime_frame['reference_frame']};"
-            f"position_error_m={runtime_frame['position_error_m']};"
-            f"rotation_error_rad={runtime_frame['rotation_error_rad']}",
+            f"frame={runtime_frame_evidence['eef_frame']};"
+            f"reference={runtime_frame_evidence['reference_frame']};"
+            f"position_error_m={runtime_frame_evidence['position_error_m']};"
+            f"rotation_error_rad={runtime_frame_evidence['rotation_error_rad']}",
+            flush=True,
+        )
+        print(
+            "POLARIS_LAP_IK_SAFETY="
+            f"profile={runtime_safety['profile']};"
+            f"cadence={runtime_safety['apply_actions_cadence']};"
+            f"physics_dt={runtime_safety['physics_dt']};"
+            "max_delta_joint_pos_rad="
+            + ",".join(
+                str(value) for value in runtime_safety["max_delta_joint_pos_rad"]
+            ),
             flush=True,
         )
 
@@ -211,6 +299,7 @@ def main(eval_args: EvalArgs):
             runtime_frame_validated = True
         if is_ego_lap:
             policy_client.reset(episode_index=episode)
+            begin_eef_safety_episode(env, episode)
         else:
             policy_client.reset()
         video = []
@@ -271,16 +360,35 @@ def main(eval_args: EvalArgs):
             "numerical_failure_reason": numerical_failure_reason,
         }
         if is_ego_lap:
-            policy_client.finalize_episode(
+            finalized_trace = policy_client.finalize_episode(
                 episode_length=episode_length,
                 success=bool(episode_data["success"]),
                 progress=float(episode_data["progress"]),
                 numerical_failure_reason=numerical_failure_reason,
             )
+            if finalized_trace is None:
+                raise RuntimeError(
+                    "Transactional Ego-LAP evaluation did not finalize a trace"
+                )
+            episode_safety = eef_episode_safety_report(env, episode)
+            artifact_identity = build_episode_artifact_identity(
+                run_folder=run_folder,
+                trace_path=finalized_trace,
+                episode_result=episode_data,
+            )
+            atomic_write_episode_safety(
+                safety_dir / f"episode_{episode:06d}.json",
+                episode_index=episode,
+                episode_result=episode_data,
+                safety=episode_safety,
+                artifact_identity=artifact_identity,
+            )
         episode_df = pd.concat(
             [episode_df, pd.DataFrame([episode_data])], ignore_index=True
         )
         atomic_write_results(episode_df, csv_path)
+        if is_ego_lap:
+            persist_runtime_contract()
         print(f"Episode {episode} finished. Episode length: {episode_length}")
         episode += 1
 

@@ -50,7 +50,11 @@ def main() -> int:
     import polaris.environments  # noqa: F401
     from polaris.config import LAP_EEF_FRAME
     from polaris.eef_runtime_contract import validate_eef_runtime_frame
+    from polaris.eef_runtime_contract import validate_eef_runtime_safety
+    from polaris.eef_runtime_contract import begin_eef_safety_episode
+    from polaris.eef_runtime_contract import eef_episode_safety_report
     from polaris.environments.droid_cfg import EefPoseActionCfg
+    from polaris.environments.robot_cfg import configure_eef_pose_joint_safety
     from polaris.policy.lap_eef_pose_client import anchor_action_chunk
 
     env_cfg = parse_env_cfg(
@@ -60,6 +64,7 @@ def main() -> int:
         use_fabric=True,
     )
     env_cfg.actions = EefPoseActionCfg()
+    configure_eef_pose_joint_safety(env_cfg.scene.robot)
     env = gym.make(args_cli.environment, cfg=env_cfg)
 
     def validate_observation_frame(observation):
@@ -87,9 +92,11 @@ def main() -> int:
 
     failures = 0
     results = []
+    safety_reports = []
     try:
-        for label, pose_delta in test_cases:
+        for case_index, (label, pose_delta) in enumerate(test_cases):
             observation, _ = env.reset(expensive=False)
+            begin_eef_safety_episode(env, case_index)
             reset_frame_position_error, reset_frame_rotation_error = (
                 validate_observation_frame(observation)
             )
@@ -144,6 +151,8 @@ def main() -> int:
                     "final_frame_rotation_error_rad": final_frame_rotation_error,
                 }
             )
+            validate_eef_runtime_safety(env)
+            safety_reports.append(eef_episode_safety_report(env, case_index))
             print(
                 f"{label:>14}: {'PASS' if passed else 'FAIL'} "
                 f"position_error={position_error * 1000:.2f}mm "
@@ -167,10 +176,12 @@ def main() -> int:
                     "rotation_tolerance_deg": args_cli.rotation_tolerance_degrees,
                     "frame_position_tolerance_m": args_cli.frame_position_tolerance,
                     "frame_rotation_tolerance_deg": args_cli.frame_rotation_tolerance_degrees,
+                    "ik_safety_episodes": safety_reports,
                     "passed": failures == 0,
                     "results": results,
                 },
                 indent=2,
+                allow_nan=False,
             )
             + "\n",
             encoding="utf-8",

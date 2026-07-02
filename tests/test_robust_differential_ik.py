@@ -1,3 +1,6 @@
+import inspect
+from pathlib import Path
+
 import torch
 import pytest
 
@@ -7,6 +10,9 @@ from polaris.robust_differential_ik import (
     DifferentialIKNumericalError,
     RobustDifferentialIKController,
     RobustDifferentialInverseKinematicsAction,
+    _bound_joint_position_target,
+    _require_current_joint_position_in_soft_limits,
+    _require_finite,
 )
 
 
@@ -63,6 +69,87 @@ def test_nonfinite_input_aborts_rollout_before_physics_step():
     assert controller.fallback_count == 0
 
 
+def test_joint_target_safety_preserves_healthy_target_and_bounds_outlier():
+    joint_pos = torch.zeros(1, 7)
+    max_delta = torch.full((1, 7), 0.02)
+    soft_limits = torch.tensor([[[-1.0, 1.0]] * 7])
+
+    healthy = torch.tensor([[0.01, -0.01, 0.0, 0.005, 0.0, 0.01, -0.01]])
+    safe, raw_delta, slew_limited, position_limited = (
+        _bound_joint_position_target(
+            joint_pos, healthy, max_delta, soft_limits
+        )
+    )
+    torch.testing.assert_close(safe, healthy, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(raw_delta, healthy, rtol=0.0, atol=0.0)
+    assert not slew_limited.any()
+    assert not position_limited.any()
+
+    # q + (target - q) rounds one ULP away for this finite float32 pair.
+    # An inactive safety guard must still preserve the inherited DLS target.
+    ulp_joint_pos = torch.full((1, 7), 1.0941112, dtype=torch.float32)
+    ulp_target = torch.full((1, 7), 0.4359291, dtype=torch.float32)
+    ulp_safe, _, ulp_slew, ulp_position = _bound_joint_position_target(
+        ulp_joint_pos,
+        ulp_target,
+        torch.ones((1, 7), dtype=torch.float32),
+        torch.tensor([[[-3.0, 3.0]] * 7], dtype=torch.float32),
+    )
+    assert not ulp_slew.any()
+    assert not ulp_position.any()
+    assert torch.equal(ulp_safe.view(torch.int32), ulp_target.view(torch.int32))
+
+    outlier = torch.tensor([[0.5, -0.5, 0.03, -0.03, 0.0, 0.02, -0.02]])
+    safe, _, slew_limited, position_limited = _bound_joint_position_target(
+        joint_pos, outlier, max_delta, soft_limits
+    )
+    assert torch.all(safe.abs() <= max_delta)
+    assert slew_limited[0, :4].tolist() == [True, True, True, True]
+    assert not position_limited.any()
+
+
+def test_joint_target_safety_intersects_slew_and_soft_position_limits():
+    joint_pos = torch.tensor([[0.99] * 7])
+    raw_target = torch.tensor([[1.5] * 7])
+    max_delta = torch.full((1, 7), 0.02)
+    soft_limits = torch.tensor([[[-1.0, 1.0]] * 7])
+
+    safe, _, slew_limited, position_limited = _bound_joint_position_target(
+        joint_pos, raw_target, max_delta, soft_limits
+    )
+
+    torch.testing.assert_close(safe, torch.ones_like(safe), rtol=0.0, atol=0.0)
+    assert slew_limited.all()
+    assert position_limited.all()
+    assert torch.all((safe - joint_pos).abs() <= max_delta)
+
+
+def test_joint_target_safety_rejects_nonfinite_and_out_of_limit_current_state():
+    with pytest.raises(DifferentialIKNumericalError, match="non-finite raw target"):
+        _require_finite(torch.tensor([float("nan")]), field="raw target")
+
+    soft_limits = torch.tensor([[[-1.0, 1.0]] * 7])
+    within_float_tolerance = torch.tensor([[-1.0 - 1e-6] + [0.0] * 6])
+    violation = _require_current_joint_position_in_soft_limits(
+        within_float_tolerance, soft_limits
+    )
+    assert violation[0, 0] > 0.0
+
+    outside = torch.tensor([[-1.0 - 1e-3] + [0.0] * 6])
+    with pytest.raises(DifferentialIKNumericalError, match="outside live soft"):
+        _require_current_joint_position_in_soft_limits(outside, soft_limits)
+
+
+def test_current_limit_and_slew_invariants_abort_before_physx_target_setter():
+    source = inspect.getsource(
+        RobustDifferentialInverseKinematicsAction.apply_actions
+    )
+    setter = source.index("self._asset.set_joint_position_target")
+    assert source.index("if current_invalid:") < setter
+    assert source.index("if target_invalid:") < setter
+    assert source.index("if slew_invalid:") < setter
+
+
 def test_eef_pose_config_installs_robust_action_term():
     from polaris.config import LAP_EEF_FRAME
     from polaris.environments.droid_cfg import EefPoseActionCfg, SceneCfg
@@ -85,3 +172,30 @@ def test_eef_pose_config_installs_robust_action_term():
     assert scene_cfg.ee_frame.target_frames[0].prim_path.endswith(
         "/robot/Gripper/Robotiq_2F_85/base_link"
     )
+
+
+def test_eef_velocity_and_effort_limits_are_scoped_to_eef_setup():
+    from polaris.environments.robot_cfg import NVIDIA_DROID
+    from polaris.environments.robot_cfg import configure_eef_pose_joint_safety
+
+    native_cfg = NVIDIA_DROID.copy()
+    eef_cfg = NVIDIA_DROID.copy()
+    assert native_cfg.actuators["panda_shoulder"].velocity_limit_sim is None
+    assert native_cfg.actuators["panda_forearm"].velocity_limit_sim is None
+
+    eval_source = (Path(__file__).parents[1] / "scripts" / "eval.py").read_text()
+    eef_branch = eval_source.index('if eval_args.control_mode == "eef-pose":')
+    configure_call = eval_source.index(
+        "configure_eef_pose_joint_safety(env_cfg.scene.robot)"
+    )
+    native_branch = eval_source.index('elif eval_args.control_mode != "joint-position":')
+    assert eef_branch < configure_call < native_branch
+
+    configure_eef_pose_joint_safety(eef_cfg)
+
+    assert eef_cfg.actuators["panda_shoulder"].velocity_limit_sim == 2.175
+    assert eef_cfg.actuators["panda_shoulder"].effort_limit_sim == 87.0
+    assert eef_cfg.actuators["panda_forearm"].velocity_limit_sim == 2.61
+    assert eef_cfg.actuators["panda_forearm"].effort_limit_sim == 12.0
+    assert native_cfg.actuators["panda_shoulder"].velocity_limit_sim is None
+    assert native_cfg.actuators["panda_forearm"].velocity_limit_sim is None

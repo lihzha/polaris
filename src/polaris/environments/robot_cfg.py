@@ -4,7 +4,40 @@ import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
 
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.utils import DATA_PATH
+
+
+def configure_eef_pose_joint_safety(robot_cfg: ArticulationCfg) -> ArticulationCfg:
+    """Enable explicit PhysX arm limits only for EEF-pose evaluation.
+
+    Isaac Lab 2.3 intentionally ignores the legacy ``velocity_limit`` field on
+    implicit actuators unless ``velocity_limit_sim`` is set. Keeping this
+    mutation in the EEF setup path preserves native joint-position semantics.
+    """
+
+    limits = {
+        "panda_shoulder": {
+            "velocity": PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S[0],
+            "effort": PANDA_EEF_JOINT_EFFORT_LIMITS[0],
+        },
+        "panda_forearm": {
+            "velocity": PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S[4],
+            "effort": PANDA_EEF_JOINT_EFFORT_LIMITS[4],
+        },
+    }
+    for actuator_name, values in limits.items():
+        try:
+            actuator = robot_cfg.actuators[actuator_name]
+        except KeyError as error:
+            raise ValueError(
+                f"DROID robot config is missing EEF safety actuator {actuator_name!r}"
+            ) from error
+        actuator.velocity_limit_sim = values["velocity"]
+        actuator.effort_limit_sim = values["effort"]
+    return robot_cfg
+
 
 NVIDIA_DROID = ArticulationCfg(
     prim_path="{ENV_REGEX_NS}/robot",

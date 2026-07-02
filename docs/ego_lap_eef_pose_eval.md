@@ -136,18 +136,25 @@ not `1x7`, and any non-finite value.
 
 ## Rollout durability and numerical containment
 
-`scripts/eval.py` atomically publishes one video, finalized per-episode policy
-trace, and then one CSV row per completed official initial condition. Resume is
-allowed only from a contiguous CSV prefix whose videos decode with the recorded
-frame counts and whose `episode_XXXXXX.jsonl` traces contain the same global
-episode ID, action count, and terminal `episode_complete` record. A preempted
-episode's hidden temporary trace is replaced on retry, so Slurm requeue does not
-duplicate or renumber trace records. EEF evaluations use the robust DLS action
-term:
+The v3 evaluator publishes one video, finalized per-episode policy trace,
+immutable `ik_safety/episode_XXXXXX.json` transaction, and then one CSV row per
+completed official initial condition. The sidecar binds the exact row, video
+size/hash/frame identity, terminal-trace size/hash/result, and isolated
+controller report. If termination occurs after the sidecar but before the CSV,
+resume validates all three artifacts and deterministically replays only that
+next contiguous row. Uncommitted video/trace/temporary artifacts are moved to a
+content-addressed `recovery_orphans/` archive before retry; evidence is never
+silently deleted. Resume reconstructs the aggregate runtime contract from all
+immutable sidecars, so a crash after CSV publication cannot erase earlier
+controller evidence. EEF evaluations use the robust DLS action term:
 
 - healthy finite inputs call Isaac Lab's implementation unchanged;
 - a finite direct-inverse failure retries the same damped system with a
   float64 pseudo-inverse;
+- each 120-Hz physics-substep target is clamped to the live Panda velocity
+  bound and canonical 7x2 soft joint limits before the PhysX target setter;
+- healthy joints on which no guard activates retain Isaac Lab's DLS target
+  bit-for-bit, including float32 ULP identity;
 - non-finite IK inputs abort only the affected rollout before another physics
   step and are recorded as `numerical_failure=True`, success false, progress
   zero.
@@ -158,12 +165,24 @@ observation to the articulation's direct `panda_link0 -> panda_link8` transform
 and verifies that the installed 7-D action term is absolute-pose differential
 IK on `panda_link8` with an identity body offset. These protocol, frame,
 controller-body, offset, command-mode, and action-dimension facts are written
-atomically to `--runtime-contract-output` (defaulting to
+atomically to schema-2 `--runtime-contract-output` (defaulting to
 `RUN_FOLDER/polaris_runtime_contract.json`). A fully resumed task performs the
 same live reset, validation, and write before its completed-path early return.
+The contract binds 120-Hz physics with decimation 8, explicit arm
+velocity/effort simulation limits, one named float32 slew tolerance, exact
+float32 Panda soft-limit values/digest, per-episode apply/abort/fallback
+counters, finite-or-null diagnostics, and aggregate maxima. A nonfailed
+450-step rollout must record exactly 3600 controller apply calls; a failed
+attempt records its exact policy step and physics substep.
 
-Run a one-rollout canary and inspect its contract JSON, trace, CSV, and complete
-video before scaling out.
+The older v2 diagnostic runs remain preserved as historical evidence but are
+superseded for publication by the `panda_velocity_softlimit_v1` v3 contract.
+
+First run the standalone controller smoke and pin its exact live soft-limit
+bytes/digest in the paired Ego-LAP revision. Only that verified immutable
+revision may launch a checkpoint canary. Inspect the canary's schema-2 contract,
+sidecar, trace, CSV, complete video, 3600-call cadence, and wall time before
+scaling out.
 
 ## Controller smoke and focused tests
 

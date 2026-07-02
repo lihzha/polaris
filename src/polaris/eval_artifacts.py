@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+import hashlib
 import json
+import math
+import numbers
 import os
 from pathlib import Path
 from typing import Any
@@ -62,7 +65,7 @@ def validate_episode_video(
     *,
     expected_frames: int,
     probe_fn: Callable[[Path], Mapping[str, Any]] = probe_episode_video,
-) -> None:
+) -> dict[str, int]:
     """Require one nonempty, decodable 448x224 video matching its CSV row."""
 
     if not path.is_file() or path.stat().st_size == 0:
@@ -75,6 +78,81 @@ def validate_episode_video(
                 f"Completed rollout video {key} mismatch for {path}: "
                 f"expected={expected_value!r}, actual={probe.get(key)!r}"
             )
+    return expected
+
+
+def sha256_file(path: Path) -> str:
+    """Return the SHA-256 identity of one durable rollout artifact."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as artifact:
+        for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def canonical_episode_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize and strictly validate the row shared by CSV/trace/sidecar."""
+
+    required = set(EVAL_RESULT_COLUMNS)
+    if set(result) != required:
+        raise ValueError(
+            "Episode result must have exactly the canonical columns: "
+            f"expected={sorted(required)!r}, actual={sorted(result)!r}"
+        )
+    episode_value = result["episode"]
+    length_value = result["episode_length"]
+    if (
+        not isinstance(episode_value, numbers.Integral)
+        or isinstance(episode_value, (bool, np.bool_))
+        or int(episode_value) < 0
+    ):
+        raise ValueError(f"Episode result has invalid episode: {episode_value!r}")
+    if (
+        not isinstance(length_value, numbers.Integral)
+        or isinstance(length_value, (bool, np.bool_))
+        or int(length_value) < 1
+    ):
+        raise ValueError(f"Episode result has invalid length: {length_value!r}")
+    success_value = result["success"]
+    failure_value = result["numerical_failure"]
+    if not isinstance(success_value, (bool, np.bool_)) or not isinstance(
+        failure_value, (bool, np.bool_)
+    ):
+        raise ValueError("Episode success/failure fields must be booleans")
+    progress_value = result["progress"]
+    if not isinstance(progress_value, numbers.Real) or isinstance(
+        progress_value, (bool, np.bool_)
+    ):
+        raise ValueError(f"Episode progress must be numeric: {progress_value!r}")
+    progress = float(progress_value)
+    if not math.isfinite(progress):
+        raise ValueError(f"Episode progress must be finite: {progress!r}")
+    if not 0.0 <= progress <= 1.0:
+        raise ValueError(f"Episode progress must be in [0, 1]: {progress!r}")
+    reason = result["numerical_failure_reason"]
+    if not isinstance(reason, str):
+        raise ValueError(
+            f"Episode numerical failure reason must be a string: {reason!r}"
+        )
+    numerical_failure = bool(failure_value)
+    if numerical_failure != bool(reason):
+        raise ValueError(
+            "Episode numerical failure flag and reason disagree: "
+            f"flag={numerical_failure!r}, reason={reason!r}"
+        )
+    if numerical_failure and bool(success_value):
+        raise ValueError("A numerical-failure episode cannot be successful")
+    if numerical_failure and progress != 0.0:
+        raise ValueError("A numerical-failure episode must have progress=0.0")
+    return {
+        "episode": int(episode_value),
+        "episode_length": int(length_value),
+        "success": bool(success_value),
+        "progress": progress,
+        "numerical_failure": numerical_failure,
+        "numerical_failure_reason": reason,
+    }
 
 
 def _read_trace_records(path: Path) -> list[dict[str, Any]]:
@@ -87,7 +165,12 @@ def _read_trace_records(path: Path) -> list[dict[str, Any]]:
         ):
             if not line.strip():
                 continue
-            record = json.loads(line)
+            record = json.loads(
+                line,
+                parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(f"non-finite JSON constant {value!r}")
+                ),
+            )
             if not isinstance(record, dict):
                 raise ValueError(f"line {line_number} is not an object")
             records.append(record)
@@ -103,7 +186,8 @@ def validate_episode_trace(
     *,
     episode: int,
     expected_length: int,
-) -> None:
+    expected_result: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Require one finalized, internally consistent per-episode policy trace."""
 
     records = _read_trace_records(path)
@@ -133,6 +217,96 @@ def validate_episode_trace(
             f"Policy trace action count mismatch for episode {episode}: "
             f"expected={expected_length}, actual={action_count}"
         )
+    terminal = records[-1]
+    terminal_result = canonical_episode_result(
+        {field: terminal.get(field) for field in EVAL_RESULT_COLUMNS}
+    )
+    expected_status = (
+        "numerical_failure" if terminal_result["numerical_failure"] else "completed"
+    )
+    if terminal.get("status") != expected_status:
+        raise ValueError(
+            f"Policy trace terminal status mismatch for episode {episode}: "
+            f"expected={expected_status!r}, actual={terminal.get('status')!r}"
+        )
+    if expected_result is not None:
+        canonical_expected = canonical_episode_result(expected_result)
+        if terminal_result != canonical_expected:
+            raise ValueError(
+                f"Policy trace terminal result mismatch for episode {episode}: "
+                f"expected={canonical_expected!r}, actual={terminal_result!r}"
+            )
+    return terminal_result
+
+
+def build_episode_artifact_identity(
+    *,
+    run_folder: Path,
+    trace_path: Path,
+    episode_result: Mapping[str, Any],
+    video_probe_fn: Callable[[Path], Mapping[str, Any]] = probe_episode_video,
+) -> dict[str, Any]:
+    """Capture immutable video and finalized terminal-trace identities."""
+
+    result = canonical_episode_result(episode_result)
+    episode = result["episode"]
+    video_path = run_folder / f"episode_{episode}.mp4"
+    expected_trace_path = trace_path.parent / f"episode_{episode:06d}.jsonl"
+    if trace_path != expected_trace_path:
+        raise ValueError(
+            "Transactional Ego-LAP evidence requires one per-episode trace: "
+            f"expected={expected_trace_path}, actual={trace_path}"
+        )
+    video_shape = validate_episode_video(
+        video_path,
+        expected_frames=result["episode_length"],
+        probe_fn=video_probe_fn,
+    )
+    terminal_result = validate_episode_trace(
+        trace_path,
+        episode=episode,
+        expected_length=result["episode_length"],
+        expected_result=result,
+    )
+    return {
+        "video": {
+            "filename": video_path.name,
+            "size_bytes": video_path.stat().st_size,
+            "sha256": sha256_file(video_path),
+            **video_shape,
+        },
+        "terminal_trace": {
+            "filename": trace_path.name,
+            "size_bytes": trace_path.stat().st_size,
+            "sha256": sha256_file(trace_path),
+            "episode_result": terminal_result,
+        },
+    }
+
+
+def validate_episode_artifact_identity(
+    identity: Mapping[str, Any],
+    *,
+    run_folder: Path,
+    trace_dir: Path,
+    episode_result: Mapping[str, Any],
+    video_probe_fn: Callable[[Path], Mapping[str, Any]] = probe_episode_video,
+) -> dict[str, Any]:
+    """Recompute and exactly match one sidecar's artifact identities."""
+
+    result = canonical_episode_result(episode_result)
+    actual = build_episode_artifact_identity(
+        run_folder=run_folder,
+        trace_path=trace_dir / f"episode_{result['episode']:06d}.jsonl",
+        episode_result=result,
+        video_probe_fn=video_probe_fn,
+    )
+    if dict(identity) != actual:
+        raise ValueError(
+            "Episode sidecar artifact identity drift: "
+            f"recorded={dict(identity)!r}, actual={actual!r}"
+        )
+    return actual
 
 
 def _validate_legacy_trace(
@@ -228,12 +402,27 @@ def load_resume_results(
         frame["numerical_failure"] = False
     if "numerical_failure_reason" not in frame:
         frame["numerical_failure_reason"] = ""
+    frame["numerical_failure_reason"] = frame[
+        "numerical_failure_reason"
+    ].fillna("")
     frame = frame.loc[:, list(EVAL_RESULT_COLUMNS)]
+    normalized_rows = [
+        canonical_episode_result(row)
+        for row in frame.to_dict(orient="records")
+    ]
+    frame = (
+        pd.DataFrame(normalized_rows, columns=EVAL_RESULT_COLUMNS)
+        if normalized_rows
+        else empty_eval_results()
+    )
 
     if require_episode_artifacts:
         if trace_dir is None and trace_path is None:
             raise ValueError("Ego-LAP resume requires per-episode policy traces")
         for episode, length in zip(episodes, lengths, strict=True):
+            result = canonical_episode_result(
+                frame.loc[frame["episode"] == episode].iloc[0].to_dict()
+            )
             validate_episode_video(
                 run_folder / f"episode_{episode}.mp4",
                 expected_frames=length,
@@ -244,6 +433,7 @@ def load_resume_results(
                     trace_dir / f"episode_{episode:06d}.jsonl",
                     episode=episode,
                     expected_length=length,
+                    expected_result=result,
                 )
         if trace_path is not None and episodes:
             _validate_legacy_trace(

@@ -6,6 +6,7 @@ import pytest
 
 from polaris.eval_artifacts import atomic_write_episode_video
 from polaris.eval_artifacts import atomic_write_results
+from polaris.eval_artifacts import canonical_episode_result
 from polaris.eval_artifacts import load_resume_results
 
 
@@ -21,6 +22,10 @@ def _write_trace(path: Path, *, episode: int, length: int) -> None:
             "episode": episode,
             "episode_length": length,
             "status": "completed",
+            "success": False,
+            "progress": 0.25,
+            "numerical_failure": False,
+            "numerical_failure_reason": "",
         },
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -161,3 +166,17 @@ def test_failed_video_publish_preserves_existing_final(tmp_path: Path):
         )
     assert video_path.read_bytes() == b"old-complete"
     assert not list(tmp_path.glob(".*.tmp.mp4"))
+
+
+def test_numerical_failure_result_requires_zero_progress_and_no_success():
+    result = _frame().iloc[0].to_dict()
+    result["numerical_failure"] = True
+    result["numerical_failure_reason"] = "controller abort"
+    result["progress"] = 0.25
+    with pytest.raises(ValueError, match="progress=0.0"):
+        canonical_episode_result(result)
+
+    result["progress"] = 0.0
+    result["success"] = True
+    with pytest.raises(ValueError, match="cannot be successful"):
+        canonical_episode_result(result)

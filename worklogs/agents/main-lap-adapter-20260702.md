@@ -159,3 +159,28 @@
   `git diff --check` pass. The two skips and the uncollected robust-IK module
   require the pinned Isaac/Pyxis cluster runtime and remain part of the clean
   deployment canary gate.
+
+## 2026-07-02 — EEF IK safety v3 remediation (in progress)
+
+- Two preserved v2 BlockStack rollouts independently reached a non-finite
+  Jacobian after an unbounded DLS joint target: episode 12/action 360 and
+  episode 38/action 242. Historical v2 results are not rewritten and are
+  explicitly superseded for future publication.
+- The opt-in EEF controller now installs explicit Panda arm simulation
+  velocity/effort limits, bounds every target at the 120-Hz physics-substep
+  cadence, clamps to the exact float32 7x2 soft limits, and aborts current-state,
+  post-clamp, or non-finite violations before the PhysX target setter. The
+  inactive guard path preserves the inherited target bit-for-bit.
+- Per-episode reports isolate apply/slew/position/abort/fallback counters,
+  per-joint maxima, the worst raw DLS update, and bounded finite-or-null guard
+  diagnostics. One named `1e-6` rad float32 tolerance is shared by controller
+  and contract checks.
+- Schema-2 runtime evidence is reconstructed from immutable per-episode safety
+  transactions binding the exact CSV row, video, and finalized terminal trace.
+  Resume can commit one prepared next row after validation and archives any
+  uncommitted artifacts by content hash rather than deleting them.
+- Pure validation currently passes the focused runtime/artifact suite. The
+  standalone Isaac controller smoke, exact live soft-limit recapture,
+  3600-apply-call full-horizon canaries, wall-time comparison, and downstream
+  Ego-LAP completion review remain mandatory before any v3 checkpoint result is
+  publishable.

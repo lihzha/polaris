@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+import hashlib
 import json
 import math
 import os
@@ -10,14 +11,30 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
 from scipy.spatial.transform import Rotation
 
 from polaris.config import LAP_EEF_FRAME
+from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
+from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
+from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
+from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256
+from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_RAD
 from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
+from polaris.eval_artifacts import EVAL_RESULT_COLUMNS
+from polaris.eval_artifacts import canonical_episode_result
+from polaris.eval_artifacts import probe_episode_video
+from polaris.eval_artifacts import validate_episode_artifact_identity
 
 
 CANONICAL_EPISODE_STEPS = 450
 CANONICAL_POLICY_HZ = 15.0
+CANONICAL_PHYSICS_HZ = 120.0
+CANONICAL_PHYSICS_DT = 1.0 / CANONICAL_PHYSICS_HZ
+CANONICAL_DECIMATION = 8
 CANONICAL_IK_METHOD = "dls"
 CANONICAL_DLS_DAMPING = 0.01
 CANONICAL_ARM_SCALE = 1.0
@@ -38,6 +55,8 @@ def validate_ego_lap_runtime_protocol(env: Any) -> dict[str, float | int]:
         cfg = runtime.cfg
         step_dt = float(cfg.sim.dt) * int(cfg.decimation)
     step_dt = float(step_dt)
+    physics_dt = float(getattr(runtime, "physics_dt", runtime.cfg.sim.dt))
+    decimation = int(getattr(runtime.cfg, "decimation", round(step_dt / physics_dt)))
     expected_dt = 1.0 / CANONICAL_POLICY_HZ
     if horizon != CANONICAL_EPISODE_STEPS:
         raise ValueError(
@@ -49,10 +68,29 @@ def validate_ego_lap_runtime_protocol(env: Any) -> dict[str, float | int]:
             "Canonical Ego-LAP/PolaRiS evaluation requires 15 Hz control; "
             f"live step_dt={step_dt!r} ({1.0 / step_dt if step_dt > 0 else math.inf:g} Hz)"
         )
+    if not math.isclose(
+        physics_dt, CANONICAL_PHYSICS_DT, rel_tol=0.0, abs_tol=1e-12
+    ) or decimation != CANONICAL_DECIMATION:
+        raise ValueError(
+            "Canonical Ego-LAP/PolaRiS EEF safety requires apply_actions at "
+            f"120 Hz with decimation 8; live physics_dt={physics_dt!r}, "
+            f"decimation={decimation!r}"
+        )
+    if not math.isclose(
+        physics_dt * decimation, step_dt, rel_tol=0.0, abs_tol=1e-12
+    ):
+        raise ValueError(
+            "Live physics/control cadence is inconsistent: "
+            f"physics_dt={physics_dt!r}, decimation={decimation!r}, "
+            f"step_dt={step_dt!r}"
+        )
     return {
         "episode_steps": horizon,
         "policy_hz": CANONICAL_POLICY_HZ,
         "step_dt": step_dt,
+        "physics_hz": CANONICAL_PHYSICS_HZ,
+        "physics_dt": physics_dt,
+        "decimation": decimation,
     }
 
 
@@ -106,6 +144,259 @@ def _finger_action_term(runtime: Any) -> Any:
     if not isinstance(terms, Mapping) or "finger_joint" not in terms:
         raise ValueError("Live Ego-LAP environment has no installed finger action term")
     return terms["finger_joint"]
+
+
+def _validate_guard_diagnostic(
+    diagnostic: Any, *, episode_index: int | None, field: str
+) -> None:
+    """Require bounded diagnostics to remain strict-JSON finite-or-null."""
+
+    if not isinstance(diagnostic, Mapping):
+        raise ValueError(f"EEF IK {field} diagnostic is not an object")
+    if diagnostic.get("episode_index") != episode_index:
+        raise ValueError(f"EEF IK {field} diagnostic episode identity drift")
+    policy_step = diagnostic.get("policy_step")
+    physics_substep = diagnostic.get("physics_substep")
+    if type(policy_step) is not int or policy_step < 0:
+        raise ValueError(f"EEF IK {field} diagnostic has invalid policy step")
+    if (
+        type(physics_substep) is not int
+        or not 0 <= physics_substep < CANONICAL_DECIMATION
+    ):
+        raise ValueError(f"EEF IK {field} diagnostic has invalid physics substep")
+    vector_fields = (
+        "joint_pos_rad",
+        "raw_delta_joint_pos_rad",
+        "raw_joint_pos_target_rad",
+        "safe_joint_pos_target_rad",
+    )
+    for vector_field in vector_fields:
+        vector = diagnostic.get(vector_field)
+        if vector is None:
+            continue
+        if not isinstance(vector, Mapping):
+            raise ValueError(f"EEF IK diagnostic {vector_field} is invalid")
+        values = vector.get("values")
+        finite_mask = vector.get("finite_mask")
+        finite_count = vector.get("finite_count")
+        if (
+            not isinstance(values, list)
+            or len(values) != 7
+            or not isinstance(finite_mask, list)
+            or len(finite_mask) != 7
+            or any(type(value) is not bool for value in finite_mask)
+            or type(finite_count) is not int
+            or finite_count != sum(finite_mask)
+        ):
+            raise ValueError(f"EEF IK diagnostic {vector_field} mask is invalid")
+        for value, finite in zip(values, finite_mask, strict=True):
+            if finite:
+                if not isinstance(value, (int, float)) or not math.isfinite(
+                    float(value)
+                ):
+                    raise ValueError(
+                        f"EEF IK diagnostic {vector_field} finite value is invalid"
+                    )
+            elif value is not None:
+                raise ValueError(
+                    f"EEF IK diagnostic {vector_field} nonfinite value must be null"
+                )
+    for scalar_field in ("pose_error_norm", "jacobian_max_abs"):
+        value = diagnostic.get(scalar_field)
+        if value is not None and (
+            not isinstance(value, (int, float)) or not math.isfinite(float(value))
+        ):
+            raise ValueError(f"EEF IK diagnostic {scalar_field} is non-finite")
+    jacobian_finite = diagnostic.get("jacobian_finite")
+    if jacobian_finite is not None and type(jacobian_finite) is not bool:
+        raise ValueError("EEF IK diagnostic jacobian_finite must be bool or null")
+
+
+def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
+    """Validate and return cumulative live EEF IK safety evidence."""
+
+    runtime = _unwrapped(env)
+    arm_term = _arm_action_term(runtime)
+    reporter = getattr(arm_term, "safety_report", None)
+    if not callable(reporter):
+        raise ValueError("Live Ego-LAP EEF action has no IK safety reporter")
+    report = reporter()
+    if not isinstance(report, dict):
+        raise ValueError("Live Ego-LAP EEF IK safety reporter returned no object")
+    exact_fields = {
+        "profile": EEF_IK_SAFETY_PROFILE,
+        "apply_actions_cadence": EEF_IK_APPLY_CADENCE,
+        "decimation": CANONICAL_DECIMATION,
+        "joint_names": list(CANONICAL_ARM_JOINTS),
+    }
+    for field, expected in exact_fields.items():
+        if report.get(field) != expected:
+            raise ValueError(
+                f"Live EEF IK safety {field} mismatch: "
+                f"expected={expected!r}, actual={report.get(field)!r}"
+            )
+    physics_dt = float(report.get("physics_dt", math.nan))
+    control_dt = float(report.get("control_dt", math.nan))
+    current_limit_tolerance = float(
+        report.get("current_joint_soft_limit_tolerance_rad", math.nan)
+    )
+    slew_tolerance = float(
+        report.get("joint_slew_float32_tolerance_rad", math.nan)
+    )
+    episode_index = report.get("episode_index")
+    if episode_index is not None and (
+        type(episode_index) is not int or episode_index < 0
+    ):
+        raise ValueError(f"Live EEF IK safety episode index is invalid: {episode_index!r}")
+    if report.get("soft_joint_pos_limit_factor") != 1.0:
+        raise ValueError(
+            "Live EEF IK safety requires soft_joint_pos_limit_factor=1"
+        )
+    if not math.isclose(
+        physics_dt, CANONICAL_PHYSICS_DT, rel_tol=0.0, abs_tol=1e-12
+    ) or not math.isclose(
+        control_dt, 1.0 / CANONICAL_POLICY_HZ, rel_tol=0.0, abs_tol=1e-12
+    ) or not math.isclose(
+        current_limit_tolerance,
+        CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD,
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ) or not math.isclose(
+        slew_tolerance,
+        JOINT_SLEW_FLOAT32_TOLERANCE_RAD,
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
+        raise ValueError(
+            "Live EEF IK safety cadence mismatch: "
+            f"physics_dt={physics_dt!r}, control_dt={control_dt!r}, "
+            f"current_limit_tolerance={current_limit_tolerance!r}, "
+            f"slew_tolerance={slew_tolerance!r}"
+        )
+
+    vector_fields = {
+        "joint_velocity_limits_rad_s": PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S,
+        "joint_effort_limits": PANDA_EEF_JOINT_EFFORT_LIMITS,
+        "max_delta_joint_pos_rad": tuple(
+            value * CANONICAL_PHYSICS_DT
+            for value in PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+        ),
+    }
+    for field, expected in vector_fields.items():
+        actual = _numpy(report.get(field)).astype(np.float64)
+        if actual.shape != (7,) or not np.isfinite(actual).all() or not np.allclose(
+            actual,
+            np.asarray(expected),
+            rtol=0.0,
+            atol=JOINT_SLEW_FLOAT32_TOLERANCE_RAD,
+        ):
+            raise ValueError(
+                f"Live EEF IK safety {field} mismatch: "
+                f"expected={expected!r}, actual={actual.tolist()!r}"
+            )
+    soft_limits = _numpy(report.get("soft_joint_pos_limits_rad")).astype(
+        np.float64
+    )
+    if (
+        soft_limits.shape != (7, 2)
+        or not np.isfinite(soft_limits).all()
+        or not np.all(soft_limits[:, 0] < soft_limits[:, 1])
+    ):
+        raise ValueError(
+            "Live EEF IK safety has invalid soft joint position limits: "
+            f"{soft_limits.tolist()!r}"
+        )
+    soft_limit_sha256 = report.get("soft_joint_pos_limits_float32_sha256")
+    computed_soft_limit_sha256 = hashlib.sha256(
+        soft_limits.astype("<f4", copy=False).tobytes()
+    ).hexdigest()
+    expected_soft_limits = np.asarray(
+        PANDA_SOFT_JOINT_POS_LIMITS_RAD, dtype="<f4"
+    )
+    if not np.array_equal(
+        soft_limits.astype("<f4", copy=False), expected_soft_limits
+    ):
+        raise ValueError(
+            "Live EEF IK safety soft limits do not match the canonical Panda "
+            f"float32 values: expected={expected_soft_limits.tolist()!r}, "
+            f"actual={soft_limits.tolist()!r}"
+        )
+    if (
+        soft_limit_sha256 != computed_soft_limit_sha256
+        or soft_limit_sha256 != PANDA_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256
+    ):
+        raise ValueError(
+            "Live EEF IK safety soft-limit digest mismatch: "
+            f"expected={PANDA_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256!r}, "
+            f"recorded={soft_limit_sha256!r}, computed={computed_soft_limit_sha256!r}"
+        )
+
+    counters = report.get("counters")
+    maxima = report.get("maxima")
+    if not isinstance(counters, dict) or not isinstance(maxima, dict):
+        raise ValueError("Live EEF IK safety requires counters and maxima objects")
+    expected_counters = {
+        "apply_calls",
+        "environment_substeps",
+        "slew_limit_events",
+        "slew_limited_joints",
+        "position_limit_events",
+        "position_limited_joints",
+        "post_clamp_target_violations",
+        "current_joint_limit_aborts",
+        "invariant_aborts",
+        "nonfinite_aborts",
+        "dls_fallbacks",
+        "guard_diagnostics_dropped",
+    }
+    if set(counters) != expected_counters or any(
+        type(counters[field]) is not int or counters[field] < 0
+        for field in expected_counters
+    ):
+        raise ValueError(f"Live EEF IK safety counters are invalid: {counters!r}")
+    if counters["environment_substeps"] != counters["apply_calls"]:
+        raise ValueError(
+            "Single-environment EEF safety substep count must equal apply calls"
+        )
+    expected_maxima = {
+        "raw_delta_joint_pos_rad",
+        "applied_delta_joint_pos_rad",
+        "raw_target_soft_limit_violation_rad",
+        "post_clamp_target_soft_limit_violation_rad",
+        "current_joint_soft_limit_violation_rad",
+    }
+    if set(maxima) != expected_maxima:
+        raise ValueError(f"Live EEF IK safety maxima are invalid: {maxima!r}")
+    for field in expected_maxima:
+        values = _numpy(maxima[field]).astype(np.float64)
+        if values.shape != (7,) or not np.isfinite(values).all() or np.any(
+            values < 0.0
+        ):
+            raise ValueError(
+                f"Live EEF IK safety maximum {field} is invalid: {values.tolist()!r}"
+            )
+    applied = np.asarray(maxima["applied_delta_joint_pos_rad"], dtype=np.float64)
+    max_delta = np.asarray(report["max_delta_joint_pos_rad"], dtype=np.float64)
+    if np.any(applied > max_delta + JOINT_SLEW_FLOAT32_TOLERANCE_RAD):
+        raise ValueError(
+            "Live EEF IK applied joint delta exceeds its physics-substep bound: "
+            f"applied={applied.tolist()!r}, bound={max_delta.tolist()!r}"
+        )
+    guard_diagnostics = report.get("guard_diagnostics")
+    if not isinstance(guard_diagnostics, list) or len(guard_diagnostics) > 32:
+        raise ValueError("Live EEF IK safety guard diagnostics are not bounded")
+    for diagnostic in guard_diagnostics:
+        _validate_guard_diagnostic(
+            diagnostic, episode_index=episode_index, field="guard"
+        )
+    max_raw_diagnostic = report.get("max_raw_delta_diagnostic")
+    if max_raw_diagnostic is not None and not isinstance(max_raw_diagnostic, dict):
+        raise ValueError("Live EEF IK safety max-raw-delta diagnostic is invalid")
+    if max_raw_diagnostic is not None:
+        _validate_guard_diagnostic(
+            max_raw_diagnostic, episode_index=episode_index, field="max-raw-delta"
+        )
+    return report
 
 
 def validate_eef_runtime_frame(
@@ -253,7 +544,502 @@ def validate_eef_runtime_frame(
         "arm_scale": CANONICAL_ARM_SCALE,
         "arm_joint_names": list(CANONICAL_ARM_JOINTS),
         "gripper_threshold_profile": GRIPPER_THRESHOLD_PROFILE,
+        "ik_safety_profile": EEF_IK_SAFETY_PROFILE,
         "action_dim": 7,
+    }
+
+
+def begin_eef_safety_episode(env: Any, episode_index: int) -> None:
+    """Reset the live action-term counters for one rollout."""
+
+    arm_term = _arm_action_term(_unwrapped(env))
+    begin = getattr(arm_term, "begin_safety_episode", None)
+    if not callable(begin):
+        raise ValueError("Live Ego-LAP EEF action cannot begin safety accounting")
+    begin(episode_index)
+
+
+def eef_episode_safety_report(env: Any, episode_index: int) -> dict[str, Any]:
+    """Return one completed rollout's live action-term safety report."""
+
+    arm_term = _arm_action_term(_unwrapped(env))
+    reporter = getattr(arm_term, "episode_safety_report", None)
+    if not callable(reporter):
+        raise ValueError("Live Ego-LAP EEF action has no episode safety reporter")
+    report = reporter(episode_index)
+    validate_eef_runtime_safety(env)
+    return report
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Non-finite JSON constant is forbidden: {value}")
+
+
+def _load_strict_json(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(), parse_constant=_reject_json_constant)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a JSON object in {path}")
+    return payload
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as output:
+            json.dump(payload, output, indent=2, sort_keys=True, allow_nan=False)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _preserve_orphan(path: Path, *, archive_directory: Path) -> Path:
+    """Move an uncommitted artifact to a content-addressed evidence archive."""
+
+    digest = _sha256(path)
+    archive_directory.mkdir(parents=True, exist_ok=True)
+    safe_name = path.name.replace(os.sep, "_")
+    destination = archive_directory / f"{safe_name}.sha256-{digest}"
+    duplicate = 0
+    while destination.exists():
+        duplicate += 1
+        destination = archive_directory / (
+            f"{safe_name}.sha256-{digest}.duplicate-{duplicate}"
+        )
+    os.replace(path, destination)
+    return destination
+
+
+def _preserve_uncommitted_episode_artifacts(
+    *,
+    run_folder: Path,
+    trace_dir: Path,
+    committed_count: int,
+    prepared_episode: int | None,
+) -> list[Path]:
+    """Archive rollout artifacts that have no recoverable prepared sidecar."""
+
+    candidates: list[tuple[int, Path, bool]] = []
+    for path in run_folder.glob("episode_*.mp4"):
+        suffix = path.stem.removeprefix("episode_")
+        if suffix.isdigit():
+            candidates.append((int(suffix), path, True))
+    for path in trace_dir.glob("episode_*.jsonl") if trace_dir.exists() else ():
+        suffix = path.stem.removeprefix("episode_")
+        if suffix.isdigit():
+            candidates.append((int(suffix), path, True))
+    # Hard termination can leave stable hidden temporary files. They never
+    # authorize a row, but they are still evidence and must not be deleted.
+    for path in (
+        *run_folder.glob(".episode_*.tmp.mp4"),
+        *(trace_dir.glob(".episode_*.jsonl.tmp") if trace_dir.exists() else ()),
+        *(run_folder / "ik_safety").glob(".episode_*.json.*.tmp"),
+        *run_folder.glob(".eval_results.tmp.csv"),
+        *run_folder.glob(".polaris_runtime_contract.json.*.tmp"),
+    ):
+        candidates.append((committed_count, path, False))
+
+    preserved: list[Path] = []
+    for episode_index, path, protected_by_prepared_sidecar in candidates:
+        if episode_index < committed_count or (
+            protected_by_prepared_sidecar and episode_index == prepared_episode
+        ):
+            continue
+        preserved.append(
+            _preserve_orphan(
+                path,
+                archive_directory=(
+                    run_folder
+                    / "recovery_orphans"
+                    / f"episode_{episode_index:06d}"
+                ),
+            )
+        )
+    return preserved
+
+
+def atomic_write_episode_safety(
+    path: Path,
+    *,
+    episode_index: int,
+    episode_result: Mapping[str, Any],
+    safety: Mapping[str, Any],
+    artifact_identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Atomically persist an immutable, CSV-recoverable episode transaction."""
+
+    result = canonical_episode_result(episode_result)
+    if result["episode"] != episode_index:
+        raise ValueError(
+            "Episode transaction result index mismatch: "
+            f"expected={episode_index}, actual={result['episode']!r}"
+        )
+    if safety.get("episode_index") != episode_index:
+        raise ValueError(
+            "Episode safety index mismatch: "
+            f"expected={episode_index}, actual={safety.get('episode_index')!r}"
+        )
+    cadence_evidence = validate_episode_safety_cadence(
+        safety=safety,
+        episode_result=result,
+    )
+    payload = {
+        "schema_version": 2,
+        "transaction_state": "prepared",
+        "episode_index": episode_index,
+        "episode_result": result,
+        "artifact_identity": dict(artifact_identity),
+        "cadence_evidence": cadence_evidence,
+        "safety": dict(safety),
+    }
+    if path.exists():
+        existing = _load_strict_json(path)
+        if existing != payload:
+            raise ValueError(f"Refusing to overwrite drifted episode safety sidecar: {path}")
+        return existing
+    _atomic_write_json(path, payload)
+    return payload
+
+
+def validate_episode_safety_cadence(
+    *,
+    safety: Mapping[str, Any],
+    episode_result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Cross-check one rollout result against exact controller substep counts."""
+
+    result = canonical_episode_result(episode_result)
+    if safety.get("episode_index") != result["episode"]:
+        raise ValueError(
+            "Episode safety/result identity mismatch: "
+            f"safety={safety.get('episode_index')!r}, result={result['episode']!r}"
+        )
+    counters = safety.get("counters")
+    if not isinstance(counters, Mapping):
+        raise ValueError("Episode safety cadence requires a counters object")
+    required_counters = {
+        "apply_calls",
+        "environment_substeps",
+        "current_joint_limit_aborts",
+        "invariant_aborts",
+        "nonfinite_aborts",
+    }
+    if not required_counters.issubset(counters) or any(
+        type(counters[field]) is not int or counters[field] < 0
+        for field in required_counters
+    ):
+        raise ValueError(f"Episode safety cadence counters are invalid: {counters!r}")
+    apply_calls = counters["apply_calls"]
+    if counters["environment_substeps"] != apply_calls:
+        raise ValueError(
+            "Single-environment episode substeps must equal controller apply calls"
+        )
+    episode_length = result["episode_length"]
+    upper = episode_length * CANONICAL_DECIMATION
+    abort_count = sum(
+        counters[field]
+        for field in (
+            "current_joint_limit_aborts",
+            "invariant_aborts",
+            "nonfinite_aborts",
+        )
+    )
+    numerical_failure = result["numerical_failure"]
+    if abort_count and not numerical_failure:
+        raise ValueError(
+            "Controller abort counters require numerical_failure=true: "
+            f"abort_count={abort_count}"
+        )
+    if numerical_failure:
+        lower = (episode_length - 1) * CANONICAL_DECIMATION
+        if not lower < apply_calls <= upper:
+            raise ValueError(
+                "Numerical-failure controller cadence mismatch: "
+                f"required={lower}<apply_calls<={upper}, actual={apply_calls}"
+            )
+        failed_policy_step = episode_length - 1
+        failed_physics_substep = (apply_calls - 1) % CANONICAL_DECIMATION
+        diagnostics = safety.get("guard_diagnostics")
+        if not isinstance(diagnostics, list):
+            raise ValueError("Numerical failure has no guard diagnostics list")
+        matching_abort = [
+            diagnostic
+            for diagnostic in diagnostics
+            if isinstance(diagnostic, Mapping)
+            and str(diagnostic.get("kind", "")).endswith("abort")
+            and diagnostic.get("policy_step") == failed_policy_step
+            and diagnostic.get("physics_substep") == failed_physics_substep
+        ]
+        if not matching_abort:
+            raise ValueError(
+                "Numerical failure lacks an exact controller abort substep diagnostic: "
+                f"policy_step={failed_policy_step}, "
+                f"physics_substep={failed_physics_substep}"
+            )
+    else:
+        if apply_calls != upper:
+            raise ValueError(
+                "Completed episode controller cadence mismatch: "
+                f"expected={upper}, actual={apply_calls}"
+            )
+        failed_policy_step = None
+        failed_physics_substep = None
+    return {
+        "apply_calls": apply_calls,
+        "expected_decimation": CANONICAL_DECIMATION,
+        "failed_policy_step": failed_policy_step,
+        "failed_physics_substep": failed_physics_substep,
+        "abort_count": abort_count,
+    }
+
+
+def load_episode_safety_sidecars(
+    directory: Path, committed_episode_indices: list[int]
+) -> list[dict[str, Any]]:
+    """Load the exact sidecar set corresponding to committed CSV episodes."""
+
+    if committed_episode_indices != list(range(len(committed_episode_indices))):
+        raise ValueError(
+            "Committed safety episode indices must be a contiguous ordered prefix: "
+            f"{committed_episode_indices!r}"
+        )
+    expected = {
+        directory / f"episode_{episode_index:06d}.json"
+        for episode_index in committed_episode_indices
+    }
+    actual = set(directory.glob("episode_*.json")) if directory.exists() else set()
+    if actual != expected:
+        missing = sorted(str(path) for path in expected - actual)
+        orphaned = sorted(str(path) for path in actual - expected)
+        raise ValueError(
+            "Episode safety sidecars are not transactionally aligned with CSV: "
+            f"missing={missing[:5]}, orphaned={orphaned[:5]}"
+        )
+    payloads = []
+    for episode_index in committed_episode_indices:
+        path = directory / f"episode_{episode_index:06d}.json"
+        payload = _load_strict_json(path)
+        if (
+            payload.get("schema_version") != 2
+            or payload.get("transaction_state") != "prepared"
+            or payload.get("episode_index") != episode_index
+        ):
+            raise ValueError(f"Invalid episode safety sidecar identity: {path}")
+        result = canonical_episode_result(payload.get("episode_result", {}))
+        if result["episode"] != episode_index:
+            raise ValueError(f"Drifted episode result identity in sidecar: {path}")
+        cadence = validate_episode_safety_cadence(
+            safety=payload.get("safety", {}),
+            episode_result=result,
+        )
+        if payload.get("cadence_evidence") != cadence:
+            raise ValueError(f"Drifted cadence evidence in sidecar: {path}")
+        if not isinstance(payload.get("artifact_identity"), Mapping):
+            raise ValueError(f"Missing artifact identity in sidecar: {path}")
+        payload["path"] = str(path)
+        payload["sha256"] = _sha256(path)
+        payloads.append(payload)
+    return payloads
+
+
+def reconcile_episode_safety_transactions(
+    frame: pd.DataFrame,
+    *,
+    directory: Path,
+    run_folder: Path,
+    trace_dir: Path,
+    expected_rollouts: int,
+    expected_horizon: int,
+    video_probe_fn: Callable[[Path], Mapping[str, Any]] = probe_episode_video,
+) -> tuple[pd.DataFrame, bool]:
+    """Validate committed sidecars and recover one prepared row after a crash.
+
+    The immutable sidecar is written only after its video and finalized trace.
+    Therefore the sole valid difference between CSV and sidecars is one prepared
+    sidecar at the next contiguous episode.  Its exact row is safely replayed
+    into the CSV; no evidence is deleted or overwritten.
+    """
+
+    rows = [
+        canonical_episode_result(row)
+        for row in frame.loc[:, list(EVAL_RESULT_COLUMNS)].to_dict(orient="records")
+    ]
+    committed_indices = [row["episode"] for row in rows]
+    if committed_indices != list(range(len(rows))):
+        raise ValueError(
+            "CSV episode identities are not a contiguous prefix during recovery: "
+            f"{committed_indices!r}"
+        )
+    if len(rows) > expected_rollouts:
+        raise ValueError(
+            f"CSV has {len(rows)} episodes for only {expected_rollouts} rollouts"
+        )
+    actual_paths = sorted(directory.glob("episode_*.json")) if directory.exists() else []
+    actual_indices: list[int] = []
+    for path in actual_paths:
+        expected_prefix = "episode_"
+        try:
+            suffix = path.stem.removeprefix(expected_prefix)
+            episode_index = int(suffix)
+        except ValueError as error:
+            raise ValueError(f"Invalid safety sidecar filename: {path}") from error
+        if path.name != f"episode_{episode_index:06d}.json":
+            raise ValueError(f"Noncanonical safety sidecar filename: {path}")
+        actual_indices.append(episode_index)
+    if actual_indices != sorted(set(actual_indices)):
+        raise ValueError(f"Duplicate or unordered safety sidecars: {actual_indices!r}")
+    allowed_indices = list(range(len(rows)))
+    if len(rows) < expected_rollouts:
+        allowed_indices.append(len(rows))
+    if actual_indices not in (list(range(len(rows))), allowed_indices):
+        raise ValueError(
+            "Safety transactions must equal the CSV prefix or add exactly its "
+            f"next episode: csv={committed_indices!r}, sidecars={actual_indices!r}"
+        )
+    prepared_episode = (
+        len(rows) if actual_indices == allowed_indices and len(actual_indices) > len(rows) else None
+    )
+    _preserve_uncommitted_episode_artifacts(
+        run_folder=run_folder,
+        trace_dir=trace_dir,
+        committed_count=len(rows),
+        prepared_episode=prepared_episode,
+    )
+
+    recovered = False
+    for episode_index in actual_indices:
+        path = directory / f"episode_{episode_index:06d}.json"
+        payload = _load_strict_json(path)
+        if (
+            payload.get("schema_version") != 2
+            or payload.get("transaction_state") != "prepared"
+            or payload.get("episode_index") != episode_index
+        ):
+            raise ValueError(f"Invalid prepared episode safety transaction: {path}")
+        result = canonical_episode_result(payload.get("episode_result", {}))
+        if result["episode"] != episode_index:
+            raise ValueError(f"Sidecar result identity mismatch: {path}")
+        if not 1 <= result["episode_length"] <= expected_horizon:
+            raise ValueError(
+                f"Sidecar episode length exceeds horizon {expected_horizon}: {path}"
+            )
+        cadence = validate_episode_safety_cadence(
+            safety=payload.get("safety", {}), episode_result=result
+        )
+        if payload.get("cadence_evidence") != cadence:
+            raise ValueError(f"Sidecar cadence identity mismatch: {path}")
+        artifact_identity = payload.get("artifact_identity")
+        if not isinstance(artifact_identity, Mapping):
+            raise ValueError(f"Sidecar has no artifact identity: {path}")
+        validate_episode_artifact_identity(
+            artifact_identity,
+            run_folder=run_folder,
+            trace_dir=trace_dir,
+            episode_result=result,
+            video_probe_fn=video_probe_fn,
+        )
+        if episode_index < len(rows):
+            if rows[episode_index] != result:
+                raise ValueError(
+                    "Committed CSV row differs from immutable episode sidecar: "
+                    f"csv={rows[episode_index]!r}, sidecar={result!r}"
+                )
+        else:
+            rows.append(result)
+            recovered = True
+
+    reconciled = (
+        pd.DataFrame(rows, columns=EVAL_RESULT_COLUMNS)
+        if rows
+        else pd.DataFrame(columns=EVAL_RESULT_COLUMNS)
+    )
+    return reconciled, recovered
+
+
+_SAFETY_STATIC_FIELDS = (
+    "profile",
+    "apply_actions_cadence",
+    "physics_dt",
+    "control_dt",
+    "decimation",
+    "current_joint_soft_limit_tolerance_rad",
+    "joint_slew_float32_tolerance_rad",
+    "soft_joint_pos_limit_factor",
+    "joint_names",
+    "joint_velocity_limits_rad_s",
+    "joint_effort_limits",
+    "max_delta_joint_pos_rad",
+    "soft_joint_pos_limits_rad",
+    "soft_joint_pos_limits_float32_sha256",
+)
+
+
+def aggregate_episode_safety(
+    live_template: Mapping[str, Any],
+    sidecars: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Merge immutable per-episode reports without losing resume history."""
+
+    static = {field: live_template[field] for field in _SAFETY_STATIC_FIELDS}
+    counter_names = set(live_template["counters"])
+    maxima_names = set(live_template["maxima"])
+    counters = {field: 0 for field in counter_names}
+    maxima = {field: [0.0] * 7 for field in maxima_names}
+    episodes = []
+    for sidecar in sidecars:
+        safety = sidecar.get("safety")
+        if not isinstance(safety, Mapping):
+            raise ValueError("Episode safety sidecar has no safety object")
+        for field, expected in static.items():
+            if safety.get(field) != expected:
+                raise ValueError(
+                    f"Episode safety static field drift for {field}: "
+                    f"expected={expected!r}, actual={safety.get(field)!r}"
+                )
+        if set(safety.get("counters", {})) != counter_names or set(
+            safety.get("maxima", {})
+        ) != maxima_names:
+            raise ValueError("Episode safety counter/maximum schema drift")
+        for field in counter_names:
+            counters[field] += int(safety["counters"][field])
+        for field in maxima_names:
+            maxima[field] = [
+                max(previous, float(current))
+                for previous, current in zip(
+                    maxima[field], safety["maxima"][field], strict=True
+                )
+            ]
+        episodes.append(
+            {
+                "episode_index": sidecar["episode_index"],
+                "episode_result": sidecar["episode_result"],
+                "artifact_identity": sidecar["artifact_identity"],
+                "cadence_evidence": sidecar["cadence_evidence"],
+                "counters": safety["counters"],
+                "maxima": safety["maxima"],
+                "guard_diagnostics": safety["guard_diagnostics"],
+                "max_raw_delta_diagnostic": safety["max_raw_delta_diagnostic"],
+                "sidecar_path": sidecar["path"],
+                "sidecar_sha256": sidecar["sha256"],
+            }
+        )
+    return {
+        **static,
+        "episodes_completed": len(episodes),
+        "counters": counters,
+        "maxima": maxima,
+        "episodes": episodes,
     }
 
 
@@ -262,22 +1048,14 @@ def atomic_write_runtime_contract(
     *,
     protocol: Mapping[str, Any],
     frame: Mapping[str, Any],
+    ik_safety: Mapping[str, Any],
 ) -> None:
     """Atomically persist the live simulator/controller contract for this attempt."""
 
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "protocol": dict(protocol),
         "frame": dict(frame),
+        "ik_safety": dict(ik_safety),
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8") as output:
-            json.dump(payload, output, indent=2, sort_keys=True)
-            output.write("\n")
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    _atomic_write_json(path, payload)
