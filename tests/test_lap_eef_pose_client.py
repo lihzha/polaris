@@ -24,6 +24,8 @@ from polaris.policy.lap_eef_pose_client import (
     validate_action_chunk,
 )
 from polaris.policy.ego_lap_contract import (
+    FRANKA_DROID_SINGLE_ARM_PROFILE,
+    MANIFEST_V1_PROFILE,
     MANIFEST_TRAIN_MATCHED_R6_MODE,
     ORIGINAL_LAP_PROFILE,
     PUBLIC_LAP_TRAIN_MATCHED_R6_MODE,
@@ -41,6 +43,7 @@ def _serving_metadata(
     policy_type="flow",
     frame_description="robot base frame",
     checkpoint_profile=ORIGINAL_LAP_PROFILE,
+    mixed_model=False,
 ):
     response_horizon = 16 if policy_type == "flow" else 1
     response_semantics = (
@@ -61,16 +64,43 @@ def _serving_metadata(
         if is_public_lap
         else MANIFEST_TRAIN_MATCHED_R6_MODE
     )
+    native_action_dim = 14 if mixed_model else 7
+    native_state_dim = 20 if mixed_model else 10
+    normalized_state_dim = 14 if mixed_model else 10
+    state_stats_dim = 20 if mixed_model else 10
+    action_stats_dim = 14 if mixed_model else 7
+    state_adapter = (
+        {
+            "type": "normalize_then_zero_pad",
+            "request_state_dim": 10,
+            "model_state_dim": 14,
+            "checkpoint_stats_dim": 20,
+        }
+        if mixed_model
+        else None
+    )
+    action_projection = (
+        {
+            "type": "leading_dimensions",
+            "source_action_dim": 14,
+            "output_action_dim": 7,
+            "indices": list(range(7)),
+            "applied_after": "checkpoint_unnormalization",
+        }
+        if mixed_model
+        else None
+    )
     contract = {
         "schema_version": 2,
         "checkpoint_profile": checkpoint_profile,
         "checkpoint_path": "/checkpoints/LAP-3B",
         "checkpoint_manifest_validated": not is_public_lap,
+        "serving_profile": FRANKA_DROID_SINGLE_ARM_PROFILE,
         "policy_type": policy_type,
         "model": {
-            "action_dim": 7,
+            "action_dim": native_action_dim,
             "action_horizon": 16,
-            "state_dim": 10,
+            "state_dim": native_state_dim,
             "image_resolution": [224, 224],
             "model_image_keys": model_image_keys,
             "prompt_format": "lap",
@@ -86,16 +116,20 @@ def _serving_metadata(
             "wrist_rotation_degrees": 180,
             "dataset_name": "droid",
             "request_state_type": "eef_pose",
+            "request_state_dim": 10,
             "is_bimanual": False,
             "state_encoding": "EEF_R6",
             "state_layout": state_layout,
             "state_layout_mode": state_layout_mode,
             "gripper_open_value": 1.0,
             "gripper_closed_value": 0.0,
+            "state_adapter": state_adapter,
         },
         "policy_output": {
             "action_encoding": "EEF_POS",
             "action_dim": 7,
+            "native_action_dim": native_action_dim,
+            "action_projection": action_projection,
             "model_action_horizon": 16,
             "response_horizon": response_horizon,
             "response_semantics": response_semantics,
@@ -146,6 +180,17 @@ def _serving_metadata(
                 "dataset_name": "droid",
                 "matches": True,
             },
+            "normalized_state_probe": {"shape": [normalized_state_dim]},
+            "flow_zero_action_probe": {"shape": [16, 7]},
+            "output_transform_types": [
+                "lap.transforms.Unnormalize",
+                "lap.policies.transforms.output_transforms.CoTOutputs",
+                *(
+                    ["lap.policies.policy_config_adapter.ProjectSingleArmActions"]
+                    if mixed_model
+                    else []
+                ),
+            ],
             "normalization_formula": {
                 "schema_version": 1,
                 "profile": "q99_train_matched_v1",
@@ -170,11 +215,21 @@ def _serving_metadata(
             },
             "normalization_stats": {
                 "keys": ["actions", "state"],
-                "arrays": {"actions": {}, "state": {}},
+                "arrays": {
+                    "actions": {
+                        "q01": {"shape": [action_stats_dim]},
+                        "q99": {"shape": [action_stats_dim]},
+                    },
+                    "state": {
+                        "q01": {"shape": [state_stats_dim]},
+                        "q99": {"shape": [state_stats_dim]},
+                    },
+                },
             },
         },
         "polaris": {
             "profile": "panda_link8_eef_pose_single_arm_v1",
+            "serving_profile": FRANKA_DROID_SINGLE_ARM_PROFILE,
             "compatible": True,
             "incompatibilities": [],
             "eef_frame": "panda_link8",
@@ -235,6 +290,169 @@ def _validate_metadata(metadata, **overrides):
 
 
 class ServingMetadataContractTest(unittest.TestCase):
+    def test_native_and_mixed_models_share_exact_ten_in_seven_out_contract(self):
+        native = _validate_metadata(_serving_metadata())
+        self.assertEqual(native.serving_profile, FRANKA_DROID_SINGLE_ARM_PROFILE)
+        self.assertEqual((native.native_action_dim, native.native_state_dim), (7, 10))
+        self.assertEqual((native.request_state_dim, native.served_action_dim), (10, 7))
+        self.assertIsNone(native.state_adapter)
+        self.assertIsNone(native.action_projection)
+
+        mixed = _validate_metadata(
+            _serving_metadata(
+                checkpoint_profile=MANIFEST_V1_PROFILE,
+                mixed_model=True,
+            ),
+            expected_checkpoint_profile=MANIFEST_V1_PROFILE,
+        )
+        self.assertEqual((mixed.native_action_dim, mixed.native_state_dim), (14, 20))
+        self.assertEqual((mixed.request_state_dim, mixed.served_action_dim), (10, 7))
+        self.assertEqual(
+            mixed.state_adapter,
+            {
+                "type": "normalize_then_zero_pad",
+                "request_state_dim": 10,
+                "model_state_dim": 14,
+                "checkpoint_stats_dim": 20,
+            },
+        )
+        self.assertEqual(
+            mixed.action_projection,
+            {
+                "type": "leading_dimensions",
+                "source_action_dim": 14,
+                "output_action_dim": 7,
+                "indices": list(range(7)),
+                "applied_after": "checkpoint_unnormalization",
+            },
+        )
+        self.assertEqual(mixed.state_layout, R6_COLUMNS_STATE_LAYOUT)
+        self.assertEqual(mixed.state_layout_mode, MANIFEST_TRAIN_MATCHED_R6_MODE)
+        self.assertEqual(mixed.normalization_profile, "q99_train_matched_v1")
+
+    def test_mixed_model_contract_rejects_profile_adapter_and_width_tampering(self):
+        cases = (
+            (("serving_profile",), "native", "serving_profile"),
+            (("polaris", "serving_profile"), "native", "polaris.serving_profile"),
+            (
+                ("checkpoint_profile",),
+                "manifest_execution_v2",
+                "checkpoint_profile for mixed",
+            ),
+            (("policy_input", "request_state_dim"), 14, "request_state_dim"),
+            (
+                ("policy_input", "state_adapter", "model_state_dim"),
+                20,
+                "state_adapter",
+            ),
+            (("policy_output", "action_dim"), 14, "policy_output.action_dim"),
+            (
+                ("policy_output", "native_action_dim"),
+                7,
+                "native_action_dim",
+            ),
+            (
+                ("policy_output", "action_projection", "indices"),
+                list(reversed(range(7))),
+                "action_projection",
+            ),
+            (
+                ("policy_output", "action_projection", "applied_after"),
+                "model_output",
+                "action_projection",
+            ),
+            (
+                ("execution", "normalized_state_probe", "shape"),
+                [10],
+                "normalized_state_probe.shape",
+            ),
+            (
+                ("execution", "flow_zero_action_probe", "shape"),
+                [16, 14],
+                "flow_zero_action_probe.shape",
+            ),
+            (
+                ("execution", "normalization_stats", "arrays", "state", "q01", "shape"),
+                [19],
+                "state.q01.shape",
+            ),
+            (
+                (
+                    "execution",
+                    "normalization_stats",
+                    "arrays",
+                    "actions",
+                    "q99",
+                    "shape",
+                ),
+                [7],
+                "actions.q99.shape",
+            ),
+        )
+
+        for path, value, error in cases:
+            with self.subTest(path=".".join(path)):
+                metadata = _serving_metadata(
+                    checkpoint_profile=MANIFEST_V1_PROFILE,
+                    mixed_model=True,
+                )
+                node = metadata["ego_lap_serving_contract"]
+                for component in path[:-1]:
+                    node = node[component]
+                node[path[-1]] = value
+                _rehash_contract(metadata)
+                with self.assertRaisesRegex(ValueError, error):
+                    _validate_metadata(metadata)
+
+    def test_mixed_model_requires_unnormalize_before_exactly_one_projection(self):
+        for transform_types, error in (
+            (
+                [
+                    "lap.policies.policy_config_adapter.ProjectSingleArmActions",
+                    "lap.transforms.Unnormalize",
+                ],
+                "unnormalization before",
+            ),
+            (["lap.transforms.Unnormalize"], "exactly one"),
+            (
+                [
+                    "lap.transforms.Unnormalize",
+                    "lap.policies.policy_config_adapter.ProjectSingleArmActions",
+                    "lap.policies.policy_config_adapter.ProjectSingleArmActions",
+                ],
+                "exactly one",
+            ),
+        ):
+            with self.subTest(transform_types=transform_types):
+                metadata = _serving_metadata(
+                    checkpoint_profile=MANIFEST_V1_PROFILE,
+                    mixed_model=True,
+                )
+                metadata["ego_lap_serving_contract"]["execution"][
+                    "output_transform_types"
+                ] = transform_types
+                _rehash_contract(metadata)
+                with self.assertRaisesRegex(ValueError, error):
+                    _validate_metadata(metadata)
+
+    def test_native_model_rejects_spurious_single_arm_projection(self):
+        metadata = _serving_metadata()
+        document = metadata["ego_lap_serving_contract"]
+        document["policy_output"]["action_projection"] = {
+            "type": "leading_dimensions",
+            "source_action_dim": 14,
+            "output_action_dim": 7,
+            "indices": list(range(7)),
+            "applied_after": "checkpoint_unnormalization",
+        }
+        document["execution"]["output_transform_types"].append(
+            "lap.policies.policy_config_adapter.ProjectSingleArmActions"
+        )
+        _rehash_contract(metadata)
+
+        with self.assertRaisesRegex(ValueError, "action_projection"):
+            _validate_metadata(metadata)
+
     def test_global_scope_does_not_select_category(self):
         metadata = _serving_metadata()
 
@@ -486,6 +704,27 @@ class ServingMetadataContractTest(unittest.TestCase):
             expected_normalization_profile="q99_legacy_upstream_v1",
         )
         self.assertEqual(contract.normalization_profile, "q99_legacy_upstream_v1")
+
+        mixed_metadata = _serving_metadata(
+            checkpoint_profile=MANIFEST_V1_PROFILE,
+            mixed_model=True,
+        )
+        mixed_document = mixed_metadata["ego_lap_serving_contract"]
+        mixed_document["normalization"].update(
+            {
+                key: copy.deepcopy(normalization[key])
+                for key in (
+                    "formula_profile",
+                    "input_formula_id",
+                    "output_formula_id",
+                )
+            }
+        )
+        mixed_document["execution"]["normalization_formula"] = copy.deepcopy(formula)
+        mixed_document["polaris"]["q99_formula_profile"] = "q99_legacy_upstream_v1"
+        _rehash_contract(mixed_metadata)
+        with self.assertRaisesRegex(ValueError, "requires.*q99_train_matched_v1"):
+            _validate_metadata(mixed_metadata)
 
     def test_ar_contract_derives_one_to_sixteen_to_four_protocol(self):
         contract = _validate_metadata(
@@ -866,6 +1105,54 @@ class ClientContractTest(unittest.TestCase):
             records[1]["state_layout_mode"],
             MANIFEST_TRAIN_MATCHED_R6_MODE,
         )
+
+    def test_mixed_manifest_client_keeps_ten_dimensional_request_and_seven_dimensional_response(
+        self,
+    ):
+        fake_server = _FakePolicyServer(
+            {"actions": np.zeros((16, 7))},
+            metadata=_serving_metadata(
+                checkpoint_profile=MANIFEST_V1_PROFILE,
+                mixed_model=True,
+            ),
+        )
+        image = np.zeros((2, 2, 3), dtype=np.uint8)
+        observation = {
+            "splat": {"external_cam": image, "wrist_cam": image},
+            "policy": {
+                "eef_pos": np.array([[0.4, 0.0, 0.2]]),
+                "eef_quat": np.array([[1.0, 0.0, 0.0, 0.0]]),
+                "gripper_pos": np.array([[0.0]]),
+            },
+        }
+        args = PolicyArgs(
+            client="EgoLAPEefPose",
+            checkpoint_profile=MANIFEST_V1_PROFILE,
+        )
+
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            mock.patch(
+                "polaris.policy.lap_eef_pose_client.websocket_client_policy.WebsocketClientPolicy",
+                return_value=fake_server,
+            ),
+            mock.patch(
+                "polaris.policy.lap_eef_pose_client.resize_lap_image",
+                side_effect=lambda value, *_: np.asarray(value),
+            ),
+            mock.patch("builtins.print"),
+        ):
+            args.trace_path = str(Path(temporary_directory) / "trace.jsonl")
+            args.contract_output = str(Path(temporary_directory) / "contract.json")
+            client = EgoLAPEefPoseClient(args)
+            client.reset()
+            action, _ = client.infer(observation, "move")
+
+        self.assertEqual(fake_server.requests[0]["observation"]["state"].shape, (10,))
+        self.assertEqual(action.shape, (8,))
+        self.assertEqual(client.contract.native_action_dim, 14)
+        self.assertEqual(client.contract.native_state_dim, 20)
+        self.assertEqual(client.contract.served_action_dim, 7)
 
     def test_ar_client_interpolates_endpoint_and_executes_first_four(self):
         fake_server = _FakePolicyServer(

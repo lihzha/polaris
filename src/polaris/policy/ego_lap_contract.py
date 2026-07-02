@@ -23,6 +23,8 @@ LEGACY_INPUT_FORMULA = "q99_input_eps1e-6_no_clip_zero0_v1"
 LEGACY_OUTPUT_FORMULA = "q99_output_eps1e-6_no_zero_override_extrapolate_v1"
 NORMALIZATION_FORMULA_SCHEMA_VERSION = 1
 POLARIS_EEF_PROFILE = "panda_link8_eef_pose_single_arm_v1"
+FRANKA_DROID_SINGLE_ARM_PROFILE = "franka_droid_single_arm_v2"
+MANIFEST_V1_PROFILE = "manifest_v1_canonical"
 R6_ROWS_STATE_LAYOUT = "xyz+r6_first_two_rows+gripper_open"
 R6_COLUMNS_STATE_LAYOUT = "xyz+r6_first_two_columns+gripper_open"
 PUBLIC_LAP_TRAIN_MATCHED_R6_MODE = "public_lap_train_matched_rows_v1"
@@ -66,7 +68,14 @@ class ValidatedEgoLAPContract:
     contract_sha256: str
     checkpoint_profile: str
     checkpoint_path: str
+    serving_profile: Literal["franka_droid_single_arm_v2"]
     policy_type: Literal["flow", "ar"]
+    native_action_dim: int
+    native_state_dim: int
+    request_state_dim: int
+    served_action_dim: int
+    state_adapter: Mapping[str, Any] | None
+    action_projection: Mapping[str, Any] | None
     response_horizon: int
     response_semantics: str
     execution_horizon: int
@@ -135,6 +144,27 @@ def _require_sequence(value: Any, expected: Sequence[Any], *, field: str) -> Non
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise ValueError(f"Ego-LAP serving contract field {field} must be a sequence")
     _require_equal(list(value), list(expected), field=field)
+
+
+def _require_quantile_stats_width(
+    stats_arrays: Mapping[str, Any],
+    key: str,
+    width: int,
+) -> None:
+    stats = _mapping(
+        stats_arrays.get(key),
+        field=f"execution.normalization_stats.arrays.{key}",
+    )
+    for quantile in ("q01", "q99"):
+        descriptor = _mapping(
+            stats.get(quantile),
+            field=f"execution.normalization_stats.arrays.{key}.{quantile}",
+        )
+        _require_sequence(
+            descriptor.get("shape"),
+            [width],
+            field=f"execution.normalization_stats.arrays.{key}.{quantile}.shape",
+        )
 
 
 def ego_lap_nested_digest(document: Mapping[str, Any]) -> str:
@@ -212,6 +242,12 @@ def validate_ego_lap_server_metadata(
         document, "checkpoint_profile", field="contract"
     )
     checkpoint_path = _required_string(document, "checkpoint_path", field="contract")
+    serving_profile = _required_string(document, "serving_profile", field="contract")
+    _require_equal(
+        serving_profile,
+        FRANKA_DROID_SINGLE_ARM_PROFILE,
+        field="serving_profile",
+    )
     policy_type = _required_string(document, "policy_type", field="contract")
     if policy_type not in {"flow", "ar"}:
         raise ValueError(
@@ -237,9 +273,22 @@ def validate_ego_lap_server_metadata(
     )
 
     model = _mapping(document.get("model"), field="model")
-    _require_equal(model.get("action_dim"), 7, field="model.action_dim")
+    native_action_dim = model.get("action_dim")
+    native_state_dim = model.get("state_dim")
+    native_dimensions = (native_action_dim, native_state_dim)
+    if native_dimensions not in {(7, 10), (14, 20)}:
+        raise ValueError(
+            "Ego-LAP serving contract mismatch for native model dimensions: "
+            f"server={native_dimensions!r}, expected=(7, 10) or (14, 20)"
+        )
+    mixed_single_arm_model = native_dimensions == (14, 20)
+    if mixed_single_arm_model:
+        _require_equal(
+            checkpoint_profile,
+            MANIFEST_V1_PROFILE,
+            field="checkpoint_profile for mixed 14-D/20-D serving",
+        )
     _require_equal(model.get("action_horizon"), 16, field="model.action_horizon")
-    _require_equal(model.get("state_dim"), 10, field="model.state_dim")
     _require_sequence(
         model.get("image_resolution"), [224, 224], field="model.image_resolution"
     )
@@ -311,6 +360,27 @@ def validate_ego_lap_server_metadata(
     _require_equal(
         state_type, expected_state_type, field="policy_input.request_state_type"
     )
+    request_state_dim = policy_input.get("request_state_dim")
+    _require_equal(
+        request_state_dim,
+        10,
+        field="policy_input.request_state_dim",
+    )
+    expected_state_adapter = (
+        {
+            "type": "normalize_then_zero_pad",
+            "request_state_dim": 10,
+            "model_state_dim": 14,
+            "checkpoint_stats_dim": 20,
+        }
+        if mixed_single_arm_model
+        else None
+    )
+    _require_equal(
+        policy_input.get("state_adapter"),
+        expected_state_adapter,
+        field="policy_input.state_adapter",
+    )
     _require_equal(
         policy_input.get("is_bimanual"), False, field="policy_input.is_bimanual"
     )
@@ -346,7 +416,29 @@ def validate_ego_lap_server_metadata(
         "EEF_POS",
         field="policy_output.action_encoding",
     )
-    _require_equal(policy_output.get("action_dim"), 7, field="policy_output.action_dim")
+    served_action_dim = policy_output.get("action_dim")
+    _require_equal(served_action_dim, 7, field="policy_output.action_dim")
+    _require_equal(
+        policy_output.get("native_action_dim"),
+        native_action_dim,
+        field="policy_output.native_action_dim",
+    )
+    expected_action_projection = (
+        {
+            "type": "leading_dimensions",
+            "source_action_dim": 14,
+            "output_action_dim": 7,
+            "indices": list(range(7)),
+            "applied_after": "checkpoint_unnormalization",
+        }
+        if mixed_single_arm_model
+        else None
+    )
+    _require_equal(
+        policy_output.get("action_projection"),
+        expected_action_projection,
+        field="policy_output.action_projection",
+    )
     _require_equal(
         policy_output.get("model_action_horizon"),
         16,
@@ -540,6 +632,15 @@ def validate_ego_lap_server_metadata(
         raise ValueError(
             f"Unsupported Ego-LAP Q99 formula profile: {normalization_profile!r}"
         )
+    if (
+        checkpoint_profile != ORIGINAL_LAP_PROFILE
+        and normalization_profile != "q99_train_matched_v1"
+    ):
+        raise ValueError(
+            "Manifest-backed Ego-LAP PolaRiS evaluation requires "
+            "normalization.formula_profile='q99_train_matched_v1'; "
+            f"got {normalization_profile!r}"
+        )
     _require_equal(
         normalization_input_formula,
         expected_formula_contract["input_formula_id"],
@@ -587,6 +688,59 @@ def validate_ego_lap_server_metadata(
     )
     _require_equal(execution.get("schema_version"), 2, field="execution.schema_version")
     _verify_nested_digest(execution, field="execution")
+    normalized_state_probe = _mapping(
+        execution.get("normalized_state_probe"),
+        field="execution.normalized_state_probe",
+    )
+    _require_sequence(
+        normalized_state_probe.get("shape"),
+        [14 if mixed_single_arm_model else 10],
+        field="execution.normalized_state_probe.shape",
+    )
+    flow_zero_action_probe = _mapping(
+        execution.get("flow_zero_action_probe"),
+        field="execution.flow_zero_action_probe",
+    )
+    _require_sequence(
+        flow_zero_action_probe.get("shape"),
+        [16, 7],
+        field="execution.flow_zero_action_probe.shape",
+    )
+    output_transform_types = execution.get("output_transform_types")
+    if not isinstance(output_transform_types, Sequence) or isinstance(
+        output_transform_types, (str, bytes)
+    ):
+        raise ValueError(
+            "Ego-LAP serving contract field execution.output_transform_types "
+            "must be a sequence"
+        )
+    output_transform_names = [str(value) for value in output_transform_types]
+    unnormalize_indices = [
+        index
+        for index, name in enumerate(output_transform_names)
+        if name.endswith(".Unnormalize") or name == "Unnormalize"
+    ]
+    projection_indices = [
+        index
+        for index, name in enumerate(output_transform_names)
+        if name.endswith(".ProjectSingleArmActions")
+        or name == "ProjectSingleArmActions"
+    ]
+    if mixed_single_arm_model:
+        if len(unnormalize_indices) != 1 or len(projection_indices) != 1:
+            raise ValueError(
+                "Mixed Ego-LAP serving requires exactly one Unnormalize and one "
+                "ProjectSingleArmActions output transform"
+            )
+        if unnormalize_indices[0] >= projection_indices[0]:
+            raise ValueError(
+                "Mixed Ego-LAP serving requires checkpoint unnormalization before "
+                "single-arm action projection"
+            )
+    elif projection_indices:
+        raise ValueError(
+            "Native 7-D Ego-LAP serving must not install ProjectSingleArmActions"
+        )
     inference_config = _mapping(
         execution.get("inference_data_config"), field="execution.inference_data_config"
     )
@@ -752,6 +906,16 @@ def validate_ego_lap_server_metadata(
         sorted(str(key) for key in selected_stats_keys),
         field="execution.normalization_stats.arrays.keys",
     )
+    _require_quantile_stats_width(
+        stats_arrays,
+        "state",
+        20 if mixed_single_arm_model else 10,
+    )
+    _require_quantile_stats_width(
+        stats_arrays,
+        "actions",
+        14 if mixed_single_arm_model else 7,
+    )
 
     polaris = _mapping(document.get("polaris"), field="polaris")
     polaris_profile = _required_string(polaris, "profile", field="polaris")
@@ -759,6 +923,11 @@ def validate_ego_lap_server_metadata(
         polaris_profile,
         POLARIS_EEF_PROFILE,
         field="polaris.profile",
+    )
+    _require_equal(
+        polaris.get("serving_profile"),
+        serving_profile,
+        field="polaris.serving_profile",
     )
     _require_equal(polaris.get("compatible"), True, field="polaris.compatible")
     _require_sequence(
@@ -814,7 +983,14 @@ def validate_ego_lap_server_metadata(
         contract_sha256=contract_sha256,
         checkpoint_profile=checkpoint_profile,
         checkpoint_path=checkpoint_path,
+        serving_profile=serving_profile,
         policy_type=policy_type,
+        native_action_dim=int(native_action_dim),
+        native_state_dim=int(native_state_dim),
+        request_state_dim=int(request_state_dim),
+        served_action_dim=int(served_action_dim),
+        state_adapter=expected_state_adapter,
+        action_projection=expected_action_projection,
         response_horizon=int(response_horizon),
         response_semantics=str(response_semantics),
         execution_horizon=execution_horizon,
