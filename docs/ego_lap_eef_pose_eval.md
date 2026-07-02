@@ -117,8 +117,11 @@ metadata; the client still sends the stable source keys `base_0_rgb` and
 ## AR evaluation
 
 AR serving must return one `7`-D total-delta endpoint. PolaRiS linearly expands
-its translation and Euler deltas into 16 cumulative targets, holds the endpoint
-gripper target across all 16, executes the first 4, and replans. Use:
+its translation and Euler deltas into 16 cumulative targets on the inclusive
+`0..1` grid used by LAP, so the first target is the unchanged query-time
+anchor and the last is the full endpoint. It holds the endpoint gripper target
+across all 16, executes the first 4, and replans. Rotation targets retain the
+contracted right-multiplication by each interpolated delta. Use:
 
 ```bash
   --policy.policy-type ar \

@@ -147,9 +147,10 @@ def validate_action_chunk(
 def interpolate_ar_endpoint(endpoint_chunk: Any, *, steps: int = 16) -> np.ndarray:
     """Expand one AR total-delta endpoint into cumulative delta targets.
 
-    Translation and Euler deltas advance linearly from ``1 / steps`` to the
-    endpoint. The endpoint gripper command is a target state and is therefore
-    held for every interpolated action rather than fractionally scaled.
+    Translation and Euler deltas advance linearly from the zero-motion anchor
+    to the endpoint, matching LAP's inclusive ``np.linspace`` interpolation.
+    The endpoint gripper command is a target state and is therefore held for
+    every interpolated action rather than fractionally scaled.
     """
 
     endpoint = np.asarray(endpoint_chunk, dtype=np.float64)
@@ -160,7 +161,7 @@ def interpolate_ar_endpoint(endpoint_chunk: Any, *, steps: int = 16) -> np.ndarr
     if not np.isfinite(endpoint).all():
         raise ValueError("AR endpoint contains non-finite values")
 
-    fractions = np.arange(1, steps + 1, dtype=np.float64)[:, None] / steps
+    fractions = np.linspace(0.0, 1.0, steps, endpoint=True, dtype=np.float64)[:, None]
     interpolated = np.repeat(endpoint, steps, axis=0)
     interpolated[:, :6] *= fractions
     return interpolated

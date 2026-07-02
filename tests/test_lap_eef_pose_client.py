@@ -897,7 +897,9 @@ class PoseConversionTest(unittest.TestCase):
         chunk = interpolate_ar_endpoint(endpoint, steps=16)
 
         self.assertEqual(chunk.shape, (16, 7))
-        np.testing.assert_allclose(chunk[0, :6], endpoint[0, :6] / 16)
+        np.testing.assert_array_equal(chunk[0, :6], np.zeros(6))
+        np.testing.assert_allclose(chunk[1, :6], endpoint[0, :6] / 15)
+        np.testing.assert_allclose(chunk[3, :6], endpoint[0, :6] * (3 / 15))
         np.testing.assert_allclose(chunk[-1, :6], endpoint[0, :6])
         np.testing.assert_array_equal(chunk[:, 6], np.ones(16))
 
@@ -1201,7 +1203,7 @@ class ClientContractTest(unittest.TestCase):
         self.assertEqual(len(fake_server.requests), 1)
         np.testing.assert_allclose(
             np.asarray(actions)[:, 0],
-            np.array([0.41, 0.42, 0.43, 0.44]),
+            np.array([0.4, 0.4 + 0.16 / 15, 0.4 + 0.32 / 15, 0.432]),
             atol=1e-7,
         )
         np.testing.assert_array_equal(np.asarray(actions)[:, 7], np.zeros(4))
@@ -1209,6 +1211,10 @@ class ClientContractTest(unittest.TestCase):
         self.assertEqual(query["response_semantics"], "total_delta_endpoint")
         self.assertEqual(len(query["server_delta_chunk"]), 1)
         self.assertEqual(len(query["raw_delta_chunk"]), 16)
+        np.testing.assert_array_equal(
+            query["raw_delta_chunk"][0], np.array([0.0] * 6 + [1.0])
+        )
+        self.assertEqual(query["raw_delta_chunk"][-1][0], 0.16)
         self.assertEqual(query["execution_horizon"], 4)
 
     def test_per_episode_trace_uses_global_id_and_reconciles_partial_retry(self):
