@@ -208,8 +208,15 @@ max-raw-delta record invalidate the episode. State/action arrays are checked
 again after float32 conversion, and JSONL traces forbid non-finite constants.
 
 ```bash
-python scripts/smoke_eef_pose_controller.py --headless
+python scripts/smoke_eef_pose_controller.py \
+  --headless \
+  --output-json /tmp/polaris-eef-controller-smoke.json
 ```
+
+`--output-json` is required. The smoke writes it atomically before teardown and
+finalizes it after teardown; failures retain the raw safety capture, completed
+partial cases, current stage/case, and flushed exception traceback as strict
+JSON.
 
 Pure adapter tests can be run without Isaac Sim:
 

@@ -229,3 +229,32 @@
   Isaac emitted headless Vulkan/display warnings, including an incompatible
   Vulkan-driver message, but the CPU-focused unit suite and JUnit were clean.
   No standalone controller smoke or checkpoint evaluation was chained.
+
+## 2026-07-02 — first standalone controller-smoke capture
+
+- Reviewer-approved standalone smoke job `1097411` ran PolaRiS commit
+  `4f1ce3c7c95ee298291bb6860f2c67f8015a2abc` in the same pinned image,
+  with the production NVIDIA Vulkan ICD mapping and PolaRiS data/cache mounts.
+  It did not start a policy server, load a checkpoint, or chain an evaluator.
+- The job failed closed after `00:02:56` because no result JSON was produced.
+  Its Python `srun` step reported `0:0`, but Isaac shutdown suppressed the
+  exception that occurred after the initial live-limit capture. The log is
+  `/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris_eval/pol_ik_v3_smoke-1097411.out`
+  (SHA-256 `6a2ba56e10bfd420bcb81489d5203666327c80f172007e5b7ba157721a1ff7d7`).
+- The live float32 Panda limits differed from the candidate only at joint 4's
+  upper bound (`-0.06979990005493164`) and joint 6's lower bound
+  (`-0.017499923706054688`). Independently hashing the 14 little-endian
+  float32 endpoints reproduced the live digest
+  `fbf7535901c042fea5d901812ecd02c5fd81ade06c23c1499c32d66a859104de`.
+  Those exact values and digest are now the candidate constants, but their
+  status remains `pending_controller_smoke` until a clean rerun validates the
+  full matrix and writes strict JSON.
+- The smoke now validates the raw capture immediately before any motion and
+  records the active stage/case. Its required output is atomically written as
+  strict JSON before teardown and finalized after teardown; failures retain
+  the raw capture, completed partial cases, exception type/message/traceback,
+  and separate environment/SimulationApp close errors. Tracebacks are flushed
+  before close and the intended nonzero exit survives teardown. The next
+  immutable sbatch must parse the JSON after Python and fail unless it is
+  finalized, passed, and free of run/close/persistence errors; file existence
+  alone is deliberately insufficient.

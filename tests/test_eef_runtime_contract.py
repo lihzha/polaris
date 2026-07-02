@@ -813,6 +813,35 @@ def test_one_step_adversarial_smoke_requires_bounded_active_slew_guard():
     assert '"max_abs"' in smoke_source
     assert '"position_within_captured_soft_limits"' in smoke_source
     assert "CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD" in smoke_source
+    assert (
+        smoke_source.index('state["raw_capture"] = initial_capture')
+        < (
+            smoke_source.index(
+                "validated_initial_capture = validate_eef_runtime_safety(env)"
+            )
+        )
+        < smoke_source.index("for case_index, (label, pose_delta)")
+    )
+    assert "os.replace(temporary_path, path)" in smoke_source
+    assert "allow_nan=False" in smoke_source
+    assert 'required=True,\n    help="Required atomic' in smoke_source
+    assert '"raw_ik_safety_capture"' in smoke_source
+    assert '"stage": state["stage"]' in smoke_source
+    assert '"case": state["case"]' in smoke_source
+    assert '"traceback": "".join(' in smoke_source
+    assert "except BaseException as run_error:" in smoke_source
+    assert "except BaseException as close_error:" in smoke_source
+    assert 'close_evidence["component"] = "environment"' in smoke_source
+    assert 'close_evidence["component"] = "simulation_app"' in smoke_source
+    assert "_result_payload(state, finalized=False" in smoke_source
+    assert "_result_payload(state, finalized=True" in smoke_source
+    assert '"failure": state["failure"]' in smoke_source
+    assert '"close_failures": state["close_failures"]' in smoke_source
+    assert '"persistence_failures": state["persistence_failures"]' in smoke_source
+    assert smoke_source.index("_print_exception(run_error)") < smoke_source.index(
+        "simulation_app.close()"
+    )
+    assert "sys.stderr.flush()" in smoke_source
 
 
 @pytest.mark.parametrize(
