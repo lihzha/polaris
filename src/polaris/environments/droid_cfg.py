@@ -1,6 +1,9 @@
 import torch
 from pathlib import Path
-from isaaclab.envs.mdp.actions.actions_cfg import BinaryJointPositionActionCfg
+from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
+from isaaclab.envs.mdp.actions.actions_cfg import (
+    BinaryJointPositionActionCfg,
+)
 from isaaclab.envs.mdp.actions.binary_joint_actions import BinaryJointPositionAction
 import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math
@@ -9,6 +12,10 @@ import numpy as np
 from typing import Sequence
 
 from polaris.environments.robot_cfg import NVIDIA_DROID
+from polaris.config import LAP_EEF_FRAME
+from polaris.robust_differential_ik import (
+    RobustDifferentialInverseKinematicsActionCfg,
+)
 
 from pxr import Usd, UsdGeom, UsdPhysics
 from isaaclab.utils import configclass, noise
@@ -104,6 +111,20 @@ class SceneCfg(InteractiveSceneCfg):
                     offset=OffsetCfg(
                         pos=[0.0, 0.0, 0.0],
                     ),
+                ),
+            ],
+        )
+        # Keep ``ee_frame`` above unchanged because PolaRiS rubrics use it.
+        # LAP needs DROID's physical Cartesian frame, which is panda_link8.
+        self.lap_ee_frame = FrameTransformerCfg(
+            prim_path="{ENV_REGEX_NS}/robot/panda_link0",
+            debug_vis=False,
+            visualizer_cfg=marker_cfg,
+            target_frames=[
+                FrameTransformerCfg.FrameCfg(
+                    prim_path=f"{{ENV_REGEX_NS}}/robot/{LAP_EEF_FRAME}",
+                    name="lap_end_effector",
+                    offset=OffsetCfg(pos=[0.0, 0.0, 0.0]),
                 ),
             ],
         )
@@ -229,11 +250,48 @@ class BinaryJointPositionZeroToOneActionCfg(BinaryJointPositionActionCfg):
 
 @configclass
 class ActionCfg:
+    """Default DROID joint-position actions (kept for backwards compatibility)."""
+
     arm = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=["panda_joint.*"],
         preserve_order=True,
         use_default_offset=False,
+    )
+
+    finger_joint = BinaryJointPositionZeroToOneActionCfg(
+        asset_name="robot",
+        joint_names=["finger_joint"],
+        open_command_expr={"finger_joint": 0.0},
+        close_command_expr={"finger_joint": np.pi / 4},
+    )
+
+
+@configclass
+class EefPoseActionCfg:
+    """Absolute ``panda_link8`` pose plus closed-positive gripper command.
+
+    Isaac Lab's absolute differential-IK controller consumes
+    ``[x, y, z, qw, qx, qy, qz]`` in the articulation root frame. The
+    :class:`SceneCfg` frame transformer and the policy observations below use
+    the same ``panda_link0 -> panda_link8`` transform. This is the Cartesian
+    end-effector frame recorded by DROID and consumed by LAP; the attached
+    Robotiq ``base_link`` is a different physical frame.
+    """
+
+    arm = RobustDifferentialInverseKinematicsActionCfg(
+        asset_name="robot",
+        joint_names=["panda_joint.*"],
+        body_name=LAP_EEF_FRAME,
+        controller=DifferentialIKControllerCfg(
+            command_type="pose",
+            use_relative_mode=False,
+            ik_method="dls",
+        ),
+        scale=1.0,
+        body_offset=RobustDifferentialInverseKinematicsActionCfg.OffsetCfg(
+            pos=(0.0, 0.0, 0.0)
+        ),
     )
 
     finger_joint = BinaryJointPositionZeroToOneActionCfg(
@@ -285,6 +343,28 @@ def gripper_pos(
     return joint_pos
 
 
+def eef_pos(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("lap_ee_frame"),
+):
+    """Return ``panda_link8`` position relative to the robot root frame."""
+
+    frames = env.scene[asset_cfg.name]
+    frame_idx = frames.data.target_frame_names.index("lap_end_effector")
+    return frames.data.target_pos_source[:, frame_idx, :]
+
+
+def eef_quat(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("lap_ee_frame"),
+):
+    """Return ``panda_link8`` quaternion relative to root, in Isaac ``wxyz`` order."""
+
+    frames = env.scene[asset_cfg.name]
+    frame_idx = frames.data.target_frame_names.index("lap_end_effector")
+    return frames.data.target_quat_source[:, frame_idx, :]
+
+
 @configclass
 class ObservationCfg:
     @configclass
@@ -295,6 +375,8 @@ class ObservationCfg:
         gripper_pos = ObsTerm(
             func=gripper_pos, noise=noise.GaussianNoiseCfg(std=0.05), clip=(0, 1)
         )
+        eef_pos = ObsTerm(func=eef_pos)
+        eef_quat = ObsTerm(func=eef_quat)
 
         def __post_init__(self) -> None:
             self.enable_corruption = False

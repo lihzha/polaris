@@ -12,10 +12,12 @@ import pandas as pd
 from pathlib import Path
 from isaaclab.app import AppLauncher
 
-from polaris.config import EvalArgs
+from polaris.config import LAP_EEF_FRAME, EvalArgs, validate_policy_control_mode
 
 
 def main(eval_args: EvalArgs):
+    validate_policy_control_mode(eval_args)
+
     # This must be done before importing anything from IsaacLab
     # Inside main function to avoid launching IsaacLab in global scope
     # >>>> Isaac Sim App Launcher <<<<
@@ -31,8 +33,10 @@ def main(eval_args: EvalArgs):
     from polaris.environments.manager_based_rl_splat_environment import (
         ManagerBasedRLSplatEnv,
     )
+    from polaris.environments.droid_cfg import EefPoseActionCfg
     from polaris.utils import load_eval_initial_conditions
     from polaris.policy import InferenceClient
+    from polaris.robust_differential_ik import DifferentialIKNumericalError
     # from real2simeval.autoscoring import TASK_TO_SUCCESS_CHECKER
 
     env_cfg = parse_env_cfg(
@@ -41,17 +45,83 @@ def main(eval_args: EvalArgs):
         num_envs=1,
         use_fabric=True,
     )
-    env: MangerBasedRLSplatEnv = gym.make(eval_args.environment, cfg=env_cfg)  # type: ignore
+    if eval_args.control_mode == "eef-pose":
+        # Action managers are constructed by gym.make, so select the controller
+        # on the config before creating the environment.
+        env_cfg.actions = EefPoseActionCfg()
+        frame_cfg = env_cfg.scene.lap_ee_frame
+        target_cfg = frame_cfg.target_frames[0]
+        observed_source = frame_cfg.prim_path
+        observed_prim = target_cfg.prim_path
+        controlled_body = env_cfg.actions.arm.body_name
+        source_offset_is_identity = tuple(frame_cfg.source_frame_offset.pos) == (
+            0.0,
+            0.0,
+            0.0,
+        ) and tuple(frame_cfg.source_frame_offset.rot) == (1.0, 0.0, 0.0, 0.0)
+        target_offset_is_identity = tuple(target_cfg.offset.pos) == (
+            0.0,
+            0.0,
+            0.0,
+        ) and tuple(target_cfg.offset.rot) == (1.0, 0.0, 0.0, 0.0)
+        control_offset = env_cfg.actions.arm.body_offset
+        control_offset_is_identity = control_offset is not None and (
+            tuple(control_offset.pos) == (0.0, 0.0, 0.0)
+            and tuple(control_offset.rot) == (1.0, 0.0, 0.0, 0.0)
+        )
+        if not observed_source.endswith("/robot/panda_link0"):
+            raise ValueError(
+                "EEF observation source does not match the DROID/LAP contract: "
+                f"{observed_source!r}"
+            )
+        if not observed_prim.endswith(f"/robot/{LAP_EEF_FRAME}"):
+            raise ValueError(
+                "EEF observation frame does not match the DROID/LAP contract: "
+                f"{observed_prim!r}"
+            )
+        if controlled_body != LAP_EEF_FRAME:
+            raise ValueError(
+                "EEF controller frame does not match the DROID/LAP contract: "
+                f"{controlled_body!r}"
+            )
+        if not source_offset_is_identity or not target_offset_is_identity:
+            raise ValueError("EEF observation source/target offsets must be identity")
+        if not control_offset_is_identity:
+            raise ValueError("EEF controller body offset must be identity")
+        print(
+            "POLARIS_LAP_EEF_FRAME="
+            f"{LAP_EEF_FRAME};reference={observed_source};"
+            f"observation={observed_prim};frame_offsets=identity;"
+            f"control={controlled_body};control_offset=identity",
+            flush=True,
+        )
+    elif eval_args.control_mode != "joint-position":
+        raise ValueError(f"Unsupported control mode: {eval_args.control_mode}")
+    env: ManagerBasedRLSplatEnv = gym.make(  # type: ignore[assignment]
+        eval_args.environment, cfg=env_cfg
+    )
 
-    language_instruction, initial_conditions = load_eval_initial_conditions(
+    default_instruction, initial_conditions = load_eval_initial_conditions(
         usd=env.usd_file,
         initial_conditions_file=eval_args.initial_conditions_file,
         rollouts=eval_args.rollouts,
+    )
+    language_instruction = (
+        eval_args.instruction
+        if eval_args.instruction is not None
+        else default_instruction
     )
     rollouts = len(initial_conditions)
     # Resume CSV logging
     run_folder = Path(eval_args.run_folder)
     run_folder.mkdir(parents=True, exist_ok=True)
+    if (
+        eval_args.policy.client == "EgoLAPEefPose"
+        and eval_args.policy.contract_output is None
+    ):
+        eval_args.policy.contract_output = str(
+            run_folder / "ego_lap_serving_contract.json"
+        )
     csv_path = run_folder / "eval_results.csv"
     if csv_path.exists():
         episode_df = pd.read_csv(csv_path)
@@ -62,8 +132,14 @@ def main(eval_args: EvalArgs):
                 "episode_length": pd.Series(dtype="int"),
                 "success": pd.Series(dtype="bool"),
                 "progress": pd.Series(dtype="float"),
+                "numerical_failure": pd.Series(dtype="bool"),
+                "numerical_failure_reason": pd.Series(dtype="str"),
             }
         )
+    if "numerical_failure" not in episode_df:
+        episode_df["numerical_failure"] = False
+    if "numerical_failure_reason" not in episode_df:
+        episode_df["numerical_failure_reason"] = ""
     episode = len(episode_df)
     if episode >= rollouts:
         print("All rollouts have been evaluated. Exiting.")
@@ -73,53 +149,74 @@ def main(eval_args: EvalArgs):
 
     policy_client: InferenceClient = InferenceClient.get_client(eval_args.policy)
 
-    video = []
     horizon = env.max_episode_length
-    bar = tqdm.tqdm(range(horizon))
-    obs, info = env.reset(
-        object_positions=initial_conditions[episode % len(initial_conditions)]
-    )
-    policy_client.reset()
-    print(f" >>> Starting eval job from episode {episode + 1} of {rollouts} <<< ")
-    while True:
-        action, viz = policy_client.infer(obs, language_instruction)
-        if viz is not None:
-            video.append(viz)
-        obs, rew, term, trunc, info = env.step(
-            torch.tensor(action).reshape(1, -1), expensive=policy_client.rerender
-        )
+    while episode < rollouts:
+        # Index the initial condition with the episode being started. The old
+        # loop reset before incrementing ``episode``, repeating condition zero.
+        obs, info = env.reset(object_positions=initial_conditions[episode])
+        policy_client.reset()
+        video = []
+        numerical_failure_reason = ""
+        bar = tqdm.tqdm(total=horizon)
+        print(f" >>> Starting eval job from episode {episode + 1} of {rollouts} <<< ")
 
-        bar.update(1)
-        if term[0] or trunc[0] or bar.n >= horizon:
-            policy_client.reset()
+        while bar.n < horizon:
+            action, viz = policy_client.infer(
+                obs, language_instruction, return_viz=True
+            )
+            if viz is not None:
+                # Request visualization every step so saved videos are complete,
+                # even when policy inference itself is open-loop chunked.
+                video.append(viz)
+            try:
+                obs, rew, term, trunc, info = env.step(
+                    torch.as_tensor(action, device=env.device).reshape(1, -1),
+                    expensive=policy_client.rerender,
+                )
+            except (DifferentialIKNumericalError, torch.linalg.LinAlgError) as error:
+                numerical_failure_reason = f"{type(error).__name__}: {error}"
+                print(
+                    f"Numerical failure in episode {episode} at action "
+                    f"{bar.n}: {numerical_failure_reason}"
+                )
+                # The policy visualization was already recorded for this
+                # attempted action, so include it in the episode length.
+                bar.update(1)
+                break
+            bar.update(1)
+            if term[0] or trunc[0]:
+                break
 
-            # Save video and metadata
+        episode_length = bar.n
+        bar.close()
+
+        if video:
             filename = run_folder / f"episode_{episode}.mp4"
             mediapy.write_video(filename, video, fps=15)
-
-            # Log episode results to CSV
-            episode_data = {
-                "episode": episode,
-                "episode_length": bar.n,
-                "success": info["rubric"]["success"],
-                "progress": info["rubric"]["progress"],
-            }
-            episode_df = pd.concat(
-                [episode_df, pd.DataFrame([episode_data])], ignore_index=True
-            )
-            episode_df.to_csv(csv_path, index=False)
-
-            bar.close()
-            print(f"Episode {episode} finished. Episode length: {bar.n}")
-            bar = tqdm.tqdm(range(horizon))
-            obs, info = env.reset(
-                object_positions=initial_conditions[episode % len(initial_conditions)]
+        else:
+            print(
+                f"Warning: policy returned no visualization for episode {episode}; "
+                "no video was written."
             )
 
-            episode += 1
-            video = []
-            if episode >= rollouts:
-                break
+        episode_data = {
+            "episode": episode,
+            "episode_length": episode_length,
+            "success": (
+                False if numerical_failure_reason else info["rubric"]["success"]
+            ),
+            "progress": (
+                0.0 if numerical_failure_reason else info["rubric"]["progress"]
+            ),
+            "numerical_failure": bool(numerical_failure_reason),
+            "numerical_failure_reason": numerical_failure_reason,
+        }
+        episode_df = pd.concat(
+            [episode_df, pd.DataFrame([episode_data])], ignore_index=True
+        )
+        episode_df.to_csv(csv_path, index=False)
+        print(f"Episode {episode} finished. Episode length: {episode_length}")
+        episode += 1
 
     env.close()
     simulation_app.close()
