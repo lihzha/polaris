@@ -29,11 +29,16 @@ from isaaclab.utils.math import compute_pose_error
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
+from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
 
 
 class DifferentialIKNumericalError(RuntimeError):
     """Raised when an invalid IK state requires aborting the current rollout."""
+
+
+class DifferentialIKInvariantError(DifferentialIKNumericalError):
+    """Raised when a finite controller state violates a safety invariant."""
 
 
 def _require_finite(value: torch.Tensor, *, field: str) -> None:
@@ -50,6 +55,21 @@ def _require_finite(value: torch.Tensor, *, field: str) -> None:
             f"PolaRiS EEF IK safety received non-finite {field}; "
             f"aborting rollout (max_abs_finite={max_abs:g})"
         )
+
+
+def _eef_quaternion_norm_is_valid(
+    quaternion: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return per-environment quaternion norms and the named unit-norm guard."""
+
+    # Float32 norm accumulation can overflow for finite policy outputs. Use
+    # float64 so the diagnostic remains strict-JSON finite while still
+    # rejecting the wildly non-unit command before pose-error computation.
+    norms = quaternion.to(torch.float64).norm(dim=-1)
+    valid = torch.isfinite(norms) & (
+        (norms - 1.0).abs() <= EEF_QUATERNION_UNIT_NORM_TOLERANCE
+    )
+    return norms, valid
 
 
 def _bound_joint_position_target(
@@ -82,9 +102,7 @@ def _bound_joint_position_target(
     upper = soft_joint_pos_limits[..., 1]
     position_limited = (slew_limited_target < lower) | (slew_limited_target > upper)
     clipped_target = torch.clamp(slew_limited_target, min=lower, max=upper)
-    safe_target = torch.where(
-        position_limited, clipped_target, slew_limited_target
-    )
+    safe_target = torch.where(position_limited, clipped_target, slew_limited_target)
     return safe_target, raw_delta_joint_pos, slew_limited, position_limited
 
 
@@ -243,11 +261,15 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._physics_dt = float(env.physics_dt)
         self._control_dt = float(env.step_dt)
         self._decimation = int(env.cfg.decimation)
-        if self._physics_dt <= 0.0 or self._decimation <= 0 or not math.isclose(
-            self._physics_dt * self._decimation,
-            self._control_dt,
-            rel_tol=0.0,
-            abs_tol=1e-12,
+        if (
+            self._physics_dt <= 0.0
+            or self._decimation <= 0
+            or not math.isclose(
+                self._physics_dt * self._decimation,
+                self._control_dt,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
         ):
             raise ValueError(
                 "PolaRiS EEF IK safety requires apply_actions at the physics "
@@ -359,10 +381,10 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             self._max_raw_delta_diagnostic_joint_pos
         )
         self._max_raw_delta_diagnostic_pose_error_norm = torch.tensor(
-            0.0, dtype=torch.float32, device=self.device
+            0.0, dtype=torch.float64, device=self.device
         )
         self._max_raw_delta_diagnostic_jacobian_max_abs = torch.tensor(
-            0.0, dtype=torch.float32, device=self.device
+            0.0, dtype=torch.float64, device=self.device
         )
 
     def begin_safety_episode(self, episode_index: int) -> None:
@@ -386,7 +408,10 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         raw_values = [float(item) for item in array.detach().cpu().tolist()]
         finite_mask = [math.isfinite(item) for item in raw_values]
         return {
-            "values": [item if finite else None for item, finite in zip(raw_values, finite_mask, strict=True)],
+            "values": [
+                item if finite else None
+                for item, finite in zip(raw_values, finite_mask, strict=True)
+            ],
             "finite_mask": finite_mask,
             "finite_count": sum(finite_mask),
         }
@@ -401,11 +426,16 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         safe_target: torch.Tensor | None,
         pose_error: torch.Tensor | None,
         jacobian: torch.Tensor | None,
+        eef_quaternion_norm: torch.Tensor | None = None,
     ) -> dict[str, object]:
         apply_index = self._apply_call_count - 1
         pose_error_norm = None
         if pose_error is not None and torch.isfinite(pose_error).all():
-            pose_error_norm = float(pose_error[0].norm().detach().cpu().item())
+            raw_pose_error_norm = float(
+                pose_error[0].to(torch.float64).norm().detach().cpu().item()
+            )
+            if math.isfinite(raw_pose_error_norm):
+                pose_error_norm = raw_pose_error_norm
         jacobian_finite = (
             None
             if jacobian is None
@@ -415,9 +445,16 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         if jacobian is not None:
             finite_values = jacobian[torch.isfinite(jacobian)]
             if finite_values.numel() > 0:
-                jacobian_max_abs = float(
-                    finite_values.abs().max().detach().cpu().item()
+                raw_jacobian_max_abs = float(
+                    finite_values.to(torch.float64).abs().max().detach().cpu().item()
                 )
+                if math.isfinite(raw_jacobian_max_abs):
+                    jacobian_max_abs = raw_jacobian_max_abs
+        quaternion_norm = None
+        if eef_quaternion_norm is not None:
+            raw_quaternion_norm = float(eef_quaternion_norm[0].detach().cpu().item())
+            if math.isfinite(raw_quaternion_norm):
+                quaternion_norm = raw_quaternion_norm
         return {
             "kind": kind,
             "episode_index": self._active_episode_index,
@@ -430,6 +467,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             "pose_error_norm": pose_error_norm,
             "jacobian_finite": jacobian_finite,
             "jacobian_max_abs": jacobian_max_abs,
+            "eef_quaternion_norm": quaternion_norm,
         }
 
     def _append_guard_diagnostic(self, **kwargs) -> dict[str, object]:
@@ -456,9 +494,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         raw_max = torch.nan_to_num(
             raw_delta.abs(), nan=0.0, posinf=0.0, neginf=0.0
         ).amax()
-        replace = raw_delta_is_finite & (
-            raw_max > self._max_raw_delta_diagnostic_value
-        )
+        replace = raw_delta_is_finite & (raw_max > self._max_raw_delta_diagnostic_value)
         self._max_raw_delta_diagnostic_value = torch.maximum(
             self._max_raw_delta_diagnostic_value, raw_max
         )
@@ -478,8 +514,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         ):
             current = getattr(self, attribute)
             setattr(self, attribute, torch.where(replace, value, current))
-        pose_error_norm = pose_error[0].norm()
-        jacobian_max_abs = jacobian[0].abs().amax()
+        pose_error_norm = pose_error[0].to(torch.float64).norm()
+        jacobian_max_abs = jacobian[0].to(torch.float64).abs().amax()
         self._max_raw_delta_diagnostic_pose_error_norm = torch.where(
             replace,
             pose_error_norm,
@@ -497,20 +533,50 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._apply_call_count += 1
         ee_pos_curr, ee_quat_curr = self._compute_frame_pose()
         joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
+        soft_limits = self._soft_joint_position_limits
+        lower = soft_limits[..., 0]
+        upper = soft_limits[..., 1]
+        current_joint_violation = torch.maximum(
+            torch.clamp(lower - joint_pos, min=0.0),
+            torch.clamp(joint_pos - upper, min=0.0),
+        )
+        current_joint_invalid = (
+            current_joint_violation > CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
+        ).any(dim=-1)
         jacobian = None
         pose_error = None
         raw_joint_pos_target = None
         fallback_count_before = self._ik_controller.fallback_count
         try:
-            current_state = torch.cat(
-                (ee_pos_curr, ee_quat_curr, joint_pos), dim=-1
+            current_state = torch.cat((ee_pos_curr, ee_quat_curr, joint_pos), dim=-1)
+            desired_state = torch.cat(
+                (
+                    self._ik_controller.ee_pos_des,
+                    self._ik_controller.ee_quat_des,
+                ),
+                dim=-1,
             )
-            current_finite, quaternion_nonzero = (
+            current_quaternion_norms, current_quaternion_norm_valid = (
+                _eef_quaternion_norm_is_valid(ee_quat_curr)
+            )
+            desired_quaternion_norms, desired_quaternion_norm_valid = (
+                _eef_quaternion_norm_is_valid(self._ik_controller.ee_quat_des)
+            )
+            (
+                current_finite,
+                desired_finite,
+                current_quaternion_valid,
+                desired_quaternion_valid,
+                current_joint_valid,
+            ) = (
                 bool(value)
                 for value in torch.stack(
                     (
                         torch.isfinite(current_state).all(),
-                        (ee_quat_curr.norm(dim=-1) > 0.0).all(),
+                        torch.isfinite(desired_state).all(),
+                        current_quaternion_norm_valid.all(),
+                        desired_quaternion_norm_valid.all(),
+                        ~current_joint_invalid.any(),
                     )
                 )
                 .detach()
@@ -521,21 +587,79 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 # Re-enter the diagnostic helper only on the abort path; the
                 # healthy path uses the single combined status synchronization.
                 _require_finite(current_state, field="current EEF/joint state")
-            if quaternion_nonzero:
-                jacobian = self._compute_frame_jacobian()
-                position_error, axis_angle_error = compute_pose_error(
-                    ee_pos_curr,
-                    ee_quat_curr,
-                    self._ik_controller.ee_pos_des,
-                    self._ik_controller.ee_quat_des,
-                    rot_error_type="axis_angle",
+            self._max_current_joint_soft_limit_violation = torch.maximum(
+                self._max_current_joint_soft_limit_violation,
+                current_joint_violation.amax(dim=0).to(
+                    self._max_current_joint_soft_limit_violation.dtype
+                ),
+            )
+            if not desired_finite:
+                _require_finite(desired_state, field="desired EEF pose")
+            if not current_quaternion_valid:
+                self._invariant_abort_count += self.num_envs
+                record = self._append_guard_diagnostic(
+                    kind="current_eef_quaternion_invariant_abort",
+                    joint_pos=joint_pos,
+                    raw_delta=None,
+                    raw_target=None,
+                    safe_target=None,
+                    pose_error=None,
+                    jacobian=None,
+                    eef_quaternion_norm=current_quaternion_norms,
                 )
-                pose_error = torch.cat((position_error, axis_angle_error), dim=1)
-                raw_joint_pos_target = self._ik_controller.compute(
-                    ee_pos_curr, ee_quat_curr, jacobian, joint_pos
+                raise DifferentialIKInvariantError(
+                    "PolaRiS EEF IK current quaternion norm violates the named "
+                    "unit invariant; aborting before PhysX "
+                    f"(norm={record['eef_quaternion_norm']!r}, "
+                    f"tolerance={EEF_QUATERNION_UNIT_NORM_TOLERANCE:g})"
                 )
-            else:
-                raw_joint_pos_target = joint_pos.clone()
+            if not desired_quaternion_valid:
+                self._invariant_abort_count += self.num_envs
+                record = self._append_guard_diagnostic(
+                    kind="desired_eef_quaternion_invariant_abort",
+                    joint_pos=joint_pos,
+                    raw_delta=None,
+                    raw_target=None,
+                    safe_target=None,
+                    pose_error=None,
+                    jacobian=None,
+                    eef_quaternion_norm=desired_quaternion_norms,
+                )
+                raise DifferentialIKInvariantError(
+                    "PolaRiS EEF IK desired quaternion norm violates the named "
+                    "unit invariant; aborting before PhysX "
+                    f"(norm={record['eef_quaternion_norm']!r}, "
+                    f"tolerance={EEF_QUATERNION_UNIT_NORM_TOLERANCE:g})"
+                )
+            if not current_joint_valid:
+                self._current_joint_limit_abort_count += current_joint_invalid.sum()
+                self._append_guard_diagnostic(
+                    kind="current_joint_limit_abort",
+                    joint_pos=joint_pos,
+                    raw_delta=None,
+                    raw_target=None,
+                    safe_target=None,
+                    pose_error=None,
+                    jacobian=None,
+                )
+                raise DifferentialIKInvariantError(
+                    "PolaRiS EEF IK current joint position is outside live soft "
+                    "limits; aborting before DLS and PhysX"
+                )
+            jacobian = self._compute_frame_jacobian()
+            position_error, axis_angle_error = compute_pose_error(
+                ee_pos_curr,
+                ee_quat_curr,
+                self._ik_controller.ee_pos_des,
+                self._ik_controller.ee_quat_des,
+                rot_error_type="axis_angle",
+            )
+            pose_error = torch.cat((position_error, axis_angle_error), dim=1)
+            raw_joint_pos_target = self._ik_controller.compute(
+                ee_pos_curr, ee_quat_curr, jacobian, joint_pos
+            )
+        except DifferentialIKInvariantError:
+            raise
         except DifferentialIKNumericalError:
             self._record_nonfinite_abort()
             self._append_guard_diagnostic(
@@ -549,19 +673,6 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             )
             raise
 
-        soft_limits = self._soft_joint_position_limits
-        lower = soft_limits[..., 0]
-        upper = soft_limits[..., 1]
-        current_joint_violation = torch.maximum(
-            torch.clamp(lower - joint_pos, min=0.0),
-            torch.clamp(joint_pos - upper, min=0.0),
-        )
-        self._max_current_joint_soft_limit_violation = torch.maximum(
-            self._max_current_joint_soft_limit_violation,
-            current_joint_violation
-            .amax(dim=0)
-            .to(self._max_current_joint_soft_limit_violation.dtype),
-        )
         safe_target, raw_delta, slew_limited, position_limited = (
             _bound_joint_position_target(
                 joint_pos,
@@ -584,38 +695,28 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._slew_limit_joint_count += slew_limited.sum()
         self._position_limit_event_count += position_limited.any(dim=-1).sum()
         self._position_limit_joint_count += position_limited.sum()
-        current_joint_invalid = (
-            current_joint_violation > CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
-        ).any(dim=-1)
         raw_target_nonfinite = ~torch.isfinite(raw_joint_pos_target).all(dim=-1)
         post_clamp_target_invalid = (post_clamp_violation > 0.0).any(dim=-1)
         post_clamp_slew_invalid = (
             applied_delta.abs()
             > self._max_delta_joint_pos + JOINT_SLEW_FLOAT32_TOLERANCE_RAD
         ).any(dim=-1)
-        self._current_joint_limit_abort_count += current_joint_invalid.sum()
         self._post_clamp_target_violation_count += post_clamp_target_invalid.sum()
         self._max_raw_delta_joint_pos = torch.maximum(
             self._max_raw_delta_joint_pos,
-            torch.nan_to_num(
-                raw_delta.abs(), nan=0.0, posinf=0.0, neginf=0.0
-            )
+            torch.nan_to_num(raw_delta.abs(), nan=0.0, posinf=0.0, neginf=0.0)
             .amax(dim=0)
             .to(self._max_raw_delta_joint_pos.dtype),
         )
         self._max_raw_target_soft_limit_violation = torch.maximum(
             self._max_raw_target_soft_limit_violation,
-            torch.nan_to_num(
-                raw_target_violation, nan=0.0, posinf=0.0, neginf=0.0
-            )
+            torch.nan_to_num(raw_target_violation, nan=0.0, posinf=0.0, neginf=0.0)
             .amax(dim=0)
             .to(self._max_raw_target_soft_limit_violation.dtype),
         )
         self._max_post_clamp_target_soft_limit_violation = torch.maximum(
             self._max_post_clamp_target_soft_limit_violation,
-            torch.nan_to_num(
-                post_clamp_violation, nan=0.0, posinf=0.0, neginf=0.0
-            )
+            torch.nan_to_num(post_clamp_violation, nan=0.0, posinf=0.0, neginf=0.0)
             .amax(dim=0)
             .to(self._max_post_clamp_target_soft_limit_violation.dtype),
         )
@@ -638,12 +739,11 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 pose_error=pose_error,
                 jacobian=jacobian,
             )
-        raw_nonfinite, current_invalid, target_invalid, slew_invalid = (
+        raw_nonfinite, target_invalid, slew_invalid = (
             bool(value)
             for value in torch.stack(
                 (
                     raw_target_nonfinite.any(),
-                    current_joint_invalid.any(),
                     post_clamp_target_invalid.any(),
                     post_clamp_slew_invalid.any(),
                 )
@@ -666,20 +766,6 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             raise DifferentialIKNumericalError(
                 "PolaRiS EEF IK safety received a non-finite raw DLS joint "
                 "target; aborting before PhysX"
-            )
-        if current_invalid:
-            self._append_guard_diagnostic(
-                kind="current_joint_limit_abort",
-                joint_pos=joint_pos,
-                raw_delta=raw_delta,
-                raw_target=raw_joint_pos_target,
-                safe_target=safe_target,
-                pose_error=pose_error,
-                jacobian=jacobian,
-            )
-            raise DifferentialIKNumericalError(
-                "PolaRiS EEF IK current joint position is outside live soft "
-                "limits; aborting before PhysX"
             )
         if target_invalid:
             self._invariant_abort_count += self.num_envs
@@ -714,9 +800,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
 
         self._max_applied_delta_joint_pos = torch.maximum(
             self._max_applied_delta_joint_pos,
-            applied_delta.abs()
-            .amax(dim=0)
-            .to(self._max_applied_delta_joint_pos.dtype),
+            applied_delta.abs().amax(dim=0).to(self._max_applied_delta_joint_pos.dtype),
         )
         self._asset.set_joint_position_target(safe_target, self._joint_ids)
 
@@ -725,12 +809,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
 
         soft_limits = self._soft_joint_position_limits
         soft_limit_bytes = (
-            soft_limits[0]
-            .detach()
-            .cpu()
-            .numpy()
-            .astype("<f4", copy=False)
-            .tobytes()
+            soft_limits[0].detach().cpu().numpy().astype("<f4", copy=False).tobytes()
         )
         max_diagnostic_index = int(
             self._max_raw_delta_diagnostic_apply_index.detach().cpu().item()
@@ -756,18 +835,15 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                     self._max_raw_delta_diagnostic_safe_target
                 ),
                 "pose_error_norm": float(
-                    self._max_raw_delta_diagnostic_pose_error_norm
-                    .detach()
-                    .cpu()
-                    .item()
+                    self._max_raw_delta_diagnostic_pose_error_norm.detach().cpu().item()
                 ),
                 "jacobian_finite": True,
                 "jacobian_max_abs": float(
-                    self._max_raw_delta_diagnostic_jacobian_max_abs
-                    .detach()
+                    self._max_raw_delta_diagnostic_jacobian_max_abs.detach()
                     .cpu()
                     .item()
                 ),
+                "eef_quaternion_norm": None,
             }
         return {
             "episode_index": self._active_episode_index,
@@ -777,6 +853,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             "control_dt": self._control_dt,
             "decimation": self._decimation,
             "current_joint_soft_limit_tolerance_rad": CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD,
+            "eef_quaternion_unit_norm_tolerance": EEF_QUATERNION_UNIT_NORM_TOLERANCE,
             "joint_slew_float32_tolerance_rad": JOINT_SLEW_FLOAT32_TOLERANCE_RAD,
             "soft_joint_pos_limit_factor": self._soft_joint_pos_limit_factor,
             "joint_names": list(self._joint_names),
@@ -784,18 +861,12 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             .detach()
             .cpu()
             .tolist(),
-            "joint_effort_limits": self._joint_effort_limits[0]
-            .detach()
-            .cpu()
-            .tolist(),
+            "joint_effort_limits": self._joint_effort_limits[0].detach().cpu().tolist(),
             "max_delta_joint_pos_rad": self._max_delta_joint_pos[0]
             .detach()
             .cpu()
             .tolist(),
-            "soft_joint_pos_limits_rad": soft_limits[0]
-            .detach()
-            .cpu()
-            .tolist(),
+            "soft_joint_pos_limits_rad": soft_limits[0].detach().cpu().tolist(),
             "soft_joint_pos_limits_float32_sha256": hashlib.sha256(
                 soft_limit_bytes
             ).hexdigest(),
@@ -833,24 +904,19 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 "guard_diagnostics_dropped": self._guard_diagnostics_dropped,
             },
             "maxima": {
-                "raw_delta_joint_pos_rad": self._max_raw_delta_joint_pos
-                .detach()
+                "raw_delta_joint_pos_rad": self._max_raw_delta_joint_pos.detach()
                 .cpu()
                 .tolist(),
-                "applied_delta_joint_pos_rad": self._max_applied_delta_joint_pos
-                .detach()
+                "applied_delta_joint_pos_rad": self._max_applied_delta_joint_pos.detach()
                 .cpu()
                 .tolist(),
-                "raw_target_soft_limit_violation_rad": self._max_raw_target_soft_limit_violation
-                .detach()
+                "raw_target_soft_limit_violation_rad": self._max_raw_target_soft_limit_violation.detach()
                 .cpu()
                 .tolist(),
-                "post_clamp_target_soft_limit_violation_rad": self._max_post_clamp_target_soft_limit_violation
-                .detach()
+                "post_clamp_target_soft_limit_violation_rad": self._max_post_clamp_target_soft_limit_violation.detach()
                 .cpu()
                 .tolist(),
-                "current_joint_soft_limit_violation_rad": self._max_current_joint_soft_limit_violation
-                .detach()
+                "current_joint_soft_limit_violation_rad": self._max_current_joint_soft_limit_violation.detach()
                 .cpu()
                 .tolist(),
             },

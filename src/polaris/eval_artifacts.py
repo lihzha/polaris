@@ -402,13 +402,10 @@ def load_resume_results(
         frame["numerical_failure"] = False
     if "numerical_failure_reason" not in frame:
         frame["numerical_failure_reason"] = ""
-    frame["numerical_failure_reason"] = frame[
-        "numerical_failure_reason"
-    ].fillna("")
+    frame["numerical_failure_reason"] = frame["numerical_failure_reason"].fillna("")
     frame = frame.loc[:, list(EVAL_RESULT_COLUMNS)]
     normalized_rows = [
-        canonical_episode_result(row)
-        for row in frame.to_dict(orient="records")
+        canonical_episode_result(row) for row in frame.to_dict(orient="records")
     ]
     frame = (
         pd.DataFrame(normalized_rows, columns=EVAL_RESULT_COLUMNS)

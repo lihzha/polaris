@@ -22,7 +22,7 @@ control mode remain the defaults.
   scoring. It is not used as the LAP state or controller frame.
 - External and wrist images are RGB uint8. Both are resized to 224 square with
   the TensorFlow-compatible half-pixel bilinear resize-and-pad path; the wrist
-  image is rotated 180 degrees before resizing.
+  image is rotated 180 degrees only after that resize-and-pad transform.
 
 Do not feed LAP deltas directly to relative IK and do not use the Robotiq
 `base_link` as the state anchor. Either change violates the checkpoint
@@ -186,8 +186,21 @@ scaling out.
 
 ## Controller smoke and focused tests
 
-The headless controller smoke checks hold, XYZ translation, and XYZ rotation
-against the direct articulation `panda_link8` transform:
+The headless controller smoke checks hold, both signs of XYZ translation, and
+both signs of XYZ rotation against the direct articulation `panda_link8`
+transform. A dedicated final phase resets, sends one deliberately oversized
+absolute +X target for exactly one policy step/eight physics substeps, captures
+the report, and resets immediately. It passes only when the state/report stay
+finite, the slew guard activates, all applied maxima remain within
+`velocity/120 + 1e-6` rad, and abort/post-clamp violation counts remain zero:
+
+Before any DLS pose-error computation, both the measured and commanded EEF
+quaternions must be finite and have norm within exactly `1e-3` of one. Current
+and desired violations have distinct invariant-abort diagnostics. Durable
+episode evidence uses closed key schemas and exact diagnostic-to-counter
+mapping; unknown aborts, dropped diagnostics, or a missing/inconsistent
+max-raw-delta record invalidate the episode. State/action arrays are checked
+again after float32 conversion, and JSONL traces forbid non-finite constants.
 
 ```bash
 python scripts/smoke_eef_pose_controller.py --headless

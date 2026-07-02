@@ -1,5 +1,10 @@
 """Lightweight constants for the canonical PolaRiS EEF IK safety profile."""
 
+from __future__ import annotations
+
+import math
+from typing import Any
+
 EEF_IK_SAFETY_PROFILE = "panda_velocity_softlimit_v1"
 EEF_IK_APPLY_CADENCE = "physics_substep"
 CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD = 1e-5
@@ -7,6 +12,7 @@ CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD = 1e-5
 # slew bound.  Keep this identical in the controller, runtime validation, and
 # the downstream Ego-LAP completion contract.
 JOINT_SLEW_FLOAT32_TOLERANCE_RAD = 1e-6
+EEF_QUATERNION_UNIT_NORM_TOLERANCE = 1e-3
 
 PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S = (
     2.175,
@@ -42,3 +48,58 @@ PANDA_SOFT_JOINT_POS_LIMITS_RAD = (
 PANDA_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256 = (
     "d7ec7ea6108d670f910c43a9fba370e5023c7a5b9aa31df06b89ffc172529e00"
 )
+
+
+def validate_one_step_adversarial_report(report: dict[str, Any]) -> dict[str, Any]:
+    """Validate the dedicated one-policy-step slew-guard smoke evidence."""
+
+    counters = report.get("counters")
+    maxima = report.get("maxima")
+    bounds = report.get("max_delta_joint_pos_rad")
+    if not isinstance(counters, dict) or not isinstance(maxima, dict):
+        raise ValueError("Adversarial EEF smoke report lacks counters/maxima")
+    if counters.get("apply_calls") != 8 or counters.get("environment_substeps") != 8:
+        raise ValueError(
+            "Adversarial EEF smoke must execute exactly 8 physics substeps"
+        )
+    if (
+        type(counters.get("slew_limit_events")) is not int
+        or counters["slew_limit_events"] < 1
+    ):
+        raise ValueError("Adversarial EEF smoke did not activate the slew guard")
+    abort_count = sum(
+        counters.get(name, -1)
+        for name in (
+            "current_joint_limit_aborts",
+            "invariant_aborts",
+            "nonfinite_aborts",
+        )
+    )
+    if abort_count != 0 or counters.get("post_clamp_target_violations") != 0:
+        raise ValueError("Adversarial EEF smoke triggered an abort/invariant violation")
+    applied = maxima.get("applied_delta_joint_pos_rad")
+    if (
+        not isinstance(applied, list)
+        or len(applied) != 7
+        or not isinstance(bounds, list)
+        or len(bounds) != 7
+    ):
+        raise ValueError("Adversarial EEF smoke has invalid per-joint slew evidence")
+    for actual, bound in zip(applied, bounds, strict=True):
+        if (
+            isinstance(actual, bool)
+            or isinstance(bound, bool)
+            or not isinstance(actual, (int, float))
+            or not isinstance(bound, (int, float))
+            or not math.isfinite(float(actual))
+            or not math.isfinite(float(bound))
+            or actual > bound + JOINT_SLEW_FLOAT32_TOLERANCE_RAD
+        ):
+            raise ValueError("Adversarial EEF smoke exceeded its float32 slew bound")
+    return {
+        "apply_calls": 8,
+        "slew_limit_events": counters["slew_limit_events"],
+        "abort_count": abort_count,
+        "post_clamp_target_violations": 0,
+        "applied_within_bounds": True,
+    }

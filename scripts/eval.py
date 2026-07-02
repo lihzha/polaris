@@ -165,9 +165,11 @@ def main(eval_args: EvalArgs):
             "Transactional Ego-LAP evaluation requires trace_dir with one "
             "immutable finalized trace per episode"
         )
-    if is_ego_lap and Path(eval_args.policy.trace_dir).resolve() != (
-        run_folder / "policy_traces"
-    ).resolve():
+    if (
+        is_ego_lap
+        and Path(eval_args.policy.trace_dir).resolve()
+        != (run_folder / "policy_traces").resolve()
+    ):
         raise ValueError(
             "Transactional Ego-LAP evaluation requires trace_dir inside the "
             "run folder at policy_traces/"
@@ -238,9 +240,7 @@ def main(eval_args: EvalArgs):
             if "episode" in episode_df
             else []
         )
-        sidecars = load_episode_safety_sidecars(
-            safety_dir, committed_episode_indices
-        )
+        sidecars = load_episode_safety_sidecars(safety_dir, committed_episode_indices)
         aggregate_safety = aggregate_episode_safety(runtime_safety, sidecars)
         atomic_write_runtime_contract(
             Path(eval_args.runtime_contract_output),

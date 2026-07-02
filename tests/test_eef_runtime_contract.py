@@ -20,11 +20,13 @@ from polaris.eef_runtime_contract import validate_eef_runtime_safety
 from polaris.eef_runtime_contract import validate_ego_lap_runtime_protocol
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
+from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_RAD
+from polaris.eef_ik_safety import validate_one_step_adversarial_report
 from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
 from polaris.eval_artifacts import build_episode_artifact_identity
 from polaris.eval_artifacts import empty_eval_results
@@ -77,6 +79,7 @@ def _runtime_fixture():
         "control_dt": 1.0 / 15.0,
         "decimation": 8,
         "current_joint_soft_limit_tolerance_rad": 1e-5,
+        "eef_quaternion_unit_norm_tolerance": EEF_QUATERNION_UNIT_NORM_TOLERANCE,
         "joint_slew_float32_tolerance_rad": JOINT_SLEW_FLOAT32_TOLERANCE_RAD,
         "soft_joint_pos_limit_factor": 1.0,
         "joint_names": [f"panda_joint{index}" for index in range(1, 8)],
@@ -114,9 +117,7 @@ def _runtime_fixture():
         max_episode_length=450,
         step_dt=1.0 / 15.0,
         physics_dt=1.0 / 120.0,
-        cfg=SimpleNamespace(
-            sim=SimpleNamespace(dt=1.0 / 120.0), decimation=8
-        ),
+        cfg=SimpleNamespace(sim=SimpleNamespace(dt=1.0 / 120.0), decimation=8),
         scene={"robot": robot},
         action_manager=SimpleNamespace(
             _terms={"arm": arm_term, "finger_joint": finger_term}
@@ -152,6 +153,25 @@ def _episode_safety(*, episode=0, length=2, numerical_failure=False):
     apply_calls = length * 8 if not numerical_failure else (length - 1) * 8 + 3
     report["counters"]["apply_calls"] = apply_calls
     report["counters"]["environment_substeps"] = apply_calls
+    zero_vector = {
+        "values": [0.0] * 7,
+        "finite_mask": [True] * 7,
+        "finite_count": 7,
+    }
+    report["max_raw_delta_diagnostic"] = {
+        "kind": "max_raw_delta",
+        "episode_index": episode,
+        "policy_step": 0,
+        "physics_substep": 0,
+        "joint_pos_rad": zero_vector,
+        "raw_delta_joint_pos_rad": zero_vector,
+        "raw_joint_pos_target_rad": zero_vector,
+        "safe_joint_pos_target_rad": zero_vector,
+        "pose_error_norm": 0.0,
+        "jacobian_finite": True,
+        "jacobian_max_abs": 0.0,
+        "eef_quaternion_norm": None,
+    }
     if numerical_failure:
         report["counters"]["nonfinite_aborts"] = 1
         report["guard_diagnostics"] = [
@@ -167,6 +187,7 @@ def _episode_safety(*, episode=0, length=2, numerical_failure=False):
                 "pose_error_norm": None,
                 "jacobian_finite": None,
                 "jacobian_max_abs": None,
+                "eef_quaternion_norm": None,
             }
         ]
     return report
@@ -183,9 +204,7 @@ def _write_completed_trace(path: Path, result):
             "event": "episode_complete",
             **result,
             "status": (
-                "numerical_failure"
-                if result["numerical_failure"]
-                else "completed"
+                "numerical_failure" if result["numerical_failure"] else "completed"
             ),
         },
     ]
@@ -273,13 +292,14 @@ def test_runtime_contract_is_atomic_and_has_exact_evidence_schema():
     protocol = validate_ego_lap_runtime_protocol(env)
     frame = validate_eef_runtime_frame(env, observation)
     safety = validate_eef_runtime_safety(env)
+    aggregate_safety = aggregate_episode_safety(safety, [])
 
     with tempfile.TemporaryDirectory() as temporary_directory:
         path = Path(temporary_directory) / "nested" / "runtime.json"
         path.parent.mkdir(parents=True)
         path.write_text('{"stale": true}\n', encoding="utf-8")
         atomic_write_runtime_contract(
-            path, protocol=protocol, frame=frame, ik_safety=safety
+            path, protocol=protocol, frame=frame, ik_safety=aggregate_safety
         )
         payload = json.loads(path.read_text(encoding="utf-8"))
 
@@ -294,7 +314,7 @@ def test_runtime_contract_is_atomic_and_has_exact_evidence_schema():
                 "decimation": 8,
             },
             "frame": frame,
-            "ik_safety": safety,
+            "ik_safety": aggregate_safety,
         }
         assert not list(path.parent.glob(".*.tmp"))
 
@@ -338,9 +358,7 @@ def test_prepared_sidecar_recovers_exact_missing_csv_row(tmp_path: Path):
 
 
 def test_transaction_recovery_is_idempotent_after_csv_commit(tmp_path: Path):
-    result, sidecar_path, payload = _prepare_episode_transaction(
-        tmp_path, episode=0
-    )
+    result, sidecar_path, payload = _prepare_episode_transaction(tmp_path, episode=0)
     committed, changed = reconcile_episode_safety_transactions(
         pd.DataFrame([result]),
         directory=sidecar_path.parent,
@@ -356,6 +374,7 @@ def test_transaction_recovery_is_idempotent_after_csv_commit(tmp_path: Path):
 
     drifted_safety = _episode_safety()
     drifted_safety["counters"]["slew_limit_events"] = 1
+    drifted_safety["counters"]["slew_limited_joints"] = 1
     with pytest.raises(ValueError, match="Refusing to overwrite drifted"):
         atomic_write_episode_safety(
             sidecar_path,
@@ -435,9 +454,7 @@ def test_transaction_recovery_archives_uncommitted_artifacts_without_deleting_ev
 def test_runtime_aggregate_reconstructs_all_resume_history(tmp_path: Path):
     for episode in range(2):
         _prepare_episode_transaction(tmp_path, episode=episode)
-    sidecars = load_episode_safety_sidecars(
-        tmp_path / "ik_safety", [0, 1]
-    )
+    sidecars = load_episode_safety_sidecars(tmp_path / "ik_safety", [0, 1])
     env, _ = _runtime_fixture()
     live = env.unwrapped.action_manager._terms["arm"].safety_report()
     aggregate = aggregate_episode_safety(live, sidecars)
@@ -520,16 +537,117 @@ def test_episode_safety_cadence_binds_success_and_failure_substep():
         )
 
 
+def test_episode_safety_rejects_schema_counter_and_unknown_abort_tamper():
+    extra = _episode_safety()
+    extra["unexpected"] = True
+    with pytest.raises(ValueError, match="schema drift"):
+        validate_episode_safety_cadence(safety=extra, episode_result=_episode_result())
+
+    mismatched = _episode_safety(numerical_failure=True)
+    mismatched["counters"]["nonfinite_aborts"] = 2
+    with pytest.raises(ValueError, match="counter history is impossible"):
+        validate_episode_safety_cadence(
+            safety=mismatched,
+            episode_result=_episode_result(numerical_failure=True),
+        )
+
+    unknown = _episode_safety(numerical_failure=True)
+    unknown["guard_diagnostics"][0]["kind"] = "unknown_abort"
+    with pytest.raises(ValueError, match="kind is not allowed"):
+        validate_episode_safety_cadence(
+            safety=unknown,
+            episode_result=_episode_result(numerical_failure=True),
+        )
+
+    dropped = _episode_safety()
+    dropped["counters"]["guard_diagnostics_dropped"] = 1
+    with pytest.raises(ValueError, match="dropped durable"):
+        validate_episode_safety_cadence(
+            safety=dropped, episode_result=_episode_result()
+        )
+
+
+def test_completed_episode_requires_consistent_max_raw_diagnostic():
+    missing = _episode_safety()
+    missing["max_raw_delta_diagnostic"] = None
+    with pytest.raises(ValueError, match="lacks max-raw-delta"):
+        validate_episode_safety_cadence(
+            safety=missing, episode_result=_episode_result()
+        )
+
+    inconsistent = _episode_safety()
+    inconsistent["maxima"]["raw_delta_joint_pos_rad"][0] = 0.25
+    with pytest.raises(ValueError, match="disagrees with maxima"):
+        validate_episode_safety_cadence(
+            safety=inconsistent, episode_result=_episode_result()
+        )
+
+    incomplete_vectors = _episode_safety()
+    incomplete_vectors["max_raw_delta_diagnostic"]["joint_pos_rad"] = None
+    with pytest.raises(ValueError, match="max-raw diagnostic is non-finite"):
+        validate_episode_safety_cadence(
+            safety=incomplete_vectors, episode_result=_episode_result()
+        )
+
+
+def test_episode_safety_rejects_impossible_counter_and_diagnostic_history():
+    impossible_events = _episode_safety()
+    impossible_events["counters"]["slew_limit_events"] = 17
+    impossible_events["counters"]["slew_limited_joints"] = 17
+    with pytest.raises(ValueError, match="history is impossible"):
+        validate_episode_safety_cadence(
+            safety=impossible_events, episode_result=_episode_result()
+        )
+
+    multiple_abort = _episode_safety(numerical_failure=True)
+    duplicate = json.loads(json.dumps(multiple_abort["guard_diagnostics"][0]))
+    multiple_abort["guard_diagnostics"].append(duplicate)
+    multiple_abort["counters"]["nonfinite_aborts"] = 2
+    with pytest.raises(ValueError, match="history is impossible|exactly one"):
+        validate_episode_safety_cadence(
+            safety=multiple_abort,
+            episode_result=_episode_result(numerical_failure=True),
+        )
+
+    out_of_order = _episode_safety(numerical_failure=True)
+    fallback = json.loads(json.dumps(out_of_order["guard_diagnostics"][0]))
+    fallback["kind"] = "dls_pseudoinverse_fallback"
+    fallback["policy_step"] = 0
+    fallback["physics_substep"] = 0
+    out_of_order["guard_diagnostics"].append(fallback)
+    out_of_order["counters"]["dls_fallbacks"] = 1
+    with pytest.raises(ValueError, match="out of order"):
+        validate_episode_safety_cadence(
+            safety=out_of_order,
+            episode_result=_episode_result(numerical_failure=True),
+        )
+
+
 def test_episode_sidecar_strict_json_rejects_nan(tmp_path: Path):
     safety = _episode_safety()
     safety["maxima"]["raw_delta_joint_pos_rad"][0] = float("nan")
-    with pytest.raises(ValueError, match="Out of range float values"):
+    with pytest.raises(ValueError, match="maximum raw_delta_joint_pos_rad is invalid"):
         atomic_write_episode_safety(
             tmp_path / "episode_000000.json",
             episode_index=0,
             episode_result=_episode_result(),
             safety=safety,
-            artifact_identity={"video": {}, "terminal_trace": {}},
+            artifact_identity={
+                "video": {
+                    "filename": "episode_0.mp4",
+                    "size_bytes": 1,
+                    "sha256": "0" * 64,
+                    "frame_count": 2,
+                    "height": 224,
+                    "width": 448,
+                },
+                "terminal_trace": {
+                    "filename": "episode_000000.jsonl",
+                    "size_bytes": 1,
+                    "sha256": "0" * 64,
+                    "episode_result": _episode_result(),
+                },
+            },
         )
     assert not (tmp_path / "episode_000000.json").exists()
 
@@ -623,8 +741,10 @@ def test_runtime_safety_diagnostic_requires_strict_null_and_finite_mask():
         "pose_error_norm": None,
         "jacobian_finite": False,
         "jacobian_max_abs": None,
+        "eef_quaternion_norm": None,
     }
     report["guard_diagnostics"] = [diagnostic]
+    report["counters"]["nonfinite_aborts"] = 1
     env.unwrapped.action_manager._terms["arm"].safety_report = lambda: report
     validated = validate_eef_runtime_safety(env)
     json.dumps(validated, allow_nan=False)
@@ -632,6 +752,60 @@ def test_runtime_safety_diagnostic_requires_strict_null_and_finite_mask():
     diagnostic["joint_pos_rad"]["values"][1] = 1.0
     with pytest.raises(ValueError, match="nonfinite value must be null"):
         validate_eef_runtime_safety(env)
+
+    diagnostic["joint_pos_rad"]["values"][1] = None
+    diagnostic["eef_quaternion_norm"] = float("nan")
+    with pytest.raises(ValueError, match="eef_quaternion_norm is non-finite"):
+        validate_eef_runtime_safety(env)
+
+
+def test_runtime_safety_binds_exact_quaternion_unit_norm_tolerance():
+    env, _ = _runtime_fixture()
+    report = env.unwrapped.action_manager._terms["arm"].safety_report()
+    validate_eef_runtime_safety(env)
+
+    report["eef_quaternion_unit_norm_tolerance"] = (
+        EEF_QUATERNION_UNIT_NORM_TOLERANCE * 2
+    )
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: report
+    with pytest.raises(ValueError, match="quaternion_tolerance"):
+        validate_eef_runtime_safety(env)
+
+
+def test_one_step_adversarial_smoke_requires_bounded_active_slew_guard():
+    report = _episode_safety()
+    report["counters"]["apply_calls"] = 8
+    report["counters"]["environment_substeps"] = 8
+    report["counters"]["slew_limit_events"] = 1
+    report["counters"]["slew_limited_joints"] = 1
+    report["maxima"]["applied_delta_joint_pos_rad"] = list(
+        report["max_delta_joint_pos_rad"]
+    )
+
+    evidence = validate_one_step_adversarial_report(report)
+    assert evidence["apply_calls"] == 8
+    assert evidence["slew_limit_events"] == 1
+    assert evidence["applied_within_bounds"] is True
+
+    no_guard = json.loads(json.dumps(report))
+    no_guard["counters"]["slew_limit_events"] = 0
+    with pytest.raises(ValueError, match="did not activate"):
+        validate_one_step_adversarial_report(no_guard)
+
+    unsafe = json.loads(json.dumps(report))
+    unsafe["maxima"]["applied_delta_joint_pos_rad"][0] += 2e-6
+    with pytest.raises(ValueError, match="exceeded"):
+        validate_one_step_adversarial_report(unsafe)
+
+    smoke_source = (
+        Path(__file__).parents[1] / "scripts" / "smoke_eef_pose_controller.py"
+    ).read_text()
+    for axis in "xyz":
+        assert f'"translate +{axis}"' in smoke_source
+        assert f'"translate -{axis}"' in smoke_source
+        assert f'"rotate +{axis}"' in smoke_source
+        assert f'"rotate -{axis}"' in smoke_source
+
 
 @pytest.mark.parametrize(
     ("field", "value", "match"),

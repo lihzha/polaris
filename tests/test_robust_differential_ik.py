@@ -11,9 +11,11 @@ from polaris.robust_differential_ik import (
     RobustDifferentialIKController,
     RobustDifferentialInverseKinematicsAction,
     _bound_joint_position_target,
+    _eef_quaternion_norm_is_valid,
     _require_current_joint_position_in_soft_limits,
     _require_finite,
 )
+from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 
 
 def _controller(controller_type, *, damping=0.01):
@@ -75,10 +77,8 @@ def test_joint_target_safety_preserves_healthy_target_and_bounds_outlier():
     soft_limits = torch.tensor([[[-1.0, 1.0]] * 7])
 
     healthy = torch.tensor([[0.01, -0.01, 0.0, 0.005, 0.0, 0.01, -0.01]])
-    safe, raw_delta, slew_limited, position_limited = (
-        _bound_joint_position_target(
-            joint_pos, healthy, max_delta, soft_limits
-        )
+    safe, raw_delta, slew_limited, position_limited = _bound_joint_position_target(
+        joint_pos, healthy, max_delta, soft_limits
     )
     torch.testing.assert_close(safe, healthy, rtol=0.0, atol=0.0)
     torch.testing.assert_close(raw_delta, healthy, rtol=0.0, atol=0.0)
@@ -140,11 +140,70 @@ def test_joint_target_safety_rejects_nonfinite_and_out_of_limit_current_state():
         _require_current_joint_position_in_soft_limits(outside, soft_limits)
 
 
-def test_current_limit_and_slew_invariants_abort_before_physx_target_setter():
-    source = inspect.getsource(
-        RobustDifferentialInverseKinematicsAction.apply_actions
+@pytest.mark.parametrize(
+    ("norm", "expected"),
+    [
+        (0.0, False),
+        (1e-12, False),
+        (1.0 + EEF_QUATERNION_UNIT_NORM_TOLERANCE + 1e-4, False),
+        (1.0 - EEF_QUATERNION_UNIT_NORM_TOLERANCE / 2, True),
+        (1.0 + EEF_QUATERNION_UNIT_NORM_TOLERANCE / 2, True),
+        (1.0, True),
+    ],
+)
+def test_eef_quaternion_named_unit_norm_guard(norm, expected):
+    quaternion = torch.tensor([[norm, 0.0, 0.0, 0.0]], dtype=torch.float64)
+
+    norms, valid = _eef_quaternion_norm_is_valid(quaternion)
+
+    assert norms.item() == norm
+    assert valid.item() is expected
+
+
+def test_eef_quaternion_named_unit_norm_guard_rejects_nonfinite():
+    for value in (float("nan"), float("inf"), torch.finfo(torch.float32).max):
+        _, valid = _eef_quaternion_norm_is_valid(torch.tensor([[value, 0.0, 0.0, 0.0]]))
+        assert not valid.item()
+
+
+def test_huge_finite_diagnostic_scalars_remain_strict_json_finite():
+    action = object.__new__(RobustDifferentialInverseKinematicsAction)
+    action._apply_call_count = 1
+    action._active_episode_index = 0
+    action._decimation = 8
+    diagnostic = action._diagnostic_record(
+        kind="current_eef_quaternion_invariant_abort",
+        joint_pos=torch.zeros(1, 7),
+        raw_delta=None,
+        raw_target=None,
+        safe_target=None,
+        pose_error=torch.full((1, 6), torch.finfo(torch.float32).max),
+        jacobian=torch.full((1, 6, 7), torch.finfo(torch.float32).max),
+        eef_quaternion_norm=torch.tensor(
+            [torch.finfo(torch.float32).max], dtype=torch.float64
+        ),
     )
+
+    assert torch.isfinite(
+        torch.tensor(diagnostic["pose_error_norm"], dtype=torch.float64)
+    )
+    assert torch.isfinite(
+        torch.tensor(diagnostic["jacobian_max_abs"], dtype=torch.float64)
+    )
+    assert torch.isfinite(
+        torch.tensor(diagnostic["eef_quaternion_norm"], dtype=torch.float64)
+    )
+
+
+def test_current_limit_and_slew_invariants_abort_before_physx_target_setter():
+    source = inspect.getsource(RobustDifferentialInverseKinematicsAction.apply_actions)
     setter = source.index("self._asset.set_joint_position_target")
+    assert source.index("if not current_quaternion_valid:") < setter
+    assert source.index("if not desired_quaternion_valid:") < setter
+    assert source.index("self._ik_controller.ee_quat_des") < setter
+    assert source.index(
+        '_require_finite(current_state, field="current EEF/joint state")'
+    ) < source.index("self._max_current_joint_soft_limit_violation")
     assert source.index("if current_invalid:") < setter
     assert source.index("if target_invalid:") < setter
     assert source.index("if slew_invalid:") < setter
@@ -188,7 +247,9 @@ def test_eef_velocity_and_effort_limits_are_scoped_to_eef_setup():
     configure_call = eval_source.index(
         "configure_eef_pose_joint_safety(env_cfg.scene.robot)"
     )
-    native_branch = eval_source.index('elif eval_args.control_mode != "joint-position":')
+    native_branch = eval_source.index(
+        'elif eval_args.control_mode != "joint-position":'
+    )
     assert eef_branch < configure_call < native_branch
 
     configure_eef_pose_joint_safety(eef_cfg)

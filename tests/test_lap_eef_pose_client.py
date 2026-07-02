@@ -961,6 +961,18 @@ class PoseConversionTest(unittest.TestCase):
         self.assertEqual(open_state[-1], 1.0)
         self.assertEqual(closed_state[-1], 0.0)
 
+    def test_state_rejects_huge_finite_value_that_overflows_float32(self):
+        with (
+            np.errstate(over="ignore"),
+            self.assertRaisesRegex(ValueError, "overflows float32"),
+        ):
+            build_lap_state(
+                np.array([np.finfo(np.float64).max, 0.0, 0.0]),
+                np.array([1.0, 0.0, 0.0, 0.0]),
+                np.array([0.0]),
+                state_layout=R6_COLUMNS_STATE_LAYOUT,
+            )
+
     def test_entire_chunk_uses_one_anchor_and_right_relative_rotations(self):
         anchor_position = np.array([0.5, -0.1, 0.2])
         anchor_rotation = Rotation.from_euler("z", 90, degrees=True)
@@ -995,6 +1007,19 @@ class PoseConversionTest(unittest.TestCase):
         )
 
         np.testing.assert_array_equal(actions[:, 7], np.array([1.0, 1.0, 0.0]))
+
+    def test_anchored_actions_reject_huge_finite_float32_overflow(self):
+        deltas = np.zeros((1, 7), dtype=np.float64)
+        deltas[0, 0] = np.finfo(np.float64).max
+        with (
+            np.errstate(over="ignore"),
+            self.assertRaisesRegex(ValueError, "overflow float32"),
+        ):
+            anchor_action_chunk(
+                deltas,
+                np.zeros(3),
+                np.array([1.0, 0.0, 0.0, 0.0]),
+            )
 
     def test_egocentric_droid_chunk_is_inverted_before_anchoring(self):
         anchor_position = np.array([0.5, -0.1, 0.2])
@@ -1409,6 +1434,21 @@ class ClientContractTest(unittest.TestCase):
         )
         self.assertEqual(query["raw_delta_chunk"][-1][0], 0.16)
         self.assertEqual(query["execution_horizon"], 8)
+
+    def test_trace_writes_and_legacy_reconciliation_require_strict_json(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trace_path = Path(temporary_directory) / "trace.jsonl"
+            client = object.__new__(EgoLAPEefPoseClient)
+            client.trace_dir = None
+            client.trace_path = trace_path
+            client._active_trace_path = None
+
+            with self.assertRaisesRegex(ValueError, "Out of range float"):
+                client._write_trace({"event": "query", "value": float("nan")})
+
+            trace_path.write_text('{"episode":0,"value":NaN}\n')
+            with self.assertRaisesRegex(ValueError, "not strict JSONL"):
+                client._reconcile_legacy_trace(resume_episode=1)
 
     def test_per_episode_trace_uses_global_id_and_reconciles_partial_retry(self):
         fake_server = _FakePolicyServer(

@@ -162,10 +162,15 @@
 
 ## 2026-07-02 — EEF IK safety v3 remediation (in progress)
 
-- Two preserved v2 BlockStack rollouts independently reached a non-finite
-  Jacobian after an unbounded DLS joint target: episode 12/action 360 and
-  episode 38/action 242. Historical v2 results are not rewritten and are
-  explicitly superseded for future publication.
+- Three preserved v2 BlockStack rollouts independently reached a non-finite
+  Jacobian after an unbounded DLS joint target: episode 12/action 360,
+  episode 38/action 242, and episode 47/action 216. Historical v2 results are
+  not rewritten and are explicitly superseded for future publication.
+- The requested v2 diagnostic jobs are now terminal: BlockStack completed
+  50/50 with 0 successes, mean progress 0.1429, and three numerical failures;
+  FoodBussing completed 50/50 with 0 successes, mean progress 0.1467, and no
+  numerical failures. Both marker trees remain preserved as non-publishable v2
+  evidence, and the diagnostic monitor was stopped after terminal inspection.
 - The opt-in EEF controller now installs explicit Panda arm simulation
   velocity/effort limits, bounds every target at the 120-Hz physics-substep
   cadence, clamps to the exact float32 7x2 soft limits, and aborts current-state,
@@ -184,3 +189,16 @@
   3600-apply-call full-horizon canaries, wall-time comparison, and downstream
   Ego-LAP completion review remain mandatory before any v3 checkpoint result is
   publishable.
+- Prelaunch review expanded the standalone smoke to hold plus all ±XYZ/±RXYZ
+  directions and a bounded one-step oversized-target phase. The adversarial
+  phase must record exactly eight apply calls, at least one slew event, finite
+  state/strict-JSON evidence, no abort/post-clamp violations, and per-joint
+  applied maxima no larger than `velocity/120 + 1e-6`, followed immediately by
+  reset.
+- The controller now rejects finite but non-unit current or desired EEF
+  quaternions before pose-error computation using the profile-bound `1e-3`
+  norm tolerance. Strict evidence validation closes the sidecar, aggregate,
+  artifact-identity, diagnostic, and counter schemas; completed rollouts also
+  bind the max-raw diagnostic to aggregate maxima. Float32 state/action casts
+  and JSONL writes are rechecked so huge finite inputs cannot become Inf/NaN
+  artifacts.

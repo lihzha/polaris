@@ -13,6 +13,7 @@ from openpi_client import websocket_client_policy
 from scipy.spatial.transform import Rotation
 
 from polaris.config import LAP_EEF_FRAME, PolicyArgs
+from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.policy.abstract_client import InferenceClient
 from polaris.policy.ego_lap_contract import GRIPPER_EXECUTION_THRESHOLD
 from polaris.policy.ego_lap_contract import R6_COLUMNS_STATE_LAYOUT
@@ -114,7 +115,10 @@ def build_lap_state(
     state = np.concatenate([position, rot6d, np.array([open_gripper])])
     if state.shape != (10,) or not np.isfinite(state).all():
         raise ValueError(f"Invalid Ego-LAP state with shape {state.shape}")
-    return state.astype(np.float32)
+    state_float32 = state.astype(np.float32)
+    if not np.isfinite(state_float32).all():
+        raise ValueError("Ego-LAP state overflows float32 after serialization cast")
+    return state_float32
 
 
 def validate_action_chunk(
@@ -286,7 +290,22 @@ def anchor_action_chunk(
     actions = np.concatenate([target_positions, target_wxyz, closed_gripper], axis=1)
     if actions.shape != (len(delta_actions), 8) or not np.isfinite(actions).all():
         raise ValueError(f"Invalid anchored PolaRiS actions with shape {actions.shape}")
-    return actions.astype(np.float32)
+    actions_float32 = actions.astype(np.float32)
+    if not np.isfinite(actions_float32).all():
+        raise ValueError(
+            "Anchored PolaRiS actions overflow float32 after serialization cast"
+        )
+    quaternion_norms = np.linalg.norm(
+        actions_float32[:, 3:7].astype(np.float64), axis=1
+    )
+    if not np.isfinite(quaternion_norms).all() or np.any(
+        np.abs(quaternion_norms - 1.0) > EEF_QUATERNION_UNIT_NORM_TOLERANCE
+    ):
+        raise ValueError(
+            "Anchored PolaRiS target quaternion violates the post-float32 "
+            "unit-norm contract"
+        )
+    return actions_float32
 
 
 def _rgb_uint8(image: Any, *, name: str) -> np.ndarray:
@@ -826,7 +845,13 @@ class EgoLAPEefPoseClient(InferenceClient):
         payload = {"timestamp": time.time(), **record}
         with path.open("a", encoding="utf-8") as trace_file:
             trace_file.write(
-                json.dumps(payload, separators=(",", ":"), default=_json_default) + "\n"
+                json.dumps(
+                    payload,
+                    separators=(",", ":"),
+                    default=_json_default,
+                    allow_nan=False,
+                )
+                + "\n"
             )
 
     def _begin_episode_trace(self) -> None:
@@ -848,14 +873,27 @@ class EgoLAPEefPoseClient(InferenceClient):
         if self.trace_path is None or not self.trace_path.exists():
             return
         retained: list[str] = []
-        for line in self.trace_path.read_text(encoding="utf-8").splitlines():
+        for line_number, line in enumerate(
+            self.trace_path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
             try:
-                record = json.loads(line)
-                record_episode = (
-                    record.get("episode") if isinstance(record, dict) else None
+                record = json.loads(
+                    line,
+                    parse_constant=lambda value: (_ for _ in ()).throw(
+                        ValueError(f"non-finite JSON constant {value!r}")
+                    ),
                 )
-            except json.JSONDecodeError:
-                continue
+            except (json.JSONDecodeError, ValueError) as error:
+                raise ValueError(
+                    "Legacy Ego-LAP trace is not strict JSONL at line "
+                    f"{line_number}: {error}"
+                ) from error
+            if not isinstance(record, dict):
+                raise ValueError(
+                    "Legacy Ego-LAP trace record is not an object at line "
+                    f"{line_number}"
+                )
+            record_episode = record.get("episode")
             if isinstance(record_episode, int) and record_episode < resume_episode:
                 retained.append(line)
         temporary = self.trace_path.with_name(

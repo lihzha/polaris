@@ -51,6 +51,7 @@ def main() -> int:
     from polaris.config import LAP_EEF_FRAME
     from polaris.eef_runtime_contract import validate_eef_runtime_frame
     from polaris.eef_runtime_contract import validate_eef_runtime_safety
+    from polaris.eef_ik_safety import validate_one_step_adversarial_report
     from polaris.eef_runtime_contract import begin_eef_safety_episode
     from polaris.eef_runtime_contract import eef_episode_safety_report
     from polaris.environments.droid_cfg import EefPoseActionCfg
@@ -83,17 +84,31 @@ def main() -> int:
     test_cases = [
         ("hold", np.zeros(6)),
         ("translate +x", np.array([delta, 0.0, 0.0, 0.0, 0.0, 0.0])),
+        ("translate -x", np.array([-delta, 0.0, 0.0, 0.0, 0.0, 0.0])),
         ("translate +y", np.array([0.0, delta, 0.0, 0.0, 0.0, 0.0])),
+        ("translate -y", np.array([0.0, -delta, 0.0, 0.0, 0.0, 0.0])),
         ("translate +z", np.array([0.0, 0.0, delta, 0.0, 0.0, 0.0])),
+        ("translate -z", np.array([0.0, 0.0, -delta, 0.0, 0.0, 0.0])),
         ("rotate +x", np.array([0.0, 0.0, 0.0, angle, 0.0, 0.0])),
+        ("rotate -x", np.array([0.0, 0.0, 0.0, -angle, 0.0, 0.0])),
         ("rotate +y", np.array([0.0, 0.0, 0.0, 0.0, angle, 0.0])),
+        ("rotate -y", np.array([0.0, 0.0, 0.0, 0.0, -angle, 0.0])),
         ("rotate +z", np.array([0.0, 0.0, 0.0, 0.0, 0.0, angle])),
+        ("rotate -z", np.array([0.0, 0.0, 0.0, 0.0, 0.0, -angle])),
     ]
 
     failures = 0
     results = []
     safety_reports = []
+    adversarial_result = None
     try:
+        arm_term = env.unwrapped.action_manager._terms["arm"]
+        initial_capture = arm_term.safety_report()
+        print(
+            "POLARIS_EEF_IK_SAFETY_CAPTURE="
+            + json.dumps(initial_capture, sort_keys=True, allow_nan=False),
+            flush=True,
+        )
         for case_index, (label, pose_delta) in enumerate(test_cases):
             observation, _ = env.reset(expensive=False)
             begin_eef_safety_episode(env, case_index)
@@ -152,16 +167,81 @@ def main() -> int:
                 }
             )
             validate_eef_runtime_safety(env)
-            safety_reports.append(eef_episode_safety_report(env, case_index))
+            safety_report = eef_episode_safety_report(env, case_index)
+            expected_apply_calls = args_cli.hold_steps * 8
+            if safety_report["counters"]["apply_calls"] != expected_apply_calls:
+                raise RuntimeError(
+                    f"Smoke case {label!r} expected {expected_apply_calls} "
+                    "physics-substep apply calls, got "
+                    f"{safety_report['counters']['apply_calls']}"
+                )
+            safety_reports.append(safety_report)
             print(
                 f"{label:>14}: {'PASS' if passed else 'FAIL'} "
                 f"position_error={position_error * 1000:.2f}mm "
                 f"rotation_error={math.degrees(rotation_error):.2f}deg"
             )
+
+        # One bounded adversarial target proves that the guard activates while
+        # preserving a finite simulator state. Never hold this target beyond
+        # the one policy step; reset immediately after evidence capture.
+        adversarial_index = len(test_cases)
+        observation, _ = env.reset(expensive=False)
+        begin_eef_safety_episode(env, adversarial_index)
+        anchor_position = observation["policy"]["eef_pos"][0].detach().cpu().numpy()
+        anchor_quaternion = observation["policy"]["eef_quat"][0].detach().cpu().numpy()
+        oversized_delta = np.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])
+        oversized_target = anchor_action_chunk(
+            oversized_delta, anchor_position, anchor_quaternion
+        )[0]
+        adversarial_observation, _, terminated, truncated, _ = env.step(
+            torch.as_tensor(oversized_target, device=env.device).reshape(1, -1),
+            expensive=False,
+        )
+        state_is_finite = bool(
+            torch.isfinite(adversarial_observation["policy"]["eef_pos"]).all()
+            and torch.isfinite(adversarial_observation["policy"]["eef_quat"]).all()
+        )
+        adversarial_safety = eef_episode_safety_report(env, adversarial_index)
+        json.dumps(adversarial_safety, allow_nan=False)
+        counters = adversarial_safety["counters"]
+        try:
+            guard_evidence = validate_one_step_adversarial_report(adversarial_safety)
+            guard_error = ""
+        except ValueError as error:
+            guard_evidence = None
+            guard_error = str(error)
+        adversarial_passed = (
+            not bool(terminated[0])
+            and not bool(truncated[0])
+            and state_is_finite
+            and guard_evidence is not None
+        )
+        adversarial_result = {
+            "case": "oversized absolute +x target for one policy step",
+            "passed": adversarial_passed,
+            "state_is_finite": state_is_finite,
+            "terminated": bool(terminated[0]),
+            "truncated": bool(truncated[0]),
+            "guard_evidence": guard_evidence,
+            "guard_error": guard_error,
+            "ik_safety": adversarial_safety,
+        }
+        failures += int(not adversarial_passed)
+        print(
+            " adversarial: "
+            f"{'PASS' if adversarial_passed else 'FAIL'} "
+            f"apply_calls={counters['apply_calls']} "
+            f"slew_events={counters['slew_limit_events']} "
+            f"guard_error={guard_error or 'none'}",
+            flush=True,
+        )
+        env.reset(expensive=False)
     finally:
         env.close()
 
-    print(f"EEF pose smoke: {len(test_cases) - failures}/{len(test_cases)} passed")
+    total_checks = len(test_cases) + 1
+    print(f"EEF pose smoke: {total_checks - failures}/{total_checks} passed")
     if args_cli.output_json is not None:
         args_cli.output_json.parent.mkdir(parents=True, exist_ok=True)
         args_cli.output_json.write_text(
@@ -177,6 +257,7 @@ def main() -> int:
                     "frame_position_tolerance_m": args_cli.frame_position_tolerance,
                     "frame_rotation_tolerance_deg": args_cli.frame_rotation_tolerance_degrees,
                     "ik_safety_episodes": safety_reports,
+                    "ik_safety_adversarial": adversarial_result,
                     "passed": failures == 0,
                     "results": results,
                 },
