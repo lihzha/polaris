@@ -5,6 +5,9 @@ import subprocess
 from scripts.polaris import (
     finalize_pi05_native_all_six_controller_smoke as finalizer,
 )
+from polaris.pi05_droid_native_eval_contract import (
+    PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT,
+)
 
 
 ROOT = Path(__file__).parents[1]
@@ -21,9 +24,14 @@ def _git_show(revision: str, relative: str) -> bytes:
 def test_official_model_io_image_norm_and_manifest_paths_are_byte_unchanged():
     for relative in finalizer.UNCHANGED_MODEL_IO_PATHS:
         current = (ROOT / relative).read_bytes()
+        accepted = _git_show(PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT, relative)
         base = _git_show(finalizer.BASE_COMMIT, relative)
-        assert current == base
-        assert hashlib.sha256(current).hexdigest() == hashlib.sha256(base).hexdigest()
+        assert accepted == base
+        assert hashlib.sha256(accepted).hexdigest() == hashlib.sha256(base).hexdigest()
+        if relative == "src/polaris/pi05_droid_native_eval_contract.py":
+            assert current != accepted
+        else:
+            assert current == accepted
     assert (
         subprocess.run(
             ["git", "-C", ROOT, "ls-tree", "HEAD", "third_party/openpi"],

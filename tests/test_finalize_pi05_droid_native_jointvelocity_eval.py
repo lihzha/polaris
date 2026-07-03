@@ -15,6 +15,8 @@ from polaris.pi05_droid_jointvelocity_contract import (
     reference_openpi_runtime_attestation,
 )
 from polaris.pi05_droid_native_eval_contract import (
+    PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS,
+    PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS,
     PI05_DROID_CONTROLLER_CRITICAL_PATHS,
     PI05_DROID_NATIVE_CANARY_PROFILE,
     PI05_DROID_NATIVE_CONFIGURED_EPISODE_LENGTH_SECONDS,
@@ -93,272 +95,196 @@ def test_base_controller_gate_binds_job1098174_runtime_image_and_sources(
     assert set(result["critical_source_files"]) == set(
         PI05_DROID_CONTROLLER_CRITICAL_PATHS
     )
-    assert result["descendant_source_authority"] == "required_job1098204_gate"
+    assert result["descendant_source_authority"] == "required_job1098349_all_six_gate"
     with pytest.raises(ValueError, match="Unexpected job1098174 completion SHA"):
         finalizer.validate_base_controller_completion(
             completion_path, "0" * 64, repository
         )
 
 
-def _scalar(value, device):
-    return {
-        "shape": [1, 1],
-        "dtype": "torch.float32",
-        "device": device,
-        "values": [[value]],
-    }
-
-
-def _gripper_runtime(base_runtime):
-    runtime = copy.deepcopy(base_runtime)
-    runtime["gripper"]["drive"] = {
-        "profile": finalizer.PI05_DROID_GRIPPER_DRIVE_PROFILE,
-        "configured": {
-            "joint_names_expr": ["finger_joint"],
-            "stiffness": None,
-            "damping": None,
-            "effort_limit": 200.0,
-            "effort_limit_sim": 200.0,
-            "velocity_limit": 5.0,
-            "velocity_limit_sim": 5.0,
-        },
-        "actuator": {
-            "stiffness": _scalar(5729.578125, "cuda:0"),
-            "damping": _scalar(0.011459155939519405, "cuda:0"),
-            "effort_limit": _scalar(200.0, "cuda:0"),
-            "effort_limit_sim": _scalar(200.0, "cuda:0"),
-            "velocity_limit": _scalar(5.0, "cuda:0"),
-            "velocity_limit_sim": _scalar(5.0, "cuda:0"),
-        },
-        "direct_physx": {
-            "stiffness": _scalar(5729.578125, "cpu"),
-            "damping": _scalar(0.011459155939519405, "cpu"),
-            "effort_limit": _scalar(200.0, "cpu"),
-            "velocity_limit": _scalar(5.0, "cpu"),
-        },
-    }
-    runtime["runtime_sha256"] = finalizer._runtime_sha256(runtime)
-    return runtime
-
-
-def _gripper_case(label, command, slew, target, processed_target, sign):
-    return {
-        "label": label,
-        "kind": "gripper",
-        "action": [0.0] * 7 + [command],
-        "processed_joint_velocity": [0.0] * 7,
-        "articulation_joint_velocity_target": [0.0] * 7,
-        "expected_finger_target": target,
-        "processed_finger_position_target": processed_target,
-        "expected_motion_sign": sign,
-        "finger_average_slew_rad_s": slew,
-        "finger_velocity_after": sign * 4.97,
-        "finger_position_before": 0.0 if sign > 0 else 0.7853981852531433,
-        "finger_position_after": 0.33 if sign > 0 else 0.45,
-        "joint_velocity_before": [0.0] * 7,
-        "joint_velocity_after": [0.0001] * 7,
-        "terminated": False,
-        "truncated": False,
-    }
-
-
-def _publish_gripper_smoke(tmp_path, runtime):
-    labels = [
-        "hold",
-        *(
-            f"panda_joint{joint}_{sign}"
-            for joint in range(1, 8)
-            for sign in ("positive", "negative")
-        ),
-        "positive_action_limit",
-        "negative_action_limit",
-    ]
-    cases = [{"label": label, "kind": "other"} for label in labels]
-    cases.extend(
-        [
-            _gripper_case("gripper_open", 0.0, -4.978439211845398, 0.0, 0.0, -1),
-            _gripper_case(
-                "gripper_closed",
-                1.0,
-                4.971333146095276,
-                0.7853981633974483,
-                0.7853981852531433,
-                1,
-            ),
-            _gripper_case(
-                "gripper_boundary_0p5",
-                0.5,
-                -4.978439211845398,
-                0.0,
-                0.0,
-                -1,
-            ),
-        ]
-    )
-    default_q = [
-        0.0,
-        -0.6283185482025146,
-        0.0,
-        -2.5132741928100586,
-        0.0,
-        1.884955644607544,
-        0.0,
-    ]
-    parent = {
-        "schema_version": 1,
-        "smoke_profile": "pi05_droid_native_jointvelocity_controller_smoke_v2",
-        "controller_profile": "openpi_pi05_droid_native_jointvelocity_v1",
-        "environment": "DROID-FoodBussing",
-        "command_magnitude": 0.25,
-        "settle_steps": 5,
-        "expected_gripper_drive_profile": finalizer.PI05_DROID_GRIPPER_DRIVE_PROFILE,
-        "gripper_precondition_steps": 5,
-        "runtime_contract": runtime,
-        "cases": cases,
-        "case_count": 20,
-        "reset_probe": {
-            "default_joint_position": default_q,
-            "joint_position": default_q,
-            "joint_velocity": [0.0] * 7,
-            "joint_velocity_target": [0.0] * 7,
-            "default_finger_position": 0.0,
-            "finger_position": 0.0,
-            "finger_velocity": 0.0,
-            "finger_position_target": 0.0,
-        },
-        "lifecycle": {
-            "env_close": "complete",
-            "simulation_app_close": "invoked_then_child_exited_zero",
-            "capture_stage": "stdlib_parent_after_kit_child_exit",
-        },
-        "status": "pass",
-    }
-    child_value = copy.deepcopy(parent)
-    child_value["lifecycle"] = {
-        "env_close": "complete",
-        "simulation_app_close": "pending_child_exit",
-        "capture_stage": "kit_child_after_env_close_before_simulation_app_close",
-    }
-    child_value["status"] = "close_validated_pending_parent"
-    child = publish_immutable_json(tmp_path / "smoke.child-close.json", child_value)
-    ready_value = {
-        "schema_version": 1,
-        "status": "success",
-        "stage": "kit_child_after_env_close_before_simulation_app_close",
-        "raw_result": {
-            "path": str((tmp_path / "smoke.child-close.json")),
-            "size_bytes": child["size"],
-            "sha256": child["sha256"],
-            "mode": "0444",
-        },
-    }
-    ready = publish_immutable_json(
-        tmp_path / "smoke.child-close.ready.json", ready_value
-    )
-    parent["completion"] = {
-        "child_exit_code": 0,
-        "publication_stage": "stdlib_parent_after_child_exit",
-        "child_capture_sha256": child["sha256"],
-        "child_capture_size": child["size"],
-        "child_capture_mode": "0444",
-        "child_capture_path": str(tmp_path / "smoke.child-close.json"),
-        "child_ready_marker_sha256": ready["sha256"],
-        "child_ready_marker_size": ready["size"],
-        "child_ready_marker_mode": "0444",
-        "child_ready_marker_path": str(tmp_path / "smoke.child-close.ready.json"),
-    }
-    smoke = publish_immutable_json(tmp_path / "smoke.json", parent)
-    return {
-        "path": str(tmp_path / "smoke.json"),
-        "size": smoke["size"],
-        "sha256": smoke["sha256"],
-        "mode": "0444",
-        "nlink": 1,
-        "status": "pass",
-        "runtime_sha256": runtime["runtime_sha256"],
-    }
-
-
-def test_gripper_cap_gate_revalidates_drive_slew_reset_lifecycle_and_source(
-    tmp_path, monkeypatch, valid_joint_velocity_smoke_payload
+def test_all_six_gate_revalidates_coupling_lifecycle_runtime_and_source(
+    tmp_path, monkeypatch
 ):
-    runtime = _gripper_runtime(valid_joint_velocity_smoke_payload["runtime_contract"])
-    monkeypatch.setattr(
-        finalizer, "PI05_DROID_GRIPPER_RUNTIME_SHA256", runtime["runtime_sha256"]
-    )
-    smoke_record = _publish_gripper_smoke(tmp_path, runtime)
     repository = tmp_path / "polaris"
     source_files = {}
-    for relative_path in PI05_DROID_CONTROLLER_CRITICAL_PATHS:
+    for relative_path in PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS:
         path = repository / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"job1098204:{relative_path}\n", encoding="utf-8")
+        path.write_text(f"job1098349:{relative_path}\n", encoding="utf-8")
         source_files[relative_path] = {
             "size": path.stat().st_size,
             "sha256": file_sha256(path),
         }
-    completion_path = tmp_path / "controller-smoke-1098204.completion.json"
+
+    model_io = {
+        "src/polaris/pi05_droid_native_eval_contract.py": {
+            "base_commit": "3e9df7f605baa75848a0ad8edd2783d629d105c5",
+            "size": 27_584,
+            "sha256": (
+                "a86e8cdaf9dd4f34ea7449fda8f3c5ff4278c924b282bc12e3664dc0e5a65c9a"
+            ),
+        }
+    }
+    for relative_path in PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS:
+        path = repository / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"official-policy-io:{relative_path}\n", encoding="utf-8")
+        model_io[relative_path] = {
+            "base_commit": "3e9df7f605baa75848a0ad8edd2783d629d105c5",
+            "size": path.stat().st_size,
+            "sha256": file_sha256(path),
+        }
+
+    runtime_sha256 = "9" * 64
+    smoke = {
+        "path": str(tmp_path / "native-all-six-smoke-1098349.json"),
+        "size": 559_362,
+        "sha256": "2" * 64,
+        "mode": "0444",
+        "nlink": 1,
+        "device": "f7980bf2",
+        "inode": 1,
+        "status": "pass",
+        "runtime_sha256": runtime_sha256,
+        "child_artifacts": {
+            "raw": {"sha256": "b" * 64},
+            "ready": {"sha256": "8" * 64},
+        },
+    }
+    srun_status = publish_immutable_json(
+        tmp_path / "srun-1098349.status.json",
+        {"job_id": 1098349, "srun_exit_code": 0},
+    )
+    gpu_inventory = publish_immutable_json(
+        tmp_path / "gpu-1098349.json",
+        {
+            "schema_version": 1,
+            "job_id": 1098349,
+            "gpus": [
+                {
+                    "uuid": "GPU-8688921b-a641-2ae1-1dc9-494501f1f422",
+                    "name": "NVIDIA L40S",
+                    "driver_version": "580.95.05",
+                }
+            ],
+        },
+    )
+    assets = {
+        relative_path: {
+            "asset": {
+                "path": str(tmp_path / relative_path),
+                "size": 1,
+                "sha256": expected["sha256"],
+                "mode": "0640",
+                "nlink": 1,
+            },
+            "metadata": {
+                "path": str(tmp_path / f"{relative_path}.metadata"),
+                "size": 1,
+                "sha256": expected["metadata_sha256"],
+                "mode": "0640",
+                "nlink": 1,
+            },
+            "hub_revision": finalizer.PI05_DROID_HUB_REVISION,
+        }
+        for relative_path, expected in finalizer.PI05_DROID_CANARY_ASSETS.items()
+    }
+    completion_path = tmp_path / "native-all-six-smoke-1098349.completion.json"
     completion = publish_immutable_json(
         completion_path,
         {
             "schema_version": 1,
-            "profile": finalizer.PI05_DROID_GRIPPER_CONTROLLER_PROFILE,
+            "profile": finalizer.PI05_DROID_ALL_SIX_CONTROLLER_PROFILE,
             "status": "pass",
-            "scope": "controller_only_no_model_or_checkpoint",
-            "promotion": "forbidden_without_separate_checkpoint_canary",
-            "candidate_intent": {
-                "expected_gripper_drive_profile": finalizer.PI05_DROID_GRIPPER_DRIVE_PROFILE
-            },
+            "job_id": 1098349,
+            "scope": "controller_only_no_model_no_checkpoint",
+            "task": "DROID-FoodBussing",
+            "official_policy_io_changed": False,
+            "checkpoint_loaded": False,
+            "model_server_started": False,
             "source": {
-                "commit": finalizer.PI05_DROID_GRIPPER_CONTROLLER_SOURCE_COMMIT,
-                "detached_head": True,
-                "tracked_and_untracked_clean": True,
-                "head_reference": "HEAD",
-                "standalone_git_directory": True,
+                "repository": "/immutable/job1098349/source",
+                "commit": finalizer.PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT,
+                "detached_and_clean": True,
+                "openpi_commit": PI05_DROID_OPENPI_INFERENCE_COMPATIBILITY_COMMIT,
                 "files": source_files,
+                "official_model_io_unchanged_from_base": model_io,
             },
-            "runtime": {"container_image": {"sha256": PI05_DROID_PYXIS_SHA256}},
-            "runtime_contract": runtime,
-            "slurm": {"job_id": 1098204, "srun_exit_code": 0},
-            "smoke_artifact": smoke_record,
+            "smoke": smoke,
+            "saved_wrapper": {
+                "path": "/immutable/job-1098349.sbatch",
+                "size": 8_146,
+                "sha256": "c" * 64,
+                "mode": "0444",
+                "nlink": 1,
+            },
+            "srun_status": {
+                key: srun_status[key]
+                for key in ("path", "size", "sha256", "mode", "nlink")
+            },
+            "gpu_inventory": {
+                key: gpu_inventory[key]
+                for key in ("path", "size", "sha256", "mode", "nlink")
+            },
+            "container": {
+                "path": "/immutable/polaris.sqsh",
+                "size": 7_183_130_624,
+                "sha256": PI05_DROID_PYXIS_SHA256,
+                "mode": "0644",
+                "nlink": 1,
+            },
+            "polaris_hub_revision": finalizer.PI05_DROID_HUB_REVISION,
+            "assets": assets,
+            "promotion": "forbidden_without_separate_official_checkpoint_canary",
         },
     )
     monkeypatch.setattr(
-        finalizer, "PI05_DROID_GRIPPER_CONTROLLER_COMPLETION_PATH", str(completion_path)
+        finalizer,
+        "PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_PATH",
+        str(completion_path),
     )
     monkeypatch.setattr(
         finalizer,
-        "PI05_DROID_GRIPPER_CONTROLLER_COMPLETION_SHA256",
+        "PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SHA256",
         completion["sha256"],
     )
     monkeypatch.setattr(
         finalizer,
-        "PI05_DROID_GRIPPER_CONTROLLER_COMPLETION_SIZE",
+        "PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SIZE",
         completion["size"],
     )
+    monkeypatch.setattr(finalizer, "PI05_DROID_ALL_SIX_RUNTIME_SHA256", runtime_sha256)
+    smoke_calls = []
+    monkeypatch.setattr(
+        finalizer,
+        "validate_immutable_native_all_six_smoke",
+        lambda path: smoke_calls.append(path) or smoke,
+    )
 
-    result = finalizer.validate_gripper_cap_controller_completion(
+    result = finalizer.validate_all_six_controller_completion(
         completion_path,
         completion["sha256"],
-        finalizer.PI05_DROID_GRIPPER_DRIVE_PROFILE,
+        finalizer.PI05_DROID_ALL_SIX_CONTROLLER_PROFILE,
         repository,
     )
-    assert result["job_id"] == 1098204
-    assert result["runtime_sha256"] == runtime["runtime_sha256"]
-    assert result["smoke"]["measured_average_slew_magnitude_rad_s"] == {
-        "gripper_open": 4.978439211845398,
-        "gripper_closed": 4.971333146095276,
-        "gripper_boundary_0p5": 4.978439211845398,
-    }
-    assert result["smoke"]["exact_reset"] is True
+    assert result["job_id"] == 1098349
+    assert result["runtime_sha256"] == runtime_sha256
+    assert result["smoke"] == smoke
+    assert smoke_calls == [Path(smoke["path"])]
+    assert set(result["critical_source_files"]) == set(
+        PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS
+    )
+    assert set(result["unchanged_policy_io_files"]) == set(
+        PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS
+    )
 
-    changed = repository / PI05_DROID_CONTROLLER_CRITICAL_PATHS[0]
+    changed = repository / PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS[0]
     changed.write_text("changed\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="differs from job1098204"):
-        finalizer.validate_gripper_cap_controller_completion(
+    with pytest.raises(ValueError, match="differs from job1098349"):
+        finalizer.validate_all_six_controller_completion(
             completion_path,
             completion["sha256"],
-            finalizer.PI05_DROID_GRIPPER_DRIVE_PROFILE,
+            finalizer.PI05_DROID_ALL_SIX_CONTROLLER_PROFILE,
             repository,
         )
 
@@ -601,6 +527,9 @@ def test_launchers_block_before_download_or_sbatch_and_forbid_resume():
     submit_source = (
         ROOT / "scripts/polaris/submit_pi05_droid_native_jointvelocity_canary.sh"
     ).read_text(encoding="utf-8")
+    sbatch_source = (
+        ROOT / "scripts/polaris/l40s_pi05_droid_native_jointvelocity_canary.sbatch"
+    ).read_text(encoding="utf-8")
     evaluator_source = (ROOT / "scripts/eval.py").read_text(encoding="utf-8")
 
     assert eval_source.index("finalize_pi05_droid_native_jointvelocity_eval.py") < (
@@ -611,9 +540,12 @@ def test_launchers_block_before_download_or_sbatch_and_forbid_resume():
     ) < submit_source.index("sbatch --parsable")
     for source in (eval_source, submit_source):
         assert "CONTROLLER_COMPLETION" in source
-        assert "GRIPPER_CAP_CONTROLLER_COMPLETION" in source
-        assert "EXPECTED_GRIPPER_CAP_COMPLETION_SHA256" in source
+        assert "ALL_SIX_CONTROLLER_COMPLETION" in source
+        assert "EXPECTED_ALL_SIX_COMPLETION_SHA256" in source
+        assert "EXPECTED_ALL_SIX_PROFILE" in source
+        assert "1098204" not in source
         assert "RESUME_FROM_TASK_DIR" in source
+    assert sbatch_source.count("#SBATCH --no-requeue") == 1
     timeout_configuration = evaluator_source.index(
         "configured_episode_length_seconds = configure_native_environment_timeout"
     )

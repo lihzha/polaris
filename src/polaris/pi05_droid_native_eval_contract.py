@@ -206,23 +206,23 @@ PI05_DROID_BASE_CONTROLLER_RUNTIME_SHA256 = (
 )
 
 PI05_DROID_CONTROLLER_JOB_ID = 1098174
-PI05_DROID_GRIPPER_CONTROLLER_JOB_ID = 1098204
-PI05_DROID_GRIPPER_CONTROLLER_COMPLETION_PATH = (
-    "/lustre/fsw/portfolios/nvr/users/lzha/results/polaris-pi05-jointvelocity/"
-    "controller-smoke/5e2947fc9008-controller-v2-gripper-cap/"
-    "controller-smoke-1098204.completion.json"
+PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID = 1098349
+PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_PATH = (
+    "/lustre/fsw/portfolios/nvr/users/lzha/results/polaris-pi05-native/"
+    "all-six-controller-smoke/20260703T201500Z-93083d2-all6-smoke2/"
+    "native-all-six-smoke-1098349.completion.json"
 )
-PI05_DROID_GRIPPER_CONTROLLER_COMPLETION_SHA256 = (
-    "778594b8eea64d6c2fb031d43af53539e07014af218e8e2c60751cb0d399a657"
+PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SHA256 = (
+    "a03ffbf0745327ce604db7be5928a94dce910eac91a8766c21f8efcb71fea867"
 )
-PI05_DROID_GRIPPER_CONTROLLER_COMPLETION_SIZE = 15_744
-PI05_DROID_GRIPPER_CONTROLLER_SOURCE_COMMIT = "5e2947fc900838715859cf8d2476410527737924"
-PI05_DROID_GRIPPER_CONTROLLER_PROFILE = (
-    "pi05_droid_native_jointvelocity_l40s_controller_smoke_v2"
+PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SIZE = 7_502
+PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT = "93083d2694b8638de30e970e3bea450526593e7e"
+PI05_DROID_ALL_SIX_CONTROLLER_PROFILE = (
+    "pi05_droid_native_all_six_l40s_controller_smoke_v1"
 )
 PI05_DROID_GRIPPER_DRIVE_PROFILE = NATIVE_GRIPPER_DRIVE_PROFILE
-PI05_DROID_GRIPPER_RUNTIME_SHA256 = (
-    "c7e932ca9f697cd02825fb06ee5fa5c0f168af73309026e91d844f16fd3729eb"
+PI05_DROID_ALL_SIX_RUNTIME_SHA256 = (
+    "9a0597d62debc01fbde064360f9845a28a2df06fd2853ff0b3556dff48c14efc"
 )
 PI05_DROID_PYXIS_SHA256 = (
     "ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d556b324a"
@@ -256,6 +256,34 @@ PI05_DROID_CONTROLLER_CRITICAL_PATHS = (
     "src/polaris/joint_velocity_runtime.py",
     "src/polaris/joint_velocity_smoke.py",
     "src/polaris/pi05_droid_jointvelocity_contract.py",
+)
+
+# These are the exact controller/runtime sources independently exercised by
+# accepted all-six job 1098349.  A model-evaluation descendant may change its
+# evaluation-only contract/launcher, but every path below must remain byte
+# identical to this gate.
+PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS = (
+    "scripts/eval.py",
+    "scripts/smoke_pi05_native_all_six_controller.py",
+    "scripts/polaris/finalize_pi05_native_all_six_controller_smoke.py",
+    "scripts/polaris/l40s_pi05_native_all_six_controller_smoke.sbatch",
+    "scripts/polaris/submit_pi05_native_all_six_controller_smoke.sh",
+    "src/polaris/environments/droid_cfg.py",
+    "src/polaris/environments/manager_based_rl_splat_environment.py",
+    "src/polaris/environments/robot_cfg.py",
+    "src/polaris/joint_velocity_runtime.py",
+    "src/polaris/native_all_six_smoke.py",
+    "src/polaris/native_gripper_runtime.py",
+    "src/polaris/pi05_droid_jointvelocity_contract.py",
+)
+
+# The accepted smoke proved these policy-facing paths were still identical to
+# the integrated official-model base.  The evaluation contract itself is
+# intentionally excluded because this descendant changes only its pinned gate.
+PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS = (
+    "scripts/polaris/pi05_droid_native_gcs_manifest.tsv",
+    "scripts/polaris/serve_pi05_droid_native_jointvelocity.py",
+    "src/polaris/policy/droid_jointvelocity_client.py",
 )
 
 

@@ -15,9 +15,9 @@ POLARIS_DATA_DIR="${POLARIS_DATA_DIR:-${NFS_ROOT}/data/PolaRiS-Hub}"
 
 : "${CONTROLLER_COMPLETION:?Set job1098174 completion path}"
 : "${EXPECTED_CONTROLLER_COMPLETION_SHA256:?Set exact job1098174 completion SHA-256}"
-: "${GRIPPER_CAP_CONTROLLER_COMPLETION:?Set later native gripper-cap completion path}"
-: "${EXPECTED_GRIPPER_CAP_COMPLETION_SHA256:?Set exact gripper-cap completion SHA-256}"
-: "${EXPECTED_GRIPPER_CAP_PROFILE:?Set independently reviewed gripper-cap profile}"
+: "${ALL_SIX_CONTROLLER_COMPLETION:?Set accepted job1098349 all-six completion path}"
+: "${EXPECTED_ALL_SIX_COMPLETION_SHA256:?Set exact all-six completion SHA-256}"
+: "${EXPECTED_ALL_SIX_PROFILE:?Set independently reviewed all-six profile}"
 
 die() {
   echo "ERROR: $*" >&2
@@ -28,9 +28,9 @@ command -v sbatch >/dev/null || die "Run this submitter on l401/l402/l403"
 [[ -z "${RESUME_FROM_TASK_DIR:-}" ]] || die "Native flow canaries forbid prefix resume"
 [[ "${EXPECTED_CONTROLLER_COMPLETION_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
   || die "Malformed job1098174 completion digest"
-[[ "${EXPECTED_GRIPPER_CAP_COMPLETION_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
-  || die "Malformed gripper-cap completion digest"
-[[ -n "${EXPECTED_GRIPPER_CAP_PROFILE}" ]] || die "Empty gripper-cap profile"
+[[ "${EXPECTED_ALL_SIX_COMPLETION_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+  || die "Malformed all-six completion digest"
+[[ -n "${EXPECTED_ALL_SIX_PROFILE}" ]] || die "Empty all-six profile"
 
 [[ ! -L "${POLARIS_DIR}" ]] || die "POLARIS_DIR must not be a symlink"
 POLARIS_DIR="$(realpath "${POLARIS_DIR}")"
@@ -51,16 +51,16 @@ POLARIS_COMMIT="$(git -C "${POLARIS_DIR}" rev-parse HEAD)"
   || die "Missing exact checkout-local OpenPI venv"
 
 # Block submission before any allocation until both external controller gates
-# validate, including job1098204 measured gripper slew and child lifecycle.
+# validate, including job1098349 all-six coupling and child lifecycle.
 PYTHONPATH="${POLARIS_DIR}/src:${SCRIPT_DIR}" \
   "${POLARIS_DIR}/third_party/openpi/.venv/bin/python" \
   "${SCRIPT_DIR}/finalize_pi05_droid_native_jointvelocity_eval.py" preflight \
   --polaris-repo "${POLARIS_DIR}" \
   --controller-completion "${CONTROLLER_COMPLETION}" \
   --expected-controller-completion-sha256 "${EXPECTED_CONTROLLER_COMPLETION_SHA256}" \
-  --gripper-cap-completion "${GRIPPER_CAP_CONTROLLER_COMPLETION}" \
-  --expected-gripper-cap-completion-sha256 "${EXPECTED_GRIPPER_CAP_COMPLETION_SHA256}" \
-  --expected-gripper-cap-profile "${EXPECTED_GRIPPER_CAP_PROFILE}"
+  --all-six-controller-completion "${ALL_SIX_CONTROLLER_COMPLETION}" \
+  --expected-all-six-completion-sha256 "${EXPECTED_ALL_SIX_COMPLETION_SHA256}" \
+  --expected-all-six-profile "${EXPECTED_ALL_SIX_PROFILE}"
 
 RUN_NAMESPACE="${RUN_NAMESPACE:-$(date -u +%Y%m%dT%H%M%SZ)-${POLARIS_COMMIT:0:12}}"
 [[ "${RUN_NAMESPACE}" =~ ^[A-Za-z0-9._-]+$ ]] || die "Unsafe RUN_NAMESPACE"
@@ -71,7 +71,7 @@ mkdir -p "${LOG_ROOT}"
 mkdir -p "$(dirname "${RUN_DIR}")"
 mkdir "${RUN_DIR}"
 
-export_vars="ALL,NFS_ROOT=${NFS_ROOT},POLARIS_DIR=${POLARIS_DIR},EXPECTED_POLARIS_COMMIT=${POLARIS_COMMIT},RUN_DIR=${RUN_DIR},POLARIS_PYXIS_IMAGE=${POLARIS_PYXIS_IMAGE},POLARIS_DATA_DIR=${POLARIS_DATA_DIR},CONTROLLER_COMPLETION=${CONTROLLER_COMPLETION},EXPECTED_CONTROLLER_COMPLETION_SHA256=${EXPECTED_CONTROLLER_COMPLETION_SHA256},GRIPPER_CAP_CONTROLLER_COMPLETION=${GRIPPER_CAP_CONTROLLER_COMPLETION},EXPECTED_GRIPPER_CAP_COMPLETION_SHA256=${EXPECTED_GRIPPER_CAP_COMPLETION_SHA256},EXPECTED_GRIPPER_CAP_PROFILE=${EXPECTED_GRIPPER_CAP_PROFILE}"
+export_vars="ALL,NFS_ROOT=${NFS_ROOT},POLARIS_DIR=${POLARIS_DIR},EXPECTED_POLARIS_COMMIT=${POLARIS_COMMIT},RUN_DIR=${RUN_DIR},POLARIS_PYXIS_IMAGE=${POLARIS_PYXIS_IMAGE},POLARIS_DATA_DIR=${POLARIS_DATA_DIR},CONTROLLER_COMPLETION=${CONTROLLER_COMPLETION},EXPECTED_CONTROLLER_COMPLETION_SHA256=${EXPECTED_CONTROLLER_COMPLETION_SHA256},ALL_SIX_CONTROLLER_COMPLETION=${ALL_SIX_CONTROLLER_COMPLETION},EXPECTED_ALL_SIX_COMPLETION_SHA256=${EXPECTED_ALL_SIX_COMPLETION_SHA256},EXPECTED_ALL_SIX_PROFILE=${EXPECTED_ALL_SIX_PROFILE}"
 job_id="$(sbatch --parsable \
   --output="${LOG_ROOT}/pi05_native_canary-%j.out" \
   --export="${export_vars}" \

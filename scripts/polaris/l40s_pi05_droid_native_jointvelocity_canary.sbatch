@@ -7,6 +7,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=03:50:00
+#SBATCH --no-requeue
 #SBATCH --job-name=pi05_native_canary
 #SBATCH --output=/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris-pi05-native/%x-%j.out
 
@@ -18,9 +19,9 @@ NFS_ROOT="${NFS_ROOT:-/lustre/fsw/portfolios/nvr/users/lzha}"
 : "${RUN_DIR:?Set one fresh canary attempt directory}"
 : "${CONTROLLER_COMPLETION:?Set job1098174 completion path}"
 : "${EXPECTED_CONTROLLER_COMPLETION_SHA256:?Set job1098174 completion digest}"
-: "${GRIPPER_CAP_CONTROLLER_COMPLETION:?Set native gripper-cap completion path}"
-: "${EXPECTED_GRIPPER_CAP_COMPLETION_SHA256:?Set native gripper-cap completion digest}"
-: "${EXPECTED_GRIPPER_CAP_PROFILE:?Set native gripper-cap completion profile}"
+: "${ALL_SIX_CONTROLLER_COMPLETION:?Set accepted job1098349 all-six completion path}"
+: "${EXPECTED_ALL_SIX_COMPLETION_SHA256:?Set accepted all-six completion digest}"
+: "${EXPECTED_ALL_SIX_PROFILE:?Set accepted all-six completion profile}"
 
 POLARIS_PYXIS_IMAGE="${POLARIS_PYXIS_IMAGE:-${NFS_ROOT}/cache/polaris/polaris-eval-cuda13-fd00a51.sqsh}"
 POLARIS_DATA_DIR="${POLARIS_DATA_DIR:-${NFS_ROOT}/data/PolaRiS-Hub}"

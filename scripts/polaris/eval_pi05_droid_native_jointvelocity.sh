@@ -27,9 +27,9 @@ SERVER_START_TIMEOUT_SECS="${SERVER_START_TIMEOUT_SECS:-2400}"
 : "${EXPECTED_POLARIS_COMMIT:?Set EXPECTED_POLARIS_COMMIT to the immutable launch commit}"
 : "${CONTROLLER_COMPLETION:?Set CONTROLLER_COMPLETION to job1098174 completion JSON}"
 : "${EXPECTED_CONTROLLER_COMPLETION_SHA256:?Set exact job1098174 completion SHA-256}"
-: "${GRIPPER_CAP_CONTROLLER_COMPLETION:?Set the later native gripper-cap completion JSON}"
-: "${EXPECTED_GRIPPER_CAP_COMPLETION_SHA256:?Set exact gripper-cap completion SHA-256}"
-: "${EXPECTED_GRIPPER_CAP_PROFILE:?Set the independently reviewed gripper-cap profile}"
+: "${ALL_SIX_CONTROLLER_COMPLETION:?Set accepted job1098349 all-six completion JSON}"
+: "${EXPECTED_ALL_SIX_COMPLETION_SHA256:?Set exact all-six completion SHA-256}"
+: "${EXPECTED_ALL_SIX_PROFILE:?Set the independently reviewed all-six profile}"
 
 die() {
   echo "ERROR: $*" >&2
@@ -40,8 +40,8 @@ die() {
 [[ "${EXPECTED_POLARIS_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || die "Malformed PolaRiS commit"
 [[ "${EXPECTED_CONTROLLER_COMPLETION_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
   || die "Malformed job1098174 completion digest"
-[[ "${EXPECTED_GRIPPER_CAP_COMPLETION_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
-  || die "Malformed gripper-cap completion digest"
+[[ "${EXPECTED_ALL_SIX_COMPLETION_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+  || die "Malformed all-six completion digest"
 if [[ ! "${PORT}" =~ ^[1-9][0-9]*$ ]] || (( PORT > 65535 )); then
   die "Invalid port"
 fi
@@ -82,15 +82,15 @@ git_common_dir="$(git -C "${POLARIS_DIR}" rev-parse --path-format=absolute --git
 
 # This is intentionally the first Python action.  It blocks before checkpoint
 # download or GPU work until both independently reviewed controller captures
-# validate, including job1098204 measured gripper slew and child lifecycle.
+# validate, including job1098349 all-six coupling and child lifecycle.
 PYTHONPATH="${POLARIS_DIR}/src:${SCRIPT_DIR}" "${OPENPI_DIR}/.venv/bin/python" \
   "${SCRIPT_DIR}/finalize_pi05_droid_native_jointvelocity_eval.py" preflight \
   --polaris-repo "${POLARIS_DIR}" \
   --controller-completion "${CONTROLLER_COMPLETION}" \
   --expected-controller-completion-sha256 "${EXPECTED_CONTROLLER_COMPLETION_SHA256}" \
-  --gripper-cap-completion "${GRIPPER_CAP_CONTROLLER_COMPLETION}" \
-  --expected-gripper-cap-completion-sha256 "${EXPECTED_GRIPPER_CAP_COMPLETION_SHA256}" \
-  --expected-gripper-cap-profile "${EXPECTED_GRIPPER_CAP_PROFILE}"
+  --all-six-controller-completion "${ALL_SIX_CONTROLLER_COMPLETION}" \
+  --expected-all-six-completion-sha256 "${EXPECTED_ALL_SIX_COMPLETION_SHA256}" \
+  --expected-all-six-profile "${EXPECTED_ALL_SIX_PROFILE}"
 
 TASK_DIR="${RUN_DIR}/${POLARIS_ENVIRONMENT}"
 SERVER_LOG="${RUN_DIR}/policy_server.log"
@@ -166,8 +166,8 @@ OPENPI_DATA_HOME="${OPENPI_DATA_HOME}" JAX_PLATFORMS=cuda \
 export RUN_RECORD RUN_DIR CHECKPOINT_PATH="${checkpoint_path}" POLARIS_DIR OPENPI_DIR
 export EXPECTED_POLARIS_COMMIT CHECKPOINT_URI CHECKPOINT_MANIFEST POLARIS_PYXIS_IMAGE
 export POLARIS_DATA_DIR CONTROLLER_COMPLETION EXPECTED_CONTROLLER_COMPLETION_SHA256
-export GRIPPER_CAP_CONTROLLER_COMPLETION EXPECTED_GRIPPER_CAP_COMPLETION_SHA256
-export EXPECTED_GRIPPER_CAP_PROFILE PORT
+export ALL_SIX_CONTROLLER_COMPLETION EXPECTED_ALL_SIX_COMPLETION_SHA256
+export EXPECTED_ALL_SIX_PROFILE PORT
 export MODEL_RUNTIME_CONTRACT
 PYTHONPATH="${POLARIS_DIR}/src" /usr/bin/python3 - <<'PY'
 import os
@@ -178,8 +178,8 @@ keys = (
     "RUN_DIR", "CHECKPOINT_PATH", "POLARIS_DIR", "OPENPI_DIR",
     "EXPECTED_POLARIS_COMMIT", "CHECKPOINT_URI", "CHECKPOINT_MANIFEST",
     "POLARIS_PYXIS_IMAGE", "POLARIS_DATA_DIR", "CONTROLLER_COMPLETION",
-    "EXPECTED_CONTROLLER_COMPLETION_SHA256", "GRIPPER_CAP_CONTROLLER_COMPLETION",
-    "EXPECTED_GRIPPER_CAP_COMPLETION_SHA256", "EXPECTED_GRIPPER_CAP_PROFILE", "PORT",
+    "EXPECTED_CONTROLLER_COMPLETION_SHA256", "ALL_SIX_CONTROLLER_COMPLETION",
+    "EXPECTED_ALL_SIX_COMPLETION_SHA256", "EXPECTED_ALL_SIX_PROFILE", "PORT",
     "MODEL_RUNTIME_CONTRACT",
 )
 publish_immutable_json(
@@ -324,8 +324,8 @@ PYTHONPATH="${POLARIS_DIR}/src:${SCRIPT_DIR}" "${OPENPI_DIR}/.venv/bin/python" \
   --data-dir "${POLARIS_DATA_DIR}" \
   --controller-completion "${CONTROLLER_COMPLETION}" \
   --expected-controller-completion-sha256 "${EXPECTED_CONTROLLER_COMPLETION_SHA256}" \
-  --gripper-cap-completion "${GRIPPER_CAP_CONTROLLER_COMPLETION}" \
-  --expected-gripper-cap-completion-sha256 "${EXPECTED_GRIPPER_CAP_COMPLETION_SHA256}" \
-  --expected-gripper-cap-profile "${EXPECTED_GRIPPER_CAP_PROFILE}"
+  --all-six-controller-completion "${ALL_SIX_CONTROLLER_COMPLETION}" \
+  --expected-all-six-completion-sha256 "${EXPECTED_ALL_SIX_COMPLETION_SHA256}" \
+  --expected-all-six-profile "${EXPECTED_ALL_SIX_PROFILE}"
 
 echo "Official pi0.5-DROID native canary complete: ${RUN_DIR}"

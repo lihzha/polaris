@@ -105,3 +105,39 @@
   tests. Bash, ShellCheck, Ruff, format, diff, exact OpenPI checkout, and
   byte-unchanged official serving/client/manifest/native-contract checks were
   rerun after that scheduler-only change.
+
+## Accepted rerun and model-canary gate preparation
+
+- Minimal source-identity repair commit
+  `93083d2694b8638de30e970e3bea450526593e7e` passed as sole rerun job
+  `1098349` on one L40S (`COMPLETED 0:0`, 3:08). The immutable controller-only
+  completion is
+  `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris-pi05-native/all-six-controller-smoke/20260703T201500Z-93083d2-all6-smoke2/native-all-six-smoke-1098349.completion.json`,
+  SHA-256
+  `a03ffbf0745327ce604db7be5928a94dce910eac91a8766c21f8efcb71fea867`,
+  size 7502, mode 0444, one link. Its runtime SHA-256 is
+  `9a0597d62debc01fbde064360f9845a28a2df06fd2853ff0b3556dff48c14efc`.
+- The follow-up official model-canary contract now replaces obsolete job
+  `1098204` as descendant authority with job `1098349`. It reopens the exact
+  all-six final/raw/ready artifacts, all 432 per-substep samples, all four
+  open/close scenarios, all-six velocity/coupling evidence, srun status, and
+  one-L40S inventory. It also requires the current descendant to retain every
+  one of the 12 controller-critical source hashes and the unchanged official
+  serving/client/checkpoint-manifest bytes attested by job `1098349`.
+- The model-canary launcher/run-record interface is renamed from the stale
+  `GRIPPER_CAP_*` vocabulary to `ALL_SIX_*`; its completion will expose the
+  gate as `controllers.native_all_six_coupled`. The live canary runtime must
+  exactly equal the accepted all-six runtime SHA above. Historical job
+  `1098174` remains a separate arm-controller prerequisite, but no longer acts
+  as descendant source authority.
+- Host validation: focused gate/lifecycle suite `22 passed`; broad non-Isaac
+  suite `152 passed, 5 subtests passed`; Ruff, formatting, Python compilation,
+  Bash syntax, and Git diff checks pass. A read-only preflight using temporary
+  audit code on `l401` reopened the actual job `1098174` and `1098349`
+  completions and passed every source, lifecycle, runtime, GPU, and policy-I/O
+  binding. The temporary audit directory was removed. No model, checkpoint,
+  GPU allocation, or Slurm job was launched for this preparation.
+- Independent frozen review returned GO with no P0/P1 findings. Its sole P2
+  noted that live l401 defaults to requeue; the model-canary wrapper now pins
+  `#SBATCH --no-requeue`, with an exact one-occurrence regression assertion,
+  so an infrastructure failure cannot consume an automatic second allocation.

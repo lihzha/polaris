@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import hashlib
 import json
 import math
@@ -22,6 +21,7 @@ else:
     from validate_pi05_droid_jointvelocity_trace import audit_trace
 
 from polaris.joint_velocity_runtime import validate_joint_velocity_runtime_report
+from polaris.native_all_six_smoke import validate_immutable_native_all_six_smoke
 from polaris.pi05_droid_jointvelocity_contract import (
     PI05_DROID_CHECKPOINT_BYTES,
     PI05_DROID_CHECKPOINT_MANIFEST_SHA256,
@@ -34,6 +34,15 @@ from polaris.pi05_droid_jointvelocity_contract import (
     validate_persisted_serving_contract,
 )
 from polaris.pi05_droid_native_eval_contract import (
+    PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_PATH,
+    PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SHA256,
+    PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SIZE,
+    PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS,
+    PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID,
+    PI05_DROID_ALL_SIX_CONTROLLER_PROFILE,
+    PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT,
+    PI05_DROID_ALL_SIX_RUNTIME_SHA256,
+    PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS,
     PI05_DROID_BASE_CONTROLLER_COMPLETION_PATH,
     PI05_DROID_BASE_CONTROLLER_COMPLETION_SHA256,
     PI05_DROID_BASE_CONTROLLER_COMPLETION_SIZE,
@@ -42,14 +51,7 @@ from polaris.pi05_droid_native_eval_contract import (
     PI05_DROID_CANARY_ASSETS,
     PI05_DROID_CONTROLLER_CRITICAL_PATHS,
     PI05_DROID_CONTROLLER_JOB_ID,
-    PI05_DROID_GRIPPER_CONTROLLER_COMPLETION_PATH,
-    PI05_DROID_GRIPPER_CONTROLLER_COMPLETION_SHA256,
-    PI05_DROID_GRIPPER_CONTROLLER_COMPLETION_SIZE,
-    PI05_DROID_GRIPPER_CONTROLLER_JOB_ID,
-    PI05_DROID_GRIPPER_CONTROLLER_PROFILE,
-    PI05_DROID_GRIPPER_CONTROLLER_SOURCE_COMMIT,
     PI05_DROID_GRIPPER_DRIVE_PROFILE,
-    PI05_DROID_GRIPPER_RUNTIME_SHA256,
     PI05_DROID_HUB_REVISION,
     PI05_DROID_NATIVE_CANARY_PROFILE,
     PI05_DROID_NATIVE_EPISODE_STEPS,
@@ -242,8 +244,8 @@ def validate_base_controller_completion(
     """Bind the exact pre-cap arm/controller gate from job 1098174.
 
     Its controller bytes are intentionally not compared with the integrated
-    checkout: job 1098204 is the descendant gate that reattests those bytes
-    after the gripper-cap fix.  Both immutable completions remain mandatory.
+    checkout: job 1098349 is the descendant gate that reattests the complete
+    all-six coupled controller.  Both immutable completions remain mandatory.
     """
 
     expected_sha256 = _sha256_string(expected_sha256, "controller completion SHA-256")
@@ -315,437 +317,254 @@ def validate_base_controller_completion(
         "profile": CONTROLLER_PROFILE,
         "runtime_sha256": runtime["runtime_sha256"],
         "critical_source_files": attested,
-        "descendant_source_authority": "required_job1098204_gate",
+        "descendant_source_authority": "required_job1098349_all_six_gate",
     }
 
 
-def _runtime_sha256(report: dict[str, Any]) -> str:
-    payload = copy.deepcopy(report)
-    payload.pop("runtime_sha256", None)
-    return hashlib.sha256(
-        json.dumps(
-            payload,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        ).encode("ascii")
-    ).hexdigest()
-
-
-def _validate_scalar_tensor(
-    value: Any, *, field: str, device: str, expected: float
-) -> None:
-    if (
-        not isinstance(value, dict)
-        or set(value) != {"shape", "dtype", "device", "values"}
-        or value["shape"] != [1, 1]
-        or value["dtype"] != "torch.float32"
-        or value["device"] != device
-        or value["values"] != [[expected]]
-    ):
-        raise ValueError(f"Gripper-cap {field} tensor mismatch")
-
-
-def _validate_gripper_runtime(report: Any) -> dict[str, Any]:
-    if (
-        not isinstance(report, dict)
-        or report.get("schema_version") != 1
-        or report.get("profile") != "openpi_pi05_droid_native_jointvelocity_v1"
-        or report.get("status") != "pass"
-        or report.get("policy_frequency_hz") != 15
-        or report.get("physics_frequency_hz") != 120
-        or report.get("decimation") != 8
-        or report.get("runtime_sha256") != PI05_DROID_GRIPPER_RUNTIME_SHA256
-        or _runtime_sha256(report) != PI05_DROID_GRIPPER_RUNTIME_SHA256
-    ):
-        raise ValueError("Gripper-cap runtime identity mismatch")
-    gripper = report.get("gripper")
-    if not isinstance(gripper, dict):
-        raise ValueError("Gripper-cap runtime lacks gripper evidence")
-    drive = gripper.get("drive")
-    if not isinstance(drive, dict) or set(drive) != {
-        "profile",
-        "configured",
-        "actuator",
-        "direct_physx",
-    }:
-        raise ValueError("Gripper-cap drive schema mismatch")
-    expected_configured = {
-        "joint_names_expr": ["finger_joint"],
-        "stiffness": None,
-        "damping": None,
-        "effort_limit": 200.0,
-        "effort_limit_sim": 200.0,
-        "velocity_limit": 5.0,
-        "velocity_limit_sim": 5.0,
-    }
-    if (
-        drive["profile"] != PI05_DROID_GRIPPER_DRIVE_PROFILE
-        or drive["configured"] != expected_configured
-    ):
-        raise ValueError("Gripper-cap configured drive mismatch")
-    actuator_expected = {
-        "stiffness": 5729.578125,
-        "damping": 0.011459155939519405,
-        "effort_limit": 200.0,
-        "effort_limit_sim": 200.0,
-        "velocity_limit": 5.0,
-        "velocity_limit_sim": 5.0,
-    }
-    direct_expected = {
-        "stiffness": 5729.578125,
-        "damping": 0.011459155939519405,
-        "effort_limit": 200.0,
-        "velocity_limit": 5.0,
-    }
-    if not isinstance(drive["actuator"], dict) or set(drive["actuator"]) != set(
-        actuator_expected
-    ):
-        raise ValueError("Gripper-cap actuator drive schema mismatch")
-    if not isinstance(drive["direct_physx"], dict) or set(drive["direct_physx"]) != set(
-        direct_expected
-    ):
-        raise ValueError("Gripper-cap direct PhysX schema mismatch")
-    for field, expected in actuator_expected.items():
-        _validate_scalar_tensor(
-            drive["actuator"][field],
-            field=f"CUDA actuator {field}",
-            device="cuda:0",
-            expected=expected,
-        )
-    for field, expected in direct_expected.items():
-        _validate_scalar_tensor(
-            drive["direct_physx"][field],
-            field=f"CPU direct PhysX {field}",
-            device="cpu",
-            expected=expected,
-        )
-    return report
-
-
-def _validate_gripper_smoke(
-    smoke_record: Any, runtime: dict[str, Any]
+def _validate_bound_json_record(
+    record: Any, *, field: str, expected_value: dict[str, Any] | None
 ) -> dict[str, Any]:
-    if not isinstance(smoke_record, dict):
-        raise ValueError("Gripper-cap completion lacks smoke artifact")
-    smoke_path = Path(smoke_record.get("path", ""))
-    smoke = validate_immutable_json(smoke_path)
-    if (
-        smoke_record.get("status") != "pass"
-        or smoke_record.get("mode") != "0444"
-        or smoke_record.get("nlink") != 1
-        or smoke_record.get("sha256") != smoke["sha256"]
-        or smoke_record.get("size") != smoke["size"]
-        or smoke_record.get("runtime_sha256") != PI05_DROID_GRIPPER_RUNTIME_SHA256
-        or Path(smoke_record.get("path", "")).resolve() != Path(smoke["path"])
-    ):
-        raise ValueError("Gripper-cap smoke identity mismatch")
-    value = smoke["value"]
-    required = {
-        "schema_version",
-        "smoke_profile",
-        "controller_profile",
-        "environment",
-        "command_magnitude",
-        "settle_steps",
-        "expected_gripper_drive_profile",
-        "gripper_precondition_steps",
-        "runtime_contract",
-        "cases",
-        "case_count",
-        "reset_probe",
-        "lifecycle",
-        "status",
-        "completion",
-    }
-    if (
-        not isinstance(value, dict)
-        or set(value) != required
-        or value["schema_version"] != 1
-        or value["smoke_profile"]
-        != "pi05_droid_native_jointvelocity_controller_smoke_v2"
-        or value["controller_profile"] != "openpi_pi05_droid_native_jointvelocity_v1"
-        or value["environment"] != PI05_DROID_NATIVE_TASK
-        or value["command_magnitude"] != 0.25
-        or value["settle_steps"] != 5
-        or value["expected_gripper_drive_profile"] != PI05_DROID_GRIPPER_DRIVE_PROFILE
-        or value["gripper_precondition_steps"] != 5
-        or value["runtime_contract"] != runtime
-        or value["case_count"] != 20
-        or value["status"] != "pass"
-        or value["lifecycle"]
-        != {
-            "env_close": "complete",
-            "simulation_app_close": "invoked_then_child_exited_zero",
-            "capture_stage": "stdlib_parent_after_kit_child_exit",
-        }
-    ):
-        raise ValueError("Gripper-cap smoke schema or identity mismatch")
-    cases = value["cases"]
-    expected_labels = {
-        "hold",
-        *(
-            f"panda_joint{joint}_{sign}"
-            for joint in range(1, 8)
-            for sign in ("positive", "negative")
-        ),
-        "gripper_open",
-        "gripper_closed",
-        "gripper_boundary_0p5",
-        "positive_action_limit",
-        "negative_action_limit",
-    }
-    if (
-        not isinstance(cases, list)
-        or len(cases) != 20
-        or {case.get("label") for case in cases if isinstance(case, dict)}
-        != expected_labels
-    ):
-        raise ValueError("Gripper-cap smoke case set mismatch")
-    gripper_cases = {
-        case["label"]: case
-        for case in cases
-        if isinstance(case, dict) and case.get("kind") == "gripper"
-    }
-    expected_gripper_cases = {
-        "gripper_open": {
-            "command": 0.0,
-            "slew": -4.978439211845398,
-            "target": 0.0,
-            "processed_target": 0.0,
-            "sign": -1,
-        },
-        "gripper_closed": {
-            "command": 1.0,
-            "slew": 4.971333146095276,
-            "target": 0.7853981633974483,
-            "processed_target": 0.7853981852531433,
-            "sign": 1,
-        },
-        "gripper_boundary_0p5": {
-            "command": 0.5,
-            "slew": -4.978439211845398,
-            "target": 0.0,
-            "processed_target": 0.0,
-            "sign": -1,
-        },
-    }
-    if set(gripper_cases) != set(expected_gripper_cases):
-        raise ValueError("Gripper-cap measured case set mismatch")
-    measured_slew = {}
-    for label, expected in expected_gripper_cases.items():
-        case = gripper_cases[label]
-        action = case.get("action")
-        q_before = case.get("joint_velocity_before")
-        q_after = case.get("joint_velocity_after")
-        slew = case.get("finger_average_slew_rad_s")
-        if (
-            not isinstance(action, list)
-            or action != [0.0] * 7 + [expected["command"]]
-            or case.get("processed_joint_velocity") != [0.0] * 7
-            or case.get("articulation_joint_velocity_target") != [0.0] * 7
-            or case.get("expected_finger_target") != expected["target"]
-            or case.get("processed_finger_position_target")
-            != expected["processed_target"]
-            or case.get("expected_motion_sign") != expected["sign"]
-            or type(slew) is not float
-            or slew != expected["slew"]
-            or abs(slew) > 5.0
-            or type(case.get("finger_velocity_after")) is not float
-            or abs(case["finger_velocity_after"]) > 5.0
-            or not isinstance(q_before, list)
-            or not isinstance(q_after, list)
-            or len(q_before) != 7
-            or len(q_after) != 7
-            or any(type(item) not in (int, float) for item in q_before + q_after)
-            or max(abs(float(item)) for item in q_before + q_after) > 0.001
-            or expected["sign"]
-            * (case.get("finger_position_after") - case.get("finger_position_before"))
-            <= 0.0
-            or case.get("terminated") is not False
-            or case.get("truncated") is not False
-        ):
-            raise ValueError(f"Gripper-cap measured slew mismatch: {label}")
-        measured_slew[label] = abs(slew)
-
-    default_q = [
-        0.0,
-        -0.6283185482025146,
-        0.0,
-        -2.5132741928100586,
-        0.0,
-        1.884955644607544,
-        0.0,
-    ]
-    if value["reset_probe"] != {
-        "default_joint_position": default_q,
-        "joint_position": default_q,
-        "joint_velocity": [0.0] * 7,
-        "joint_velocity_target": [0.0] * 7,
-        "default_finger_position": 0.0,
-        "finger_position": 0.0,
-        "finger_velocity": 0.0,
-        "finger_position_target": 0.0,
-    }:
-        raise ValueError("Gripper-cap exact reset mismatch")
-
-    completion = value["completion"]
-    if (
-        not isinstance(completion, dict)
-        or set(completion)
-        != {
-            "child_exit_code",
-            "publication_stage",
-            "child_capture_sha256",
-            "child_capture_size",
-            "child_capture_mode",
-            "child_capture_path",
-            "child_ready_marker_sha256",
-            "child_ready_marker_size",
-            "child_ready_marker_mode",
-            "child_ready_marker_path",
-        }
-        or completion["child_exit_code"] != 0
-        or completion["publication_stage"] != "stdlib_parent_after_child_exit"
-        or completion["child_capture_mode"] != "0444"
-        or completion["child_ready_marker_mode"] != "0444"
-    ):
-        raise ValueError("Gripper-cap parent lifecycle mismatch")
-    child = validate_immutable_json(Path(completion["child_capture_path"]))
-    ready = validate_immutable_json(Path(completion["child_ready_marker_path"]))
-    if (
-        child["sha256"] != completion["child_capture_sha256"]
-        or child["size"] != completion["child_capture_size"]
-        or ready["sha256"] != completion["child_ready_marker_sha256"]
-        or ready["size"] != completion["child_ready_marker_size"]
-    ):
-        raise ValueError("Gripper-cap child lifecycle identity mismatch")
-    expected_child = copy.deepcopy(value)
-    expected_child.pop("completion")
-    expected_child["status"] = "close_validated_pending_parent"
-    expected_child["lifecycle"] = {
-        "env_close": "complete",
-        "simulation_app_close": "pending_child_exit",
-        "capture_stage": ("kit_child_after_env_close_before_simulation_app_close"),
-    }
-    expected_ready = {
-        "schema_version": 1,
-        "status": "success",
-        "stage": "kit_child_after_env_close_before_simulation_app_close",
-        "raw_result": {
-            "path": completion["child_capture_path"],
-            "size_bytes": child["size"],
-            "sha256": child["sha256"],
-            "mode": "0444",
-        },
-    }
-    if child["value"] != expected_child or ready["value"] != expected_ready:
-        raise ValueError("Gripper-cap child-close/ready lifecycle mismatch")
-    return {
-        "artifact": {
-            key: smoke[key] for key in ("path", "size", "sha256", "mode", "nlink")
-        },
-        "child_close": {
-            key: child[key] for key in ("path", "size", "sha256", "mode", "nlink")
-        },
-        "child_ready": {
-            key: ready[key] for key in ("path", "size", "sha256", "mode", "nlink")
-        },
-        "measured_average_slew_magnitude_rad_s": measured_slew,
-        "measured_arm_velocity_abs_max_limit_rad_s": 0.001,
-        "exact_reset": True,
-    }
+    _require(isinstance(record, dict), f"{field} record must be an object")
+    artifact = validate_immutable_json(Path(record.get("path", "")))
+    identity_keys = ("path", "size", "sha256", "mode", "nlink")
+    _require(
+        set(record) == set(identity_keys)
+        and all(record[key] == artifact[key] for key in identity_keys)
+        and (expected_value is None or artifact["value"] == expected_value),
+        f"{field} identity mismatch",
+    )
+    return artifact
 
 
-def validate_gripper_cap_controller_completion(
+def validate_all_six_controller_completion(
     completion_path: Path,
     expected_sha256: str,
     expected_profile: str,
     repository: Path,
 ) -> dict[str, Any]:
-    """Reverify the exact terminal job1098204 cap completion and smoke."""
+    """Reverify accepted all-six controller job 1098349 and its full lifecycle."""
 
-    expected_sha256 = _sha256_string(expected_sha256, "gripper-cap completion SHA-256")
-    if expected_sha256 != PI05_DROID_GRIPPER_CONTROLLER_COMPLETION_SHA256:
-        raise ValueError("Unexpected gripper-cap completion SHA-256")
-    if expected_profile != PI05_DROID_GRIPPER_DRIVE_PROFILE:
-        raise ValueError("Unexpected gripper-cap drive profile")
-    if str(Path(completion_path)) != PI05_DROID_GRIPPER_CONTROLLER_COMPLETION_PATH:
-        raise ValueError("Unexpected gripper-cap completion path")
+    expected_sha256 = _sha256_string(expected_sha256, "all-six completion SHA-256")
+    if expected_sha256 != PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SHA256:
+        raise ValueError("Unexpected all-six completion SHA-256")
+    if expected_profile != PI05_DROID_ALL_SIX_CONTROLLER_PROFILE:
+        raise ValueError("Unexpected all-six completion profile")
+    if str(Path(completion_path)) != PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_PATH:
+        raise ValueError("Unexpected all-six completion path")
     artifact = validate_immutable_json(completion_path)
     if (
         artifact["sha256"] != expected_sha256
-        or artifact["size"] != PI05_DROID_GRIPPER_CONTROLLER_COMPLETION_SIZE
+        or artifact["size"] != PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SIZE
     ):
-        raise ValueError("Gripper-cap completion identity mismatch")
+        raise ValueError("All-six completion identity mismatch")
     value = artifact["value"]
     required = {
         "schema_version",
         "profile",
         "status",
+        "job_id",
         "scope",
-        "promotion",
-        "candidate_intent",
+        "task",
+        "official_policy_io_changed",
+        "checkpoint_loaded",
+        "model_server_started",
         "source",
-        "runtime",
-        "runtime_contract",
-        "slurm",
-        "smoke_artifact",
+        "smoke",
+        "saved_wrapper",
+        "srun_status",
+        "gpu_inventory",
+        "container",
+        "polaris_hub_revision",
+        "assets",
+        "promotion",
     }
     if (
         not isinstance(value, dict)
         or set(value) != required
         or value["schema_version"] != 1
-        or value["profile"] != PI05_DROID_GRIPPER_CONTROLLER_PROFILE
+        or value["profile"] != PI05_DROID_ALL_SIX_CONTROLLER_PROFILE
         or value["status"] != "pass"
-        or value["scope"] != "controller_only_no_model_or_checkpoint"
-        or value["promotion"] != "forbidden_without_separate_checkpoint_canary"
-        or value["candidate_intent"]
-        != {"expected_gripper_drive_profile": PI05_DROID_GRIPPER_DRIVE_PROFILE}
-        or value["slurm"].get("job_id") != PI05_DROID_GRIPPER_CONTROLLER_JOB_ID
-        or value["slurm"].get("srun_exit_code") != 0
-        or value["runtime"].get("container_image", {}).get("sha256")
-        != PI05_DROID_PYXIS_SHA256
+        or value["job_id"] != PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID
+        or value["scope"] != "controller_only_no_model_no_checkpoint"
+        or value["task"] != PI05_DROID_NATIVE_TASK
+        or value["official_policy_io_changed"] is not False
+        or value["checkpoint_loaded"] is not False
+        or value["model_server_started"] is not False
+        or value["promotion"] != "forbidden_without_separate_official_checkpoint_canary"
+        or value["polaris_hub_revision"] != PI05_DROID_HUB_REVISION
     ):
-        raise ValueError("Gripper-cap completion schema or identity mismatch")
+        raise ValueError("All-six completion schema or identity mismatch")
+
     source = value["source"]
     if (
         not isinstance(source, dict)
-        or source.get("commit") != PI05_DROID_GRIPPER_CONTROLLER_SOURCE_COMMIT
-        or source.get("detached_head") is not True
-        or source.get("tracked_and_untracked_clean") is not True
-        or source.get("head_reference") != "HEAD"
-        or source.get("standalone_git_directory") is not True
-        or not isinstance(source.get("files"), dict)
+        or set(source)
+        != {
+            "repository",
+            "commit",
+            "detached_and_clean",
+            "openpi_commit",
+            "files",
+            "official_model_io_unchanged_from_base",
+        }
+        or not isinstance(source["repository"], str)
+        or not source["repository"]
+        or source["commit"] != PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT
+        or source["detached_and_clean"] is not True
+        or source["openpi_commit"] != PI05_DROID_OPENPI_INFERENCE_COMPATIBILITY_COMMIT
+        or not isinstance(source["files"], dict)
+        or set(source["files"]) != set(PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS)
     ):
-        raise ValueError("Gripper-cap source provenance mismatch")
+        raise ValueError("All-six source provenance mismatch")
+
     repository = Path(repository).resolve()
     source_files = {}
-    for relative_path in PI05_DROID_CONTROLLER_CRITICAL_PATHS:
-        record = source["files"].get(relative_path)
+    for relative_path in PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS:
+        record = source["files"][relative_path]
         path = repository / relative_path
         if (
             not isinstance(record, dict)
             or set(record) != {"size", "sha256"}
+            or type(record["size"]) is not int
+            or record["size"] <= 0
             or path.stat().st_size != record["size"]
             or file_sha256(path) != record["sha256"]
         ):
             raise ValueError(
-                f"Integrated source differs from job1098204: {relative_path}"
+                f"Integrated source differs from job1098349: {relative_path}"
             )
+        _sha256_string(record["sha256"], f"job1098349 {relative_path}")
         source_files[relative_path] = record
-    runtime = _validate_gripper_runtime(value["runtime_contract"])
-    smoke = _validate_gripper_smoke(value["smoke_artifact"], runtime)
+
+    model_io = source["official_model_io_unchanged_from_base"]
+    accepted_model_io_paths = {
+        *PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS,
+        "src/polaris/pi05_droid_native_eval_contract.py",
+    }
+    if not isinstance(model_io, dict) or set(model_io) != accepted_model_io_paths:
+        raise ValueError("All-six official model-I/O attestation mismatch")
+    for relative_path, record in model_io.items():
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"base_commit", "size", "sha256"}
+            or record["base_commit"] != "3e9df7f605baa75848a0ad8edd2783d629d105c5"
+            or type(record["size"]) is not int
+            or record["size"] <= 0
+        ):
+            raise ValueError(
+                f"All-six official model-I/O record mismatch: {relative_path}"
+            )
+        _sha256_string(record["sha256"], f"job1098349 model-I/O {relative_path}")
+    accepted_eval_contract = model_io["src/polaris/pi05_droid_native_eval_contract.py"]
+    if accepted_eval_contract != {
+        "base_commit": "3e9df7f605baa75848a0ad8edd2783d629d105c5",
+        "size": 27_584,
+        "sha256": "a86e8cdaf9dd4f34ea7449fda8f3c5ff4278c924b282bc12e3664dc0e5a65c9a",
+    }:
+        raise ValueError("Accepted pre-promotion eval-contract identity mismatch")
+    policy_io_files = {}
+    for relative_path in PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS:
+        record = model_io[relative_path]
+        path = repository / relative_path
+        if (
+            path.stat().st_size != record["size"]
+            or file_sha256(path) != record["sha256"]
+        ):
+            raise ValueError(
+                f"Official policy I/O differs from job1098349: {relative_path}"
+            )
+        policy_io_files[relative_path] = record
+
+    smoke_record = value["smoke"]
+    if not isinstance(smoke_record, dict) or not isinstance(
+        smoke_record.get("path"), str
+    ):
+        raise ValueError("All-six completion lacks smoke artifact")
+    # The completion stores the resolved fs11 artifact identity, while the
+    # child lifecycle was intentionally published through the stable fsw
+    # namespace.  Reopen through the completion's lexical fsw sibling so the
+    # embedded raw/ready paths remain exact, then compare the resolved identity.
+    expected_smoke_path = Path(completion_path).with_name(
+        f"native-all-six-smoke-{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}.json"
+    )
+    if Path(smoke_record["path"]).resolve() != expected_smoke_path.resolve():
+        raise ValueError("All-six smoke path binding mismatch")
+    smoke = validate_immutable_native_all_six_smoke(expected_smoke_path)
+    if smoke != smoke_record:
+        raise ValueError("All-six smoke identity mismatch")
+    if smoke["runtime_sha256"] != PI05_DROID_ALL_SIX_RUNTIME_SHA256:
+        raise ValueError("All-six runtime identity mismatch")
+
+    srun_status_artifact = _validate_bound_json_record(
+        value["srun_status"],
+        field="all-six srun status",
+        expected_value={
+            "job_id": PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID,
+            "srun_exit_code": 0,
+        },
+    )
+    gpu_inventory_artifact = _validate_bound_json_record(
+        value["gpu_inventory"],
+        field="all-six GPU inventory",
+        expected_value=None,
+    )
+    gpu_value = gpu_inventory_artifact["value"]
+    if (
+        not isinstance(gpu_value, dict)
+        or set(gpu_value) != {"schema_version", "job_id", "gpus"}
+        or gpu_value["schema_version"] != 1
+        or gpu_value["job_id"] != PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID
+        or not isinstance(gpu_value["gpus"], list)
+        or len(gpu_value["gpus"]) != 1
+        or not isinstance(gpu_value["gpus"][0], dict)
+        or set(gpu_value["gpus"][0]) != {"uuid", "name", "driver_version"}
+        or gpu_value["gpus"][0]["name"] != "NVIDIA L40S"
+        or not str(gpu_value["gpus"][0]["uuid"]).startswith("GPU-")
+        or not isinstance(gpu_value["gpus"][0]["driver_version"], str)
+        or not gpu_value["gpus"][0]["driver_version"]
+    ):
+        raise ValueError("All-six GPU inventory mismatch")
+    container = value["container"]
+    if (
+        not isinstance(container, dict)
+        or container.get("sha256") != PI05_DROID_PYXIS_SHA256
+        or container.get("size") != 7_183_130_624
+        or container.get("mode") != "0644"
+        or container.get("nlink") != 1
+    ):
+        raise ValueError("All-six container identity mismatch")
+    assets = value["assets"]
+    if not isinstance(assets, dict) or set(assets) != set(PI05_DROID_CANARY_ASSETS):
+        raise ValueError("All-six asset set mismatch")
+    for relative_path, expected in PI05_DROID_CANARY_ASSETS.items():
+        record = assets[relative_path]
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"asset", "metadata", "hub_revision"}
+            or record["hub_revision"] != PI05_DROID_HUB_REVISION
+            or record["asset"].get("sha256") != expected["sha256"]
+            or record["metadata"].get("sha256") != expected["metadata_sha256"]
+        ):
+            raise ValueError(f"All-six asset identity mismatch: {relative_path}")
+
     return {
         **{key: artifact[key] for key in ("path", "size", "sha256", "mode", "nlink")},
-        "job_id": PI05_DROID_GRIPPER_CONTROLLER_JOB_ID,
-        "controller_profile": PI05_DROID_GRIPPER_CONTROLLER_PROFILE,
+        "job_id": PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID,
+        "controller_profile": PI05_DROID_ALL_SIX_CONTROLLER_PROFILE,
         "drive_profile": PI05_DROID_GRIPPER_DRIVE_PROFILE,
-        "runtime_sha256": PI05_DROID_GRIPPER_RUNTIME_SHA256,
-        "source_commit": PI05_DROID_GRIPPER_CONTROLLER_SOURCE_COMMIT,
+        "runtime_sha256": PI05_DROID_ALL_SIX_RUNTIME_SHA256,
+        "source_commit": PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT,
         "critical_source_files": source_files,
+        "unchanged_policy_io_files": policy_io_files,
         "smoke": smoke,
+        "srun_status": {
+            key: srun_status_artifact[key]
+            for key in ("path", "size", "sha256", "mode", "nlink")
+        },
+        "gpu_inventory": {
+            key: gpu_inventory_artifact[key]
+            for key in ("path", "size", "sha256", "mode", "nlink")
+        },
         "promotion": "prerequisite_only_for_one_checkpoint_canary",
     }
 
@@ -1196,9 +1015,9 @@ def _validate_run_record(
         "POLARIS_DATA_DIR",
         "CONTROLLER_COMPLETION",
         "EXPECTED_CONTROLLER_COMPLETION_SHA256",
-        "GRIPPER_CAP_CONTROLLER_COMPLETION",
-        "EXPECTED_GRIPPER_CAP_COMPLETION_SHA256",
-        "EXPECTED_GRIPPER_CAP_PROFILE",
+        "ALL_SIX_CONTROLLER_COMPLETION",
+        "EXPECTED_ALL_SIX_COMPLETION_SHA256",
+        "EXPECTED_ALL_SIX_PROFILE",
         "PORT",
         "MODEL_RUNTIME_CONTRACT",
     }
@@ -1238,7 +1057,7 @@ def _validate_run_record(
         "POLARIS_PYXIS_IMAGE": Path(args.container_image),
         "POLARIS_DATA_DIR": Path(args.data_dir),
         "CONTROLLER_COMPLETION": Path(args.controller_completion),
-        "GRIPPER_CAP_CONTROLLER_COMPLETION": Path(args.gripper_cap_completion),
+        "ALL_SIX_CONTROLLER_COMPLETION": Path(args.all_six_controller_completion),
         "MODEL_RUNTIME_CONTRACT": run_dir / "pi05_droid_native_model_runtime.json",
     }
     if any(
@@ -1252,10 +1071,8 @@ def _validate_run_record(
         "EXPECTED_CONTROLLER_COMPLETION_SHA256": (
             args.expected_controller_completion_sha256
         ),
-        "EXPECTED_GRIPPER_CAP_COMPLETION_SHA256": (
-            args.expected_gripper_cap_completion_sha256
-        ),
-        "EXPECTED_GRIPPER_CAP_PROFILE": args.expected_gripper_cap_profile,
+        "EXPECTED_ALL_SIX_COMPLETION_SHA256": (args.expected_all_six_completion_sha256),
+        "EXPECTED_ALL_SIX_PROFILE": args.expected_all_six_profile,
     }
     if any(values[key] != expected for key, expected in expected_scalars.items()):
         raise ValueError("Run-record scalar binding mismatch")
@@ -1336,10 +1153,10 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         args.expected_controller_completion_sha256,
         args.polaris_repo,
     )
-    gripper_controller = validate_gripper_cap_controller_completion(
-        args.gripper_cap_completion,
-        args.expected_gripper_cap_completion_sha256,
-        args.expected_gripper_cap_profile,
+    all_six_controller = validate_all_six_controller_completion(
+        args.all_six_controller_completion,
+        args.expected_all_six_completion_sha256,
+        args.expected_all_six_profile,
         args.polaris_repo,
     )
     checkpoint = _validate_checkpoint_artifact(run_dir / "checkpoint_verification.json")
@@ -1361,9 +1178,9 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
     serving_contract_path = run_dir / PI05_DROID_CONTRACT_FILENAME
     serving_contract = validate_persisted_serving_contract(serving_contract_path)
     runtime = _validate_runtime_artifact(task_dir / "joint_velocity_runtime.json")
-    if runtime["runtime_sha256"] != gripper_controller["runtime_sha256"]:
+    if runtime["runtime_sha256"] != all_six_controller["runtime_sha256"]:
         raise ValueError(
-            "Canary runtime differs from the job1098204 controller-attested runtime"
+            "Canary runtime differs from the job1098349 all-six-attested runtime"
         )
     close_ready = _validate_close_ready(
         task_dir / "evaluator_close_ready.json", runtime, run_dir
@@ -1463,7 +1280,7 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         "openpi": openpi,
         "controllers": {
             "native_joint_velocity": base_controller,
-            "native_gripper_cap": gripper_controller,
+            "native_all_six_coupled": all_six_controller,
         },
         "checkpoint": checkpoint,
         "model_runtime": model_runtime,
@@ -1528,9 +1345,9 @@ def _add_controller_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--polaris-repo", type=Path, required=True)
     parser.add_argument("--controller-completion", type=Path, required=True)
     parser.add_argument("--expected-controller-completion-sha256", required=True)
-    parser.add_argument("--gripper-cap-completion", type=Path, required=True)
-    parser.add_argument("--expected-gripper-cap-completion-sha256", required=True)
-    parser.add_argument("--expected-gripper-cap-profile", required=True)
+    parser.add_argument("--all-six-controller-completion", type=Path, required=True)
+    parser.add_argument("--expected-all-six-completion-sha256", required=True)
+    parser.add_argument("--expected-all-six-profile", required=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1557,16 +1374,14 @@ def main() -> None:
             args.expected_controller_completion_sha256,
             args.polaris_repo,
         )
-        gripper = validate_gripper_cap_controller_completion(
-            args.gripper_cap_completion,
-            args.expected_gripper_cap_completion_sha256,
-            args.expected_gripper_cap_profile,
+        all_six = validate_all_six_controller_completion(
+            args.all_six_controller_completion,
+            args.expected_all_six_completion_sha256,
+            args.expected_all_six_profile,
             args.polaris_repo,
         )
         print(
-            canonical_json_bytes({"base": base, "gripper_cap": gripper}).decode(
-                "ascii"
-            ),
+            canonical_json_bytes({"base": base, "all_six": all_six}).decode("ascii"),
             end="",
         )
         return
