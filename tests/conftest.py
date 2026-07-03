@@ -108,6 +108,9 @@ def make_joint_velocity_runtime_report():
         "action_cfg_class": (
             "polaris.environments.droid_cfg.AuditedDroidJointVelocityActionCfg"
         ),
+        "action_cfg_base_class": (
+            "isaaclab.envs.mdp.actions.actions_cfg.JointVelocityActionCfg"
+        ),
         "scale": 1.0,
         "offset": 0.0,
         "use_default_offset": False,

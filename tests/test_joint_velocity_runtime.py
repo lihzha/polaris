@@ -40,6 +40,24 @@ BinaryGripperAction = _named_class(
 )
 
 
+def test_source_resolution_distinguishes_custom_config_from_upstream_base():
+    upstream = _named_class(
+        "isaaclab.envs.mdp.actions.actions_cfg", "JointVelocityActionCfg"
+    )
+    custom = type(
+        "AuditedDroidJointVelocityActionCfg",
+        (upstream,),
+        {"__module__": "polaris.environments.droid_cfg"},
+    )
+    resolved = runtime._resolve_joint_velocity_cfg_base(SimpleNamespace(cfg=custom()))
+    assert resolved is upstream
+    assert f"{type(custom()).__module__}.{type(custom()).__qualname__}" == (
+        "polaris.environments.droid_cfg.AuditedDroidJointVelocityActionCfg"
+    )
+    with pytest.raises(ValueError, match="velocity action config base"):
+        runtime._resolve_joint_velocity_cfg_base(SimpleNamespace(cfg=object()))
+
+
 class _DeviceTensor:
     """CPU-backed tensor double with an explicit source-device contract."""
 
@@ -244,6 +262,12 @@ def test_runtime_binds_action_class_order_affine_and_direct_physx_drive(monkeypa
     assert report["profile"] == PI05_DROID_JOINTVELOCITY_PROFILE
     assert report["joint_names"] == list(PANDA_ARM_JOINT_NAMES)
     assert report["position_integration"] == "absent_by_exact_action_class"
+    assert report["action_cfg_class"] == (
+        "polaris.environments.droid_cfg.AuditedDroidJointVelocityActionCfg"
+    )
+    assert report["action_cfg_base_class"] == (
+        "isaaclab.envs.mdp.actions.actions_cfg.JointVelocityActionCfg"
+    )
     assert report["velocity_drive"]["position_stiffness"] == 0.0
     assert report["velocity_drive"]["velocity_damping"] == 80.0
     assert report["clip"]["device"] == "cuda:0"

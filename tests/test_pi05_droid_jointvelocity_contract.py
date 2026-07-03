@@ -64,6 +64,10 @@ def test_exact_contract_binds_checkpoint_norm_openpi_action_and_control():
     assert contract["policy_output"]["response_shape"] == [15, 8]
     assert contract["policy_output"]["execute_first"] == 8
     assert contract["control"]["position_integration"] == "forbidden"
+    assert contract["control"]["action_cfg"] == (
+        "polaris_AuditedDroidJointVelocityActionCfg"
+    )
+    assert contract["control"]["action_cfg_base"] == ("isaaclab_JointVelocityActionCfg")
     assert contract["control"]["velocity_drive"]["position_stiffness"] == 0.0
     assert contract["control"]["gripper_drive"]["profile"] == (
         NATIVE_GRIPPER_DRIVE_PROFILE

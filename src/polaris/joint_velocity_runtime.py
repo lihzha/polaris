@@ -53,6 +53,9 @@ _JOINT_VELOCITY_CFG_CLASS = (
 _JOINT_VELOCITY_BASE_CLASS = (
     "isaaclab.envs.mdp.actions.joint_actions.JointVelocityAction"
 )
+_JOINT_VELOCITY_CFG_BASE_CLASS = (
+    "isaaclab.envs.mdp.actions.actions_cfg.JointVelocityActionCfg"
+)
 _MANAGER_BASED_RL_ENV_BASE_CLASS = (
     "isaaclab.envs.manager_based_rl_env.ManagerBasedRLEnv"
 )
@@ -170,6 +173,7 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
         "joint_names",
         "action_term_class",
         "action_cfg_class",
+        "action_cfg_base_class",
         "scale",
         "offset",
         "use_default_offset",
@@ -205,6 +209,7 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
         "joint_names": list(PANDA_ARM_JOINT_NAMES),
         "action_term_class": _JOINT_VELOCITY_ACTION_CLASS,
         "action_cfg_class": _JOINT_VELOCITY_CFG_CLASS,
+        "action_cfg_base_class": _JOINT_VELOCITY_CFG_BASE_CLASS,
         "scale": 1.0,
         "offset": 0.0,
         "use_default_offset": False,
@@ -422,6 +427,21 @@ def _installed_isaaclab_version() -> str:
     return importlib.metadata.version("isaaclab")
 
 
+def _resolve_joint_velocity_cfg_base(arm_term: Any) -> type:
+    resolved = next(
+        (
+            candidate
+            for candidate in type(arm_term.cfg).__mro__
+            if f"{candidate.__module__}.{candidate.__qualname__}"
+            == _JOINT_VELOCITY_CFG_BASE_CLASS
+        ),
+        None,
+    )
+    if resolved is None:
+        raise ValueError("Cannot resolve pinned Isaac Lab velocity action config base")
+    return resolved
+
+
 def _verify_isaaclab_sources(
     *, root_env: Any, arm_term: Any, finger_term: Any, robot: Any, actuator: Any
 ) -> dict[str, str]:
@@ -447,6 +467,7 @@ def _verify_isaaclab_sources(
     )
     if velocity_base is None:
         raise ValueError("Cannot resolve pinned Isaac Lab velocity-action base class")
+    velocity_cfg_base = _resolve_joint_velocity_cfg_base(arm_term)
     rl_env_base = next(
         (
             cls
@@ -459,7 +480,7 @@ def _verify_isaaclab_sources(
     if rl_env_base is None:
         raise ValueError("Cannot resolve pinned Isaac Lab manager-based RL base class")
     objects = {
-        "actions_cfg.py": arm_term.cfg,
+        "actions_cfg.py": velocity_cfg_base,
         "joint_actions.py": velocity_base,
         "binary_joint_actions.py": binary_base,
         "actuator_cfg.py": robot.cfg.actuators["panda_shoulder"],
@@ -489,12 +510,18 @@ def _verify_isaaclab_sources(
     return actual
 
 
-def _verify_polaris_sources(*, root_env: Any, finger_term: Any) -> dict[str, str]:
+def _verify_polaris_sources(
+    *, root_env: Any, arm_term: Any, finger_term: Any
+) -> dict[str, str]:
     from polaris import native_gripper_runtime
     from polaris.environments import robot_cfg
 
+    droid_cfg_objects = (type(arm_term), type(arm_term.cfg), type(finger_term))
+    droid_cfg_paths = {inspect.getsourcefile(value) for value in droid_cfg_objects}
+    if None in droid_cfg_paths or len(droid_cfg_paths) != 1:
+        raise ValueError("PolaRiS DROID action/config source identity mismatch")
     objects = {
-        "droid_cfg.py": type(finger_term),
+        "droid_cfg.py": type(arm_term.cfg),
         "robot_cfg.py": robot_cfg.make_nvidia_droid_joint_velocity_cfg,
         "native_gripper_runtime.py": (
             native_gripper_runtime.apply_native_gripper_all_six_velocity_limits
@@ -675,7 +702,7 @@ def validate_joint_velocity_runtime(
         actuator=robot.actuators["panda_shoulder"],
     )
     polaris_runtime_source_sha256 = _verify_polaris_sources(
-        root_env=root_env, finger_term=finger_term
+        root_env=root_env, arm_term=arm_term, finger_term=finger_term
     )
 
     expected_stiffness = np.zeros((1, 7), dtype=np.float32)
@@ -852,6 +879,7 @@ def validate_joint_velocity_runtime(
         "joint_names": list(joint_names),
         "action_term_class": _class_path(arm_term),
         "action_cfg_class": _class_path(arm_term.cfg),
+        "action_cfg_base_class": _JOINT_VELOCITY_CFG_BASE_CLASS,
         "scale": 1.0,
         "offset": 0.0,
         "use_default_offset": False,

@@ -73,6 +73,31 @@
   patched. The second read-only review returned `GO` with no residual P0/P1/P2
   findings, scoped only to the no-model controller smoke. No L40S coupled smoke
   and no checkpoint/model evaluation has been submitted from this branch.
+
+## First exact-commit L40S attempt and source-identity repair
+
+- Exact deployed commit `ad3274a47e7c4c515b48d7296b1e742a02fd6e82`
+  ran as the sole no-model job `1098328` on one L40S. It terminated `FAILED`
+  with exit `1:0` after 2:53 at `validate_runtime`; no model or checkpoint was
+  loaded.
+- Immutable failure evidence reports that the `actions_cfg.py` check observed
+  SHA `19ceacee...`, the exact PolaRiS `droid_cfg.py` digest. The verifier had
+  passed the custom `AuditedDroidJointVelocityActionCfg` directly to the
+  upstream Isaac Lab source check, so it compared the correct custom source to
+  the distinct pinned upstream `actions_cfg.py` digest `94722a...`.
+- The minimal repair now resolves
+  `isaaclab.envs.mdp.actions.actions_cfg.JointVelocityActionCfg` from the custom
+  config's MRO for the upstream source hash. The PolaRiS source check explicitly
+  requires the custom arm term, custom config, and binary finger term to share
+  the pinned `droid_cfg.py` source. Runtime and serving contracts now record the
+  custom action-config identity separately from its upstream base identity.
+- Focused source/runtime/contract/all-six suite: `60 passed`. Broad non-Isaac
+  suite: `152 passed, 5 subtests passed`. Changed-file Ruff, formatting,
+  compilation, and `git diff --check` pass.
+- Job evidence is mirrored under
+  `/home/lzha/code/ego-lap/.codex_artifacts/pi05-native-all-six-controller-ad3274a/job_1098328`;
+  the detailed operational log is the sibling `worklog.md`. A relaunch remains
+  forbidden pending an independently reviewed frozen repair.
 - Main-agent frozen-diff review added an explicit `#SBATCH --no-requeue` gate
   (plus regression assertion), so a failed smoke cannot silently recreate an
   allocation. The correctly rooted broad suite independently reproduced
