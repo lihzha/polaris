@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay the official LAP-3B boundary failure and stress the v4 EEF guard.
+"""Replay the official LAP-3B boundary failure and stress the v5 EEF guard.
 
 This is a standalone Isaac smoke.  It does not start a policy server or load a
 checkpoint: the committed fixture contains the exact absolute PolaRiS actions
@@ -98,6 +98,9 @@ OUTER_LOWER_LIMIT_RAD = -2.8973000049591064
 OUTER_UPPER_LIMIT_RAD = 2.8973000049591064
 INNER_UPPER_LIMIT_RAD = 2.8755500316619873
 TARGET_LIMIT_DIGEST = "09b20ab18c35d6dc22a3edbc2beca2edff419e242dd07d74cd1d65df9ce67e0f"
+PHYSX_DERIVED_SOFT_LIMIT_DIGEST = (
+    "dd7865f59efb23e96d7d4cbb5e129906b04a42b5e5c0941459bfc8866dd7ecd0"
+)
 SOFT_LIMIT_DIGEST = "fbf7535901c042fea5d901812ecd02c5fd81ade06c23c1499c32d66a859104de"
 EXPECTED_MAX_DELTA_RAD = [0.018125001341104507] * 4 + [0.02174999937415123] * 3
 EXPECTED_VELOCITY_LIMITS_RAD_S = [2.174999952316284] * 4 + [2.609999895095825] * 3
@@ -120,6 +123,26 @@ EXPECTED_TARGET_LIMITS_RAD = [
     [0.004250075668096542, 3.73075008392334],
     [-2.8755500316619873, 2.8755500316619873],
 ]
+EXPECTED_PHYSX_DERIVED_SOFT_LIMITS_RAD = [
+    [-2.8791749477386475, 2.8791749477386475],
+    [-1.7446749210357666, 1.7446749210357666],
+    [-2.8791749477386475, 2.8791749477386475],
+    [-3.0536749362945557, -0.08792495727539062],
+    [-2.8755500316619873, 2.8755500316619873],
+    [0.004250049591064453, 3.73075008392334],
+    [-2.8755500316619873, 2.8755500316619873],
+]
+if (
+    hashlib.sha256(
+        b"".join(
+            struct.pack("<f", value)
+            for pair in EXPECTED_PHYSX_DERIVED_SOFT_LIMITS_RAD
+            for value in pair
+        )
+    ).hexdigest()
+    != PHYSX_DERIVED_SOFT_LIMIT_DIGEST
+):
+    raise RuntimeError("Canonical PhysX-derived soft-limit digest drift")
 ZERO_COUNTERS = (
     "current_joint_limit_aborts",
     "invariant_aborts",
@@ -138,6 +161,7 @@ SAFETY_FIELDS = {
     "current_joint_soft_limit_tolerance_rad",
     "target_soft_limit_guard_band_profile",
     "physx_hard_limit_profile",
+    "physx_derived_soft_limit_profile",
     "physx_hard_limit_write_count",
     "arm_velocity_target_profile",
     "joint_velocity_limit_tolerance_rad_s",
@@ -153,6 +177,8 @@ SAFETY_FIELDS = {
     "target_joint_pos_limits_float32_sha256",
     "physx_hard_joint_pos_limits_rad",
     "physx_hard_joint_pos_limits_float32_sha256",
+    "physx_derived_soft_joint_pos_limits_rad",
+    "physx_derived_soft_joint_pos_limits_float32_sha256",
     "arm_velocity_target_rad_s",
     "soft_joint_pos_limits_rad",
     "soft_joint_pos_limits_float32_sha256",
@@ -547,7 +573,7 @@ def _validate_diagnostic_vector(value: Any, field: str) -> list[float]:
 def validate_safety_static(
     report: dict[str, Any], *, episode_index: int | None
 ) -> None:
-    """Validate the closed v4 safety schema and every immutable static field."""
+    """Validate the closed v5 safety schema and every immutable static field."""
 
     _require(isinstance(report, dict) and set(report) == SAFETY_FIELDS, "safety schema")
     _require(report.get("episode_index") == episode_index, "safety episode index")
@@ -562,6 +588,9 @@ def validate_safety_static(
             "eef_physx_inner_hardlimit_one_substep_v2"
         ),
         "physx_hard_limit_profile": "outer_minus_one_velocity_substep_v1",
+        "physx_derived_soft_limit_profile": (
+            "isaaclab_midpoint_range_factor1_float32_v1"
+        ),
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": "zero_per_physics_substep_v1",
         "joint_velocity_limit_tolerance_rad_s": 1e-5,
@@ -571,6 +600,9 @@ def validate_safety_static(
         "joint_names": [f"panda_joint{index}" for index in range(1, 8)],
         "target_joint_pos_limits_float32_sha256": TARGET_LIMIT_DIGEST,
         "physx_hard_joint_pos_limits_float32_sha256": TARGET_LIMIT_DIGEST,
+        "physx_derived_soft_joint_pos_limits_float32_sha256": (
+            PHYSX_DERIVED_SOFT_LIMIT_DIGEST
+        ),
         "soft_joint_pos_limits_float32_sha256": SOFT_LIMIT_DIGEST,
     }
     for field, expected in exact.items():
@@ -604,6 +636,11 @@ def validate_safety_static(
         report.get("physx_hard_joint_pos_limits_rad"),
         "safety PhysX hard limits",
         EXPECTED_TARGET_LIMITS_RAD,
+    )
+    _validate_float_matrix(
+        report.get("physx_derived_soft_joint_pos_limits_rad"),
+        "safety PhysX-derived soft limits",
+        EXPECTED_PHYSX_DERIVED_SOFT_LIMITS_RAD,
     )
     velocity_target = _finite_vector(
         report.get("arm_velocity_target_rad_s"),
@@ -915,6 +952,11 @@ def validate_boundary_result(
     _require(
         safety.get("physx_hard_joint_pos_limits_float32_sha256") == TARGET_LIMIT_DIGEST,
         "boundary PhysX hard-limit digest",
+    )
+    _require(
+        safety.get("physx_derived_soft_joint_pos_limits_float32_sha256")
+        == PHYSX_DERIVED_SOFT_LIMIT_DIGEST,
+        "boundary PhysX-derived soft-limit digest",
     )
     _require(safety.get("decimation") == DECIMATION, "boundary decimation")
     _require(

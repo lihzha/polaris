@@ -117,6 +117,9 @@ def _safety_report(*, episode_index=0, apply_calls=smoke.EXPECTED_APPLY_CALLS):
             "eef_physx_inner_hardlimit_one_substep_v2"
         ),
         "physx_hard_limit_profile": "outer_minus_one_velocity_substep_v1",
+        "physx_derived_soft_limit_profile": (
+            "isaaclab_midpoint_range_factor1_float32_v1"
+        ),
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": "zero_per_physics_substep_v1",
         "joint_velocity_limit_tolerance_rad_s": 1e-5,
@@ -134,6 +137,12 @@ def _safety_report(*, episode_index=0, apply_calls=smoke.EXPECTED_APPLY_CALLS):
             smoke.EXPECTED_TARGET_LIMITS_RAD
         ),
         "physx_hard_joint_pos_limits_float32_sha256": smoke.TARGET_LIMIT_DIGEST,
+        "physx_derived_soft_joint_pos_limits_rad": copy.deepcopy(
+            smoke.EXPECTED_PHYSX_DERIVED_SOFT_LIMITS_RAD
+        ),
+        "physx_derived_soft_joint_pos_limits_float32_sha256": (
+            smoke.PHYSX_DERIVED_SOFT_LIMIT_DIGEST
+        ),
         "arm_velocity_target_rad_s": [0.0] * 7,
         "soft_joint_pos_limits_rad": copy.deepcopy(smoke.EXPECTED_OUTER_LIMITS_RAD),
         "soft_joint_pos_limits_float32_sha256": smoke.SOFT_LIMIT_DIGEST,
@@ -406,6 +415,18 @@ def test_boundary_evidence_accepts_exact_full_state_dwell():
                 "target_joint_pos_limits_float32_sha256", "0" * 64
             ),
             "target_joint_pos_limits_float32_sha256",
+        ),
+        (
+            lambda boundary, safety: safety["physx_derived_soft_joint_pos_limits_rad"][
+                3
+            ].__setitem__(1, smoke.EXPECTED_TARGET_LIMITS_RAD[3][1]),
+            "PhysX-derived soft limits",
+        ),
+        (
+            lambda boundary, safety: safety["arm_velocity_target_rad_s"].__setitem__(
+                4, 1e-3
+            ),
+            "velocity target drift",
         ),
     ],
 )

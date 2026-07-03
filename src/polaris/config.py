@@ -65,6 +65,8 @@ class PolicyArgs:
     normalization_profile: str | None = None
     normalization_input_formula: str | None = None
     normalization_output_formula: str | None = None
+    contract_sha256: str | None = None
+    execution_contract_sha256: str | None = None
 
 
 @dataclass

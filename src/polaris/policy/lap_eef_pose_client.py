@@ -457,6 +457,8 @@ class EgoLAPEefPoseClient(InferenceClient):
             expected_normalization_profile=args.normalization_profile,
             expected_normalization_input_formula=args.normalization_input_formula,
             expected_normalization_output_formula=args.normalization_output_formula,
+            expected_contract_sha256=args.contract_sha256,
+            expected_execution_contract_sha256=args.execution_contract_sha256,
             expected_frame_description=args.frame_description,
             expected_action_frame=args.action_frame,
             expected_dataset_name=args.dataset_name,

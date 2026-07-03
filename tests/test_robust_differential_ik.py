@@ -11,6 +11,7 @@ from polaris.robust_differential_ik import (
     RobustDifferentialIKController,
     RobustDifferentialInverseKinematicsAction,
     _bound_joint_position_target,
+    _derive_isaac_soft_joint_position_limits,
     _eef_quaternion_norm_is_valid,
     _install_eef_physx_position_limits,
     _require_current_joint_position_in_soft_limits,
@@ -19,6 +20,7 @@ from polaris.robust_differential_ik import (
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+from polaris.eef_ik_safety import PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_RAD
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_RAD
 
 
@@ -204,48 +206,81 @@ def test_joint_target_guard_band_does_not_consume_recovery_for_in_range_state(
     torch.testing.assert_close(safe, strict_inner, rtol=0.0, atol=0.0)
 
 
-def test_eef_physx_inner_limits_are_written_once_and_read_back_exactly():
-    class Data:
-        pass
+class _LimitData:
+    pass
 
-    class RootView:
-        def __init__(self, limits):
-            self.limits = limits
 
-        def get_dof_limits(self):
-            return self.limits
+class _LimitRootView:
+    def __init__(self, limits):
+        self.limits = limits
 
-    class Asset:
-        device = "cpu"
+    def get_dof_limits(self):
+        return self.limits
 
-        def __init__(self, limits):
-            self.data = Data()
-            self.data.joint_pos_limits = limits.clone()
-            self.data.soft_joint_pos_limits = limits.clone()
-            self.root_physx_view = RootView(limits.clone())
-            self.write_count = 0
 
-        def write_joint_position_limit_to_sim(
-            self, limits, *, joint_ids, env_ids, warn_limit_violation
-        ):
-            assert env_ids is None
-            assert warn_limit_violation is True
-            self.write_count += 1
-            self.data.joint_pos_limits[:, joint_ids, :] = limits
-            self.data.soft_joint_pos_limits[:, joint_ids, :] = limits
-            self.root_physx_view.limits[:, joint_ids, :] = limits
+class _LimitCfg:
+    soft_joint_pos_limit_factor = 1.0
 
+
+class _LimitAsset:
+    device = "cpu"
+    cfg = _LimitCfg()
+
+    def __init__(self, limits, *, corrupt_physx=False, corrupt_soft=False):
+        self.data = _LimitData()
+        self.data.joint_pos_limits = limits.clone()
+        self.data.soft_joint_pos_limits = limits.clone()
+        self.root_physx_view = _LimitRootView(limits.clone())
+        self.write_count = 0
+        self.corrupt_physx = corrupt_physx
+        self.corrupt_soft = corrupt_soft
+
+    def write_joint_position_limit_to_sim(
+        self, limits, *, joint_ids, env_ids, warn_limit_violation
+    ):
+        assert env_ids is None
+        assert warn_limit_violation is True
+        self.write_count += 1
+        self.data.joint_pos_limits[:, joint_ids, :] = limits
+        self.root_physx_view.limits[:, joint_ids, :] = limits
+
+        # Reproduce the pinned Isaac Lab implementation, including the
+        # float32 midpoint/range roundoff that makes this buffer distinct from
+        # the requested hard limits for panda_joint4 and panda_joint6.
+        hard = self.data.joint_pos_limits
+        joint_pos_mean = (hard[..., 0] + hard[..., 1]) / 2
+        joint_pos_range = hard[..., 1] - hard[..., 0]
+        factor = self.cfg.soft_joint_pos_limit_factor
+        self.data.soft_joint_pos_limits[..., 0] = (
+            joint_pos_mean - 0.5 * joint_pos_range * factor
+        )
+        self.data.soft_joint_pos_limits[..., 1] = (
+            joint_pos_mean + 0.5 * joint_pos_range * factor
+        )
+        if self.corrupt_physx:
+            self.root_physx_view.limits[0, 0, 0] += 1e-3
+        if self.corrupt_soft:
+            self.data.soft_joint_pos_limits[0, 0, 0] += 1e-3
+
+
+def _canonical_limit_inputs():
     outer = torch.tensor([PANDA_SOFT_JOINT_POS_LIMITS_RAD], dtype=torch.float32)
     max_delta = torch.tensor(
         [PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S], dtype=torch.float32
     ) * torch.tensor(1.0 / 120.0, dtype=torch.float32)
-    asset = Asset(outer)
+    return outer, max_delta
 
-    inner = _install_eef_physx_position_limits(
+
+def test_eef_physx_inner_limits_are_written_once_and_read_back_exactly():
+    outer, max_delta = _canonical_limit_inputs()
+    asset = _LimitAsset(outer)
+
+    inner, derived_soft = _install_eef_physx_position_limits(
         asset,
         joint_ids=list(range(7)),
         outer_limits=outer,
         max_delta_joint_pos=max_delta,
+        soft_limit_factor=1.0,
     )
 
     expected = torch.stack(
@@ -255,8 +290,83 @@ def test_eef_physx_inner_limits_are_written_once_and_read_back_exactly():
     assert torch.equal(inner, expected)
     assert torch.equal(asset.root_physx_view.get_dof_limits(), expected)
     assert torch.equal(asset.data.joint_pos_limits, expected)
-    assert torch.equal(asset.data.soft_joint_pos_limits, expected)
+    assert not torch.equal(asset.data.soft_joint_pos_limits, expected)
+    assert torch.equal(asset.data.soft_joint_pos_limits, derived_soft)
+    assert torch.equal(
+        derived_soft,
+        torch.tensor(
+            [PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_RAD],
+            dtype=torch.float32,
+        ),
+    )
+    assert torch.equal(
+        derived_soft,
+        _derive_isaac_soft_joint_position_limits(
+            expected,
+            soft_limit_factor=1.0,
+        ),
+    )
     assert torch.equal(outer, torch.tensor([PANDA_SOFT_JOINT_POS_LIMITS_RAD]))
+
+
+@pytest.mark.parametrize(
+    ("asset_kwargs", "match"),
+    [
+        ({"corrupt_physx": True}, "PhysX position-limit readback"),
+        ({"corrupt_soft": True}, "derived-soft position-limit readback"),
+    ],
+)
+def test_eef_physx_limit_install_rejects_readback_mutation(asset_kwargs, match):
+    outer, max_delta = _canonical_limit_inputs()
+    with pytest.raises(ValueError, match=match):
+        _install_eef_physx_position_limits(
+            _LimitAsset(outer, **asset_kwargs),
+            joint_ids=list(range(7)),
+            outer_limits=outer,
+            max_delta_joint_pos=max_delta,
+            soft_limit_factor=1.0,
+        )
+
+
+def test_eef_physx_limit_install_rejects_prewrite_outer_identity_drift():
+    outer, max_delta = _canonical_limit_inputs()
+    asset = _LimitAsset(outer)
+    asset.data.joint_pos_limits[0, 0, 0] += 1e-3
+    with pytest.raises(ValueError, match="live hard and soft joint limits disagree"):
+        _install_eef_physx_position_limits(
+            asset,
+            joint_ids=list(range(7)),
+            outer_limits=outer,
+            max_delta_joint_pos=max_delta,
+            soft_limit_factor=1.0,
+        )
+
+
+def test_safety_report_rejects_live_velocity_target_mutation():
+    outer, max_delta = _canonical_limit_inputs()
+    asset = _LimitAsset(outer)
+    hard, derived_soft = _install_eef_physx_position_limits(
+        asset,
+        joint_ids=list(range(7)),
+        outer_limits=outer,
+        max_delta_joint_pos=max_delta,
+        soft_limit_factor=1.0,
+    )
+    asset.data.joint_vel_target = torch.zeros((1, 7), dtype=torch.float32)
+    asset.data.joint_vel_target[0, 4] = 1e-3
+
+    action = object.__new__(RobustDifferentialInverseKinematicsAction)
+    action._asset = asset
+    action._joint_ids = list(range(7))
+    action._soft_joint_position_limits = outer
+    action._physx_hard_joint_position_limits = hard
+    action._physx_derived_soft_joint_position_limits = derived_soft
+    action._zero_joint_velocity_target = torch.zeros((1, 7), dtype=torch.float32)
+
+    with pytest.raises(
+        ValueError, match="live arm velocity target is not exactly zero"
+    ):
+        action.safety_report()
 
 
 def test_joint_target_safety_rejects_nonfinite_and_out_of_limit_current_state():
@@ -357,6 +467,13 @@ def test_current_limit_and_slew_invariants_abort_before_physx_target_setter():
     init_source = inspect.getsource(RobustDifferentialInverseKinematicsAction.__init__)
     assert "_install_eef_physx_position_limits" in init_source
     assert "write_joint_state_to_sim" not in init_source
+
+    report_source = inspect.getsource(
+        RobustDifferentialInverseKinematicsAction.safety_report
+    )
+    assert "self._asset.data.joint_vel_target" in report_source
+    assert "torch.equal(live_velocity_target" in report_source
+    assert '"arm_velocity_target_rad_s": live_velocity_target[0]' in report_source
 
 
 def test_eef_pose_config_installs_robust_action_term():

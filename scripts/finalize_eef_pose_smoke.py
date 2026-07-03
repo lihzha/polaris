@@ -20,6 +20,9 @@ EXPECTED_DIGEST = "fbf7535901c042fea5d901812ecd02c5fd81ade06c23c1499c32d66a85910
 EXPECTED_TARGET_DIGEST = (
     "09b20ab18c35d6dc22a3edbc2beca2edff419e242dd07d74cd1d65df9ce67e0f"
 )
+EXPECTED_PHYSX_DERIVED_SOFT_DIGEST = (
+    "dd7865f59efb23e96d7d4cbb5e129906b04a42b5e5c0941459bfc8866dd7ecd0"
+)
 EXPECTED_LIMITS = [
     [-2.8973000049591064, 2.8973000049591064],
     [-1.7627999782562256, 1.7627999782562256],
@@ -63,6 +66,15 @@ EXPECTED_TARGET_LIMITS = [
     [_float32(lower + margin), _float32(upper - margin)]
     for (lower, upper), margin in zip(EXPECTED_LIMITS, EXPECTED_MAX_DELTA, strict=True)
 ]
+EXPECTED_PHYSX_DERIVED_SOFT_LIMITS = [
+    [-2.8791749477386475, 2.8791749477386475],
+    [-1.7446749210357666, 1.7446749210357666],
+    [-2.8791749477386475, 2.8791749477386475],
+    [-3.0536749362945557, -0.08792495727539062],
+    [-2.8755500316619873, 2.8755500316619873],
+    [0.004250049591064453, 3.73075008392334],
+    [-2.8755500316619873, 2.8755500316619873],
+]
 if (
     hashlib.sha256(
         b"".join(
@@ -74,6 +86,17 @@ if (
     != EXPECTED_TARGET_DIGEST
 ):
     raise RuntimeError("Canonical Panda target guard-band digest drift")
+if (
+    hashlib.sha256(
+        b"".join(
+            struct.pack("<f", value)
+            for pair in EXPECTED_PHYSX_DERIVED_SOFT_LIMITS
+            for value in pair
+        )
+    ).hexdigest()
+    != EXPECTED_PHYSX_DERIVED_SOFT_DIGEST
+):
+    raise RuntimeError("Canonical Panda PhysX-derived soft-limit digest drift")
 RAW_FIELDS = {
     "schema_version",
     "finalized",
@@ -122,6 +145,7 @@ SAFETY_FIELDS = {
     "current_joint_soft_limit_tolerance_rad",
     "target_soft_limit_guard_band_profile",
     "physx_hard_limit_profile",
+    "physx_derived_soft_limit_profile",
     "physx_hard_limit_write_count",
     "arm_velocity_target_profile",
     "joint_velocity_limit_tolerance_rad_s",
@@ -137,6 +161,8 @@ SAFETY_FIELDS = {
     "target_joint_pos_limits_float32_sha256",
     "physx_hard_joint_pos_limits_rad",
     "physx_hard_joint_pos_limits_float32_sha256",
+    "physx_derived_soft_joint_pos_limits_rad",
+    "physx_derived_soft_joint_pos_limits_float32_sha256",
     "arm_velocity_target_rad_s",
     "soft_joint_pos_limits_rad",
     "soft_joint_pos_limits_float32_sha256",
@@ -418,9 +444,17 @@ def _validate_safety_report(
             "eef_physx_inner_hardlimit_one_substep_v2",
         ),
         ("physx_hard_limit_profile", "outer_minus_one_velocity_substep_v1"),
+        (
+            "physx_derived_soft_limit_profile",
+            "isaaclab_midpoint_range_factor1_float32_v1",
+        ),
         ("arm_velocity_target_profile", "zero_per_physics_substep_v1"),
         ("target_joint_pos_limits_float32_sha256", EXPECTED_TARGET_DIGEST),
         ("physx_hard_joint_pos_limits_float32_sha256", EXPECTED_TARGET_DIGEST),
+        (
+            "physx_derived_soft_joint_pos_limits_float32_sha256",
+            EXPECTED_PHYSX_DERIVED_SOFT_DIGEST,
+        ),
         ("soft_joint_pos_limits_float32_sha256", EXPECTED_DIGEST),
     ):
         _require(
@@ -491,6 +525,23 @@ def _validate_safety_report(
             actual,
             expected,
             f"{field}.physx_hard_joint_pos_limits_rad[{index}]",
+        )
+    physx_derived_soft_limits = _list(
+        report.get("physx_derived_soft_joint_pos_limits_rad"),
+        f"{field}.physx_derived_soft_joint_pos_limits_rad",
+        length=7,
+    )
+    for index, (actual, expected) in enumerate(
+        zip(
+            physx_derived_soft_limits,
+            EXPECTED_PHYSX_DERIVED_SOFT_LIMITS,
+            strict=True,
+        )
+    ):
+        _exact_float_vector(
+            actual,
+            expected,
+            f"{field}.physx_derived_soft_joint_pos_limits_rad[{index}]",
         )
     _exact_float_vector(
         report.get("arm_velocity_target_rad_s"),
@@ -1143,6 +1194,7 @@ def _verify_raw(raw: dict[str, Any]) -> dict[str, Any]:
         "ordinary_apply_calls_each": 360,
         "soft_limit_digest": EXPECTED_DIGEST,
         "target_limit_digest": EXPECTED_TARGET_DIGEST,
+        "physx_derived_soft_limit_digest": EXPECTED_PHYSX_DERIVED_SOFT_DIGEST,
         "adversarial": {
             "passed": True,
             "apply_calls": 8,

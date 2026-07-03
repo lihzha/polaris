@@ -241,6 +241,8 @@ def validate_ego_lap_server_metadata(
     expected_normalization_profile: str | None,
     expected_normalization_input_formula: str | None,
     expected_normalization_output_formula: str | None,
+    expected_contract_sha256: str | None,
+    expected_execution_contract_sha256: str | None,
     expected_frame_description: str | None,
     expected_action_frame: Literal["robot_base"] | None,
     expected_dataset_name: str,
@@ -825,7 +827,17 @@ def validate_ego_lap_server_metadata(
         field="execution.live_pipeline_validated",
     )
     _require_equal(execution.get("schema_version"), 2, field="execution.schema_version")
-    _verify_nested_digest(execution, field="execution")
+    execution_contract_sha256 = _verify_nested_digest(execution, field="execution")
+    if expected_execution_contract_sha256 is not None:
+        _require_sha256(
+            expected_execution_contract_sha256,
+            field="expected_execution_contract_sha256",
+        )
+        _require_equal(
+            execution_contract_sha256,
+            expected_execution_contract_sha256,
+            field="execution.sha256",
+        )
     normalized_state_probe = _mapping(
         execution.get("normalized_state_probe"),
         field="execution.normalized_state_probe",
@@ -1192,6 +1204,13 @@ def validate_ego_lap_server_metadata(
         ego_lap_contract_digest(document),
         field="sha256",
     )
+    if expected_contract_sha256 is not None:
+        _require_sha256(expected_contract_sha256, field="expected_contract_sha256")
+        _require_equal(
+            contract_sha256,
+            expected_contract_sha256,
+            field="sha256",
+        )
 
     return ValidatedEgoLAPContract(
         document=document,

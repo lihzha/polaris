@@ -24,10 +24,15 @@ from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+from polaris.eef_ik_safety import (
+    PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256,
+)
+from polaris.eef_ik_safety import PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_RAD
 from polaris.eef_ik_safety import PANDA_PHYSX_HARD_JOINT_POS_LIMITS_FLOAT32_SHA256
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_RAD
 from polaris.eef_ik_safety import PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256
+from polaris.eef_ik_safety import PHYSX_DERIVED_SOFT_LIMIT_PROFILE
 from polaris.eef_ik_safety import PHYSX_HARD_LIMIT_PROFILE
 from polaris.eef_ik_safety import TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
 from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
@@ -104,6 +109,7 @@ SAFETY_STATIC_FIELDS = (
     "current_joint_soft_limit_tolerance_rad",
     "target_soft_limit_guard_band_profile",
     "physx_hard_limit_profile",
+    "physx_derived_soft_limit_profile",
     "physx_hard_limit_write_count",
     "arm_velocity_target_profile",
     "joint_velocity_limit_tolerance_rad_s",
@@ -119,6 +125,8 @@ SAFETY_STATIC_FIELDS = (
     "target_joint_pos_limits_float32_sha256",
     "physx_hard_joint_pos_limits_rad",
     "physx_hard_joint_pos_limits_float32_sha256",
+    "physx_derived_soft_joint_pos_limits_rad",
+    "physx_derived_soft_joint_pos_limits_float32_sha256",
     "arm_velocity_target_rad_s",
     "soft_joint_pos_limits_rad",
     "soft_joint_pos_limits_float32_sha256",
@@ -390,6 +398,7 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         "apply_actions_cadence": EEF_IK_APPLY_CADENCE,
         "target_soft_limit_guard_band_profile": TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE,
         "physx_hard_limit_profile": PHYSX_HARD_LIMIT_PROFILE,
+        "physx_derived_soft_limit_profile": PHYSX_DERIVED_SOFT_LIMIT_PROFILE,
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": ARM_VELOCITY_TARGET_PROFILE,
         "decimation": CANONICAL_DECIMATION,
@@ -593,6 +602,33 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         raise ValueError(
             "Live EEF IK PhysX hard-limit readback does not match the exact "
             "target guard-band envelope"
+        )
+    physx_derived_soft_limits = _numpy(
+        report.get("physx_derived_soft_joint_pos_limits_rad")
+    ).astype(np.float64)
+    physx_derived_soft_limit_sha256 = report.get(
+        "physx_derived_soft_joint_pos_limits_float32_sha256"
+    )
+    computed_physx_derived_soft_limit_sha256 = hashlib.sha256(
+        physx_derived_soft_limits.astype("<f4", copy=False).tobytes()
+    ).hexdigest()
+    expected_physx_derived_soft_limits = np.asarray(
+        PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_RAD,
+        dtype="<f4",
+    )
+    if (
+        physx_derived_soft_limits.shape != (7, 2)
+        or not np.array_equal(
+            physx_derived_soft_limits.astype(np.float32),
+            expected_physx_derived_soft_limits,
+        )
+        or physx_derived_soft_limit_sha256 != computed_physx_derived_soft_limit_sha256
+        or physx_derived_soft_limit_sha256
+        != PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256
+    ):
+        raise ValueError(
+            "Live EEF IK PhysX-derived soft-limit readback does not match "
+            "pinned Isaac Lab float32 midpoint/range arithmetic"
         )
     arm_velocity_target = _numpy(report.get("arm_velocity_target_rad_s")).astype(
         np.float64

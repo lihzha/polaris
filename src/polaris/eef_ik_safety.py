@@ -10,6 +10,7 @@ EEF_IK_APPLY_CADENCE = "physics_substep"
 CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD = 1e-5
 TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE = "eef_physx_inner_hardlimit_one_substep_v2"
 PHYSX_HARD_LIMIT_PROFILE = "outer_minus_one_velocity_substep_v1"
+PHYSX_DERIVED_SOFT_LIMIT_PROFILE = "isaaclab_midpoint_range_factor1_float32_v1"
 ARM_VELOCITY_TARGET_PROFILE = "zero_per_physics_substep_v1"
 # One named allowance for float32 subtraction around the configured per-substep
 # slew bound.  Keep this identical in the controller, runtime validation, and
@@ -57,6 +58,22 @@ PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256 = (
 )
 PANDA_PHYSX_HARD_JOINT_POS_LIMITS_FLOAT32_SHA256 = (
     PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256
+)
+# Isaac Lab derives its soft buffer from the installed hard limits with
+# float32 midpoint/range arithmetic.  Even with factor=1 this is not a bitwise
+# identity for two asymmetric Panda limits, so bind that readback separately
+# from both the canonical outer envelope and the exact PhysX hard envelope.
+PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_RAD = (
+    (-2.8791749477386475, 2.8791749477386475),
+    (-1.7446749210357666, 1.7446749210357666),
+    (-2.8791749477386475, 2.8791749477386475),
+    (-3.0536749362945557, -0.08792495727539062),
+    (-2.8755500316619873, 2.8755500316619873),
+    (0.004250049591064453, 3.73075008392334),
+    (-2.8755500316619873, 2.8755500316619873),
+)
+PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256 = (
+    "dd7865f59efb23e96d7d4cbb5e129906b04a42b5e5c0941459bfc8866dd7ecd0"
 )
 
 

@@ -339,6 +339,8 @@ def _validate_metadata(metadata, **overrides):
         "expected_normalization_profile": None,
         "expected_normalization_input_formula": None,
         "expected_normalization_output_formula": None,
+        "expected_contract_sha256": None,
+        "expected_execution_contract_sha256": None,
         "expected_frame_description": None,
         "expected_action_frame": None,
         "expected_dataset_name": "droid",
@@ -1128,6 +1130,32 @@ class _FakePolicyServer:
 
 
 class ClientContractTest(unittest.TestCase):
+    def test_exact_contract_digests_reject_before_first_policy_query(self):
+        metadata = _serving_metadata()
+        contract = metadata["ego_lap_serving_contract"]
+        expected = {
+            "contract_sha256": contract["sha256"],
+            "execution_contract_sha256": contract["execution"]["sha256"],
+        }
+        for field in expected:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                fake_server = _FakePolicyServer(
+                    {"actions": np.zeros((16, 7))}, metadata
+                )
+                arguments = dict(expected)
+                arguments[field] = "0" * 64
+                args = PolicyArgs(client="EgoLAPEefPose", **arguments)
+                args.contract_output = str(Path(directory) / "contract.json")
+                with (
+                    mock.patch(
+                        "polaris.policy.lap_eef_pose_client.websocket_client_policy.WebsocketClientPolicy",
+                        return_value=fake_server,
+                    ),
+                    self.assertRaisesRegex(ValueError, "sha256"),
+                ):
+                    EgoLAPEefPoseClient(args)
+                self.assertEqual(fake_server.requests, [])
+
     def test_registered_client_builds_request_and_reuses_anchored_chunk(self):
         fake_server = _FakePolicyServer(
             {

@@ -29,9 +29,14 @@ from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+from polaris.eef_ik_safety import (
+    PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256,
+)
+from polaris.eef_ik_safety import PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_RAD
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_RAD
 from polaris.eef_ik_safety import PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256
+from polaris.eef_ik_safety import PHYSX_DERIVED_SOFT_LIMIT_PROFILE
 from polaris.eef_ik_safety import PHYSX_HARD_LIMIT_PROFILE
 from polaris.eef_ik_safety import TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
 from polaris.eef_ik_safety import validate_one_step_adversarial_report
@@ -104,6 +109,7 @@ def _runtime_fixture():
         "current_joint_soft_limit_tolerance_rad": 1e-5,
         "target_soft_limit_guard_band_profile": TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE,
         "physx_hard_limit_profile": PHYSX_HARD_LIMIT_PROFILE,
+        "physx_derived_soft_limit_profile": PHYSX_DERIVED_SOFT_LIMIT_PROFILE,
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": ARM_VELOCITY_TARGET_PROFILE,
         "joint_velocity_limit_tolerance_rad_s": JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S,
@@ -117,8 +123,14 @@ def _runtime_fixture():
         "target_soft_limit_margin_rad": list(max_delta),
         "target_joint_pos_limits_rad": target_limits,
         "target_joint_pos_limits_float32_sha256": target_limit_sha256,
-        "physx_hard_joint_pos_limits_rad": target_limits,
+        "physx_hard_joint_pos_limits_rad": json.loads(json.dumps(target_limits)),
         "physx_hard_joint_pos_limits_float32_sha256": target_limit_sha256,
+        "physx_derived_soft_joint_pos_limits_rad": [
+            list(pair) for pair in PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_RAD
+        ],
+        "physx_derived_soft_joint_pos_limits_float32_sha256": (
+            PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256
+        ),
         "arm_velocity_target_rad_s": [0.0] * 7,
         "soft_joint_pos_limits_rad": soft_limits,
         "soft_joint_pos_limits_float32_sha256": soft_limit_sha256,
@@ -820,6 +832,29 @@ def test_runtime_safety_rejects_drift_and_unbounded_applied_delta():
     tampered["target_joint_pos_limits_float32_sha256"] = "0" * 64
     env.unwrapped.action_manager._terms["arm"].safety_report = lambda: tampered
     with pytest.raises(ValueError, match="target guard-band digest"):
+        validate_eef_runtime_safety(env)
+
+    env, _ = _runtime_fixture()
+    tampered = env.unwrapped.action_manager._terms["arm"].safety_report()
+    tampered["physx_derived_soft_joint_pos_limits_rad"][3][1] = tampered[
+        "physx_hard_joint_pos_limits_rad"
+    ][3][1]
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: tampered
+    with pytest.raises(ValueError, match="PhysX-derived soft-limit readback"):
+        validate_eef_runtime_safety(env)
+
+    env, _ = _runtime_fixture()
+    tampered = env.unwrapped.action_manager._terms["arm"].safety_report()
+    tampered["physx_derived_soft_joint_pos_limits_float32_sha256"] = "0" * 64
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: tampered
+    with pytest.raises(ValueError, match="PhysX-derived soft-limit readback"):
+        validate_eef_runtime_safety(env)
+
+    env, _ = _runtime_fixture()
+    tampered = env.unwrapped.action_manager._terms["arm"].safety_report()
+    tampered["arm_velocity_target_rad_s"][4] = 1e-3
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: tampered
+    with pytest.raises(ValueError, match="velocity target must be exactly zero"):
         validate_eef_runtime_safety(env)
 
     env, _ = _runtime_fixture()

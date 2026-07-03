@@ -75,6 +75,9 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
             "eef_physx_inner_hardlimit_one_substep_v2"
         ),
         "physx_hard_limit_profile": "outer_minus_one_velocity_substep_v1",
+        "physx_derived_soft_limit_profile": (
+            "isaaclab_midpoint_range_factor1_float32_v1"
+        ),
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": "zero_per_physics_substep_v1",
         "joint_velocity_limit_tolerance_rad_s": 1e-5,
@@ -91,6 +94,12 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
         "physx_hard_joint_pos_limits_rad": finalizer.EXPECTED_TARGET_LIMITS,
         "physx_hard_joint_pos_limits_float32_sha256": (
             finalizer.EXPECTED_TARGET_DIGEST
+        ),
+        "physx_derived_soft_joint_pos_limits_rad": (
+            [list(pair) for pair in finalizer.EXPECTED_PHYSX_DERIVED_SOFT_LIMITS]
+        ),
+        "physx_derived_soft_joint_pos_limits_float32_sha256": (
+            finalizer.EXPECTED_PHYSX_DERIVED_SOFT_DIGEST
         ),
         "arm_velocity_target_rad_s": [0.0] * 7,
         "soft_joint_pos_limits_rad": finalizer.EXPECTED_LIMITS,
@@ -289,6 +298,18 @@ def test_raw_smoke_gate_requires_pending_full_evidence():
     raw = _valid_raw_result()
     raw["raw_ik_safety_capture"]["soft_joint_pos_limits_rad"][0][0] += 0.01
     with pytest.raises(finalizer.VerificationError, match="limits"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["raw_ik_safety_capture"]["physx_derived_soft_joint_pos_limits_rad"][3][1] = (
+        finalizer.EXPECTED_TARGET_LIMITS[3][1]
+    )
+    with pytest.raises(finalizer.VerificationError, match="physx_derived_soft"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["raw_ik_safety_capture"]["arm_velocity_target_rad_s"][4] = 1e-3
+    with pytest.raises(finalizer.VerificationError, match="velocity_target"):
         finalizer._verify_raw(raw)
 
     raw = _valid_raw_result()
