@@ -15,16 +15,20 @@ import pandas as pd
 from scipy.spatial.transform import Rotation
 
 from polaris.config import LAP_EEF_FRAME
+from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
+from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+from polaris.eef_ik_safety import PANDA_PHYSX_HARD_JOINT_POS_LIMITS_FLOAT32_SHA256
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_RAD
 from polaris.eef_ik_safety import PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256
+from polaris.eef_ik_safety import PHYSX_HARD_LIMIT_PROFILE
 from polaris.eef_ik_safety import TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
 from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
 from polaris.eval_artifacts import EVAL_RESULT_COLUMNS
@@ -63,6 +67,9 @@ SAFETY_MAXIMA_FIELDS = {
     "post_clamp_target_soft_limit_violation_rad",
     "post_clamp_target_guard_band_violation_rad",
     "current_joint_soft_limit_violation_rad",
+    "current_physx_hard_limit_violation_rad",
+    "abs_joint_vel_rad_s",
+    "minimum_outer_joint_clearance_rad",
 }
 SAFETY_DIAGNOSTIC_FIELDS = {
     "kind",
@@ -80,6 +87,7 @@ SAFETY_DIAGNOSTIC_FIELDS = {
 }
 SAFETY_DIAGNOSTIC_COUNTERS = {
     "current_joint_limit_abort": "current_joint_limit_aborts",
+    "current_joint_velocity_limit_abort": "invariant_aborts",
     "post_clamp_position_invariant_abort": "invariant_aborts",
     "post_clamp_slew_invariant_abort": "invariant_aborts",
     "current_eef_quaternion_invariant_abort": "invariant_aborts",
@@ -95,6 +103,10 @@ SAFETY_STATIC_FIELDS = (
     "decimation",
     "current_joint_soft_limit_tolerance_rad",
     "target_soft_limit_guard_band_profile",
+    "physx_hard_limit_profile",
+    "physx_hard_limit_write_count",
+    "arm_velocity_target_profile",
+    "joint_velocity_limit_tolerance_rad_s",
     "eef_quaternion_unit_norm_tolerance",
     "joint_slew_float32_tolerance_rad",
     "soft_joint_pos_limit_factor",
@@ -105,6 +117,9 @@ SAFETY_STATIC_FIELDS = (
     "target_soft_limit_margin_rad",
     "target_joint_pos_limits_rad",
     "target_joint_pos_limits_float32_sha256",
+    "physx_hard_joint_pos_limits_rad",
+    "physx_hard_joint_pos_limits_float32_sha256",
+    "arm_velocity_target_rad_s",
     "soft_joint_pos_limits_rad",
     "soft_joint_pos_limits_float32_sha256",
 )
@@ -374,6 +389,9 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         "profile": EEF_IK_SAFETY_PROFILE,
         "apply_actions_cadence": EEF_IK_APPLY_CADENCE,
         "target_soft_limit_guard_band_profile": TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE,
+        "physx_hard_limit_profile": PHYSX_HARD_LIMIT_PROFILE,
+        "physx_hard_limit_write_count": 1,
+        "arm_velocity_target_profile": ARM_VELOCITY_TARGET_PROFILE,
         "decimation": CANONICAL_DECIMATION,
         "joint_names": list(CANONICAL_ARM_JOINTS),
     }
@@ -389,6 +407,9 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         report.get("current_joint_soft_limit_tolerance_rad", math.nan)
     )
     slew_tolerance = float(report.get("joint_slew_float32_tolerance_rad", math.nan))
+    velocity_tolerance = float(
+        report.get("joint_velocity_limit_tolerance_rad_s", math.nan)
+    )
     quaternion_tolerance = float(
         report.get("eef_quaternion_unit_norm_tolerance", math.nan)
     )
@@ -419,6 +440,12 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
             abs_tol=0.0,
         )
         or not math.isclose(
+            velocity_tolerance,
+            JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        )
+        or not math.isclose(
             quaternion_tolerance,
             EEF_QUATERNION_UNIT_NORM_TOLERANCE,
             rel_tol=0.0,
@@ -430,6 +457,7 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
             f"physics_dt={physics_dt!r}, control_dt={control_dt!r}, "
             f"current_limit_tolerance={current_limit_tolerance!r}, "
             f"slew_tolerance={slew_tolerance!r}, "
+            f"velocity_tolerance={velocity_tolerance!r}, "
             f"quaternion_tolerance={quaternion_tolerance!r}"
         )
 
@@ -546,6 +574,34 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
             f"recorded={target_limit_sha256!r}, "
             f"computed={computed_target_limit_sha256!r}"
         )
+    physx_hard_limits = _numpy(report.get("physx_hard_joint_pos_limits_rad")).astype(
+        np.float64
+    )
+    physx_hard_limit_sha256 = report.get("physx_hard_joint_pos_limits_float32_sha256")
+    computed_physx_hard_limit_sha256 = hashlib.sha256(
+        physx_hard_limits.astype("<f4", copy=False).tobytes()
+    ).hexdigest()
+    if (
+        physx_hard_limits.shape != (7, 2)
+        or not np.array_equal(
+            physx_hard_limits.astype(np.float32),
+            expected_target_limits,
+        )
+        or physx_hard_limit_sha256 != computed_physx_hard_limit_sha256
+        or physx_hard_limit_sha256 != PANDA_PHYSX_HARD_JOINT_POS_LIMITS_FLOAT32_SHA256
+    ):
+        raise ValueError(
+            "Live EEF IK PhysX hard-limit readback does not match the exact "
+            "target guard-band envelope"
+        )
+    arm_velocity_target = _numpy(report.get("arm_velocity_target_rad_s")).astype(
+        np.float64
+    )
+    if arm_velocity_target.shape != (7,) or not np.array_equal(
+        arm_velocity_target,
+        np.zeros(7, dtype=np.float64),
+    ):
+        raise ValueError("Live EEF IK arm velocity target must be exactly zero")
     counters = report.get("counters")
     maxima = report.get("maxima")
     if not isinstance(counters, dict) or not isinstance(maxima, dict):
@@ -568,7 +624,7 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         if (
             values.shape != (7,)
             or not np.isfinite(values).all()
-            or np.any(values < 0.0)
+            or (field != "minimum_outer_joint_clearance_rad" and np.any(values < 0.0))
         ):
             raise ValueError(
                 f"Live EEF IK safety maximum {field} is invalid: {values.tolist()!r}"
@@ -580,6 +636,34 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
             "Live EEF IK applied joint delta exceeds its physics-substep bound: "
             f"applied={applied.tolist()!r}, bound={max_delta.tolist()!r}"
         )
+    max_abs_velocity = np.asarray(maxima["abs_joint_vel_rad_s"], dtype=np.float64)
+    velocity_limits = np.asarray(
+        report["joint_velocity_limits_rad_s"], dtype=np.float64
+    )
+    if np.any(
+        max_abs_velocity > velocity_limits + JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
+    ):
+        raise ValueError("Live EEF IK joint velocity exceeds its configured bound")
+    hard_violation = np.asarray(
+        maxima["current_physx_hard_limit_violation_rad"], dtype=np.float64
+    )
+    if np.any(hard_violation > max_delta + CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD):
+        raise ValueError(
+            "Live EEF IK PhysX hard-limit slop consumed the canonical outer envelope"
+        )
+    outer_violation = np.asarray(
+        maxima["current_joint_soft_limit_violation_rad"], dtype=np.float64
+    )
+    minimum_outer_clearance = np.asarray(
+        maxima["minimum_outer_joint_clearance_rad"], dtype=np.float64
+    )
+    if not np.allclose(
+        outer_violation,
+        np.maximum(-minimum_outer_clearance, 0.0),
+        rtol=0.0,
+        atol=JOINT_SLEW_FLOAT32_TOLERANCE_RAD,
+    ):
+        raise ValueError("Live EEF IK outer violation/clearance evidence disagrees")
     guard_diagnostics = report.get("guard_diagnostics")
     if not isinstance(guard_diagnostics, list) or len(guard_diagnostics) > 32:
         raise ValueError("Live EEF IK safety guard diagnostics are not bounded")

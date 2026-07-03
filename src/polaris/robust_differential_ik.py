@@ -27,10 +27,13 @@ from isaaclab.utils import configclass
 from isaaclab.utils.math import compute_pose_error
 
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
+from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
+from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
+from polaris.eef_ik_safety import PHYSX_HARD_LIMIT_PROFILE
 from polaris.eef_ik_safety import TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
 
 
@@ -153,6 +156,55 @@ def _require_current_joint_position_in_soft_limits(
             "limits; aborting before PhysX"
         )
     return violation
+
+
+def _install_eef_physx_position_limits(
+    asset,
+    *,
+    joint_ids,
+    outer_limits: torch.Tensor,
+    max_delta_joint_pos: torch.Tensor,
+) -> torch.Tensor:
+    """Install and exactly verify the EEF-only inner PhysX joint envelope."""
+
+    inner_limits = torch.stack(
+        (
+            outer_limits[..., 0] + max_delta_joint_pos,
+            outer_limits[..., 1] - max_delta_joint_pos,
+        ),
+        dim=-1,
+    )
+    _require_finite(inner_limits, field="EEF PhysX hard joint position limits")
+    if (inner_limits[..., 0] >= inner_limits[..., 1]).any():
+        raise ValueError("PolaRiS EEF PhysX hard-limit envelope is not ordered")
+    prewrite_hard_limits = asset.data.joint_pos_limits[:, joint_ids, :].clone()
+    if not torch.equal(prewrite_hard_limits, outer_limits):
+        raise ValueError(
+            "PolaRiS EEF live hard and soft joint limits disagree before the "
+            "inner PhysX envelope is installed"
+        )
+    asset.write_joint_position_limit_to_sim(
+        inner_limits,
+        joint_ids=joint_ids,
+        env_ids=None,
+        warn_limit_violation=True,
+    )
+    physx_limits = asset.root_physx_view.get_dof_limits().to(asset.device)[
+        :, joint_ids, :
+    ]
+    mirror_limits = asset.data.joint_pos_limits[:, joint_ids, :]
+    derived_soft_limits = asset.data.soft_joint_pos_limits[:, joint_ids, :]
+    for field, actual in (
+        ("PhysX", physx_limits),
+        ("articulation mirror", mirror_limits),
+        ("derived soft", derived_soft_limits),
+    ):
+        if not torch.equal(actual, inner_limits):
+            raise ValueError(
+                f"PolaRiS EEF {field} position-limit readback does not exactly "
+                "match the requested inner envelope"
+            )
+    return inner_limits.clone()
 
 
 class RobustDifferentialIKController(DifferentialIKController):
@@ -334,14 +386,6 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             raise ValueError(
                 "PolaRiS EEF IK safety requires ordered live soft joint limits"
             )
-        target_lower = soft_limits[..., 0] + self._max_delta_joint_pos
-        target_upper = soft_limits[..., 1] - self._max_delta_joint_pos
-        if (target_lower >= target_upper).any():
-            raise ValueError(
-                "PolaRiS EEF IK one-substep target guard band leaves no valid "
-                "joint range"
-            )
-        self._soft_joint_position_limits = soft_limits.clone()
         self._soft_joint_pos_limit_factor = float(
             self._asset.cfg.soft_joint_pos_limit_factor
         )
@@ -349,6 +393,15 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             raise ValueError(
                 "PolaRiS EEF IK safety requires soft_joint_pos_limit_factor=1"
             )
+        self._soft_joint_position_limits = soft_limits.clone()
+        self._physx_hard_joint_position_limits = _install_eef_physx_position_limits(
+            self._asset,
+            joint_ids=self._joint_ids,
+            outer_limits=self._soft_joint_position_limits,
+            max_delta_joint_pos=self._max_delta_joint_pos,
+        )
+        self._physx_hard_limit_write_count = 1
+        self._zero_joint_velocity_target = torch.zeros_like(self._max_delta_joint_pos)
         self._max_guard_diagnostics = 32
         self._reset_episode_safety_state(episode_index=None)
 
@@ -397,6 +450,14 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         )
         self._max_current_joint_soft_limit_violation = torch.zeros_like(
             self._max_raw_delta_joint_pos
+        )
+        self._max_current_physx_hard_limit_violation = torch.zeros_like(
+            self._max_raw_delta_joint_pos
+        )
+        self._max_abs_joint_vel = torch.zeros_like(self._max_raw_delta_joint_pos)
+        self._minimum_outer_joint_clearance = torch.full_like(
+            self._max_raw_delta_joint_pos,
+            float("inf"),
         )
         self._fallback_count_at_episode_start = self._ik_controller.fallback_count
         self._guard_diagnostics: list[dict[str, object]] = []
@@ -572,6 +633,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._apply_call_count += 1
         ee_pos_curr, ee_quat_curr = self._compute_frame_pose()
         joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
+        joint_vel = self._asset.data.joint_vel[:, self._joint_ids]
         soft_limits = self._soft_joint_position_limits
         lower = soft_limits[..., 0]
         upper = soft_limits[..., 1]
@@ -582,12 +644,26 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         current_joint_invalid = (
             current_joint_violation > CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
         ).any(dim=-1)
+        hard_limits = self._physx_hard_joint_position_limits
+        hard_lower = hard_limits[..., 0]
+        hard_upper = hard_limits[..., 1]
+        current_hard_limit_violation = torch.maximum(
+            torch.clamp(hard_lower - joint_pos, min=0.0),
+            torch.clamp(joint_pos - hard_upper, min=0.0),
+        )
+        current_outer_clearance = torch.minimum(joint_pos - lower, upper - joint_pos)
+        current_joint_velocity_invalid = (
+            joint_vel.abs()
+            > self._joint_velocity_limits + JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
+        ).any(dim=-1)
         jacobian = None
         pose_error = None
         raw_joint_pos_target = None
         fallback_count_before = self._ik_controller.fallback_count
         try:
-            current_state = torch.cat((ee_pos_curr, ee_quat_curr, joint_pos), dim=-1)
+            current_state = torch.cat(
+                (ee_pos_curr, ee_quat_curr, joint_pos, joint_vel), dim=-1
+            )
             desired_state = torch.cat(
                 (
                     self._ik_controller.ee_pos_des,
@@ -607,6 +683,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 current_quaternion_valid,
                 desired_quaternion_valid,
                 current_joint_valid,
+                current_joint_velocity_valid,
             ) = (
                 bool(value)
                 for value in torch.stack(
@@ -616,6 +693,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                         current_quaternion_norm_valid.all(),
                         desired_quaternion_norm_valid.all(),
                         ~current_joint_invalid.any(),
+                        ~current_joint_velocity_invalid.any(),
                     )
                 )
                 .detach()
@@ -630,6 +708,22 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 self._max_current_joint_soft_limit_violation,
                 current_joint_violation.amax(dim=0).to(
                     self._max_current_joint_soft_limit_violation.dtype
+                ),
+            )
+            self._max_current_physx_hard_limit_violation = torch.maximum(
+                self._max_current_physx_hard_limit_violation,
+                current_hard_limit_violation.amax(dim=0).to(
+                    self._max_current_physx_hard_limit_violation.dtype
+                ),
+            )
+            self._max_abs_joint_vel = torch.maximum(
+                self._max_abs_joint_vel,
+                joint_vel.abs().amax(dim=0).to(self._max_abs_joint_vel.dtype),
+            )
+            self._minimum_outer_joint_clearance = torch.minimum(
+                self._minimum_outer_joint_clearance,
+                current_outer_clearance.amin(dim=0).to(
+                    self._minimum_outer_joint_clearance.dtype
                 ),
             )
             if not desired_finite:
@@ -684,6 +778,21 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 raise DifferentialIKInvariantError(
                     "PolaRiS EEF IK current joint position is outside live soft "
                     "limits; aborting before DLS and PhysX"
+                )
+            if not current_joint_velocity_valid:
+                self._invariant_abort_count += current_joint_velocity_invalid.sum()
+                self._append_guard_diagnostic(
+                    kind="current_joint_velocity_limit_abort",
+                    joint_pos=joint_pos,
+                    raw_delta=None,
+                    raw_target=None,
+                    safe_target=None,
+                    pose_error=None,
+                    jacobian=None,
+                )
+                raise DifferentialIKInvariantError(
+                    "PolaRiS EEF IK current joint velocity exceeds the live "
+                    "simulation limit; aborting before DLS and PhysX"
                 )
             jacobian = self._compute_frame_jacobian()
             position_error, axis_angle_error = compute_pose_error(
@@ -866,24 +975,45 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             self._max_applied_delta_joint_pos,
             applied_delta.abs().amax(dim=0).to(self._max_applied_delta_joint_pos.dtype),
         )
+        self._asset.set_joint_velocity_target(
+            self._zero_joint_velocity_target,
+            self._joint_ids,
+        )
         self._asset.set_joint_position_target(safe_target, self._joint_ids)
 
     def safety_report(self) -> dict[str, object]:
         """Return JSON-serializable evidence for the active rollout."""
 
         soft_limits = self._soft_joint_position_limits
-        target_limits = torch.stack(
-            (
-                soft_limits[..., 0] + self._max_delta_joint_pos,
-                soft_limits[..., 1] - self._max_delta_joint_pos,
-            ),
-            dim=-1,
-        )
+        target_limits = self._physx_hard_joint_position_limits
+        physx_hard_limit_readback = self._asset.root_physx_view.get_dof_limits().to(
+            self._asset.device
+        )[:, self._joint_ids, :]
+        mirror_hard_limits = self._asset.data.joint_pos_limits[:, self._joint_ids, :]
+        derived_soft_limits = self._asset.data.soft_joint_pos_limits[
+            :, self._joint_ids, :
+        ]
+        if not (
+            torch.equal(physx_hard_limit_readback, target_limits)
+            and torch.equal(mirror_hard_limits, target_limits)
+            and torch.equal(derived_soft_limits, target_limits)
+        ):
+            raise ValueError(
+                "PolaRiS EEF PhysX hard-limit readback drifted after installation"
+            )
         soft_limit_bytes = (
             soft_limits[0].detach().cpu().numpy().astype("<f4", copy=False).tobytes()
         )
         target_limit_bytes = (
             target_limits[0].detach().cpu().numpy().astype("<f4", copy=False).tobytes()
+        )
+        physx_hard_limit_readback_bytes = (
+            physx_hard_limit_readback[0]
+            .detach()
+            .cpu()
+            .numpy()
+            .astype("<f4", copy=False)
+            .tobytes()
         )
         max_diagnostic_index = int(
             self._max_raw_delta_diagnostic_apply_index.detach().cpu().item()
@@ -928,6 +1058,10 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             "decimation": self._decimation,
             "current_joint_soft_limit_tolerance_rad": CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD,
             "target_soft_limit_guard_band_profile": TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE,
+            "physx_hard_limit_profile": PHYSX_HARD_LIMIT_PROFILE,
+            "physx_hard_limit_write_count": self._physx_hard_limit_write_count,
+            "arm_velocity_target_profile": ARM_VELOCITY_TARGET_PROFILE,
+            "joint_velocity_limit_tolerance_rad_s": JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S,
             "eef_quaternion_unit_norm_tolerance": EEF_QUATERNION_UNIT_NORM_TOLERANCE,
             "joint_slew_float32_tolerance_rad": JOINT_SLEW_FLOAT32_TOLERANCE_RAD,
             "soft_joint_pos_limit_factor": self._soft_joint_pos_limit_factor,
@@ -949,6 +1083,17 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             "target_joint_pos_limits_float32_sha256": hashlib.sha256(
                 target_limit_bytes
             ).hexdigest(),
+            "physx_hard_joint_pos_limits_rad": physx_hard_limit_readback[0]
+            .detach()
+            .cpu()
+            .tolist(),
+            "physx_hard_joint_pos_limits_float32_sha256": hashlib.sha256(
+                physx_hard_limit_readback_bytes
+            ).hexdigest(),
+            "arm_velocity_target_rad_s": self._zero_joint_velocity_target[0]
+            .detach()
+            .cpu()
+            .tolist(),
             "soft_joint_pos_limits_rad": soft_limits[0].detach().cpu().tolist(),
             "soft_joint_pos_limits_float32_sha256": hashlib.sha256(
                 soft_limit_bytes
@@ -1003,6 +1148,18 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 .cpu()
                 .tolist(),
                 "current_joint_soft_limit_violation_rad": self._max_current_joint_soft_limit_violation.detach()
+                .cpu()
+                .tolist(),
+                "current_physx_hard_limit_violation_rad": self._max_current_physx_hard_limit_violation.detach()
+                .cpu()
+                .tolist(),
+                "abs_joint_vel_rad_s": self._max_abs_joint_vel.detach().cpu().tolist(),
+                "minimum_outer_joint_clearance_rad": (
+                    self._minimum_outer_joint_clearance
+                    if self._apply_call_count > 0
+                    else torch.zeros_like(self._minimum_outer_joint_clearance)
+                )
+                .detach()
                 .cpu()
                 .tolist(),
             },

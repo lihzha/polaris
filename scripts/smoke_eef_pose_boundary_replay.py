@@ -137,6 +137,10 @@ SAFETY_FIELDS = {
     "decimation",
     "current_joint_soft_limit_tolerance_rad",
     "target_soft_limit_guard_band_profile",
+    "physx_hard_limit_profile",
+    "physx_hard_limit_write_count",
+    "arm_velocity_target_profile",
+    "joint_velocity_limit_tolerance_rad_s",
     "eef_quaternion_unit_norm_tolerance",
     "joint_slew_float32_tolerance_rad",
     "soft_joint_pos_limit_factor",
@@ -147,6 +151,9 @@ SAFETY_FIELDS = {
     "target_soft_limit_margin_rad",
     "target_joint_pos_limits_rad",
     "target_joint_pos_limits_float32_sha256",
+    "physx_hard_joint_pos_limits_rad",
+    "physx_hard_joint_pos_limits_float32_sha256",
+    "arm_velocity_target_rad_s",
     "soft_joint_pos_limits_rad",
     "soft_joint_pos_limits_float32_sha256",
     "counters",
@@ -175,6 +182,9 @@ SAFETY_MAXIMA_FIELDS = {
     "post_clamp_target_soft_limit_violation_rad",
     "post_clamp_target_guard_band_violation_rad",
     "current_joint_soft_limit_violation_rad",
+    "current_physx_hard_limit_violation_rad",
+    "abs_joint_vel_rad_s",
+    "minimum_outer_joint_clearance_rad",
 }
 DIAGNOSTIC_FIELDS = {
     "kind",
@@ -542,20 +552,25 @@ def validate_safety_static(
     _require(isinstance(report, dict) and set(report) == SAFETY_FIELDS, "safety schema")
     _require(report.get("episode_index") == episode_index, "safety episode index")
     exact = {
-        "profile": "panda_velocity_softlimit_guardband_v2",
+        "profile": "panda_velocity_physxlimit_v3",
         "apply_actions_cadence": "physics_substep",
         "physics_dt": 1.0 / 120.0,
         "control_dt": 1.0 / 15.0,
         "decimation": 8,
         "current_joint_soft_limit_tolerance_rad": 1e-5,
         "target_soft_limit_guard_band_profile": (
-            "one_physics_substep_velocity_bound_v1"
+            "eef_physx_inner_hardlimit_one_substep_v2"
         ),
+        "physx_hard_limit_profile": "outer_minus_one_velocity_substep_v1",
+        "physx_hard_limit_write_count": 1,
+        "arm_velocity_target_profile": "zero_per_physics_substep_v1",
+        "joint_velocity_limit_tolerance_rad_s": 1e-5,
         "eef_quaternion_unit_norm_tolerance": 1e-3,
         "joint_slew_float32_tolerance_rad": 1e-6,
         "soft_joint_pos_limit_factor": 1.0,
         "joint_names": [f"panda_joint{index}" for index in range(1, 8)],
         "target_joint_pos_limits_float32_sha256": TARGET_LIMIT_DIGEST,
+        "physx_hard_joint_pos_limits_float32_sha256": TARGET_LIMIT_DIGEST,
         "soft_joint_pos_limits_float32_sha256": SOFT_LIMIT_DIGEST,
     }
     for field, expected in exact.items():
@@ -585,6 +600,17 @@ def validate_safety_static(
         "safety target limits",
         EXPECTED_TARGET_LIMITS_RAD,
     )
+    _validate_float_matrix(
+        report.get("physx_hard_joint_pos_limits_rad"),
+        "safety PhysX hard limits",
+        EXPECTED_TARGET_LIMITS_RAD,
+    )
+    velocity_target = _finite_vector(
+        report.get("arm_velocity_target_rad_s"),
+        "safety arm velocity target",
+        length=7,
+    )
+    _require(velocity_target == [0.0] * 7, "safety arm velocity target drift")
     counters = report.get("counters")
     maxima = report.get("maxima")
     _require(
@@ -600,13 +626,40 @@ def validate_safety_static(
         "safety maxima schema",
     )
     for field, vector in maxima.items():
+        values = _finite_vector(vector, f"maxima {field}", length=7)
         _require(
-            all(
-                value >= 0.0
-                for value in _finite_vector(vector, f"maxima {field}", length=7)
-            ),
+            field == "minimum_outer_joint_clearance_rad"
+            or all(value >= 0.0 for value in values),
             f"maxima {field} negative",
         )
+    hard_slop = _finite_vector(
+        maxima["current_physx_hard_limit_violation_rad"],
+        "maxima current PhysX hard limit violation",
+        length=7,
+    )
+    _require(
+        all(
+            value <= margin + 1e-5
+            for value, margin in zip(hard_slop, EXPECTED_MAX_DELTA_RAD, strict=True)
+        ),
+        "PhysX hard-limit slop consumed the outer envelope",
+    )
+    abs_velocity = _finite_vector(
+        maxima["abs_joint_vel_rad_s"],
+        "maxima absolute joint velocity",
+        length=7,
+    )
+    _require(
+        all(
+            value <= limit + 1e-5
+            for value, limit in zip(
+                abs_velocity,
+                EXPECTED_VELOCITY_LIMITS_RAD_S,
+                strict=True,
+            )
+        ),
+        "joint velocity maximum exceeded the configured limit",
+    )
     diagnostics = report.get("guard_diagnostics")
     _require(isinstance(diagnostics, list), "safety diagnostics")
 
@@ -851,13 +904,17 @@ def validate_boundary_result(
     validate_safety_static(safety, episode_index=0)
     _require(safety.get("episode_index") == 0, "boundary safety episode")
     _require(
-        safety.get("profile") == "panda_velocity_softlimit_guardband_v2",
+        safety.get("profile") == "panda_velocity_physxlimit_v3",
         "boundary safety profile",
     )
     _require(
         safety.get("target_soft_limit_guard_band_profile")
-        == "one_physics_substep_velocity_bound_v1",
+        == "eef_physx_inner_hardlimit_one_substep_v2",
         "boundary target guard profile",
+    )
+    _require(
+        safety.get("physx_hard_joint_pos_limits_float32_sha256") == TARGET_LIMIT_DIGEST,
+        "boundary PhysX hard-limit digest",
     )
     _require(safety.get("decimation") == DECIMATION, "boundary decimation")
     _require(
@@ -941,6 +998,27 @@ def validate_boundary_result(
     ):
         vector = _finite_vector(maxima.get(field), f"boundary maxima {field}", length=7)
         _require(all(item == 0.0 for item in vector), f"boundary {field} is nonzero")
+    hard_slop = _finite_vector(
+        maxima.get("current_physx_hard_limit_violation_rad"),
+        "boundary PhysX hard-limit slop",
+        length=7,
+    )
+    _require(
+        all(
+            slop <= margin
+            for slop, margin in zip(hard_slop, EXPECTED_MAX_DELTA_RAD, strict=True)
+        ),
+        "boundary PhysX hard-limit slop consumed the outer containment margin",
+    )
+    outer_clearance = _finite_vector(
+        maxima.get("minimum_outer_joint_clearance_rad"),
+        "boundary minimum outer clearance",
+        length=7,
+    )
+    _require(
+        all(clearance >= 0.0 for clearance in outer_clearance),
+        "boundary has negative canonical outer clearance",
+    )
     applied = _finite_vector(
         maxima.get("applied_delta_joint_pos_rad"),
         "boundary applied delta",
@@ -1086,7 +1164,7 @@ def validate_success_payload(payload: dict[str, Any]) -> dict[str, Any]:
         ("dls_damping", 0.01),
         ("arm_scale", 1.0),
         ("action_dim", 7),
-        ("ik_safety_profile", "panda_velocity_softlimit_guardband_v2"),
+        ("ik_safety_profile", "panda_velocity_physxlimit_v3"),
     ):
         _require(runtime_frame.get(field) == expected, f"payload frame {field}")
     _require(

@@ -81,6 +81,9 @@ def _safety_report(*, episode_index=0, apply_calls=smoke.EXPECTED_APPLY_CALLS):
         "post_clamp_target_soft_limit_violation_rad": [0.0] * 7,
         "post_clamp_target_guard_band_violation_rad": [0.0] * 7,
         "current_joint_soft_limit_violation_rad": [0.0] * 7,
+        "current_physx_hard_limit_violation_rad": [0.0] * 7,
+        "abs_joint_vel_rad_s": [0.1] * 7 if active else [0.0] * 7,
+        "minimum_outer_joint_clearance_rad": [0.01] * 7 if active else [0.0] * 7,
     }
     q = [(lower + upper) / 2.0 for lower, upper in smoke.EXPECTED_TARGET_LIMITS_RAD]
     raw_target = [value + delta for value, delta in zip(q, raw_delta, strict=True)]
@@ -104,15 +107,19 @@ def _safety_report(*, episode_index=0, apply_calls=smoke.EXPECTED_APPLY_CALLS):
     )
     return {
         "episode_index": episode_index,
-        "profile": "panda_velocity_softlimit_guardband_v2",
+        "profile": "panda_velocity_physxlimit_v3",
         "apply_actions_cadence": "physics_substep",
         "physics_dt": 1.0 / 120.0,
         "control_dt": 1.0 / 15.0,
         "decimation": 8,
         "current_joint_soft_limit_tolerance_rad": 1e-5,
         "target_soft_limit_guard_band_profile": (
-            "one_physics_substep_velocity_bound_v1"
+            "eef_physx_inner_hardlimit_one_substep_v2"
         ),
+        "physx_hard_limit_profile": "outer_minus_one_velocity_substep_v1",
+        "physx_hard_limit_write_count": 1,
+        "arm_velocity_target_profile": "zero_per_physics_substep_v1",
+        "joint_velocity_limit_tolerance_rad_s": 1e-5,
         "eef_quaternion_unit_norm_tolerance": 1e-3,
         "joint_slew_float32_tolerance_rad": 1e-6,
         "soft_joint_pos_limit_factor": 1.0,
@@ -123,6 +130,11 @@ def _safety_report(*, episode_index=0, apply_calls=smoke.EXPECTED_APPLY_CALLS):
         "target_soft_limit_margin_rad": list(smoke.EXPECTED_MAX_DELTA_RAD),
         "target_joint_pos_limits_rad": copy.deepcopy(smoke.EXPECTED_TARGET_LIMITS_RAD),
         "target_joint_pos_limits_float32_sha256": smoke.TARGET_LIMIT_DIGEST,
+        "physx_hard_joint_pos_limits_rad": copy.deepcopy(
+            smoke.EXPECTED_TARGET_LIMITS_RAD
+        ),
+        "physx_hard_joint_pos_limits_float32_sha256": smoke.TARGET_LIMIT_DIGEST,
+        "arm_velocity_target_rad_s": [0.0] * 7,
         "soft_joint_pos_limits_rad": copy.deepcopy(smoke.EXPECTED_OUTER_LIMITS_RAD),
         "soft_joint_pos_limits_float32_sha256": smoke.SOFT_LIMIT_DIGEST,
         "counters": counters,
@@ -262,7 +274,7 @@ def _success_payload():
             "gripper_threshold_profile": (
                 "closed_positive_ge_0p5_inverse_open_gt_0p5_v1"
             ),
-            "ik_safety_profile": "panda_velocity_softlimit_guardband_v2",
+            "ik_safety_profile": "panda_velocity_physxlimit_v3",
             "action_dim": 7,
         },
         "initial_ik_safety_capture": _safety_report(episode_index=None, apply_calls=0),

@@ -24,12 +24,15 @@ from polaris.eef_runtime_contract import validate_ego_lap_runtime_protocol
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
+from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
+from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_RAD
 from polaris.eef_ik_safety import PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256
+from polaris.eef_ik_safety import PHYSX_HARD_LIMIT_PROFILE
 from polaris.eef_ik_safety import TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
 from polaris.eef_ik_safety import validate_one_step_adversarial_report
 from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
@@ -100,6 +103,10 @@ def _runtime_fixture():
         "decimation": 8,
         "current_joint_soft_limit_tolerance_rad": 1e-5,
         "target_soft_limit_guard_band_profile": TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE,
+        "physx_hard_limit_profile": PHYSX_HARD_LIMIT_PROFILE,
+        "physx_hard_limit_write_count": 1,
+        "arm_velocity_target_profile": ARM_VELOCITY_TARGET_PROFILE,
+        "joint_velocity_limit_tolerance_rad_s": JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S,
         "eef_quaternion_unit_norm_tolerance": EEF_QUATERNION_UNIT_NORM_TOLERANCE,
         "joint_slew_float32_tolerance_rad": JOINT_SLEW_FLOAT32_TOLERANCE_RAD,
         "soft_joint_pos_limit_factor": 1.0,
@@ -110,6 +117,9 @@ def _runtime_fixture():
         "target_soft_limit_margin_rad": list(max_delta),
         "target_joint_pos_limits_rad": target_limits,
         "target_joint_pos_limits_float32_sha256": target_limit_sha256,
+        "physx_hard_joint_pos_limits_rad": target_limits,
+        "physx_hard_joint_pos_limits_float32_sha256": target_limit_sha256,
+        "arm_velocity_target_rad_s": [0.0] * 7,
         "soft_joint_pos_limits_rad": soft_limits,
         "soft_joint_pos_limits_float32_sha256": soft_limit_sha256,
         "counters": {
@@ -133,6 +143,9 @@ def _runtime_fixture():
             "post_clamp_target_soft_limit_violation_rad": [0.0] * 7,
             "post_clamp_target_guard_band_violation_rad": [0.0] * 7,
             "current_joint_soft_limit_violation_rad": [0.0] * 7,
+            "current_physx_hard_limit_violation_rad": [0.0] * 7,
+            "abs_joint_vel_rad_s": [0.0] * 7,
+            "minimum_outer_joint_clearance_rad": [0.0] * 7,
         },
         "guard_diagnostics": [],
         "max_raw_delta_diagnostic": None,

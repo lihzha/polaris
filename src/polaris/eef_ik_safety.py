@@ -5,14 +5,17 @@ from __future__ import annotations
 import math
 from typing import Any
 
-EEF_IK_SAFETY_PROFILE = "panda_velocity_softlimit_guardband_v2"
+EEF_IK_SAFETY_PROFILE = "panda_velocity_physxlimit_v3"
 EEF_IK_APPLY_CADENCE = "physics_substep"
 CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD = 1e-5
-TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE = "one_physics_substep_velocity_bound_v1"
+TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE = "eef_physx_inner_hardlimit_one_substep_v2"
+PHYSX_HARD_LIMIT_PROFILE = "outer_minus_one_velocity_substep_v1"
+ARM_VELOCITY_TARGET_PROFILE = "zero_per_physics_substep_v1"
 # One named allowance for float32 subtraction around the configured per-substep
 # slew bound.  Keep this identical in the controller, runtime validation, and
 # the downstream Ego-LAP completion contract.
 JOINT_SLEW_FLOAT32_TOLERANCE_RAD = 1e-6
+JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S = 1e-5
 EEF_QUATERNION_UNIT_NORM_TOLERANCE = 1e-3
 
 PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S = (
@@ -51,6 +54,9 @@ PANDA_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256 = (
 )
 PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256 = (
     "09b20ab18c35d6dc22a3edbc2beca2edff419e242dd07d74cd1d65df9ce67e0f"
+)
+PANDA_PHYSX_HARD_JOINT_POS_LIMITS_FLOAT32_SHA256 = (
+    PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256
 )
 
 

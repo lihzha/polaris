@@ -65,15 +65,19 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
         max_raw["safe_joint_pos_target_rad"] = _diagnostic_vector(safe_target)
     return {
         "episode_index": episode_index,
-        "profile": "panda_velocity_softlimit_guardband_v2",
+        "profile": "panda_velocity_physxlimit_v3",
         "apply_actions_cadence": "physics_substep",
         "physics_dt": 1.0 / 120.0,
         "control_dt": 1.0 / 15.0,
         "decimation": 8,
         "current_joint_soft_limit_tolerance_rad": 1e-5,
         "target_soft_limit_guard_band_profile": (
-            "one_physics_substep_velocity_bound_v1"
+            "eef_physx_inner_hardlimit_one_substep_v2"
         ),
+        "physx_hard_limit_profile": "outer_minus_one_velocity_substep_v1",
+        "physx_hard_limit_write_count": 1,
+        "arm_velocity_target_profile": "zero_per_physics_substep_v1",
+        "joint_velocity_limit_tolerance_rad_s": 1e-5,
         "eef_quaternion_unit_norm_tolerance": 1e-3,
         "joint_slew_float32_tolerance_rad": 1e-6,
         "soft_joint_pos_limit_factor": 1.0,
@@ -84,6 +88,11 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
         "target_soft_limit_margin_rad": finalizer.EXPECTED_MAX_DELTA,
         "target_joint_pos_limits_rad": finalizer.EXPECTED_TARGET_LIMITS,
         "target_joint_pos_limits_float32_sha256": (finalizer.EXPECTED_TARGET_DIGEST),
+        "physx_hard_joint_pos_limits_rad": finalizer.EXPECTED_TARGET_LIMITS,
+        "physx_hard_joint_pos_limits_float32_sha256": (
+            finalizer.EXPECTED_TARGET_DIGEST
+        ),
+        "arm_velocity_target_rad_s": [0.0] * 7,
         "soft_joint_pos_limits_rad": finalizer.EXPECTED_LIMITS,
         "soft_joint_pos_limits_float32_sha256": finalizer.EXPECTED_DIGEST,
         "counters": counters,

@@ -374,3 +374,22 @@
   position-target vectors plus the full controller safety report before
   failure teardown so the replacement can be based on measured terminal
   dynamics rather than an assumed margin.
+- Diagnostic rerun `1097986` captured the exact residual dynamics. It failed
+  at policy step 378/substep 6 after 3,031 apply calls with joint 5 at
+  `2.8973512649536133` rad, `5.125999450683594e-05` above the canonical outer
+  limit, while its position target was the bit-exact inner upper limit
+  `2.8755500316619873` and velocity remained outward at
+  `0.07716280221939087` rad/s. All targets and vectors were finite and every
+  post-clamp invariant passed. Failure JSON SHA-256 is
+  `8b014f4f3a4620aa010062e43cf51b7e4ee08817a8b3b6be96ca3358447a204d`.
+- V5 therefore promotes the already-forbidden target envelope to an EEF-only
+  PhysX hard-position envelope. The action term freezes the original Panda
+  limits as the canonical outer safety contract, writes `outer +/- v/120`
+  exactly once through Isaac Lab's position-limit writer, and requires exact
+  PhysX, articulation-mirror, and derived-soft-limit readback. It explicitly
+  writes a zero arm velocity target before each position target. No joint state
+  is teleported, healthy DLS/target bits remain unchanged, and native joint/
+  pi05 setup never instantiates this mutation. Static/runtime evidence now
+  binds the hard-limit profile/digest/write count/readback and zero-velocity
+  profile; per-episode maxima bind hard-limit solver slop, absolute velocity,
+  and canonical outer clearance.

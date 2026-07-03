@@ -121,6 +121,10 @@ SAFETY_FIELDS = {
     "decimation",
     "current_joint_soft_limit_tolerance_rad",
     "target_soft_limit_guard_band_profile",
+    "physx_hard_limit_profile",
+    "physx_hard_limit_write_count",
+    "arm_velocity_target_profile",
+    "joint_velocity_limit_tolerance_rad_s",
     "eef_quaternion_unit_norm_tolerance",
     "joint_slew_float32_tolerance_rad",
     "soft_joint_pos_limit_factor",
@@ -131,6 +135,9 @@ SAFETY_FIELDS = {
     "target_soft_limit_margin_rad",
     "target_joint_pos_limits_rad",
     "target_joint_pos_limits_float32_sha256",
+    "physx_hard_joint_pos_limits_rad",
+    "physx_hard_joint_pos_limits_float32_sha256",
+    "arm_velocity_target_rad_s",
     "soft_joint_pos_limits_rad",
     "soft_joint_pos_limits_float32_sha256",
     "counters",
@@ -159,6 +166,9 @@ MAXIMA_FIELDS = {
     "post_clamp_target_soft_limit_violation_rad",
     "post_clamp_target_guard_band_violation_rad",
     "current_joint_soft_limit_violation_rad",
+    "current_physx_hard_limit_violation_rad",
+    "abs_joint_vel_rad_s",
+    "minimum_outer_joint_clearance_rad",
 }
 DIAGNOSTIC_FIELDS = {
     "kind",
@@ -401,13 +411,16 @@ def _validate_safety_report(
     else:
         _exact_int(report.get("episode_index"), episode_index, f"{field}.episode_index")
     for name, expected in (
-        ("profile", "panda_velocity_softlimit_guardband_v2"),
+        ("profile", "panda_velocity_physxlimit_v3"),
         ("apply_actions_cadence", "physics_substep"),
         (
             "target_soft_limit_guard_band_profile",
-            "one_physics_substep_velocity_bound_v1",
+            "eef_physx_inner_hardlimit_one_substep_v2",
         ),
+        ("physx_hard_limit_profile", "outer_minus_one_velocity_substep_v1"),
+        ("arm_velocity_target_profile", "zero_per_physics_substep_v1"),
         ("target_joint_pos_limits_float32_sha256", EXPECTED_TARGET_DIGEST),
+        ("physx_hard_joint_pos_limits_float32_sha256", EXPECTED_TARGET_DIGEST),
         ("soft_joint_pos_limits_float32_sha256", EXPECTED_DIGEST),
     ):
         _require(
@@ -420,10 +433,16 @@ def _validate_safety_report(
         ("current_joint_soft_limit_tolerance_rad", 1e-5),
         ("eef_quaternion_unit_norm_tolerance", 1e-3),
         ("joint_slew_float32_tolerance_rad", 1e-6),
+        ("joint_velocity_limit_tolerance_rad_s", 1e-5),
         ("soft_joint_pos_limit_factor", 1.0),
     ):
         _exact_float(report.get(name), expected, f"{field}.{name}")
     _exact_int(report.get("decimation"), 8, f"{field}.decimation")
+    _exact_int(
+        report.get("physx_hard_limit_write_count"),
+        1,
+        f"{field}.physx_hard_limit_write_count",
+    )
     _require(
         report.get("joint_names") == EXPECTED_JOINT_NAMES
         and all(type(name) is str for name in report["joint_names"]),
@@ -460,6 +479,24 @@ def _validate_safety_report(
         _exact_float_vector(
             actual, expected, f"{field}.target_joint_pos_limits_rad[{index}]"
         )
+    physx_limits = _list(
+        report.get("physx_hard_joint_pos_limits_rad"),
+        f"{field}.physx_hard_joint_pos_limits_rad",
+        length=7,
+    )
+    for index, (actual, expected) in enumerate(
+        zip(physx_limits, EXPECTED_TARGET_LIMITS, strict=True)
+    ):
+        _exact_float_vector(
+            actual,
+            expected,
+            f"{field}.physx_hard_joint_pos_limits_rad[{index}]",
+        )
+    _exact_float_vector(
+        report.get("arm_velocity_target_rad_s"),
+        [0.0] * 7,
+        f"{field}.arm_velocity_target_rad_s",
+    )
     limits = _list(report.get("soft_joint_pos_limits_rad"), f"{field}.limits", length=7)
     for index, (actual, expected) in enumerate(
         zip(limits, EXPECTED_LIMITS, strict=True)
@@ -502,7 +539,12 @@ def _validate_safety_report(
         for name, vector in maxima_value.items()
     }
     _require(
-        all(item >= 0.0 for vector in maxima.values() for item in vector),
+        all(
+            item >= 0.0
+            for name, vector in maxima.items()
+            if name != "minimum_outer_joint_clearance_rad"
+            for item in vector
+        ),
         f"{field}.maxima must be nonnegative",
     )
     _require(
@@ -532,6 +574,28 @@ def _validate_safety_report(
     _require(
         all(item <= 1e-5 for item in maxima["current_joint_soft_limit_violation_rad"]),
         f"{field}.current-limit maxima",
+    )
+    _require(
+        all(
+            actual <= limit + 1e-5
+            for actual, limit in zip(
+                maxima["abs_joint_vel_rad_s"],
+                EXPECTED_VELOCITY_LIMITS,
+                strict=True,
+            )
+        ),
+        f"{field}.joint-velocity maxima",
+    )
+    _require(
+        all(
+            slop <= margin + 1e-5
+            for slop, margin in zip(
+                maxima["current_physx_hard_limit_violation_rad"],
+                EXPECTED_MAX_DELTA,
+                strict=True,
+            )
+        ),
+        f"{field}.PhysX hard-limit containment",
     )
     _require(
         all(
