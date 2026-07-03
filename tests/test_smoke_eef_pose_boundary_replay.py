@@ -31,6 +31,9 @@ class _FakeTensor:
     def tolist(self):
         return self._values
 
+    def __getitem__(self, _index):
+        return self
+
 
 def test_failure_vector_evidence_replaces_nonfinite_values_with_null() -> None:
     evidence = smoke._finite_vector_evidence(  # noqa: SLF001
@@ -43,6 +46,46 @@ def test_failure_vector_evidence_replaces_nonfinite_values_with_null() -> None:
         "finite_count": 2,
     }
     assert b"NaN" not in smoke._strict_json_bytes(evidence)  # noqa: SLF001
+
+
+def test_failure_runtime_capture_uses_raw_action_term_report() -> None:
+    expected_report = {"failure_diagnostic": True}
+
+    class _ArmTerm:
+        _joint_ids = list(range(7))
+        _joint_names = [f"panda_joint{index}" for index in range(1, 8)]
+
+        def episode_safety_report(self, episode_index):
+            assert episode_index == 0
+            return expected_report
+
+    class _RobotData:
+        joint_pos = _FakeTensor([0.1] * 7)
+        joint_vel = _FakeTensor([3.0] + [0.0] * 6)
+        joint_pos_target = _FakeTensor([0.2] * 7)
+
+    class _Robot:
+        data = _RobotData()
+
+    class _ActionManager:
+        _terms = {"arm": _ArmTerm()}
+
+    class _Environment:
+        unwrapped = None
+        action_manager = _ActionManager()
+        scene = {"robot": _Robot()}
+
+    environment = _Environment()
+    environment.unwrapped = environment
+
+    evidence = smoke._capture_failure_runtime_evidence(  # noqa: SLF001
+        environment,
+        policy_step=115,
+    )
+
+    assert evidence["policy_step"] == 115
+    assert evidence["arm_joint_vel_rad_s"]["values"] == [3.0] + [0.0] * 6
+    assert evidence["ik_safety"] is expected_report
 
 
 def _diagnostic_vector(values):

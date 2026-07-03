@@ -1316,11 +1316,12 @@ def _finite_vector_evidence(values: Any) -> dict[str, Any]:
 def _capture_failure_runtime_evidence(env: Any, *, policy_step: Any) -> dict[str, Any]:
     """Capture the live arm state and controller report before failure teardown."""
 
-    from polaris.eef_runtime_contract import eef_episode_safety_report
-
     arm_term = env.unwrapped.action_manager._terms["arm"]
     robot = env.unwrapped.scene["robot"]
     joint_ids = arm_term._joint_ids
+    reporter = getattr(arm_term, "episode_safety_report", None)
+    if not callable(reporter):
+        raise ValueError("Live EEF action has no failure-safe episode reporter")
     return {
         "policy_step": policy_step,
         "arm_joint_names": list(arm_term._joint_names),
@@ -1333,7 +1334,10 @@ def _capture_failure_runtime_evidence(env: Any, *, policy_step: Any) -> dict[str
         "arm_joint_target_rad": _finite_vector_evidence(
             robot.data.joint_pos_target[:, joint_ids][0]
         ),
-        "ik_safety": eef_episode_safety_report(env, 0),
+        # Deliberately bypass the success-path runtime validator here. A
+        # violated invariant is why this failure-only capture runs; the raw
+        # action-term report must remain available for diagnosis.
+        "ik_safety": reporter(0),
     }
 
 
