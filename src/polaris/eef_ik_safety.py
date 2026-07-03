@@ -5,9 +5,10 @@ from __future__ import annotations
 import math
 from typing import Any
 
-EEF_IK_SAFETY_PROFILE = "panda_velocity_softlimit_v1"
+EEF_IK_SAFETY_PROFILE = "panda_velocity_softlimit_guardband_v2"
 EEF_IK_APPLY_CADENCE = "physics_substep"
 CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD = 1e-5
+TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE = "one_physics_substep_velocity_bound_v1"
 # One named allowance for float32 subtraction around the configured per-substep
 # slew bound.  Keep this identical in the controller, runtime validation, and
 # the downstream Ego-LAP completion contract.
@@ -34,8 +35,8 @@ PANDA_EEF_JOINT_EFFORT_LIMITS = (
 )
 
 # Canonical float32 limits expected from the pinned NVIDIA DROID articulation
-# with soft_joint_pos_limit_factor=1.  The first live controller smoke must
-# independently recapture these bytes before a standard v3 suite is launched.
+# with soft_joint_pos_limit_factor=1.  Every safety-profile revision must
+# independently recapture these bytes before a standard suite is launched.
 PANDA_SOFT_JOINT_POS_LIMITS_RAD = (
     (-2.8973000049591064, 2.8973000049591064),
     (-1.7627999782562256, 1.7627999782562256),
@@ -47,6 +48,9 @@ PANDA_SOFT_JOINT_POS_LIMITS_RAD = (
 )
 PANDA_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256 = (
     "fbf7535901c042fea5d901812ecd02c5fd81ade06c23c1499c32d66a859104de"
+)
+PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256 = (
+    "09b20ab18c35d6dc22a3edbc2beca2edff419e242dd07d74cd1d65df9ce67e0f"
 )
 
 

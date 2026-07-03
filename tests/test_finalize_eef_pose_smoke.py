@@ -65,12 +65,15 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
         max_raw["safe_joint_pos_target_rad"] = _diagnostic_vector(safe_target)
     return {
         "episode_index": episode_index,
-        "profile": "panda_velocity_softlimit_v1",
+        "profile": "panda_velocity_softlimit_guardband_v2",
         "apply_actions_cadence": "physics_substep",
         "physics_dt": 1.0 / 120.0,
         "control_dt": 1.0 / 15.0,
         "decimation": 8,
         "current_joint_soft_limit_tolerance_rad": 1e-5,
+        "target_soft_limit_guard_band_profile": (
+            "one_physics_substep_velocity_bound_v1"
+        ),
         "eef_quaternion_unit_norm_tolerance": 1e-3,
         "joint_slew_float32_tolerance_rad": 1e-6,
         "soft_joint_pos_limit_factor": 1.0,
@@ -78,6 +81,9 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
         "joint_velocity_limits_rad_s": finalizer.EXPECTED_VELOCITY_LIMITS,
         "joint_effort_limits": finalizer.EXPECTED_EFFORT_LIMITS,
         "max_delta_joint_pos_rad": finalizer.EXPECTED_MAX_DELTA,
+        "target_soft_limit_margin_rad": finalizer.EXPECTED_MAX_DELTA,
+        "target_joint_pos_limits_rad": finalizer.EXPECTED_TARGET_LIMITS,
+        "target_joint_pos_limits_float32_sha256": (finalizer.EXPECTED_TARGET_DIGEST),
         "soft_joint_pos_limits_rad": finalizer.EXPECTED_LIMITS,
         "soft_joint_pos_limits_float32_sha256": finalizer.EXPECTED_DIGEST,
         "counters": counters,
@@ -397,6 +403,28 @@ def test_raw_smoke_gate_requires_pending_full_evidence():
         "safe_joint_pos_target_rad"
     ]["values"][0] += 0.1
     with pytest.raises(finalizer.VerificationError, match="safe slew"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["ik_safety_episodes"][0]["target_joint_pos_limits_float32_sha256"] = "0" * 64
+    with pytest.raises(finalizer.VerificationError, match="target_joint_pos_limits"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["ik_safety_episodes"][0]["maxima"][
+        "post_clamp_target_guard_band_violation_rad"
+    ][0] = 2e-5
+    with pytest.raises(finalizer.VerificationError, match="target guard-band maxima"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["ik_safety_episodes"][0]["maxima"][
+        "post_clamp_target_guard_band_violation_rad"
+    ][0] = 5e-6
+    with pytest.raises(
+        finalizer.VerificationError,
+        match="target guard-band recovery attribution",
+    ):
         finalizer._verify_raw(raw)
 
     raw = _valid_raw_result()

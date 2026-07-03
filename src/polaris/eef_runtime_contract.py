@@ -24,6 +24,8 @@ from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_RAD
+from polaris.eef_ik_safety import PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256
+from polaris.eef_ik_safety import TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
 from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
 from polaris.eval_artifacts import EVAL_RESULT_COLUMNS
 from polaris.eval_artifacts import canonical_episode_result
@@ -59,6 +61,7 @@ SAFETY_MAXIMA_FIELDS = {
     "applied_delta_joint_pos_rad",
     "raw_target_soft_limit_violation_rad",
     "post_clamp_target_soft_limit_violation_rad",
+    "post_clamp_target_guard_band_violation_rad",
     "current_joint_soft_limit_violation_rad",
 }
 SAFETY_DIAGNOSTIC_FIELDS = {
@@ -91,6 +94,7 @@ SAFETY_STATIC_FIELDS = (
     "control_dt",
     "decimation",
     "current_joint_soft_limit_tolerance_rad",
+    "target_soft_limit_guard_band_profile",
     "eef_quaternion_unit_norm_tolerance",
     "joint_slew_float32_tolerance_rad",
     "soft_joint_pos_limit_factor",
@@ -98,6 +102,9 @@ SAFETY_STATIC_FIELDS = (
     "joint_velocity_limits_rad_s",
     "joint_effort_limits",
     "max_delta_joint_pos_rad",
+    "target_soft_limit_margin_rad",
+    "target_joint_pos_limits_rad",
+    "target_joint_pos_limits_float32_sha256",
     "soft_joint_pos_limits_rad",
     "soft_joint_pos_limits_float32_sha256",
 )
@@ -366,6 +373,7 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
     exact_fields = {
         "profile": EEF_IK_SAFETY_PROFILE,
         "apply_actions_cadence": EEF_IK_APPLY_CADENCE,
+        "target_soft_limit_guard_band_profile": TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE,
         "decimation": CANONICAL_DECIMATION,
         "joint_names": list(CANONICAL_ARM_JOINTS),
     }
@@ -432,6 +440,10 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
             value * CANONICAL_PHYSICS_DT
             for value in PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
         ),
+        "target_soft_limit_margin_rad": tuple(
+            value * CANONICAL_PHYSICS_DT
+            for value in PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+        ),
     }
     for field, expected in vector_fields.items():
         actual = _numpy(report.get(field)).astype(np.float64)
@@ -449,6 +461,19 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
                 f"Live EEF IK safety {field} mismatch: "
                 f"expected={expected!r}, actual={actual.tolist()!r}"
             )
+    max_delta_report = report.get("max_delta_joint_pos_rad")
+    target_margin_report = report.get("target_soft_limit_margin_rad")
+    canonical_max_delta = np.asarray(
+        PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S, dtype=np.float32
+    ) * np.float32(CANONICAL_PHYSICS_DT)
+    if target_margin_report != max_delta_report or not np.array_equal(
+        np.asarray(max_delta_report, dtype=np.float32),
+        canonical_max_delta,
+    ):
+        raise ValueError(
+            "Live EEF IK target margin must exactly equal the canonical "
+            "float32 physics-substep slew vector"
+        )
     soft_limits = _numpy(report.get("soft_joint_pos_limits_rad")).astype(np.float64)
     if (
         soft_limits.shape != (7, 2)
@@ -480,6 +505,47 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
             f"recorded={soft_limit_sha256!r}, computed={computed_soft_limit_sha256!r}"
         )
 
+    target_limits = _numpy(report.get("target_joint_pos_limits_rad")).astype(np.float64)
+    max_delta_float32 = np.asarray(max_delta_report, dtype=np.float32)
+    expected_target_limits = np.stack(
+        (
+            soft_limits.astype(np.float32)[:, 0] + max_delta_float32,
+            soft_limits.astype(np.float32)[:, 1] - max_delta_float32,
+        ),
+        axis=-1,
+    )
+    if (
+        target_limits.shape != (7, 2)
+        or not np.isfinite(target_limits).all()
+        or not np.array_equal(target_limits.astype(np.float32), expected_target_limits)
+        or not np.all(target_limits[:, 0] < target_limits[:, 1])
+    ):
+        raise ValueError(
+            "Live EEF IK target guard-band limits do not match one physics "
+            "substep of the velocity bounds: "
+            f"expected={expected_target_limits.tolist()!r}, "
+            f"actual={target_limits.tolist()!r}"
+        )
+    target_limit_sha256 = report.get("target_joint_pos_limits_float32_sha256")
+    computed_target_limit_sha256 = hashlib.sha256(
+        target_limits.astype("<f4", copy=False).tobytes()
+    ).hexdigest()
+    expected_target_limit_sha256 = hashlib.sha256(
+        expected_target_limits.astype("<f4", copy=False).tobytes()
+    ).hexdigest()
+    if (
+        target_limit_sha256 != computed_target_limit_sha256
+        or target_limit_sha256 != expected_target_limit_sha256
+        or target_limit_sha256 != PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256
+    ):
+        raise ValueError(
+            "Live EEF IK target guard-band digest mismatch: "
+            f"expected={expected_target_limit_sha256!r}, "
+            "canonical="
+            f"{PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256!r}, "
+            f"recorded={target_limit_sha256!r}, "
+            f"computed={computed_target_limit_sha256!r}"
+        )
     counters = report.get("counters")
     maxima = report.get("maxima")
     if not isinstance(counters, dict) or not isinstance(maxima, dict):
@@ -935,7 +1001,6 @@ def _validate_episode_safety_evidence_shape(
             )
         ):
             raise ValueError(f"Episode safety maximum {name} is invalid")
-
     diagnostics = safety.get("guard_diagnostics")
     if not isinstance(diagnostics, list) or len(diagnostics) > 32:
         raise ValueError("Episode safety guard diagnostics are invalid")
@@ -1079,6 +1144,25 @@ def validate_episode_safety_cadence(
             raise ValueError("Completed episode has post-clamp violation maxima")
         if any(
             value > CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
+            for value in safety["maxima"]["post_clamp_target_guard_band_violation_rad"]
+        ):
+            raise ValueError(
+                "Completed episode exceeded the target guard-band recovery tolerance"
+            )
+        if any(
+            guard > current + JOINT_SLEW_FLOAT32_TOLERANCE_RAD
+            for guard, current in zip(
+                safety["maxima"]["post_clamp_target_guard_band_violation_rad"],
+                safety["maxima"]["current_joint_soft_limit_violation_rad"],
+                strict=True,
+            )
+        ):
+            raise ValueError(
+                "Completed episode target guard-band recovery is not attributable "
+                "to a tolerated current-state limit excursion"
+            )
+        if any(
+            value > CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
             for value in safety["maxima"]["current_joint_soft_limit_violation_rad"]
         ):
             raise ValueError("Completed episode current-position maximum is unsafe")
@@ -1099,6 +1183,17 @@ def validate_episode_safety_cadence(
             vector = max_raw.get(vector_name)
             if not isinstance(vector, Mapping) or vector.get("finite_count") != 7:
                 raise ValueError("Completed episode max-raw diagnostic is non-finite")
+        safe_values = max_raw["safe_joint_pos_target_rad"]["values"]
+        target_limits = safety["target_joint_pos_limits_rad"]
+        if any(
+            value < lower - CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
+            or value > upper + CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
+            for value, (lower, upper) in zip(safe_values, target_limits, strict=True)
+        ):
+            raise ValueError(
+                "Completed episode max-raw safe target exceeded the target "
+                "guard-band recovery tolerance"
+            )
         if max_raw.get("jacobian_finite") is not True or any(
             not isinstance(max_raw.get(name), (int, float))
             or isinstance(max_raw.get(name), bool)

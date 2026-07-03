@@ -29,6 +29,8 @@ from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_RAD
+from polaris.eef_ik_safety import PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256
+from polaris.eef_ik_safety import TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
 from polaris.eef_ik_safety import validate_one_step_adversarial_report
 from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
 from polaris.eval_artifacts import build_episode_artifact_identity
@@ -71,8 +73,23 @@ def _runtime_fixture():
         _body_idx=1,
         _joint_names=[f"panda_joint{index}" for index in range(1, 8)],
     )
-    max_delta = [value / 120.0 for value in PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S]
+    max_delta = [
+        np.float32(np.float32(value) * np.float32(1.0 / 120.0)).item()
+        for value in PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+    ]
     soft_limits = [list(values) for values in PANDA_SOFT_JOINT_POS_LIMITS_RAD]
+    soft_limits_f32 = np.asarray(soft_limits, dtype=np.float32)
+    margin_f32 = np.asarray(max_delta, dtype=np.float32)
+    target_limits = np.stack(
+        (
+            soft_limits_f32[:, 0] + margin_f32,
+            soft_limits_f32[:, 1] - margin_f32,
+        ),
+        axis=-1,
+    ).tolist()
+    target_limit_sha256 = hashlib.sha256(
+        np.asarray(target_limits, dtype="<f4").tobytes()
+    ).hexdigest()
     soft_limit_sha256 = PANDA_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256
     arm_term.safety_report = lambda: {
         "episode_index": None,
@@ -82,13 +99,17 @@ def _runtime_fixture():
         "control_dt": 1.0 / 15.0,
         "decimation": 8,
         "current_joint_soft_limit_tolerance_rad": 1e-5,
+        "target_soft_limit_guard_band_profile": TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE,
         "eef_quaternion_unit_norm_tolerance": EEF_QUATERNION_UNIT_NORM_TOLERANCE,
         "joint_slew_float32_tolerance_rad": JOINT_SLEW_FLOAT32_TOLERANCE_RAD,
         "soft_joint_pos_limit_factor": 1.0,
         "joint_names": [f"panda_joint{index}" for index in range(1, 8)],
         "joint_velocity_limits_rad_s": list(PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S),
         "joint_effort_limits": list(PANDA_EEF_JOINT_EFFORT_LIMITS),
-        "max_delta_joint_pos_rad": max_delta,
+        "max_delta_joint_pos_rad": list(max_delta),
+        "target_soft_limit_margin_rad": list(max_delta),
+        "target_joint_pos_limits_rad": target_limits,
+        "target_joint_pos_limits_float32_sha256": target_limit_sha256,
         "soft_joint_pos_limits_rad": soft_limits,
         "soft_joint_pos_limits_float32_sha256": soft_limit_sha256,
         "counters": {
@@ -110,6 +131,7 @@ def _runtime_fixture():
             "applied_delta_joint_pos_rad": [0.0] * 7,
             "raw_target_soft_limit_violation_rad": [0.0] * 7,
             "post_clamp_target_soft_limit_violation_rad": [0.0] * 7,
+            "post_clamp_target_guard_band_violation_rad": [0.0] * 7,
             "current_joint_soft_limit_violation_rad": [0.0] * 7,
         },
         "guard_diagnostics": [],
@@ -161,15 +183,23 @@ def _episode_safety(*, episode=0, length=2, numerical_failure=False):
         "finite_mask": [True] * 7,
         "finite_count": 7,
     }
+    neutral_joint_pos = [
+        (lower + upper) / 2.0 for lower, upper in report["target_joint_pos_limits_rad"]
+    ]
+    neutral_vector = {
+        "values": neutral_joint_pos,
+        "finite_mask": [True] * 7,
+        "finite_count": 7,
+    }
     report["max_raw_delta_diagnostic"] = {
         "kind": "max_raw_delta",
         "episode_index": episode,
         "policy_step": 0,
         "physics_substep": 0,
-        "joint_pos_rad": zero_vector,
+        "joint_pos_rad": neutral_vector,
         "raw_delta_joint_pos_rad": zero_vector,
-        "raw_joint_pos_target_rad": zero_vector,
-        "safe_joint_pos_target_rad": zero_vector,
+        "raw_joint_pos_target_rad": neutral_vector,
+        "safe_joint_pos_target_rad": neutral_vector,
         "pose_error_norm": 0.0,
         "jacobian_finite": True,
         "jacobian_max_abs": 0.0,
@@ -286,8 +316,16 @@ def test_runtime_frame_matches_direct_link8_and_absolute_action_term():
     safety = validate_eef_runtime_safety(env)
     assert safety["profile"] == EEF_IK_SAFETY_PROFILE
     assert safety["max_delta_joint_pos_rad"] == [
-        value / 120.0 for value in PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+        np.float32(np.float32(value) * np.float32(1.0 / 120.0)).item()
+        for value in PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
     ]
+    assert safety["target_soft_limit_margin_rad"] == safety["max_delta_joint_pos_rad"]
+    assert safety["target_soft_limit_guard_band_profile"] == (
+        TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
+    )
+    assert safety["target_joint_pos_limits_float32_sha256"] == (
+        PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256
+    )
 
 
 def test_runtime_contract_is_atomic_and_has_exact_evidence_schema():
@@ -531,6 +569,31 @@ def test_episode_safety_cadence_binds_success_and_failure_substep():
     assert failed["failed_policy_step"] == 1
     assert failed["failed_physics_substep"] == 2
 
+    contained_guard_abort = _episode_safety(numerical_failure=True)
+    contained_guard_abort["counters"]["nonfinite_aborts"] = 0
+    contained_guard_abort["counters"]["invariant_aborts"] = 1
+    contained_guard_abort["counters"]["post_clamp_target_violations"] = 1
+    contained_guard_abort["maxima"]["post_clamp_target_guard_band_violation_rad"][0] = (
+        5e-6
+    )
+    diagnostic = json.loads(
+        json.dumps(contained_guard_abort["max_raw_delta_diagnostic"])
+    )
+    diagnostic.update(
+        {
+            "kind": "post_clamp_position_invariant_abort",
+            "policy_step": 1,
+            "physics_substep": 2,
+        }
+    )
+    contained_guard_abort["guard_diagnostics"] = [diagnostic]
+    contained = validate_episode_safety_cadence(
+        safety=contained_guard_abort,
+        episode_result=_episode_result(numerical_failure=True),
+    )
+    assert contained["abort_count"] == 1
+    assert contained["failed_policy_step"] == 1
+
     invalid = _episode_safety()
     invalid["counters"]["apply_calls"] -= 1
     invalid["counters"]["environment_substeps"] -= 1
@@ -590,6 +653,32 @@ def test_completed_episode_requires_consistent_max_raw_diagnostic():
     with pytest.raises(ValueError, match="max-raw diagnostic is non-finite"):
         validate_episode_safety_cadence(
             safety=incomplete_vectors, episode_result=_episode_result()
+        )
+
+    guard_band_max = _episode_safety()
+    guard_band_max["maxima"]["post_clamp_target_guard_band_violation_rad"][0] = 2e-5
+    guard_band_max["maxima"]["current_joint_soft_limit_violation_rad"][0] = 2e-5
+    with pytest.raises(ValueError, match="guard-band recovery tolerance"):
+        validate_episode_safety_cadence(
+            safety=guard_band_max, episode_result=_episode_result()
+        )
+
+    unattributed_recovery = _episode_safety()
+    unattributed_recovery["maxima"]["post_clamp_target_guard_band_violation_rad"][0] = (
+        5e-6
+    )
+    with pytest.raises(ValueError, match="not attributable"):
+        validate_episode_safety_cadence(
+            safety=unattributed_recovery, episode_result=_episode_result()
+        )
+
+    guard_band_target = _episode_safety()
+    guard_band_target["max_raw_delta_diagnostic"]["safe_joint_pos_target_rad"][
+        "values"
+    ][0] = guard_band_target["target_joint_pos_limits_rad"][0][1] + 2e-5
+    with pytest.raises(ValueError, match="guard-band recovery tolerance"):
+        validate_episode_safety_cadence(
+            safety=guard_band_target, episode_result=_episode_result()
         )
 
 
@@ -704,6 +793,30 @@ def test_runtime_safety_rejects_drift_and_unbounded_applied_delta():
     ).hexdigest()
     env.unwrapped.action_manager._terms["arm"].safety_report = lambda: tampered
     with pytest.raises(ValueError, match="canonical Panda float32"):
+        validate_eef_runtime_safety(env)
+
+    env, _ = _runtime_fixture()
+    tampered = env.unwrapped.action_manager._terms["arm"].safety_report()
+    tampered["target_joint_pos_limits_rad"][4][1] += 1e-3
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: tampered
+    with pytest.raises(ValueError, match="target guard-band limits"):
+        validate_eef_runtime_safety(env)
+
+    env, _ = _runtime_fixture()
+    tampered = env.unwrapped.action_manager._terms["arm"].safety_report()
+    tampered["target_joint_pos_limits_float32_sha256"] = "0" * 64
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: tampered
+    with pytest.raises(ValueError, match="target guard-band digest"):
+        validate_eef_runtime_safety(env)
+
+    env, _ = _runtime_fixture()
+    tampered = env.unwrapped.action_manager._terms["arm"].safety_report()
+    tampered["target_soft_limit_margin_rad"][0] = np.nextafter(
+        np.float32(tampered["target_soft_limit_margin_rad"][0]),
+        np.float32(np.inf),
+    ).item()
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: tampered
+    with pytest.raises(ValueError, match="must exactly equal"):
         validate_eef_runtime_safety(env)
 
 

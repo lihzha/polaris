@@ -15,7 +15,10 @@ from polaris.robust_differential_ik import (
     _require_current_joint_position_in_soft_limits,
     _require_finite,
 )
+from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_RAD
 
 
 def _controller(controller_type, *, damping=0.01):
@@ -118,10 +121,86 @@ def test_joint_target_safety_intersects_slew_and_soft_position_limits():
         joint_pos, raw_target, max_delta, soft_limits
     )
 
-    torch.testing.assert_close(safe, torch.ones_like(safe), rtol=0.0, atol=0.0)
+    # The command remains one maximum physics-substep motion inside the live
+    # articulation limit, so the implicit actuator has room to brake.
+    torch.testing.assert_close(safe, torch.full_like(safe, 0.98), rtol=0.0, atol=0.0)
     assert slew_limited.all()
     assert position_limited.all()
     assert torch.all((safe - joint_pos).abs() <= max_delta)
+
+
+@pytest.mark.parametrize("direction", [-1.0, 1.0])
+def test_joint_target_guard_band_prevents_exact_bound_actuator_command(direction):
+    soft_limits = torch.tensor([PANDA_SOFT_JOINT_POS_LIMITS_RAD], dtype=torch.float32)
+    max_delta = torch.tensor(
+        [PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S], dtype=torch.float32
+    ) * (1.0 / 120.0)
+    boundary = soft_limits[..., 1] if direction > 0 else soft_limits[..., 0]
+    joint_pos = boundary - direction * max_delta / 4.0
+    raw_target = boundary + direction * max_delta
+
+    safe, _, slew_limited, position_limited = _bound_joint_position_target(
+        joint_pos, raw_target, max_delta, soft_limits
+    )
+
+    expected = boundary - direction * max_delta
+    torch.testing.assert_close(safe, expected, rtol=0.0, atol=0.0)
+    assert slew_limited.all()
+    assert position_limited.all()
+    if direction > 0:
+        assert torch.all(safe < soft_limits[..., 1])
+    else:
+        assert torch.all(safe > soft_limits[..., 0])
+    assert torch.all((safe - joint_pos).abs() <= max_delta)
+
+
+@pytest.mark.parametrize("direction", [-1.0, 1.0])
+def test_joint_target_guard_band_recovers_outer_tolerance_without_slew_violation(
+    direction,
+):
+    soft_limits = torch.tensor([PANDA_SOFT_JOINT_POS_LIMITS_RAD], dtype=torch.float32)
+    max_delta = torch.tensor(
+        [PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S], dtype=torch.float32
+    ) * (1.0 / 120.0)
+    boundary = soft_limits[..., 1] if direction > 0 else soft_limits[..., 0]
+    outer_tolerance_offset = torch.full_like(boundary, 5e-6)
+    joint_pos = boundary + direction * outer_tolerance_offset
+    raw_target = boundary + direction
+
+    safe, _, slew_limited, position_limited = _bound_joint_position_target(
+        joint_pos, raw_target, max_delta, soft_limits
+    )
+
+    strict_inner = boundary - direction * max_delta
+    guard_band_violation = (safe - strict_inner) * direction
+    assert slew_limited.all()
+    assert position_limited.all()
+    assert torch.all((safe - joint_pos).abs() <= max_delta + 1e-6)
+    assert torch.all(guard_band_violation >= 0.0)
+    assert torch.all(guard_band_violation <= CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD)
+    assert torch.all(safe <= soft_limits[..., 1])
+    assert torch.all(safe >= soft_limits[..., 0])
+
+
+@pytest.mark.parametrize("direction", [-1.0, 1.0])
+def test_joint_target_guard_band_does_not_consume_recovery_for_in_range_state(
+    direction,
+):
+    soft_limits = torch.tensor([PANDA_SOFT_JOINT_POS_LIMITS_RAD], dtype=torch.float32)
+    max_delta = torch.tensor(
+        [PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S], dtype=torch.float32
+    ) * (1.0 / 120.0)
+    boundary = soft_limits[..., 1] if direction > 0 else soft_limits[..., 0]
+    joint_pos = boundary - direction * torch.full_like(boundary, 5e-6)
+    raw_target = boundary + direction
+
+    safe, _, _, position_limited = _bound_joint_position_target(
+        joint_pos, raw_target, max_delta, soft_limits
+    )
+
+    strict_inner = boundary - direction * max_delta
+    assert position_limited.all()
+    torch.testing.assert_close(safe, strict_inner, rtol=0.0, atol=0.0)
 
 
 def test_joint_target_safety_rejects_nonfinite_and_out_of_limit_current_state():

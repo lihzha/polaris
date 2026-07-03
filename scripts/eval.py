@@ -269,6 +269,10 @@ def main(eval_args: EvalArgs):
             f"profile={runtime_safety['profile']};"
             f"cadence={runtime_safety['apply_actions_cadence']};"
             f"physics_dt={runtime_safety['physics_dt']};"
+            "target_guard_band="
+            f"{runtime_safety['target_soft_limit_guard_band_profile']};"
+            "target_limit_sha256="
+            f"{runtime_safety['target_joint_pos_limits_float32_sha256']};"
             "max_delta_joint_pos_rad="
             + ",".join(
                 str(value) for value in runtime_safety["max_delta_joint_pos_rad"]

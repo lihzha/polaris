@@ -10,12 +10,16 @@ import math
 import os
 from pathlib import Path
 import stat
+import struct
 import subprocess
 import sys
 from typing import Any
 
 
 EXPECTED_DIGEST = "fbf7535901c042fea5d901812ecd02c5fd81ade06c23c1499c32d66a859104de"
+EXPECTED_TARGET_DIGEST = (
+    "09b20ab18c35d6dc22a3edbc2beca2edff419e242dd07d74cd1d65df9ce67e0f"
+)
 EXPECTED_LIMITS = [
     [-2.8973000049591064, 2.8973000049591064],
     [-1.7627999782562256, 1.7627999782562256],
@@ -49,6 +53,27 @@ EXPECTED_JOINT_NAMES = [f"panda_joint{index}" for index in range(1, 8)]
 EXPECTED_VELOCITY_LIMITS = [2.174999952316284] * 4 + [2.609999895095825] * 3
 EXPECTED_EFFORT_LIMITS = [87.0] * 4 + [12.0] * 3
 EXPECTED_MAX_DELTA = [0.018125001341104507] * 4 + [0.02174999937415123] * 3
+
+
+def _float32(value: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+EXPECTED_TARGET_LIMITS = [
+    [_float32(lower + margin), _float32(upper - margin)]
+    for (lower, upper), margin in zip(EXPECTED_LIMITS, EXPECTED_MAX_DELTA, strict=True)
+]
+if (
+    hashlib.sha256(
+        b"".join(
+            struct.pack("<f", value)
+            for pair in EXPECTED_TARGET_LIMITS
+            for value in pair
+        )
+    ).hexdigest()
+    != EXPECTED_TARGET_DIGEST
+):
+    raise RuntimeError("Canonical Panda target guard-band digest drift")
 RAW_FIELDS = {
     "schema_version",
     "finalized",
@@ -95,6 +120,7 @@ SAFETY_FIELDS = {
     "control_dt",
     "decimation",
     "current_joint_soft_limit_tolerance_rad",
+    "target_soft_limit_guard_band_profile",
     "eef_quaternion_unit_norm_tolerance",
     "joint_slew_float32_tolerance_rad",
     "soft_joint_pos_limit_factor",
@@ -102,6 +128,9 @@ SAFETY_FIELDS = {
     "joint_velocity_limits_rad_s",
     "joint_effort_limits",
     "max_delta_joint_pos_rad",
+    "target_soft_limit_margin_rad",
+    "target_joint_pos_limits_rad",
+    "target_joint_pos_limits_float32_sha256",
     "soft_joint_pos_limits_rad",
     "soft_joint_pos_limits_float32_sha256",
     "counters",
@@ -128,6 +157,7 @@ MAXIMA_FIELDS = {
     "applied_delta_joint_pos_rad",
     "raw_target_soft_limit_violation_rad",
     "post_clamp_target_soft_limit_violation_rad",
+    "post_clamp_target_guard_band_violation_rad",
     "current_joint_soft_limit_violation_rad",
 }
 DIAGNOSTIC_FIELDS = {
@@ -371,8 +401,13 @@ def _validate_safety_report(
     else:
         _exact_int(report.get("episode_index"), episode_index, f"{field}.episode_index")
     for name, expected in (
-        ("profile", "panda_velocity_softlimit_v1"),
+        ("profile", "panda_velocity_softlimit_guardband_v2"),
         ("apply_actions_cadence", "physics_substep"),
+        (
+            "target_soft_limit_guard_band_profile",
+            "one_physics_substep_velocity_bound_v1",
+        ),
+        ("target_joint_pos_limits_float32_sha256", EXPECTED_TARGET_DIGEST),
         ("soft_joint_pos_limits_float32_sha256", EXPECTED_DIGEST),
     ):
         _require(
@@ -409,6 +444,22 @@ def _validate_safety_report(
         EXPECTED_MAX_DELTA,
         f"{field}.max_delta_joint_pos_rad",
     )
+    _exact_float_vector(
+        report.get("target_soft_limit_margin_rad"),
+        EXPECTED_MAX_DELTA,
+        f"{field}.target_soft_limit_margin_rad",
+    )
+    target_limits = _list(
+        report.get("target_joint_pos_limits_rad"),
+        f"{field}.target_joint_pos_limits_rad",
+        length=7,
+    )
+    for index, (actual, expected) in enumerate(
+        zip(target_limits, EXPECTED_TARGET_LIMITS, strict=True)
+    ):
+        _exact_float_vector(
+            actual, expected, f"{field}.target_joint_pos_limits_rad[{index}]"
+        )
     limits = _list(report.get("soft_joint_pos_limits_rad"), f"{field}.limits", length=7)
     for index, (actual, expected) in enumerate(
         zip(limits, EXPECTED_LIMITS, strict=True)
@@ -459,6 +510,24 @@ def _validate_safety_report(
             item == 0.0 for item in maxima["post_clamp_target_soft_limit_violation_rad"]
         ),
         f"{field}.post-clamp maxima",
+    )
+    _require(
+        all(
+            item <= 1e-5
+            for item in maxima["post_clamp_target_guard_band_violation_rad"]
+        ),
+        f"{field}.target guard-band maxima",
+    )
+    _require(
+        all(
+            guard <= current + 1e-6
+            for guard, current in zip(
+                maxima["post_clamp_target_guard_band_violation_rad"],
+                maxima["current_joint_soft_limit_violation_rad"],
+                strict=True,
+            )
+        ),
+        f"{field}.target guard-band recovery attribution",
     )
     _require(
         all(item <= 1e-5 for item in maxima["current_joint_soft_limit_violation_rad"]),
@@ -577,7 +646,7 @@ def _validate_safety_report(
         raw_target = finite_vectors["raw_joint_pos_target_rad"]
         safe_target = finite_vectors["safe_joint_pos_target_rad"]
         raw_delta = [float(item) for item in raw_vector]
-        for index, (q, delta, raw, safe, bound, limits) in enumerate(
+        for index, (q, delta, raw, safe, bound, limits, target_limits) in enumerate(
             zip(
                 q_vector,
                 raw_delta,
@@ -585,6 +654,7 @@ def _validate_safety_report(
                 safe_target,
                 EXPECTED_MAX_DELTA,
                 EXPECTED_LIMITS,
+                EXPECTED_TARGET_LIMITS,
                 strict=True,
             )
         ):
@@ -599,6 +669,10 @@ def _validate_safety_report(
             _require(
                 limits[0] - 1e-5 <= safe <= limits[1] + 1e-5,
                 f"{field}.max-raw joint {index} safe limits",
+            )
+            _require(
+                target_limits[0] - 1e-5 <= safe <= target_limits[1] + 1e-5,
+                f"{field}.max-raw joint {index} target guard band",
             )
     return counters, maxima
 
@@ -1004,6 +1078,7 @@ def _verify_raw(raw: dict[str, Any]) -> dict[str, Any]:
         "ordinary_safety_report_count": 13,
         "ordinary_apply_calls_each": 360,
         "soft_limit_digest": EXPECTED_DIGEST,
+        "target_limit_digest": EXPECTED_TARGET_DIGEST,
         "adversarial": {
             "passed": True,
             "apply_calls": 8,
