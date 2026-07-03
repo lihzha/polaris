@@ -65,7 +65,7 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
         max_raw["safe_joint_pos_target_rad"] = _diagnostic_vector(safe_target)
     return {
         "episode_index": episode_index,
-        "profile": "panda_velocity_physxlimit_solveriter1_v4",
+        "profile": "panda_velocity_physxlimit_solveriter4_v5",
         "apply_actions_cadence": "physics_substep",
         "physics_dt": 1.0 / 120.0,
         "control_dt": 1.0 / 15.0,
@@ -80,13 +80,13 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
         ),
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": "zero_per_physics_substep_v1",
-        "articulation_solver_profile": "tgs_position64_velocity1_eef_only_v1",
+        "articulation_solver_profile": "tgs_position64_velocity4_eef_only_v2",
         "articulation_solver_readback": (
             "composed_usd_physx_articulation_api_all_env_roots_v1"
         ),
         "physx_solver_type": 1,
         "solver_position_iteration_count": 64,
-        "solver_velocity_iteration_count": 1,
+        "solver_velocity_iteration_count": 4,
         "joint_velocity_limit_tolerance_rad_s": 1e-5,
         "eef_quaternion_unit_norm_tolerance": 1e-3,
         "joint_slew_float32_tolerance_rad": 1e-6,

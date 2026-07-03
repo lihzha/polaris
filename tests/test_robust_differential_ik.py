@@ -365,20 +365,20 @@ def _install_solver_schema_fakes(monkeypatch, apis):
 def test_solver_schema_readback_covers_every_authored_articulation_root(monkeypatch):
     asset = _install_solver_schema_fakes(
         monkeypatch,
-        [_SolverApi(64, 1), _SolverApi(64, 1)],
+        [_SolverApi(64, 4), _SolverApi(64, 4)],
     )
 
     position, velocity = robust_ik._read_articulation_solver_iteration_counts(asset)
 
     assert position == (64, 64)
-    assert velocity == (1, 1)
+    assert velocity == (4, 4)
 
 
 @pytest.mark.parametrize(
     "api",
     [
-        _SolverApi(64, 1, position_authored=False),
-        _SolverApi(64, 1, velocity_authored=False),
+        _SolverApi(64, 4, position_authored=False),
+        _SolverApi(64, 4, velocity_authored=False),
     ],
 )
 def test_solver_schema_readback_rejects_fallback_but_unauthored_values(
@@ -518,11 +518,11 @@ def test_safety_report_rejects_live_velocity_target_mutation(monkeypatch):
     action._joint_velocity_limits = asset.root_physx_view.max_velocities.clone()
     action._joint_effort_limits = asset.root_physx_view.max_forces.clone()
     action._solver_position_iteration_counts = (64,)
-    action._solver_velocity_iteration_counts = (1,)
+    action._solver_velocity_iteration_counts = (4,)
     monkeypatch.setattr(
         robust_ik,
         "_read_articulation_solver_iteration_counts",
-        lambda _asset: ((64,), (1,)),
+        lambda _asset: ((64,), (4,)),
     )
 
     with pytest.raises(
@@ -565,11 +565,11 @@ def test_safety_report_rejects_live_physx_joint_limit_drift(monkeypatch, limit_f
     action._joint_velocity_limits = asset.root_physx_view.max_velocities.clone()
     action._joint_effort_limits = asset.root_physx_view.max_forces.clone()
     action._solver_position_iteration_counts = (64,)
-    action._solver_velocity_iteration_counts = (1,)
+    action._solver_velocity_iteration_counts = (4,)
     monkeypatch.setattr(
         robust_ik,
         "_read_articulation_solver_iteration_counts",
-        lambda _asset: ((64,), (1,)),
+        lambda _asset: ((64,), (4,)),
     )
     getattr(asset.root_physx_view, limit_field)[0, 0] += 1e-3
 
@@ -738,7 +738,7 @@ def test_eef_velocity_and_effort_limits_are_scoped_to_eef_setup():
     assert eef_cfg.actuators["panda_forearm"].velocity_limit_sim == 2.61
     assert eef_cfg.actuators["panda_forearm"].effort_limit_sim == 12.0
     assert eef_cfg.spawn.articulation_props.solver_position_iteration_count == 64
-    assert eef_cfg.spawn.articulation_props.solver_velocity_iteration_count == 1
+    assert eef_cfg.spawn.articulation_props.solver_velocity_iteration_count == 4
     assert eef_physx_cfg.solver_type == 1
     assert native_cfg.actuators["panda_shoulder"].velocity_limit_sim is None
     assert native_cfg.actuators["panda_forearm"].velocity_limit_sim is None

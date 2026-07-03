@@ -5,17 +5,17 @@ from __future__ import annotations
 import math
 from typing import Any
 
-EEF_IK_SAFETY_PROFILE = "panda_velocity_physxlimit_solveriter1_v4"
+EEF_IK_SAFETY_PROFILE = "panda_velocity_physxlimit_solveriter4_v5"
 EEF_IK_APPLY_CADENCE = "physics_substep"
 CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD = 1e-5
 TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE = "eef_physx_inner_hardlimit_one_substep_v2"
 PHYSX_HARD_LIMIT_PROFILE = "outer_minus_one_velocity_substep_v1"
 PHYSX_DERIVED_SOFT_LIMIT_PROFILE = "isaaclab_midpoint_range_factor1_float32_v1"
 ARM_VELOCITY_TARGET_PROFILE = "zero_per_physics_substep_v1"
-ARTICULATION_SOLVER_PROFILE = "tgs_position64_velocity1_eef_only_v1"
+ARTICULATION_SOLVER_PROFILE = "tgs_position64_velocity4_eef_only_v2"
 ARTICULATION_SOLVER_READBACK = "composed_usd_physx_articulation_api_all_env_roots_v1"
 PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT = 64
-PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT = 1
+PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT = 4
 PANDA_EEF_PHYSX_SOLVER_TYPE = 1
 # One named allowance for float32 subtraction around the configured per-substep
 # slew bound.  Keep this identical in the controller, runtime validation, and

@@ -30,7 +30,7 @@ import zlib
 
 ENVIRONMENT = "DROID-FoodBussing"
 FIXTURE_PROFILE = "official_lap3b_foodbussing_v3_boundary_actions_v1"
-SMOKE_PROFILE = "panda_joint5_upper_solveriter1_boundary_replay_v2"
+SMOKE_PROFILE = "panda_joint5_upper_solveriter4_boundary_replay_v3"
 FIXTURE_PATH = (
     Path(__file__).resolve().parent
     / "fixtures"
@@ -583,7 +583,7 @@ def validate_safety_static(
     _require(isinstance(report, dict) and set(report) == SAFETY_FIELDS, "safety schema")
     _require(report.get("episode_index") == episode_index, "safety episode index")
     exact = {
-        "profile": "panda_velocity_physxlimit_solveriter1_v4",
+        "profile": "panda_velocity_physxlimit_solveriter4_v5",
         "apply_actions_cadence": "physics_substep",
         "physics_dt": 1.0 / 120.0,
         "control_dt": 1.0 / 15.0,
@@ -598,13 +598,13 @@ def validate_safety_static(
         ),
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": "zero_per_physics_substep_v1",
-        "articulation_solver_profile": "tgs_position64_velocity1_eef_only_v1",
+        "articulation_solver_profile": "tgs_position64_velocity4_eef_only_v2",
         "articulation_solver_readback": (
             "composed_usd_physx_articulation_api_all_env_roots_v1"
         ),
         "physx_solver_type": 1,
         "solver_position_iteration_count": 64,
-        "solver_velocity_iteration_count": 1,
+        "solver_velocity_iteration_count": 4,
         "joint_velocity_limit_tolerance_rad_s": 1e-5,
         "eef_quaternion_unit_norm_tolerance": 1e-3,
         "joint_slew_float32_tolerance_rad": 1e-6,
@@ -953,7 +953,7 @@ def validate_boundary_result(
     validate_safety_static(safety, episode_index=0)
     _require(safety.get("episode_index") == 0, "boundary safety episode")
     _require(
-        safety.get("profile") == "panda_velocity_physxlimit_solveriter1_v4",
+        safety.get("profile") == "panda_velocity_physxlimit_solveriter4_v5",
         "boundary safety profile",
     )
     _require(
@@ -1220,7 +1220,7 @@ def validate_success_payload(payload: dict[str, Any]) -> dict[str, Any]:
         ("action_dim", 7),
         (
             "ik_safety_profile",
-            "panda_velocity_physxlimit_solveriter1_v4",
+            "panda_velocity_physxlimit_solveriter4_v5",
         ),
     ):
         _require(runtime_frame.get(field) == expected, f"payload frame {field}")

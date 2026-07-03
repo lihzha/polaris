@@ -442,7 +442,7 @@ def _validate_safety_report(
     else:
         _exact_int(report.get("episode_index"), episode_index, f"{field}.episode_index")
     for name, expected in (
-        ("profile", "panda_velocity_physxlimit_solveriter1_v4"),
+        ("profile", "panda_velocity_physxlimit_solveriter4_v5"),
         ("apply_actions_cadence", "physics_substep"),
         (
             "target_soft_limit_guard_band_profile",
@@ -456,7 +456,7 @@ def _validate_safety_report(
         ("arm_velocity_target_profile", "zero_per_physics_substep_v1"),
         (
             "articulation_solver_profile",
-            "tgs_position64_velocity1_eef_only_v1",
+            "tgs_position64_velocity4_eef_only_v2",
         ),
         (
             "articulation_solver_readback",
@@ -486,7 +486,7 @@ def _validate_safety_report(
     )
     _exact_int(
         report.get("solver_velocity_iteration_count"),
-        1,
+        4,
         f"{field}.solver_velocity_iteration_count",
     )
     for name, expected in (
