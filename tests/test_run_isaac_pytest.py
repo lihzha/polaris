@@ -26,6 +26,7 @@ def _invoke_main(
     report_error=None,
     observations=None,
     exit_code_file=None,
+    close_clears_exit_code_file=False,
 ) -> int:
     if observations is None:
         observations = {}
@@ -34,6 +35,11 @@ def _invoke_main(
     class _App:
         def close(self):
             observations["close_calls"] += 1
+            if close_clears_exit_code_file:
+                run_isaac_pytest.os.environ.pop(
+                    run_isaac_pytest.EXIT_CODE_FILE_ENV,
+                    None,
+                )
             if close_error is not None:
                 raise close_error
 
@@ -234,6 +240,23 @@ def test_bootstrap_exit_code_publish_failure_forces_one(monkeypatch, tmp_path):
         == 1
     )
     assert not exit_code_file.exists()
+
+
+def test_bootstrap_captures_exit_file_before_close_mutates_environment(
+    monkeypatch, tmp_path
+):
+    exit_code_file = tmp_path / "isaac-pytest.exit"
+    assert (
+        _invoke_main(
+            monkeypatch,
+            pytest_exit_code=0,
+            exit_code_file=exit_code_file,
+            close_clears_exit_code_file=True,
+        )
+        == 0
+    )
+    assert exit_code_file.read_bytes() == b"0\n"
+    assert stat.S_IMODE(exit_code_file.stat().st_mode) == 0o444
 
 
 def test_bootstrap_flush_failure_publishes_one(monkeypatch, tmp_path):

@@ -111,11 +111,15 @@ def _flush_and_exit(exit_code: int, *, streams=None, exit_code_file=None) -> Non
     except BaseException as error:
         final_exit_code = 1
         _report_exception(error)
+        _flush_streams(final_exit_code)
     finally:
         os._exit(final_exit_code)
 
 
 def main() -> None:
+    # Kit teardown can mutate process-global state. Capture the host-provided
+    # publication path before AppLauncher or pytest can run.
+    exit_code_file = os.environ.get(EXIT_CODE_FILE_ENV)
     pytest_args = sys.argv[1:]
     sys.argv = [sys.argv[0]]
 
@@ -132,6 +136,7 @@ def main() -> None:
         pytest = importlib.import_module("pytest")
 
         print(f"ISAAC_PYTEST_ARGS={pytest_args!r}", flush=True)
+        print(f"ISAAC_PYTEST_EXIT_CODE_FILE={exit_code_file!r}", flush=True)
         print(
             f"ISAAC_CONTROLLER={controller_module.DifferentialIKController.__module__}",
             flush=True,
@@ -155,7 +160,7 @@ def main() -> None:
         # itself fails.
         _flush_and_exit(
             exit_code,
-            exit_code_file=os.environ.get(EXIT_CODE_FILE_ENV),
+            exit_code_file=exit_code_file,
         )
 
 
