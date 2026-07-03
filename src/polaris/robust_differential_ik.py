@@ -49,8 +49,6 @@ from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
-from polaris.eef_ik_safety import GRIPPER_CLOSE_ARM_INTERLOCK_CANDIDATE_PROFILE
-from polaris.eef_ik_safety import GRIPPER_CLOSE_ARM_INTERLOCK_SUBSTEPS
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import format_current_joint_velocity_abort_message
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
@@ -73,7 +71,11 @@ from polaris.eef_gripper_runtime import GRIPPER_JOINT_NAMES
 from polaris.eef_gripper_runtime import GRIPPER_OPEN_TARGET_FLOAT32
 from polaris.eef_gripper_runtime import PINNED_DYNAMIC_DEVICE
 from polaris.eef_gripper_runtime import PINNED_TENSOR_DTYPE
+from polaris.eef_gripper_runtime import eef_gripper_target_slew_profile
 from polaris.eef_gripper_runtime import validate_eef_gripper_dynamic_evidence
+from polaris.eef_gripper_runtime import (
+    validate_eef_gripper_close_arm_interlock_binding,
+)
 from polaris.eef_gripper_runtime import validate_eef_gripper_static_contract
 
 
@@ -634,6 +636,9 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             else EEF_IK_SAFETY_PROFILE
         )
         self._gripper_runtime_static: dict[str, object] | None = None
+        self._gripper_target_slew_profile: str | None = None
+        self._gripper_close_arm_interlock_profile: str | None = None
+        self._gripper_close_arm_interlock_configured_substeps: int | None = None
         self._ik_controller = RobustDifferentialIKController(
             cfg=self.cfg.controller,
             num_envs=self.num_envs,
@@ -1159,7 +1164,15 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             raise ValueError(
                 "PolaRiS EEF gripper contract must be installed before apply"
             )
-        validated = validate_eef_gripper_static_contract(contract)
+        target_slew_contract = contract.get("driver_target_slew")
+        if not isinstance(target_slew_contract, dict):
+            raise ValueError("PolaRiS EEF gripper target-slew contract is absent")
+        target_slew_profile = target_slew_contract.get("profile")
+        target_slew_spec = eef_gripper_target_slew_profile(target_slew_profile)
+        validated = validate_eef_gripper_static_contract(
+            contract,
+            expected_target_slew_profile=target_slew_spec.profile,
+        )
         target_slew_static = getattr(
             finger_term, "gripper_target_slew_static_contract", None
         )
@@ -1172,6 +1185,11 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             )
         if target_slew_static() != validated["driver_target_slew"]:
             raise ValueError("PolaRiS EEF gripper target-slew static evidence drifted")
+        bound_interlock_spec = validate_eef_gripper_close_arm_interlock_binding(
+            target_slew_profile=target_slew_spec.profile,
+            interlock_profile=target_slew_spec.close_interlock_profile,
+            configured_substeps=target_slew_spec.close_interlock_substeps,
+        )
         for field in (
             "joint_pos",
             "joint_vel",
@@ -1194,6 +1212,13 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 )
         self._gripper_runtime_static = validated
         self._gripper_target_slew_term = finger_term
+        self._gripper_target_slew_profile = target_slew_spec.profile
+        self._gripper_close_arm_interlock_profile = (
+            bound_interlock_spec.close_interlock_profile
+        )
+        self._gripper_close_arm_interlock_configured_substeps = (
+            bound_interlock_spec.close_interlock_substeps
+        )
         self._reset_gripper_runtime_evidence()
 
     def _next_gripper_close_arm_interlock_transition(
@@ -1201,6 +1226,11 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
     ) -> GripperCloseArmInterlockTransition:
         """Read the bound binary endpoint and stage one interlock transition."""
 
+        configured_substeps = self._gripper_close_arm_interlock_configured_substeps
+        if type(configured_substeps) is not int or configured_substeps <= 0:
+            raise ValueError(
+                "PolaRiS EEF close interlock has no target-slew profile binding"
+            )
         if not self._gripper_close_arm_interlock_enabled:
             return advance_gripper_close_arm_interlock(
                 enabled=False,
@@ -1215,6 +1245,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 ),
                 endpoint_is_closed=False,
                 remaining_before_apply=self._gripper_close_arm_interlock_remaining,
+                configured_substeps=configured_substeps,
             )
         finger_term = getattr(self, "_gripper_target_slew_term", None)
         if finger_term is None:
@@ -1275,6 +1306,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             ),
             endpoint_is_closed=endpoint_is_closed,
             remaining_before_apply=self._gripper_close_arm_interlock_remaining,
+            configured_substeps=configured_substeps,
         )
 
     def _reset_gripper_runtime_evidence(self) -> None:
@@ -1408,6 +1440,9 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
     def _gripper_runtime_dynamic_report(self) -> dict[str, object]:
         if getattr(self, "_gripper_runtime_static", None) is None:
             raise ValueError("PolaRiS EEF gripper runtime contract is not installed")
+        target_slew_profile = self._gripper_target_slew_profile
+        if type(target_slew_profile) is not str:
+            raise ValueError("PolaRiS EEF gripper target-slew profile is unbound")
         total_samples = (
             self._gripper_apply_entry_samples + self._gripper_post_policy_step_samples
         )
@@ -1466,7 +1501,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 "driver_target_slew": target_slew_reporter(),
                 "nonfinite_samples": self._gripper_nonfinite_samples,
                 "dropped_diagnostics": self._gripper_dropped_diagnostics,
-            }
+            },
+            expected_target_slew_profile=target_slew_profile,
         )
 
     def begin_safety_episode(self, episode_index: int) -> None:
@@ -2576,6 +2612,14 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         )
         if not torch.equal(expected_nominal, self._nominal_max_delta_joint_pos):
             raise ValueError("PolaRiS EEF nominal arm-slew candidate state drift")
+        target_slew_profile = self._gripper_target_slew_profile
+        interlock_profile = self._gripper_close_arm_interlock_profile
+        configured_substeps = self._gripper_close_arm_interlock_configured_substeps
+        bound_profile = validate_eef_gripper_close_arm_interlock_binding(
+            target_slew_profile=target_slew_profile,
+            interlock_profile=interlock_profile,
+            configured_substeps=configured_substeps,
+        )
         if not self._gripper_close_arm_interlock_enabled and (
             self._gripper_close_arm_interlock_remaining != 0
             or self._gripper_close_arm_interlock_activation_count != 0
@@ -2611,8 +2655,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             },
             "gripper_close_arm_interlock": {
                 "enabled": self._gripper_close_arm_interlock_enabled,
-                "profile": GRIPPER_CLOSE_ARM_INTERLOCK_CANDIDATE_PROFILE,
-                "configured_substeps": GRIPPER_CLOSE_ARM_INTERLOCK_SUBSTEPS,
+                "profile": bound_profile.close_interlock_profile,
+                "configured_substeps": bound_profile.close_interlock_substeps,
                 "remaining_substeps": self._gripper_close_arm_interlock_remaining,
                 "observed_endpoint_change_count": (
                     self._gripper_close_arm_interlock_observed_endpoint_change_count
@@ -2982,8 +3026,12 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 }
             )
         if getattr(self, "_gripper_runtime_static", None) is not None:
+            target_slew_profile = self._gripper_target_slew_profile
+            if type(target_slew_profile) is not str:
+                raise ValueError("PolaRiS EEF gripper target-slew profile is unbound")
             report["gripper_runtime_static"] = validate_eef_gripper_static_contract(
-                self._gripper_runtime_static
+                self._gripper_runtime_static,
+                expected_target_slew_profile=target_slew_profile,
             )
             report["gripper_runtime_dynamic"] = self._gripper_runtime_dynamic_report()
         return report

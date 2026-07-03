@@ -259,6 +259,9 @@ class EefBinaryJointPositionTargetSlewAction(
 class EefBinaryJointPositionTargetSlewActionCfg(BinaryJointPositionZeroToOneActionCfg):
     """Configuration selecting the EEF-only driven-finger target slew."""
 
+    enable_target_slew_rate_0p25_candidate: bool = False
+    """Opt into the closed factor-0.25 target-slew candidate profile."""
+
     class_type = EefBinaryJointPositionTargetSlewAction
 
 

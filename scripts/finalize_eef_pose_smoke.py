@@ -269,6 +269,10 @@ GRIPPER_RUNTIME_PROFILE = (
 GRIPPER_TARGET_SLEW_PROFILE = (
     "eef_binary_driver_target_slew_rate2p5_from_live_limit5_per_120hz_substep_v2"
 )
+GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE = (
+    "eef_binary_driver_target_slew_rate1p25_from_live_limit5_"
+    "per_120hz_substep_candidate_v1"
+)
 GRIPPER_TARGET_SLEW_ACTION_CLASS = "EefBinaryJointPositionTargetSlewAction"
 GRIPPER_TARGET_SLEW_RESET_PROFILE = (
     "first_apply_after_action_reset_anchor_live_driver_position_v1"
@@ -291,13 +295,109 @@ GRIPPER_TARGET_SLEW_PHYSICS_DT_FLOAT32 = _float32(1.0 / 120.0)
 GRIPPER_MAX_TARGET_STEP = _float32(
     GRIPPER_TARGET_SLEW_RATE * GRIPPER_TARGET_SLEW_PHYSICS_DT_FLOAT32
 )
-GRIPPER_CLOSED_TARGET = struct.unpack("<f", struct.pack("<f", math.pi / 4.0))[0]
-GRIPPER_CLOSE_TRANSITION_APPLIES = math.ceil(
-    GRIPPER_CLOSED_TARGET / GRIPPER_MAX_TARGET_STEP
+GRIPPER_TARGET_SLEW_RATE_0P25_FACTOR = _float32(0.25)
+GRIPPER_TARGET_SLEW_RATE_0P25 = _float32(
+    GRIPPER_PHYSICAL_VELOCITY_LIMIT * GRIPPER_TARGET_SLEW_RATE_0P25_FACTOR
 )
-GRIPPER_CLOSE_LIMITED_APPLIES = GRIPPER_CLOSE_TRANSITION_APPLIES - 1
-if GRIPPER_CLOSE_TRANSITION_APPLIES != 38:
+GRIPPER_MAX_TARGET_STEP_0P25 = _float32(
+    GRIPPER_TARGET_SLEW_RATE_0P25 * GRIPPER_TARGET_SLEW_PHYSICS_DT_FLOAT32
+)
+GRIPPER_CLOSED_TARGET = struct.unpack("<f", struct.pack("<f", math.pi / 4.0))[0]
+
+
+def _float32_add(left: float, right: float) -> float:
+    return _float32(_float32(left) + _float32(right))
+
+
+def _float32_subtract(left: float, right: float) -> float:
+    return _float32(_float32(left) - _float32(right))
+
+
+def _float32_nextafter_toward(left: float, right: float) -> float:
+    left = _float32(left)
+    right = _float32(right)
+    if left == right:
+        return right
+    bits = struct.unpack("<I", struct.pack("<f", left))[0]
+    bits = bits - 1 if left > right and left > 0.0 else bits + 1
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def _simulate_gripper_close(max_target_step: float) -> dict[str, int]:
+    previous = _float32(0.0)
+    endpoint = _float32(GRIPPER_CLOSED_TARGET)
+    maximum = _float32(max_target_step)
+    applies = 0
+    limited_applies = 0
+    nextafter_corrections = 0
+    while previous != endpoint:
+        if applies >= 1024:
+            raise RuntimeError("EEF gripper close validation simulation did not end")
+        delta = _float32_subtract(endpoint, previous)
+        limited = abs(delta) > maximum
+        step = min(max(delta, -maximum), maximum)
+        candidate = _float32_add(previous, step)
+        next_target = candidate if limited else endpoint
+        applied_step = _float32_subtract(next_target, previous)
+        if abs(applied_step) > maximum:
+            next_target = _float32_nextafter_toward(next_target, previous)
+            nextafter_corrections += 1
+            applied_step = _float32_subtract(next_target, previous)
+        if not (
+            math.isfinite(next_target)
+            and math.isfinite(applied_step)
+            and abs(applied_step) <= maximum
+            and previous <= next_target <= endpoint
+        ):
+            raise RuntimeError("EEF gripper close validation simulation invariant")
+        previous = next_target
+        applies += 1
+        limited_applies += int(limited)
+    return {
+        "endpoint_applies": applies,
+        "limited_applies": limited_applies,
+        "nextafter_corrections": nextafter_corrections,
+    }
+
+
+GRIPPER_CLOSE_SIMULATION = _simulate_gripper_close(GRIPPER_MAX_TARGET_STEP)
+GRIPPER_CLOSE_0P25_SIMULATION = _simulate_gripper_close(GRIPPER_MAX_TARGET_STEP_0P25)
+GRIPPER_CLOSE_TRANSITION_APPLIES = GRIPPER_CLOSE_SIMULATION["endpoint_applies"]
+GRIPPER_CLOSE_LIMITED_APPLIES = GRIPPER_CLOSE_SIMULATION["limited_applies"]
+GRIPPER_CLOSE_TRANSITION_0P25_APPLIES = GRIPPER_CLOSE_0P25_SIMULATION[
+    "endpoint_applies"
+]
+GRIPPER_CLOSE_LIMITED_0P25_APPLIES = GRIPPER_CLOSE_0P25_SIMULATION["limited_applies"]
+if GRIPPER_CLOSE_SIMULATION != {
+    "endpoint_applies": 38,
+    "limited_applies": 37,
+    "nextafter_corrections": 15,
+}:
     raise RuntimeError("EEF gripper close transition count drift")
+if GRIPPER_CLOSE_0P25_SIMULATION != {
+    "endpoint_applies": 76,
+    "limited_applies": 75,
+    "nextafter_corrections": 41,
+}:
+    raise RuntimeError("EEF gripper rate-0.25 close transition count drift")
+GRIPPER_TARGET_SLEW_PROFILES = {
+    GRIPPER_TARGET_SLEW_PROFILE: {
+        "profile": GRIPPER_TARGET_SLEW_PROFILE,
+        "rate_factor": GRIPPER_TARGET_SLEW_RATE_FACTOR,
+        "rate_rad_s": GRIPPER_TARGET_SLEW_RATE,
+        "max_target_step_rad": GRIPPER_MAX_TARGET_STEP,
+        "close_transition_applies": GRIPPER_CLOSE_TRANSITION_APPLIES,
+        "close_limited_applies": GRIPPER_CLOSE_LIMITED_APPLIES,
+    },
+    GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE: {
+        "profile": GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE,
+        "rate_factor": GRIPPER_TARGET_SLEW_RATE_0P25_FACTOR,
+        "rate_rad_s": GRIPPER_TARGET_SLEW_RATE_0P25,
+        "max_target_step_rad": GRIPPER_MAX_TARGET_STEP_0P25,
+        "close_transition_applies": GRIPPER_CLOSE_TRANSITION_0P25_APPLIES,
+        "close_limited_applies": GRIPPER_CLOSE_LIMITED_0P25_APPLIES,
+    },
+}
 GRIPPER_MIN_ANCHOR = _float32(-_float32(1e-6))
 GRIPPER_MAX_ANCHOR = _float32(GRIPPER_CLOSED_TARGET + _float32(1e-6))
 COUNTER_FIELDS = {
@@ -631,14 +731,28 @@ def _validate_gripper_tensor(
     return tensor
 
 
-def _validate_gripper_target_slew_static(value: Any, *, field: str) -> None:
+def _gripper_target_slew_profile(profile: str) -> dict[str, Any]:
+    _require(
+        type(profile) is str and profile in GRIPPER_TARGET_SLEW_PROFILES,
+        f"unknown gripper target-slew profile: {profile!r}",
+    )
+    return GRIPPER_TARGET_SLEW_PROFILES[profile]
+
+
+def _validate_gripper_target_slew_static(
+    value: Any,
+    *,
+    field: str,
+    expected_profile: str = GRIPPER_TARGET_SLEW_PROFILE,
+) -> None:
     contract = _object(value, field)
+    profile = _gripper_target_slew_profile(expected_profile)
     _require(
         set(contract) == GRIPPER_TARGET_SLEW_STATIC_FIELDS,
         f"{field} schema drift",
     )
     exact = {
-        "profile": GRIPPER_TARGET_SLEW_PROFILE,
+        "profile": profile["profile"],
         "scope": "eef_pose_only_native_joint_position_unchanged_v1",
         "action_class": GRIPPER_TARGET_SLEW_ACTION_CLASS,
         "driver_joint_name": "finger_joint",
@@ -667,9 +781,9 @@ def _validate_gripper_target_slew_static(value: Any, *, field: str) -> None:
         ("open_target_rad", 0.0),
         ("closed_target_rad", GRIPPER_CLOSED_TARGET),
         ("physical_velocity_limit_rad_s", GRIPPER_PHYSICAL_VELOCITY_LIMIT),
-        ("target_slew_rate_factor", GRIPPER_TARGET_SLEW_RATE_FACTOR),
-        ("target_slew_rate_rad_s", GRIPPER_TARGET_SLEW_RATE),
-        ("max_target_step_rad", GRIPPER_MAX_TARGET_STEP),
+        ("target_slew_rate_factor", profile["rate_factor"]),
+        ("target_slew_rate_rad_s", profile["rate_rad_s"]),
+        ("max_target_step_rad", profile["max_target_step_rad"]),
     ):
         _require(_same_float32(contract.get(name), expected), f"{field}.{name}")
     recomputed_rate = _float32(
@@ -689,7 +803,12 @@ def _validate_gripper_target_slew_static(value: Any, *, field: str) -> None:
     )
 
 
-def _validate_gripper_static(value: Any, *, field: str) -> None:
+def _validate_gripper_static(
+    value: Any,
+    *,
+    field: str,
+    expected_target_slew_profile: str = GRIPPER_TARGET_SLEW_PROFILE,
+) -> None:
     contract = _object(value, field)
     _require(set(contract) == GRIPPER_RUNTIME_STATIC_FIELDS, f"{field} schema drift")
     exact = {
@@ -874,7 +993,9 @@ def _validate_gripper_static(value: Any, *, field: str) -> None:
     _require(_typed_equal(after, full_input), f"{field}.write/readback")
     _require(before["values"][:8] == after["values"][:8], f"{field}.driver drift")
     _validate_gripper_target_slew_static(
-        contract.get("driver_target_slew"), field=f"{field}.target_slew"
+        contract.get("driver_target_slew"),
+        field=f"{field}.target_slew",
+        expected_profile=expected_target_slew_profile,
     )
 
 
@@ -885,13 +1006,15 @@ def _validate_gripper_target_slew_dynamic(
     apply_calls: int,
     expect_closed_target: bool,
     expected_endpoint_change_count: int = 0,
+    expected_profile: str = GRIPPER_TARGET_SLEW_PROFILE,
 ) -> None:
     report = _object(value, field)
+    profile = _gripper_target_slew_profile(expected_profile)
     _require(
         set(report) == GRIPPER_TARGET_SLEW_DYNAMIC_FIELDS,
         f"{field} schema drift",
     )
-    _require(report.get("profile") == GRIPPER_TARGET_SLEW_PROFILE, f"{field}.profile")
+    _require(report.get("profile") == profile["profile"], f"{field}.profile")
     expected_process = apply_calls // 8
     counters = {
         name: report.get(name)
@@ -933,7 +1056,7 @@ def _validate_gripper_target_slew_dynamic(
     ]
     _require(
         all(item >= 0.0 for item in maxima)
-        and maxima[0] <= GRIPPER_MAX_TARGET_STEP + 1e-6
+        and maxima[0] <= profile["max_target_step_rad"] + 1e-6
         and maxima[1] <= GRIPPER_MAX_ANCHOR
         and maxima[2] <= maxima[1] + 1e-6,
         f"{field}.maxima",
@@ -963,12 +1086,12 @@ def _validate_gripper_target_slew_dynamic(
         )
         if expect_closed_target:
             _require(
-                apply_calls >= GRIPPER_CLOSE_TRANSITION_APPLIES
+                apply_calls >= profile["close_transition_applies"]
                 and counters["slew_limited_apply_count"]
-                == GRIPPER_CLOSE_LIMITED_APPLIES
+                == profile["close_limited_applies"]
                 and counters["endpoint_reached_apply_count"]
-                == apply_calls - GRIPPER_CLOSE_LIMITED_APPLIES
-                and _same_float32(maxima[0], GRIPPER_MAX_TARGET_STEP)
+                == apply_calls - profile["close_limited_applies"]
+                and _same_float32(maxima[0], profile["max_target_step_rad"])
                 and _same_float32(maxima[1], GRIPPER_CLOSED_TARGET)
                 and _same_float32(anchor, 0.0)
                 and _same_float32(applied, GRIPPER_CLOSED_TARGET),
@@ -992,6 +1115,7 @@ def _validate_gripper_dynamic(
     apply_calls: int,
     expect_closed_target: bool,
     expected_endpoint_change_count: int = 0,
+    expected_target_slew_profile: str = GRIPPER_TARGET_SLEW_PROFILE,
 ) -> None:
     report = _object(value, field)
     _require(set(report) == GRIPPER_RUNTIME_DYNAMIC_FIELDS, f"{field} schema drift")
@@ -1078,6 +1202,7 @@ def _validate_gripper_dynamic(
         apply_calls=apply_calls,
         expect_closed_target=expect_closed_target,
         expected_endpoint_change_count=expected_endpoint_change_count,
+        expected_profile=expected_target_slew_profile,
     )
 
 
@@ -1089,6 +1214,7 @@ def _validate_safety_report(
     apply_calls: int,
     expect_closed_target: bool = False,
     expected_endpoint_change_count: int = 0,
+    expected_gripper_target_slew_profile: str = GRIPPER_TARGET_SLEW_PROFILE,
 ) -> tuple[dict[str, int], dict[str, list[float]]]:
     report = _object(value, field)
     _require(set(report) == SAFETY_FIELDS, f"{field} schema drift")
@@ -1097,7 +1223,9 @@ def _validate_safety_report(
         f"{field}.current_joint_velocity_abort must be null",
     )
     _validate_gripper_static(
-        report.get("gripper_runtime_static"), field=f"{field}.gripper_static"
+        report.get("gripper_runtime_static"),
+        field=f"{field}.gripper_static",
+        expected_target_slew_profile=expected_gripper_target_slew_profile,
     )
     _validate_gripper_dynamic(
         report.get("gripper_runtime_dynamic"),
@@ -1105,6 +1233,7 @@ def _validate_safety_report(
         apply_calls=apply_calls,
         expect_closed_target=expect_closed_target,
         expected_endpoint_change_count=expected_endpoint_change_count,
+        expected_target_slew_profile=expected_gripper_target_slew_profile,
     )
     if episode_index is None:
         _require(report.get("episode_index") is None, f"{field}.episode_index")

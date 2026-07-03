@@ -4,10 +4,10 @@ The public DROID action remains binary: ``0`` requests the exact open joint
 target and ``pi/4`` requests the exact closed joint target.  This mixin changes
 only how the EEF action term reaches that endpoint.  It anchors once from the
 live post-reset driven-finger position and advances the position target by at
-most the EEF-only 2.5 rad/s target-slew rate times one physics step.  That
-command rate is a versioned float32 factor of the independently validated live
-5 rad/s physical driver limit; the physical actuator and mimic-joint limits are
-not changed here.
+most the profile-selected rate times one physics step.  Production keeps the
+EEF-only 2.5 rad/s default; one explicit candidate uses 1.25 rad/s.  Both are
+versioned float32 factors of the independently validated live 5 rad/s physical
+driver limit; the physical actuator and mimic-joint limits are not changed.
 
 The mixin deliberately has no Isaac Lab import.  Production composes it with
 Isaac Lab's pinned ``BinaryJointPositionAction`` implementation, while host
@@ -30,8 +30,6 @@ from polaris.eef_gripper_runtime import EEF_GRIPPER_TARGET_SLEW_RESET_PROFILE
 from polaris.eef_gripper_runtime import GRIPPER_CLOSED_TARGET_FLOAT32
 from polaris.eef_gripper_runtime import GRIPPER_DRIVER_VELOCITY_LIMIT_FLOAT32
 from polaris.eef_gripper_runtime import GRIPPER_OPEN_TARGET_FLOAT32
-from polaris.eef_gripper_runtime import GRIPPER_TARGET_SLEW_RATE_FACTOR_FLOAT32
-from polaris.eef_gripper_runtime import GRIPPER_TARGET_SLEW_RATE_RAD_S_FLOAT32
 from polaris.eef_gripper_runtime import GRIPPER_TARGET_SLEW_RATE_SOURCE
 from polaris.eef_gripper_runtime import GRIPPER_TARGET_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_gripper_runtime import GRIPPER_TARGET_SLEW_MAX_ANCHOR_FLOAT32
@@ -39,6 +37,7 @@ from polaris.eef_gripper_runtime import GRIPPER_TARGET_SLEW_MIN_ANCHOR_FLOAT32
 from polaris.eef_gripper_runtime import GRIPPER_TARGET_SLEW_PHYSICS_DT
 from polaris.eef_gripper_runtime import GRIPPER_TARGET_SLEW_PHYSICS_HZ
 from polaris.eef_gripper_runtime import PINNED_ACTUATOR_DEVICE
+from polaris.eef_gripper_runtime import select_eef_gripper_target_slew_profile
 from polaris.eef_gripper_runtime import validate_eef_gripper_target_slew_dynamic
 from polaris.eef_gripper_runtime import validate_eef_gripper_target_slew_static
 from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
@@ -66,6 +65,20 @@ class EefGripperTargetSlewMixin:
 
     def __init__(self, cfg: Any, env: Any) -> None:
         super().__init__(cfg, env)
+        rate_0p25_candidate = getattr(
+            cfg, "enable_target_slew_rate_0p25_candidate", None
+        )
+        _require(
+            type(rate_0p25_candidate) is bool,
+            "EEF gripper target-slew rate-0.25 candidate flag must be bool",
+        )
+        self._gripper_target_slew_rate_0p25_candidate_enabled = rate_0p25_candidate
+        self._gripper_target_slew_profile_spec = select_eef_gripper_target_slew_profile(
+            enable_rate_0p25_candidate=rate_0p25_candidate
+        )
+        self.gripper_target_slew_profile = (
+            self._gripper_target_slew_profile_spec.profile
+        )
         _require(self.num_envs == 1, "EEF gripper target slew requires one environment")
         _require(
             list(self._joint_names) == [DRIVEN_GRIPPER_JOINT_NAME],
@@ -112,7 +125,14 @@ class EefGripperTargetSlewMixin:
 
     def _require_profile(self) -> None:
         _require(
-            self.gripper_target_slew_profile == EEF_GRIPPER_TARGET_SLEW_PROFILE
+            self.gripper_target_slew_profile
+            == self._gripper_target_slew_profile_spec.profile
+            and self._gripper_target_slew_profile_spec
+            == select_eef_gripper_target_slew_profile(
+                enable_rate_0p25_candidate=(
+                    self._gripper_target_slew_rate_0p25_candidate_enabled
+                )
+            )
             and self.gripper_target_slew_action_class
             == EEF_GRIPPER_TARGET_SLEW_ACTION_CLASS,
             "EEF gripper target slew profile drift",
@@ -202,14 +222,16 @@ class EefGripperTargetSlewMixin:
         """Derive and validate the versioned EEF command rate in float32."""
 
         factor = torch.full_like(
-            physical_limit, GRIPPER_TARGET_SLEW_RATE_FACTOR_FLOAT32
+            physical_limit,
+            self._gripper_target_slew_profile_spec.rate_factor_float32,
         )
         target_rate = torch.mul(physical_limit, factor)
         _require(
             bool(torch.isfinite(target_rate).all().item())
             and bool((target_rate > 0).all().item())
             and _same_float32_tensor(
-                target_rate, GRIPPER_TARGET_SLEW_RATE_RAD_S_FLOAT32
+                target_rate,
+                self._gripper_target_slew_profile_spec.rate_rad_s_float32,
             ),
             "EEF gripper target slew physical-limit/factor/rate binding drift",
         )
@@ -230,7 +252,7 @@ class EefGripperTargetSlewMixin:
             "EEF gripper target slew derived cap is invalid",
         )
         contract = {
-            "profile": EEF_GRIPPER_TARGET_SLEW_PROFILE,
+            "profile": self._gripper_target_slew_profile_spec.profile,
             "scope": "eef_pose_only_native_joint_position_unchanged_v1",
             "action_class": EEF_GRIPPER_TARGET_SLEW_ACTION_CLASS,
             "driver_joint_name": DRIVEN_GRIPPER_JOINT_NAME,
@@ -245,7 +267,9 @@ class EefGripperTargetSlewMixin:
                 physical_limit[0, 0].detach().cpu().item()
             ),
             "target_slew_rate_source": GRIPPER_TARGET_SLEW_RATE_SOURCE,
-            "target_slew_rate_factor": GRIPPER_TARGET_SLEW_RATE_FACTOR_FLOAT32,
+            "target_slew_rate_factor": (
+                self._gripper_target_slew_profile_spec.rate_factor_float32
+            ),
             "target_slew_rate_rad_s": float(target_rate[0, 0].detach().cpu().item()),
             "physics_hz": GRIPPER_TARGET_SLEW_PHYSICS_HZ,
             "physics_dt": self._gripper_target_slew_physics_dt,
@@ -255,7 +279,10 @@ class EefGripperTargetSlewMixin:
             "tensor_dtype": str(self._processed_actions.dtype),
             "tensor_device": str(self._processed_actions.device),
         }
-        return validate_eef_gripper_target_slew_static(contract)
+        return validate_eef_gripper_target_slew_static(
+            contract,
+            expected_profile=self._gripper_target_slew_profile_spec.profile,
+        )
 
     def install_gripper_target_slew_contract(self, contract: Mapping[str, Any]) -> None:
         """Install once after the live EEF gripper drive is fully validated."""
@@ -264,7 +291,10 @@ class EefGripperTargetSlewMixin:
             self._gripper_target_slew_contract is None,
             "EEF gripper target slew contract is already installed",
         )
-        validated = validate_eef_gripper_target_slew_static(dict(contract))
+        validated = validate_eef_gripper_target_slew_static(
+            dict(contract),
+            expected_profile=self._gripper_target_slew_profile_spec.profile,
+        )
         live = self.gripper_target_slew_static_contract()
         _require(validated == live, "EEF gripper target slew install identity drift")
         physical_limit = self._live_gripper_driver_limit()
@@ -521,7 +551,7 @@ class EefGripperTargetSlewMixin:
             return float(value.detach().cpu().item())
 
         report = {
-            "profile": EEF_GRIPPER_TARGET_SLEW_PROFILE,
+            "profile": self._gripper_target_slew_profile_spec.profile,
             "process_action_calls": self._gripper_target_slew_process_calls,
             "apply_calls": self._gripper_target_slew_apply_calls,
             "initialization_count": self._gripper_target_slew_initialization_count,
@@ -561,7 +591,10 @@ class EefGripperTargetSlewMixin:
                 else None
             ),
         }
-        return validate_eef_gripper_target_slew_dynamic(report)
+        return validate_eef_gripper_target_slew_dynamic(
+            report,
+            expected_profile=self._gripper_target_slew_profile_spec.profile,
+        )
 
 
 __all__ = ["EefGripperTargetSlewError", "EefGripperTargetSlewMixin"]

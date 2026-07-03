@@ -3,22 +3,124 @@ from pathlib import Path
 import pytest
 import torch
 
-from polaris.eef_controller_repair import advance_gripper_close_arm_interlock
+from polaris.eef_controller_repair import (
+    advance_gripper_close_arm_interlock as _advance_gripper_close_arm_interlock,
+)
 from polaris.eef_controller_repair import bound_joint_position_target
 from polaris.eef_controller_repair import (
     DISABLED_GRIPPER_CLOSE_ARM_INTERLOCK_TRANSITION,
 )
 from polaris.eef_ik_safety import ARM_SLEW_HEADROOM_RATIO
 from polaris.eef_ik_safety import GRIPPER_CLOSE_ARM_INTERLOCK_SUBSTEPS
+from polaris.eef_gripper_runtime import (
+    EEF_GRIPPER_TARGET_SLEW_PROFILE,
+    EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE,
+)
+from polaris.eef_gripper_runtime import eef_gripper_target_slew_profile
+from polaris.eef_gripper_runtime import (
+    validate_eef_gripper_close_arm_interlock_binding,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def advance_gripper_close_arm_interlock(**kwargs):
+    return _advance_gripper_close_arm_interlock(
+        configured_substeps=GRIPPER_CLOSE_ARM_INTERLOCK_SUBSTEPS,
+        **kwargs,
+    )
 
 
 def test_candidate_constants_are_bounded_and_exact():
     assert ARM_SLEW_HEADROOM_RATIO == 0.95
     assert GRIPPER_CLOSE_ARM_INTERLOCK_SUBSTEPS == 48
     assert 0.0 < ARM_SLEW_HEADROOM_RATIO < 1.0
+    slow = eef_gripper_target_slew_profile(
+        EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+    )
+    assert slow.close_transition_applies == 76
+    assert slow.close_limited_applies == 75
+    assert slow.close_nextafter_corrections == 41
+    assert slow.close_interlock_substeps == 86
+
+
+def test_pure_interlock_uses_the_explicit_profile_bound_duration():
+    transition = _advance_gripper_close_arm_interlock(
+        enabled=True,
+        previous_endpoint_change_count=0,
+        current_endpoint_change_count=0,
+        endpoint_observed_before_apply=False,
+        endpoint_is_closed=True,
+        remaining_before_apply=0,
+        configured_substeps=86,
+    )
+    assert transition.active is True
+    assert transition.remaining_after_successful_apply == 85
+
+    for configured in (0, -1, False, 86.0):
+        with pytest.raises(ValueError, match="positive int"):
+            _advance_gripper_close_arm_interlock(
+                enabled=True,
+                previous_endpoint_change_count=0,
+                current_endpoint_change_count=0,
+                endpoint_observed_before_apply=False,
+                endpoint_is_closed=True,
+                remaining_before_apply=0,
+                configured_substeps=configured,
+            )
+
+
+def test_closed_profile_mapping_rejects_crossed_interlock_durations():
+    baseline = eef_gripper_target_slew_profile(EEF_GRIPPER_TARGET_SLEW_PROFILE)
+    slow = eef_gripper_target_slew_profile(
+        EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+    )
+    assert (
+        validate_eef_gripper_close_arm_interlock_binding(
+            target_slew_profile=baseline.profile,
+            interlock_profile=baseline.close_interlock_profile,
+            configured_substeps=baseline.close_interlock_substeps,
+        )
+        == baseline
+    )
+    assert (
+        validate_eef_gripper_close_arm_interlock_binding(
+            target_slew_profile=slow.profile,
+            interlock_profile=slow.close_interlock_profile,
+            configured_substeps=slow.close_interlock_substeps,
+        )
+        == slow
+    )
+    for target, interlock, substeps in (
+        (slow.profile, baseline.close_interlock_profile, 48),
+        (baseline.profile, slow.close_interlock_profile, 86),
+        (slow.profile, slow.close_interlock_profile, 48),
+        (baseline.profile, baseline.close_interlock_profile, 86),
+    ):
+        with pytest.raises(ValueError, match="profile mismatch"):
+            validate_eef_gripper_close_arm_interlock_binding(
+                target_slew_profile=target,
+                interlock_profile=interlock,
+                configured_substeps=substeps,
+            )
+
+
+def test_float32_close_simulation_binds_nextafter_corrections():
+    baseline = eef_gripper_target_slew_profile(EEF_GRIPPER_TARGET_SLEW_PROFILE)
+    slow = eef_gripper_target_slew_profile(
+        EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+    )
+    assert (
+        baseline.close_transition_applies,
+        baseline.close_limited_applies,
+        baseline.close_nextafter_corrections,
+    ) == (38, 37, 15)
+    assert (
+        slow.close_transition_applies,
+        slow.close_limited_applies,
+        slow.close_nextafter_corrections,
+    ) == (76, 75, 41)
 
 
 def test_disabled_interlock_is_a_zero_state_identity():

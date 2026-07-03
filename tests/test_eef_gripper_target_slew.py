@@ -90,13 +90,19 @@ def host_device_contract(monkeypatch):
     monkeypatch.setattr(runtime, "PINNED_ACTUATOR_DEVICE", "cpu")
 
 
-def _action(*, joint_position=0.0):
+def _action(*, joint_position=0.0, rate_0p25_candidate=False):
     asset = _FakeAsset(joint_position=joint_position)
     env = SimpleNamespace(
         physics_dt=runtime.GRIPPER_TARGET_SLEW_PHYSICS_DT,
         asset=asset,
     )
-    action = _HostEefTargetSlewAction(SimpleNamespace(clip=None), env)
+    action = _HostEefTargetSlewAction(
+        SimpleNamespace(
+            clip=None,
+            enable_target_slew_rate_0p25_candidate=rate_0p25_candidate,
+        ),
+        env,
+    )
     static = action.gripper_target_slew_static_contract()
     action.install_gripper_target_slew_contract(static)
     return action, asset, static
@@ -151,6 +157,55 @@ def test_static_contract_separates_physical_limit_and_eef_target_rate(
     assert action._gripper_target_slew_max_step.item() == (
         runtime.GRIPPER_MAX_TARGET_STEP_FLOAT32
     )
+
+
+def test_rate_0p25_candidate_is_exact_opt_in_and_reaches_close_on_apply_76(
+    host_device_contract,
+):
+    action, asset, static = _action(rate_0p25_candidate=True)
+    assert static["profile"] == (
+        runtime.EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+    )
+    assert static["physical_velocity_limit_rad_s"] == 5.0
+    assert static["target_slew_rate_factor"] == 0.25
+    assert static["target_slew_rate_rad_s"] == 1.25
+    assert static["max_target_step_rad"] == pytest.approx(
+        0.010416666977107525, rel=0.0, abs=0.0
+    )
+
+    targets = []
+    for apply_index in range(76):
+        if apply_index % 8 == 0:
+            action.process_actions(torch.tensor([[1.0]], dtype=torch.float32))
+        action.apply_actions()
+        targets.append(asset.data.joint_pos_target[0, 7].item())
+    assert all(value < runtime.GRIPPER_CLOSED_TARGET_FLOAT32 for value in targets[:75])
+    assert targets[75] == runtime.GRIPPER_CLOSED_TARGET_FLOAT32
+    report = action.gripper_target_slew_dynamic_report()
+    assert report["slew_limited_apply_count"] == 75
+    assert report["endpoint_reached_apply_count"] == 1
+    spec = runtime.eef_gripper_target_slew_profile(static["profile"])
+    assert spec.close_transition_applies == 76
+    assert spec.close_limited_applies == 75
+    assert spec.close_nextafter_corrections == 41
+    assert spec.close_interlock_substeps == 86
+
+
+@pytest.mark.parametrize("flag", [None, 0, 1, 0.25, "true"])
+def test_rate_candidate_selector_requires_one_exact_bool(host_device_contract, flag):
+    asset = _FakeAsset()
+    env = SimpleNamespace(
+        physics_dt=runtime.GRIPPER_TARGET_SLEW_PHYSICS_DT,
+        asset=asset,
+    )
+    cfg = SimpleNamespace(clip=None)
+    if flag is not None:
+        cfg.enable_target_slew_rate_0p25_candidate = flag
+    with pytest.raises(
+        target_slew.EefGripperTargetSlewError,
+        match="candidate flag must be bool",
+    ):
+        _HostEefTargetSlewAction(cfg, env)
 
 
 def test_open_close_exact_cap_no_overshoot_and_threshold_equality(
@@ -683,6 +738,17 @@ def test_native_joint_position_action_ast_is_unchanged_and_eef_alone_selects_sle
     assert finger_constructor("EgoLapEefPoseActionCfg") == (
         "EefBinaryJointPositionTargetSlewActionCfg"
     )
+    config = classes["EefBinaryJointPositionTargetSlewActionCfg"]
+    candidate_flags = [
+        node
+        for node in config.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "enable_target_slew_rate_0p25_candidate"
+    ]
+    assert len(candidate_flags) == 1
+    assert isinstance(candidate_flags[0].value, ast.Constant)
+    assert candidate_flags[0].value.value is False
 
 
 def test_public_eval_and_controller_smoke_install_candidate_before_first_apply():
@@ -695,6 +761,18 @@ def test_public_eval_and_controller_smoke_install_candidate_before_first_apply()
     assert "install_eef_gripper_runtime(" in eval_source
     assert "validate_eef_gripper_post_reset(" in eval_source
     assert "record_eef_gripper_post_policy_step(env)" in eval_source
+
+    candidate_flag = "enable_target_slew_rate_0p25_candidate"
+    for relative in (
+        "scripts/eval.py",
+        "src/polaris/config.py",
+        "src/polaris/policy/droid_jointpos_client.py",
+    ):
+        assert candidate_flag not in (root / relative).read_text(encoding="utf-8")
+    candidate_runner = (
+        root / "scripts/smoke_eef_pose_canary_controller_candidate.py"
+    ).read_text(encoding="utf-8")
+    assert candidate_runner.count(candidate_flag) == 1
 
     smoke_source = (root / "scripts/smoke_eef_pose_controller.py").read_text(
         encoding="utf-8"

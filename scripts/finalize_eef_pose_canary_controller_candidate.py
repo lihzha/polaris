@@ -197,6 +197,7 @@ def build_attestation(args: argparse.Namespace) -> dict[str, Any]:
         (args.expected_polaris_commit, "PolaRiS commit", 40),
         (args.expected_runner_sha256, "runner SHA", 64),
         (args.expected_validator_sha256, "validator SHA", 64),
+        (args.expected_failure_verifier_sha256, "failure verifier SHA", 64),
         (args.expected_safety_validator_sha256, "safety validator SHA", 64),
         (args.expected_gate0_helper_sha256, "Gate0 helper SHA", 64),
         (args.expected_fixture_sha256, "fixture SHA", 64),
@@ -353,6 +354,14 @@ def build_attestation(args: argparse.Namespace) -> dict[str, Any]:
             field="candidate validator",
             expected_sha256=args.expected_validator_sha256,
         ),
+        # The verifier is a standalone failure-path subprocess consumer.  Bind
+        # its exact repository source here rather than importing it into the
+        # successful finalization process.
+        "failure_verifier": _source_identity(
+            repo / "scripts/verify_eef_pose_canary_controller_candidate_failure.py",
+            field="candidate failure verifier",
+            expected_sha256=args.expected_failure_verifier_sha256,
+        ),
         "safety_validator": _source_identity(
             repo / "scripts/finalize_eef_pose_smoke.py",
             field="production-equivalent host safety validator",
@@ -469,6 +478,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-polaris-commit", required=True)
     parser.add_argument("--expected-runner-sha256", required=True)
     parser.add_argument("--expected-validator-sha256", required=True)
+    parser.add_argument("--expected-failure-verifier-sha256", required=True)
     parser.add_argument("--expected-safety-validator-sha256", required=True)
     parser.add_argument("--expected-gate0-helper-sha256", required=True)
     parser.add_argument("--expected-fixture-sha256", required=True)

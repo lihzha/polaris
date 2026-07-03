@@ -15,6 +15,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
+TEST_START_TIME_MARGIN_NS = 1_000_000_000
 
 
 def _load_script(name: str):
@@ -76,11 +77,11 @@ def _publish_raw_pair(
             "candidate": candidate.CANDIDATE_BY_VARIANT[variant],
             "lifecycle": lifecycle,
             "action_plan": validator.ACTION_PLAN,
-            "final_safety": {"counters": {"apply_calls": 976}},
+            "final_safety": {"counters": {"apply_calls": 1016}},
             "fixture": {"source_trace_sha256": "a" * 64},
             "outcome": {
                 "status": "candidate_replay_completed_without_controller_abort",
-                "actions_completed": 122,
+                "actions_completed": 127,
                 "original_failure_step_crossed": 117,
                 "post_fixture_release_probe_completed": True,
             },
@@ -154,7 +155,9 @@ def _finalizer_args(
     launch_id = "1" * 64
     job_id = 123
     monkeypatch.setenv("SLURM_JOB_ID", str(job_id))
-    started_at_ns = time.time_ns()
+    # Some filesystems quantize an immediately following mtime just below the
+    # userspace clock sample. Keep the synthetic start unambiguously pre-write.
+    started_at_ns = time.time_ns() - TEST_START_TIME_MARGIN_NS
     raw_path, ready_path, lifecycle, returned_at_ns = _publish_raw_pair(
         tmp_path,
         launch_id=launch_id,
@@ -202,7 +205,7 @@ def _finalizer_args(
         "sources": {"fixture": {key: fixture[key] for key in fixture if key != "mode"}},
         "initial_candidate": {"stage": "initial"},
         "final_candidate": {"stage": "final"},
-        "replay_validation": {"arm_apply_calls": 976},
+        "replay_validation": {"arm_apply_calls": 1016},
         "velocity_headroom": {"maximum_ratio": 0.94, "passed": True},
     }
     monkeypatch.setattr(validator, "validate", lambda _args: validation)
@@ -222,6 +225,9 @@ def _finalizer_args(
         ),
         expected_validator_sha256=_sha256(
             SCRIPTS / "validate_eef_pose_canary_controller_candidate.py"
+        ),
+        expected_failure_verifier_sha256=_sha256(
+            SCRIPTS / "verify_eef_pose_canary_controller_candidate_failure.py"
         ),
         expected_safety_validator_sha256=_sha256(
             SCRIPTS / "finalize_eef_pose_smoke.py"
@@ -253,7 +259,7 @@ def test_status_writer_binds_zero_return_raw_ready_and_strict_types(
     launch_id = "3" * 64
     job_id = 456
     monkeypatch.setenv("SLURM_JOB_ID", str(job_id))
-    started_at_ns = time.time_ns()
+    started_at_ns = time.time_ns() - TEST_START_TIME_MARGIN_NS
     raw, _, _, returned_at_ns = _publish_raw_pair(
         tmp_path,
         launch_id=launch_id,
@@ -282,9 +288,14 @@ def test_finalizer_reconstructs_and_nonoverwrites_attestation(tmp_path, monkeypa
     expected = finalizer.build_attestation(args)
     assert expected["lifecycle"] == expected_evidence["lifecycle"]
     assert expected["validation_summary"]["replay_validation"] == {
-        "arm_apply_calls": 976
+        "arm_apply_calls": 1016
     }
     assert expected["provenance"]["job_artifacts"]["gpu_inventory"]["mode"] == "0444"
+    failure_verifier = expected["provenance"]["sources"]["failure_verifier"]
+    assert failure_verifier["path"] == str(
+        SCRIPTS / "verify_eef_pose_canary_controller_candidate_failure.py"
+    )
+    assert failure_verifier["sha256"] == args.expected_failure_verifier_sha256
     finalizer._publish(args.attestation, expected)
     assert stat.S_IMODE(args.attestation.stat().st_mode) == 0o444
     with pytest.raises(finalizer.CandidateFinalizationError, match="exists"):
@@ -315,6 +326,17 @@ def test_finalizer_cannot_publish_when_artifact_validator_rejects(
     assert not args.attestation.exists()
 
 
+def test_finalizer_rejects_failure_verifier_digest_mismatch(tmp_path, monkeypatch):
+    args, _ = _finalizer_args(tmp_path, monkeypatch)
+    args.expected_failure_verifier_sha256 = "f" * 64
+    with pytest.raises(
+        finalizer.CandidateFinalizationError,
+        match="candidate failure verifier digest mismatch",
+    ):
+        finalizer.build_attestation(args)
+    assert not args.attestation.exists()
+
+
 def test_finalizer_rejects_numeric_type_alias_in_status_identity(tmp_path, monkeypatch):
     args, _ = _finalizer_args(tmp_path, monkeypatch)
     payload = gate0.strict_json_loads(args.srun_status.read_bytes(), field="status")
@@ -337,10 +359,18 @@ def test_wrapper_uses_host_preflight_status_and_separate_finalizer():
     assert "CANDIDATE_STATUS_WRITER_SHA256" in source
     assert "CANDIDATE_FINALIZER_SHA256" in source
     assert "CANDIDATE_SAFETY_VALIDATOR_SHA256" in source
+    assert "CANDIDATE_FAILURE_VERIFIER_SHA256" in source
     assert 'scripts/finalize_eef_pose_smoke.py"' in source
     assert (
         '--expected-safety-validator-sha256 "${CANDIDATE_SAFETY_VALIDATOR_SHA256}"'
     ) in source
+    finalizer_call = source.index(
+        'finalize_eef_pose_canary_controller_candidate.py" finalize'
+    )
+    assert (
+        "--expected-failure-verifier-sha256 "
+        '"${CANDIDATE_FAILURE_VERIFIER_SHA256}"' in source[finalizer_call:]
+    )
     assert "write_eef_pose_canary_controller_candidate_srun_status.py" in source
     assert 'finalize_eef_pose_canary_controller_candidate.py" finalize' in source
     assert '--srun-status "${srun_status}"' in source

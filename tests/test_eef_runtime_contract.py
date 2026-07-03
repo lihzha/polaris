@@ -1330,11 +1330,19 @@ def test_current_velocity_abort_preserves_sidecar_and_runtime_evidence(
     )
 
     def validate_exact_returned_report(
-        passed_env, *, require_gripper_runtime=False, report=None
+        passed_env,
+        *,
+        require_gripper_runtime=False,
+        report=None,
+        expected_gripper_target_slew_profile=None,
     ):
         assert passed_env is env
         assert require_gripper_runtime is True
         assert report is safety
+        assert expected_gripper_target_slew_profile == (
+            "eef_binary_driver_target_slew_rate2p5_"
+            "from_live_limit5_per_120hz_substep_v2"
+        )
         return report
 
     with monkeypatch.context() as patch:

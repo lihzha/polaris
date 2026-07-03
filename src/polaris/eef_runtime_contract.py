@@ -50,6 +50,7 @@ from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
 from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
 from polaris.eef_gripper_runtime import validate_eef_gripper_dynamic_evidence
 from polaris.eef_gripper_runtime import validate_eef_gripper_static_contract
+from polaris.eef_gripper_runtime import EEF_GRIPPER_TARGET_SLEW_PROFILE
 from polaris.eval_artifacts import EVAL_RESULT_COLUMNS
 from polaris.eval_artifacts import canonical_episode_result
 from polaris.eval_artifacts import probe_episode_video
@@ -1472,6 +1473,7 @@ def _validate_eef_runtime_safety_report(
     *,
     report: Mapping[str, Any],
     require_gripper_runtime: bool = False,
+    expected_gripper_target_slew_profile: str = EEF_GRIPPER_TARGET_SLEW_PROFILE,
 ) -> dict[str, Any]:
     """Validate one exact report already obtained from the live action term."""
 
@@ -1922,9 +1924,13 @@ def _validate_eef_runtime_safety_report(
             allowed_kinds={"max_raw_delta"},
         )
     if gripper_runtime_enabled:
-        validate_eef_gripper_static_contract(report["gripper_runtime_static"])
+        validate_eef_gripper_static_contract(
+            report["gripper_runtime_static"],
+            expected_target_slew_profile=expected_gripper_target_slew_profile,
+        )
         dynamic = validate_eef_gripper_dynamic_evidence(
-            report["gripper_runtime_dynamic"]
+            report["gripper_runtime_dynamic"],
+            expected_target_slew_profile=expected_gripper_target_slew_profile,
         )
         if dynamic["apply_entry_samples"] != counters["apply_calls"]:
             raise ValueError("All-six gripper/apply sample counts disagree")
@@ -1938,7 +1944,10 @@ def _validate_eef_runtime_safety_report(
 
 
 def validate_eef_runtime_safety(
-    env: Any, *, require_gripper_runtime: bool = False
+    env: Any,
+    *,
+    require_gripper_runtime: bool = False,
+    expected_gripper_target_slew_profile: str = EEF_GRIPPER_TARGET_SLEW_PROFILE,
 ) -> dict[str, Any]:
     """Fetch, validate, and return cumulative live EEF IK safety evidence."""
 
@@ -1950,6 +1959,7 @@ def validate_eef_runtime_safety(
         env,
         report=reporter(),
         require_gripper_runtime=require_gripper_runtime,
+        expected_gripper_target_slew_profile=(expected_gripper_target_slew_profile),
     )
 
 
@@ -2114,7 +2124,12 @@ def begin_eef_safety_episode(env: Any, episode_index: int) -> None:
     begin(episode_index)
 
 
-def eef_episode_safety_report(env: Any, episode_index: int) -> dict[str, Any]:
+def eef_episode_safety_report(
+    env: Any,
+    episode_index: int,
+    *,
+    expected_gripper_target_slew_profile: str = EEF_GRIPPER_TARGET_SLEW_PROFILE,
+) -> dict[str, Any]:
     """Return one completed rollout's live action-term safety report."""
 
     arm_term = _arm_action_term(_unwrapped(env))
@@ -2126,6 +2141,7 @@ def eef_episode_safety_report(env: Any, episode_index: int) -> dict[str, Any]:
         env,
         require_gripper_runtime=True,
         report=report,
+        expected_gripper_target_slew_profile=(expected_gripper_target_slew_profile),
     )
 
 

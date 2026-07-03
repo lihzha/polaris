@@ -84,19 +84,24 @@ pxr.PhysxSchema = types.SimpleNamespace()
 pxr.UsdPhysics = types.SimpleNamespace()
 
 import polaris.robust_differential_ik as robust
+from polaris.eef_gripper_runtime import EEF_GRIPPER_TARGET_SLEW_PROFILE
 
 robust.PINNED_DYNAMIC_DEVICE = "cpu"
-robust.validate_eef_gripper_static_contract = lambda value: dict(value)
+robust.validate_eef_gripper_static_contract = lambda value, **_kwargs: dict(value)
 captured_dynamic = []
 
 
-def validate_dynamic(value):
+def validate_dynamic(value, **_kwargs):
     captured_dynamic.append(value)
     return value
 
 
 robust.validate_eef_gripper_dynamic_evidence = validate_dynamic
-static = {"driver_target_slew": {"profile": "target-slew-static"}}
+static = {
+    "driver_target_slew": {
+        "profile": EEF_GRIPPER_TARGET_SLEW_PROFILE
+    }
+}
 
 
 class Finger:
@@ -115,7 +120,7 @@ class Finger:
         )
 
     def gripper_target_slew_static_contract(self):
-        return {"profile": "target-slew-static"}
+        return {"profile": EEF_GRIPPER_TARGET_SLEW_PROFILE}
 
     def gripper_target_slew_dynamic_report(self):
         return {"profile": "target-slew-dynamic"}

@@ -130,6 +130,39 @@ def _typed_equal(left: Any, right: Any) -> bool:
     return bool(left == right)
 
 
+def _validate_lifecycle(
+    value: Any,
+    *,
+    launch_id: str,
+    job_id: int,
+    field: str,
+) -> dict[str, Any]:
+    """Close one single-rank Slurm lifecycle with exact JSON scalar types."""
+
+    _require(
+        isinstance(value, dict)
+        and set(value) == LIFECYCLE_FIELDS
+        and type(value.get("profile")) is str
+        and value.get("profile") == "slurm_single_task_srun_lifecycle_v1"
+        and type(value.get("launch_id")) is str
+        and value.get("launch_id") == launch_id
+        and type(value.get("job_id")) is int
+        and value.get("job_id") == job_id
+        and type(value.get("step_id")) is int
+        and value["step_id"] >= 0
+        and type(value.get("nodelist")) is str
+        and bool(value["nodelist"].strip())
+        and type(value.get("procid")) is int
+        and value.get("procid") == 0
+        and type(value.get("localid")) is int
+        and value.get("localid") == 0
+        and type(value.get("ntasks")) is int
+        and value.get("ntasks") == 1,
+        f"{field} drift",
+    )
+    return value
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -318,6 +351,7 @@ def _validate_offline_safety(
     apply_calls: int,
     expect_closed_target: bool,
     expected_endpoint_change_count: int,
+    expected_gripper_target_slew_profile: str,
 ) -> dict[str, Any]:
     try:
         safety_validator._validate_safety_report(
@@ -327,6 +361,7 @@ def _validate_offline_safety(
             apply_calls=apply_calls,
             expect_closed_target=expect_closed_target,
             expected_endpoint_change_count=expected_endpoint_change_count,
+            expected_gripper_target_slew_profile=(expected_gripper_target_slew_profile),
         )
     except (TypeError, ValueError) as error:
         raise CandidateArtifactValidationError(
@@ -450,25 +485,11 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
     )
     _same_recorded_file(ready.get("raw_result"), raw_identity, field="ready raw")
 
-    lifecycle = raw.get("lifecycle")
-    _require(
-        isinstance(lifecycle, dict)
-        and set(lifecycle) == LIFECYCLE_FIELDS
-        and lifecycle.get("profile") == "slurm_single_task_srun_lifecycle_v1"
-        and type(lifecycle.get("job_id")) is int
-        and lifecycle.get("job_id") == args.job_id
-        and type(lifecycle.get("launch_id")) is str
-        and lifecycle.get("launch_id") == args.launch_id
-        and type(lifecycle.get("procid")) is int
-        and type(lifecycle.get("localid")) is int
-        and lifecycle.get("procid") == lifecycle.get("localid") == 0
-        and type(lifecycle.get("ntasks")) is int
-        and lifecycle.get("ntasks") == 1
-        and type(lifecycle.get("step_id")) is int
-        and lifecycle["step_id"] >= 0
-        and isinstance(lifecycle.get("nodelist"), str)
-        and bool(lifecycle["nodelist"].strip()),
-        "candidate Slurm lifecycle drift",
+    _validate_lifecycle(
+        raw.get("lifecycle"),
+        launch_id=args.launch_id,
+        job_id=args.job_id,
+        field="candidate Slurm lifecycle",
     )
     recorded_repository = raw.get("repository")
     _require(
@@ -553,6 +574,7 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         safety_validator._validate_gripper_static(
             raw.get("gripper_runtime_contract"),
             field="candidate gripper runtime contract",
+            expected_target_slew_profile=(candidate.CANDIDATE_TARGET_SLEW_PROFILE),
         )
     except (TypeError, ValueError) as error:
         raise CandidateArtifactValidationError(
@@ -565,6 +587,7 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         apply_calls=0,
         expect_closed_target=False,
         expected_endpoint_change_count=0,
+        expected_gripper_target_slew_profile=(candidate.CANDIDATE_TARGET_SLEW_PROFILE),
     )
     final_safety = _validate_offline_safety(
         raw.get("final_safety"),
@@ -572,6 +595,7 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         apply_calls=candidate.TOTAL_ACTION_COUNT * gate0.DECIMATION,
         expect_closed_target=args.variant == "official_lap3b",
         expected_endpoint_change_count=int(args.variant == "official_lap3b"),
+        expected_gripper_target_slew_profile=(candidate.CANDIDATE_TARGET_SLEW_PROFILE),
     )
     _require(
         _typed_equal(
@@ -629,6 +653,285 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         "final_candidate": final_candidate,
         "replay_validation": replay_validation,
         "velocity_headroom": velocity,
+    }
+
+
+def validate_failure(args: argparse.Namespace) -> dict[str, Any]:
+    """Independently verify one immutable, non-promotable failed raw."""
+
+    for name, value, width in (
+        ("launch ID", args.launch_id, 64),
+        ("PolaRiS commit", args.expected_polaris_commit, 40),
+        ("runner SHA-256", args.expected_runner_sha256, 64),
+        ("validator SHA-256", args.expected_validator_sha256, 64),
+        ("failure verifier SHA-256", args.expected_failure_verifier_sha256, 64),
+        ("safety validator SHA-256", args.expected_safety_validator_sha256, 64),
+        ("Gate0 helper SHA-256", args.expected_gate0_helper_sha256, 64),
+        ("fixture SHA-256", args.expected_fixture_sha256, 64),
+        ("container SHA-256", args.expected_container_sha256, 64),
+    ):
+        _require(
+            isinstance(value, str)
+            and re.fullmatch(rf"[0-9a-f]{{{width}}}", value) is not None,
+            f"invalid {name}",
+        )
+    _require(type(args.job_id) is int and args.job_id > 0, "job ID")
+    _require(
+        type(args.expected_container_size_bytes) is int
+        and args.expected_container_size_bytes > 0,
+        "container size",
+    )
+
+    repo = args.polaris_repo.resolve()
+    repository = _repository_identity(repo, args.expected_polaris_commit)
+    source_specs = {
+        "runner": (
+            repo / "scripts/smoke_eef_pose_canary_controller_candidate.py",
+            args.expected_runner_sha256,
+        ),
+        "validator": (
+            repo / "scripts/validate_eef_pose_canary_controller_candidate.py",
+            args.expected_validator_sha256,
+        ),
+        "failure_verifier": (
+            args.failure_verifier.resolve(),
+            args.expected_failure_verifier_sha256,
+        ),
+        "safety_validator": (
+            repo / "scripts/finalize_eef_pose_smoke.py",
+            args.expected_safety_validator_sha256,
+        ),
+        "gate0_helper": (
+            repo / "scripts/smoke_eef_pose_canary_trace_replay.py",
+            args.expected_gate0_helper_sha256,
+        ),
+        "fixture": (
+            repo
+            / "scripts/fixtures"
+            / gate0.EXPECTED_FIXTURES[args.variant]["filename"],
+            args.expected_fixture_sha256,
+        ),
+    }
+    source_identities: dict[str, Any] = {}
+    for name, (path, expected_sha256) in source_specs.items():
+        _require(path.is_file() and not path.is_symlink(), f"missing source {name}")
+        identity = {
+            "path": str(path.resolve()),
+            "size_bytes": path.stat().st_size,
+            "sha256": _sha256(path),
+        }
+        _require(identity["sha256"] == expected_sha256, f"source hash drift: {name}")
+        source_identities[name] = identity
+    for module, source_name in (
+        (candidate, "runner"),
+        (safety_validator, "safety_validator"),
+        (gate0, "gate0_helper"),
+    ):
+        _require(
+            os.path.samefile(module.__file__, source_identities[source_name]["path"]),
+            f"imported module differs from hashed source: {source_name}",
+        )
+
+    container = args.container_image.resolve()
+    _require(
+        container.is_file() and not container.is_symlink(),
+        "container must be a regular non-symlink file",
+    )
+    _require(
+        container.stat().st_size == args.expected_container_size_bytes
+        and _sha256(container) == args.expected_container_sha256,
+        "container content identity drift",
+    )
+    container_record = candidate.validate_container_argument(
+        str(container),
+        size_bytes=args.expected_container_size_bytes,
+        sha256=args.expected_container_sha256,
+    )
+
+    raw_identity = _immutable_file(args.raw_result)
+    namespace = args.raw_result.resolve().parent
+    _require(
+        args.raw_result.name == f"candidate-{args.variant}.raw.json"
+        and namespace.name == f"launch_{args.launch_id}"
+        and namespace.parent.name == f"job_{args.job_id}"
+        and namespace.parent.parent.name == args.variant,
+        "failed raw variant/job/launch namespace",
+    )
+    for forbidden in (
+        args.raw_result.with_name(args.raw_result.name + ".ready.json"),
+        namespace / f"candidate-{args.variant}.srun-status.json",
+        namespace / f"candidate-{args.variant}.attestation.json",
+    ):
+        _require(
+            not forbidden.exists() and not forbidden.is_symlink(),
+            f"failed raw has a promotion artifact: {forbidden.name}",
+        )
+    raw = gate0.strict_json_loads(args.raw_result.read_bytes(), field="failure raw")
+    candidate.validate_failure_payload(
+        raw,
+        variant=args.variant,
+        require_complete_capture=True,
+    )
+    context = raw.get("failure_context")
+    _require(isinstance(context, dict), "failed raw context drift")
+    _validate_lifecycle(
+        context.get("lifecycle"),
+        launch_id=args.launch_id,
+        job_id=args.job_id,
+        field="failed raw lifecycle",
+    )
+    recorded_repository = context["repository"]
+    _require(
+        recorded_repository["commit"] == repository["commit"]
+        and recorded_repository["clean_tracked"] is True
+        and os.path.samefile(recorded_repository["path"], repository["path"]),
+        "failed raw repository drift",
+    )
+    _require(
+        _typed_equal(context["container_image"], container_record),
+        "failed raw container drift",
+    )
+    _validate_production_eval(context["production_eval"])
+    live_fixture_identity, live_fixture_payload, live_actions = (
+        gate0.load_replay_fixture(args.variant)
+    )
+    fixture = context["fixture"]
+    _require(
+        fixture.get("sha256") == args.expected_fixture_sha256
+        and fixture.get("fixture_action_count") == candidate.FIXTURE_ACTION_COUNT
+        and len(live_actions) == candidate.FIXTURE_ACTION_COUNT
+        and fixture.get("source_trace_sha256")
+        == live_fixture_payload["source"]["trace_sha256"]
+        and fixture.get("action_float32_sha256")
+        == live_fixture_payload["action_encoding"]["uncompressed_sha256"],
+        "failed raw fixture drift",
+    )
+    _same_recorded_file(
+        {field: fixture[field] for field in FILE_IDENTITY_FIELDS},
+        live_fixture_identity,
+        field="failed raw fixture",
+    )
+    _require(
+        _typed_equal(context["action_plan"], ACTION_PLAN),
+        "failed raw action plan drift",
+    )
+    boundary, live_boundary_identity = gate0._load_boundary_helper()  # noqa: SLF001
+    _same_recorded_file(
+        context["boundary_helper"],
+        live_boundary_identity,
+        field="failed raw boundary helper",
+    )
+    assets = context["assets"]
+    _require(
+        isinstance(assets, dict)
+        and set(assets) == {"contract", "scene", "robot_usd"}
+        and _typed_equal(assets["contract"], gate0.EXPECTED_ASSET_CONTRACT),
+        "failed raw asset contract",
+    )
+    scene_path = assets.get("scene", {}).get("scene", {}).get("path")
+    _require(isinstance(scene_path, str), "failed raw scene path")
+    _compare_with_samefile_paths(
+        assets["scene"],
+        boundary.validate_asset_contract(Path(scene_path)),
+        field="failed raw scene",
+    )
+    robot_path = assets.get("robot_usd", {}).get("path")
+    _require(isinstance(robot_path, str), "failed raw robot path")
+    _same_recorded_file(
+        assets["robot_usd"],
+        gate0._file_identity(Path(robot_path)),  # noqa: SLF001
+        field="failed raw robot USD",
+    )
+    _validate_runtime_protocol(context["runtime_protocol"])
+    _validate_runtime_frame(context["runtime_frame"])
+    safety_validator._validate_gripper_static(
+        context["gripper_runtime_contract"],
+        field="failed raw gripper runtime contract",
+        expected_target_slew_profile=candidate.CANDIDATE_TARGET_SLEW_PROFILE,
+    )
+    initial_safety = _validate_offline_safety(
+        context["initial_safety"],
+        field="failed raw initial safety",
+        apply_calls=0,
+        expect_closed_target=False,
+        expected_endpoint_change_count=0,
+        expected_gripper_target_slew_profile=(candidate.CANDIDATE_TARGET_SLEW_PROFILE),
+    )
+    _require(
+        _typed_equal(
+            initial_safety["gripper_runtime_static"],
+            context["gripper_runtime_contract"],
+        ),
+        "failed raw initial gripper binding",
+    )
+    candidate.validate_candidate_report(
+        context["initial_candidate"], variant=args.variant, final=False
+    )
+
+    capture = raw["controller_abort_capture"]
+    parsed = capture["parsed_failure"]
+    arm_failure = capture["arm_failure_runtime_evidence"]
+    gate0._validate_arm_failure_runtime_evidence(  # noqa: SLF001
+        arm_failure,
+        expected_failure=parsed,
+    )
+    gate0.validate_gripper_tail(
+        capture["all_six_gripper_tail"],
+        expected_failure=parsed,
+    )
+    active_safety = capture["active_safety"]
+    counters = active_safety.get("counters")
+    dynamic = active_safety.get("gripper_runtime_dynamic")
+    target_slew = capture["active_target_slew"]
+    _require(
+        isinstance(counters, dict)
+        and type(counters.get("apply_calls")) is int
+        and counters["apply_calls"] >= 2
+        and isinstance(dynamic, dict)
+        and dynamic.get("apply_entry_samples") == counters["apply_calls"]
+        and dynamic.get("dropped_diagnostics") == 0
+        and target_slew == dynamic.get("driver_target_slew")
+        and target_slew.get("profile") == candidate.CANDIDATE_TARGET_SLEW_PROFILE
+        and target_slew.get("process_action_calls") == raw["policy_step"] + 1
+        and target_slew.get("apply_calls") == counters["apply_calls"] - 1
+        and target_slew.get("live_limit_validation_count")
+        == target_slew.get("apply_calls")
+        and target_slew.get("slew_limited_apply_count")
+        + target_slew.get("endpoint_reached_apply_count")
+        == target_slew.get("apply_calls"),
+        "failed raw active gripper/target-slew cadence",
+    )
+    _require(
+        isinstance(target_slew.get("max_abs_target_step_rad"), (int, float))
+        and not isinstance(target_slew["max_abs_target_step_rad"], bool)
+        and 0.0
+        <= float(target_slew["max_abs_target_step_rad"])
+        <= candidate.CANDIDATE_TARGET_SLEW_MAX_STEP_RAD + 1e-6,
+        "failed raw target-slew maximum",
+    )
+    _require(
+        active_safety.get("gripper_runtime_static")
+        == context["gripper_runtime_contract"],
+        "failed raw active gripper static drift",
+    )
+    candidate.validate_candidate_report(
+        capture["active_candidate"], variant=args.variant, final=None
+    )
+    return {
+        "profile": "polaris_eef_controller_candidate_failure_verification_v1",
+        "variant": args.variant,
+        "job_id": args.job_id,
+        "launch_id": args.launch_id,
+        "raw_result": raw_identity,
+        "repository": repository,
+        "container_image": container_record,
+        "sources": source_identities,
+        "policy_step": raw["policy_step"],
+        "physics_substep": parsed["physics_substep"],
+        "joint_name": parsed["joint_name"],
+        "evidence_sha256": parsed["evidence_sha256"],
+        "arm_apply_calls": counters["apply_calls"],
+        "gripper_apply_calls": target_slew["apply_calls"],
     }
 
 

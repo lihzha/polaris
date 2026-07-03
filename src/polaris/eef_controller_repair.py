@@ -7,7 +7,6 @@ from dataclasses import dataclass
 import torch
 
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
-from polaris.eef_ik_safety import GRIPPER_CLOSE_ARM_INTERLOCK_SUBSTEPS
 
 
 def bound_joint_position_target(
@@ -92,13 +91,14 @@ def advance_gripper_close_arm_interlock(
     endpoint_observed_before_apply: bool,
     endpoint_is_closed: bool,
     remaining_before_apply: int,
+    configured_substeps: int,
 ) -> GripperCloseArmInterlockTransition:
     """Resolve the arm hold for one physics apply without mutating state.
 
-    A newly observed close transition starts one fixed 48-substep window. A
-    newly observed open transition cancels it. Repeated endpoint commands do
-    not refresh the countdown, so a policy cannot freeze the arm forever by
-    merely holding a binary close action.
+    A newly observed close transition starts the caller's profile-bound
+    substep window. A newly observed open transition cancels it. Repeated
+    endpoint commands do not refresh the countdown, so a policy cannot freeze
+    the arm forever by merely holding a binary close action.
     """
 
     for name, value in (
@@ -108,6 +108,10 @@ def advance_gripper_close_arm_interlock(
     ):
         if type(value) is not int or value < 0:
             raise ValueError(f"PolaRiS EEF {name} must be a non-negative int")
+    if type(configured_substeps) is not int or configured_substeps <= 0:
+        raise ValueError(
+            "PolaRiS EEF configured interlock substeps must be a positive int"
+        )
     if (
         type(enabled) is not bool
         or type(endpoint_observed_before_apply) is not bool
@@ -138,11 +142,11 @@ def advance_gripper_close_arm_interlock(
                 "PolaRiS EEF first observed gripper endpoint has change history"
             )
         if endpoint_is_closed:
-            remaining = GRIPPER_CLOSE_ARM_INTERLOCK_SUBSTEPS
+            remaining = configured_substeps
             activation_count_delta = 1
     elif count_delta == 1:
         if endpoint_is_closed:
-            remaining = GRIPPER_CLOSE_ARM_INTERLOCK_SUBSTEPS
+            remaining = configured_substeps
             activation_count_delta = 1
         else:
             remaining = 0

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Replay exact failed canary actions through isolated controller candidates.
 
-This is a model-free promotion gate. Both variants enable the 0.95 nominal arm
-slew bound. The official LAP-3B variant additionally enables the bounded
-gripper-close/arm interlock. After the 120 content-pinned actions, two repeats
-of the final recorded action prove that the 48-substep interlock releases and
-ordinary arm motion resumes without crossing a live physical velocity limit.
+This is a model-free promotion gate. Both variants use one identical default-
+off controller profile: 0.95 nominal arm slew, factor-0.25 gripper target slew,
+and the profile-bound 86-substep close/arm interlock. After the 120 content-
+pinned actions, seven repeats of the final recorded action give the official
+close transition exactly 96 applies: 86 interlocked and 10 released. The open
+reasoning fixture proves the same static controller identity without activating
+the close interlock.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import argparse
 import math
 import os
 from pathlib import Path
+import struct
 import sys
 import traceback
 from typing import Any
@@ -23,11 +26,80 @@ import smoke_eef_pose_canary_trace_replay as gate0
 
 PROFILE = "polaris_eef_canary_controller_candidate_replay_v1"
 FIXTURE_ACTION_COUNT = 120
-POST_FIXTURE_REPEAT_COUNT = 2
+POST_FIXTURE_REPEAT_COUNT = 7
 TOTAL_ACTION_COUNT = FIXTURE_ACTION_COUNT + POST_FIXTURE_REPEAT_COUNT
+CANDIDATE_TARGET_SLEW_PROFILE = (
+    "eef_binary_driver_target_slew_rate1p25_from_live_limit5_"
+    "per_120hz_substep_candidate_v1"
+)
+CANDIDATE_TARGET_SLEW_MAX_STEP_RAD = 0.010416666977107525
+
+
+def _float32(value: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def _next_float32_toward(left: float, right: float) -> float:
+    left = _float32(left)
+    right = _float32(right)
+    if left == right:
+        return right
+    bits = struct.unpack("<I", struct.pack("<f", left))[0]
+    bits = bits - 1 if left > right and left > 0.0 else bits + 1
+    return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def _simulate_candidate_close_transition() -> dict[str, int]:
+    endpoint = _float32(math.pi / 4.0)
+    maximum = _float32(CANDIDATE_TARGET_SLEW_MAX_STEP_RAD)
+    previous = _float32(0.0)
+    applies = 0
+    limited_applies = 0
+    nextafter_corrections = 0
+    while previous != endpoint:
+        if applies >= 1024:
+            raise RuntimeError("Candidate close simulation did not end")
+        delta = _float32(endpoint - previous)
+        limited = abs(delta) > maximum
+        step = min(max(delta, -maximum), maximum)
+        next_target = _float32(previous + step) if limited else endpoint
+        applied = _float32(next_target - previous)
+        if abs(applied) > maximum:
+            next_target = _next_float32_toward(next_target, previous)
+            nextafter_corrections += 1
+            applied = _float32(next_target - previous)
+        if not (
+            math.isfinite(next_target)
+            and math.isfinite(applied)
+            and abs(applied) <= maximum
+            and previous <= next_target <= endpoint
+        ):
+            raise RuntimeError("Candidate close simulation invariant")
+        previous = next_target
+        applies += 1
+        limited_applies += int(limited)
+    return {
+        "endpoint_applies": applies,
+        "limited_applies": limited_applies,
+        "nextafter_corrections": nextafter_corrections,
+    }
+
+
+CANDIDATE_CLOSE_SIMULATION = _simulate_candidate_close_transition()
+if CANDIDATE_CLOSE_SIMULATION != {
+    "endpoint_applies": 76,
+    "limited_applies": 75,
+    "nextafter_corrections": 41,
+}:
+    raise RuntimeError("Candidate float32 close-transition profile drift")
+CANDIDATE_CLOSE_TRANSITION_APPLIES = CANDIDATE_CLOSE_SIMULATION["endpoint_applies"]
+CANDIDATE_CLOSE_LIMITED_APPLIES = CANDIDATE_CLOSE_SIMULATION["limited_applies"]
+CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS = CANDIDATE_CLOSE_TRANSITION_APPLIES + 10
+CANDIDATE_CLOSE_INTERLOCK_PROFILE = "eef_gripper_close_hold_arm_86_physics_substeps_v1"
+CANDIDATE_PROFILE = "arm_slew_0p95_plus_gripper_rate0p25_close_interlock86_v1"
 CANDIDATE_BY_VARIANT = {
-    "official_lap3b": "arm_slew_0p95_plus_gripper_close_interlock48_v1",
-    "reasoning_43075": "arm_slew_0p95_only_v1",
+    "official_lap3b": CANDIDATE_PROFILE,
+    "reasoning_43075": CANDIDATE_PROFILE,
 }
 ARM_CANDIDATE_FIELDS = {
     "enabled",
@@ -59,6 +131,50 @@ ZERO_SAFETY_COUNTERS = {
     "position_limited_joints",
     "post_clamp_target_violations",
 }
+CONTROLLER_ABORT_CAPTURE_PROFILE = (
+    "polaris_eef_controller_candidate_transactional_abort_capture_v1"
+)
+CONTROLLER_ABORT_CAPTURE_FIELDS = {
+    "profile",
+    "failure_exception",
+    "parsed_failure",
+    "arm_failure_runtime_evidence",
+    "all_six_gripper_tail",
+    "active_safety",
+    "active_candidate",
+    "active_target_slew",
+}
+FAILURE_CONTEXT_FIELDS = {
+    "lifecycle",
+    "repository",
+    "container_image",
+    "production_eval",
+    "fixture",
+    "action_plan",
+    "boundary_helper",
+    "assets",
+    "runtime_protocol",
+    "runtime_frame",
+    "gripper_runtime_contract",
+    "initial_safety",
+    "initial_candidate",
+}
+FAILURE_RAW_FIELDS = {
+    "schema_version",
+    "profile",
+    "finalized",
+    "passed",
+    "stage",
+    "environment",
+    "variant",
+    "candidate",
+    "policy_step",
+    "failure_context",
+    "failure",
+    "controller_abort_capture",
+    "controller_abort_capture_failure",
+    "close_failures",
+}
 
 
 class CandidateReplayValidationError(ValueError):
@@ -70,8 +186,147 @@ def _require(condition: bool, message: str) -> None:
         raise CandidateReplayValidationError(message)
 
 
+def _typed_equal(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(right, dict):
+        return set(left) == set(right) and all(
+            _typed_equal(left[name], value) for name, value in right.items()
+        )
+    if isinstance(right, list):
+        return len(left) == len(right) and all(
+            _typed_equal(actual, expected)
+            for actual, expected in zip(left, right, strict=True)
+        )
+    return bool(left == right)
+
+
+def validate_failure_context(value: Any, *, variant: str) -> dict[str, Any]:
+    """Validate the closed pre-replay context retained by a failed raw."""
+
+    _require(variant in CANDIDATE_BY_VARIANT, "failure-context variant")
+    _require(
+        isinstance(value, dict) and set(value) == FAILURE_CONTEXT_FIELDS,
+        "failure-context schema drift",
+    )
+    lifecycle = value.get("lifecycle")
+    _require(
+        isinstance(lifecycle, dict)
+        and set(lifecycle)
+        == {
+            "profile",
+            "launch_id",
+            "job_id",
+            "step_id",
+            "nodelist",
+            "procid",
+            "localid",
+            "ntasks",
+        }
+        and type(lifecycle.get("profile")) is str
+        and lifecycle.get("profile") == "slurm_single_task_srun_lifecycle_v1"
+        and type(lifecycle.get("launch_id")) is str
+        and len(lifecycle["launch_id"]) == 64
+        and all(character in "0123456789abcdef" for character in lifecycle["launch_id"])
+        and type(lifecycle.get("job_id")) is int
+        and lifecycle["job_id"] > 0
+        and type(lifecycle.get("step_id")) is int
+        and lifecycle["step_id"] >= 0
+        and type(lifecycle.get("nodelist")) is str
+        and bool(lifecycle["nodelist"].strip())
+        and type(lifecycle.get("procid")) is int
+        and type(lifecycle.get("localid")) is int
+        and lifecycle.get("procid") == lifecycle.get("localid") == 0
+        and type(lifecycle.get("ntasks")) is int
+        and lifecycle.get("ntasks") == 1,
+        "failure-context lifecycle drift",
+    )
+    repository = value.get("repository")
+    _require(
+        isinstance(repository, dict)
+        and set(repository) == {"path", "commit", "clean_tracked"}
+        and isinstance(repository.get("path"), str)
+        and isinstance(repository.get("commit"), str)
+        and len(repository["commit"]) == 40
+        and repository.get("clean_tracked") is True,
+        "failure-context repository drift",
+    )
+    container = value.get("container_image")
+    _require(
+        isinstance(container, dict)
+        and _typed_equal(
+            container,
+            validate_container_argument(
+                container.get("path"),
+                size_bytes=container.get("size_bytes"),
+                sha256=container.get("sha256"),
+            ),
+        ),
+        "failure-context container drift",
+    )
+    fixture = value.get("fixture")
+    _require(
+        isinstance(fixture, dict)
+        and type(fixture.get("fixture_action_count")) is int
+        and fixture["fixture_action_count"] == FIXTURE_ACTION_COUNT,
+        "failure-context fixture drift",
+    )
+    expected_action_plan = {
+        "profile": "exact_fixture_then_repeat_final_recorded_action_v1",
+        "fixture_action_count": FIXTURE_ACTION_COUNT,
+        "post_fixture_repeat_count": POST_FIXTURE_REPEAT_COUNT,
+        "total_action_count": TOTAL_ACTION_COUNT,
+    }
+    _require(
+        _typed_equal(value.get("action_plan"), expected_action_plan),
+        "failure-context action plan drift",
+    )
+    _require(
+        isinstance(value.get("production_eval"), dict)
+        and isinstance(value.get("boundary_helper"), dict)
+        and isinstance(value.get("assets"), dict)
+        and value["assets"].get("contract") == gate0.EXPECTED_ASSET_CONTRACT,
+        "failure-context source/asset drift",
+    )
+    runtime_protocol = value.get("runtime_protocol")
+    _require(
+        isinstance(runtime_protocol, dict)
+        and runtime_protocol.get("decimation") == gate0.DECIMATION
+        and runtime_protocol.get("physics_hz") == 120.0
+        and runtime_protocol.get("policy_hz") == 15.0,
+        "failure-context runtime protocol drift",
+    )
+    runtime_frame = value.get("runtime_frame")
+    _require(
+        isinstance(runtime_frame, dict)
+        and runtime_frame.get("eef_frame") == "panda_link8"
+        and runtime_frame.get("reference_frame") == "panda_link0"
+        and runtime_frame.get("controlled_body") == "panda_link8",
+        "failure-context runtime frame drift",
+    )
+    gripper_contract = value.get("gripper_runtime_contract")
+    _require(
+        isinstance(gripper_contract, dict)
+        and gripper_contract.get("driver_target_slew", {}).get("profile")
+        == CANDIDATE_TARGET_SLEW_PROFILE,
+        "failure-context gripper target-slew drift",
+    )
+    initial_safety = value.get("initial_safety")
+    _require(
+        isinstance(initial_safety, dict)
+        and initial_safety.get("counters", {}).get("apply_calls") == 0
+        and initial_safety.get("current_joint_velocity_abort") is None
+        and initial_safety.get("gripper_runtime_static") == gripper_contract,
+        "failure-context initial safety drift",
+    )
+    validate_candidate_report(
+        value.get("initial_candidate"), variant=variant, final=False
+    )
+    return dict(value)
+
+
 def validate_candidate_report(
-    report: Any, *, variant: str, final: bool
+    report: Any, *, variant: str, final: bool | None
 ) -> dict[str, Any]:
     _require(isinstance(report, dict), "candidate report must be an object")
     _require(
@@ -118,13 +373,11 @@ def validate_candidate_report(
             f"arm-slew candidate ratio {index}",
         )
 
-    enabled = variant == "official_lap3b"
     _require(
-        interlock.get("enabled") is enabled
-        and interlock.get("profile")
-        == "eef_gripper_close_hold_arm_48_physics_substeps_v1"
+        interlock.get("enabled") is True
+        and interlock.get("profile") == CANDIDATE_CLOSE_INTERLOCK_PROFILE
         and type(interlock.get("configured_substeps")) is int
-        and interlock.get("configured_substeps") == 48,
+        and interlock.get("configured_substeps") == CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS,
         "close-interlock candidate identity drift",
     )
     for name in (
@@ -160,7 +413,7 @@ def validate_candidate_report(
             ),
             f"close-interlock {field} vector",
         )
-    if not final:
+    if final is False:
         _require(
             interlock.get("remaining_substeps") == 0
             and interlock.get("observed_endpoint_change_count") == 0
@@ -172,31 +425,195 @@ def validate_candidate_report(
             and all(float(value) == 0.0 for value in released_vector),
             "initial close-interlock state is not empty",
         )
-    elif enabled:
+    elif final is True and variant == "official_lap3b":
         _require(
             interlock.get("remaining_substeps") == 0
             and interlock.get("observed_endpoint_change_count") == 1
             and interlock.get("endpoint_observed") is True
             and interlock.get("activation_count") == 1
-            and interlock.get("active_apply_count") == 48
-            and interlock.get("released_apply_count") == 8
+            and interlock.get("active_apply_count")
+            == CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS
+            and interlock.get("released_apply_count") == 10
             and all(float(value) == 0.0 for value in active_vector)
             and any(float(value) > 0.0 for value in released_vector),
             "official close interlock did not activate, release, and resume",
         )
-    else:
+    elif final is True:
         _require(
             interlock.get("remaining_substeps") == 0
             and interlock.get("observed_endpoint_change_count") == 0
-            and interlock.get("endpoint_observed") is False
+            and interlock.get("endpoint_observed") is True
             and interlock.get("activation_count") == 0
             and interlock.get("active_apply_count") == 0
             and interlock.get("released_apply_count") == 0
             and all(float(value) == 0.0 for value in active_vector)
             and all(float(value) == 0.0 for value in released_vector),
-            "reasoning replay unexpectedly used the close interlock",
+            "reasoning open replay unexpectedly activated the close interlock",
         )
+    else:
+        activation_count = interlock["activation_count"]
+        active_count = interlock["active_apply_count"]
+        released_count = interlock["released_apply_count"]
+        remaining = interlock["remaining_substeps"]
+        _require(
+            activation_count in (0, 1)
+            and active_count <= CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS
+            and remaining <= CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS
+            and all(float(value) == 0.0 for value in active_vector),
+            "captured close-interlock state is impossible",
+        )
+        if activation_count == 0:
+            _require(
+                active_count == released_count == remaining == 0
+                and all(float(value) == 0.0 for value in released_vector),
+                "inactive captured close-interlock state retained evidence",
+            )
+        elif released_count == 0:
+            _require(
+                active_count + remaining == CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS,
+                "active captured close-interlock countdown drift",
+            )
+        else:
+            _require(
+                active_count == CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS and remaining == 0,
+                "released captured close-interlock countdown drift",
+            )
     return dict(report)
+
+
+def validate_controller_abort_capture(value: Any, *, variant: str) -> dict[str, Any]:
+    """Validate one failure-only, non-promotable controller transaction."""
+
+    _require(variant in CANDIDATE_BY_VARIANT, "controller-abort variant")
+    _require(
+        isinstance(value, dict) and set(value) == CONTROLLER_ABORT_CAPTURE_FIELDS,
+        "controller-abort capture schema drift",
+    )
+    _require(
+        value.get("profile") == CONTROLLER_ABORT_CAPTURE_PROFILE,
+        "controller-abort capture profile drift",
+    )
+    failure = value.get("failure_exception")
+    _require(
+        isinstance(failure, dict)
+        and set(failure) == {"type", "message", "traceback"}
+        and isinstance(failure.get("type"), str)
+        and failure["type"].endswith(".DifferentialIKInvariantError")
+        and isinstance(failure.get("message"), str)
+        and isinstance(failure.get("traceback"), str),
+        "controller-abort exception evidence",
+    )
+    parsed = gate0.parse_failure_exception(failure["message"])
+    _require(
+        value.get("parsed_failure") == parsed,
+        "controller-abort parsed exception drift",
+    )
+    arm_failure = value.get("arm_failure_runtime_evidence")
+    gate0._validate_arm_failure_runtime_evidence(  # noqa: SLF001
+        arm_failure,
+        expected_failure=parsed,
+    )
+    gate0.validate_gripper_tail(
+        value.get("all_six_gripper_tail"),
+        expected_failure=parsed,
+    )
+    _require(isinstance(arm_failure, dict), "controller-abort arm evidence")
+    active_safety = value.get("active_safety")
+    _require(
+        isinstance(active_safety, dict)
+        and active_safety == arm_failure.get("ik_safety")
+        and isinstance(active_safety.get("current_joint_velocity_abort"), dict),
+        "controller-abort active/current-abort safety drift",
+    )
+    active_candidate = validate_candidate_report(
+        value.get("active_candidate"), variant=variant, final=None
+    )
+    target_slew = value.get("active_target_slew")
+    dynamic = active_safety.get("gripper_runtime_dynamic")
+    _require(
+        isinstance(dynamic, dict)
+        and isinstance(target_slew, dict)
+        and target_slew == dynamic.get("driver_target_slew")
+        and target_slew.get("profile") == CANDIDATE_TARGET_SLEW_PROFILE,
+        "controller-abort active target-slew state drift",
+    )
+    _require(
+        active_candidate["gripper_close_arm_interlock"]["enabled"] is True,
+        "controller-abort close interlock was not enabled",
+    )
+    return dict(value)
+
+
+def validate_failure_payload(
+    value: Any, *, variant: str, require_complete_capture: bool
+) -> dict[str, Any]:
+    """Validate a closed non-promotable failure payload before publication."""
+
+    _require(type(require_complete_capture) is bool, "failure capture requirement")
+    _require(
+        isinstance(value, dict) and set(value) == FAILURE_RAW_FIELDS,
+        "failure raw schema drift",
+    )
+    _require(
+        type(value.get("schema_version")) is int
+        and value.get("schema_version") == 1
+        and value.get("profile") == PROFILE
+        and value.get("finalized") is False
+        and value.get("passed") is False
+        and value.get("environment") == gate0.ENVIRONMENT
+        and value.get("variant") == variant
+        and value.get("candidate") == CANDIDATE_BY_VARIANT[variant]
+        and value.get("close_failures") == [],
+        "failure raw identity drift",
+    )
+    context = validate_failure_context(value.get("failure_context"), variant=variant)
+    failure = value.get("failure")
+    failure_type = failure.get("type") if isinstance(failure, dict) else None
+    _require(
+        isinstance(failure, dict)
+        and set(failure) == {"type", "message", "traceback"}
+        and isinstance(failure_type, str)
+        and failure_type.endswith(
+            ("DifferentialIKNumericalError", "DifferentialIKInvariantError")
+        )
+        and isinstance(failure.get("message"), str)
+        and isinstance(failure.get("traceback"), str),
+        "failure raw primary exception drift",
+    )
+    _require(
+        type(value.get("policy_step")) is int and value["policy_step"] >= 0,
+        "failure raw policy step",
+    )
+    capture = value.get("controller_abort_capture")
+    capture_failure = value.get("controller_abort_capture_failure")
+    if require_complete_capture:
+        validated_capture = validate_controller_abort_capture(capture, variant=variant)
+        _require(
+            value.get("stage") == "failed_controller_abort_captured"
+            and capture_failure is None
+            and validated_capture["failure_exception"] == failure
+            and validated_capture["parsed_failure"]["policy_step"]
+            == value["policy_step"],
+            "complete failure raw transaction drift",
+        )
+    else:
+        _require(
+            value.get("stage") == "failed_controller_abort_capture_incomplete"
+            and isinstance(capture_failure, dict)
+            and set(capture_failure) == {"type", "message", "traceback"}
+            and all(
+                isinstance(capture_failure.get(field), str)
+                for field in ("type", "message", "traceback")
+            ),
+            "incomplete failure raw transaction drift",
+        )
+        if capture is not None:
+            _require(isinstance(capture, dict), "incomplete failure capture type")
+    _require(
+        context["initial_candidate"]["gripper_close_arm_interlock"]["enabled"] is True,
+        "failure raw controller context was not enabled",
+    )
+    return dict(value)
 
 
 def validate_candidate_replay_evidence(
@@ -274,8 +691,15 @@ def validate_candidate_replay_evidence(
     driver = gripper.get("driver_target_slew")
     _require(isinstance(driver, dict), "candidate gripper target-slew evidence")
     expected_changes = 1 if variant == "official_lap3b" else 0
+    expected_limited = (
+        CANDIDATE_CLOSE_LIMITED_APPLIES if variant == "official_lap3b" else 0
+    )
     _require(
-        driver.get("apply_calls") == TOTAL_ACTION_COUNT * gate0.DECIMATION
+        driver.get("profile") == CANDIDATE_TARGET_SLEW_PROFILE
+        and driver.get("slew_limited_apply_count") == expected_limited
+        and driver.get("endpoint_reached_apply_count")
+        == TOTAL_ACTION_COUNT * gate0.DECIMATION - expected_limited
+        and driver.get("apply_calls") == TOTAL_ACTION_COUNT * gate0.DECIMATION
         and driver.get("live_limit_validation_count")
         == TOTAL_ACTION_COUNT * gate0.DECIMATION
         and driver.get("process_action_calls") == TOTAL_ACTION_COUNT
@@ -291,6 +715,11 @@ def validate_candidate_replay_evidence(
         "gripper_apply_calls": driver["apply_calls"],
         "process_action_calls": driver["process_action_calls"],
         "post_policy_step_samples": gripper["post_policy_step_samples"],
+        "target_slew_profile": driver["profile"],
+        "target_slew_limited_apply_count": expected_limited,
+        "target_slew_endpoint_reached_apply_count": driver[
+            "endpoint_reached_apply_count"
+        ],
         "slew_limit_events": counters["slew_limit_events"],
         "dls_fallbacks": 0,
         "abort_count": 0,
@@ -372,6 +801,47 @@ def validate_container_argument(
     }
 
 
+def _capture_controller_abort(
+    *,
+    error: BaseException,
+    variant: str,
+    policy_step: int,
+    env: Any,
+    boundary: Any,
+    finger_term: Any,
+    candidate_reporter: Any,
+) -> dict[str, Any]:
+    """Capture and validate all controller/gripper state before teardown."""
+
+    failure_exception = gate0._exception_evidence(error)  # noqa: SLF001
+    parsed_failure = gate0.parse_failure_exception(failure_exception["message"])
+    _require(
+        parsed_failure["policy_step"] == policy_step,
+        "controller-abort loop/exception policy-step drift",
+    )
+    finger_term.finalize_gate0_failure()
+    arm_failure = boundary._capture_failure_runtime_evidence(  # noqa: SLF001
+        env,
+        policy_step=policy_step,
+    )
+    gripper_tail = finger_term.gate0_gripper_tail()
+    active_safety = arm_failure["ik_safety"]
+    active_candidate = candidate_reporter()
+    target_reporter = getattr(finger_term, "gripper_target_slew_dynamic_report", None)
+    _require(callable(target_reporter), "controller-abort target-slew reporter")
+    payload = {
+        "profile": CONTROLLER_ABORT_CAPTURE_PROFILE,
+        "failure_exception": failure_exception,
+        "parsed_failure": parsed_failure,
+        "arm_failure_runtime_evidence": arm_failure,
+        "all_six_gripper_tail": gripper_tail,
+        "active_safety": active_safety,
+        "active_candidate": active_candidate,
+        "active_target_slew": target_reporter(),
+    }
+    return validate_controller_abort_capture(payload, variant=variant)
+
+
 def _run_live(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any]:
     import gymnasium as gym  # noqa: PLC0415
     import torch  # noqa: PLC0415
@@ -395,6 +865,9 @@ def _run_live(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any]
     )
     from polaris.environments.robot_cfg import (  # noqa: PLC0415
         configure_eef_pose_joint_safety,
+    )
+    from polaris.robust_differential_ik import (  # noqa: PLC0415
+        DifferentialIKNumericalError,
     )
     from polaris.utils import load_eval_initial_conditions  # noqa: PLC0415
 
@@ -427,9 +900,8 @@ def _run_live(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any]
     env_cfg.actions.arm.enable_failure_substep_trace = True
     env_cfg.actions.arm.enable_wrist_energy_brake = False
     env_cfg.actions.arm.enable_arm_slew_headroom = True
-    env_cfg.actions.arm.enable_gripper_close_arm_interlock = (
-        args.variant == "official_lap3b"
-    )
+    env_cfg.actions.arm.enable_gripper_close_arm_interlock = True
+    env_cfg.actions.finger_joint.enable_target_slew_rate_0p25_candidate = True
     tracing_class = gate0._make_tracing_gripper_class(
         EefBinaryJointPositionTargetSlewAction
     )
@@ -470,7 +942,11 @@ def _run_live(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any]
     )
     runtime_frame = validate_eef_runtime_frame(env, observation)
     begin_eef_safety_episode(env, 0)
-    initial_safety = validate_eef_runtime_safety(env, require_gripper_runtime=True)
+    initial_safety = validate_eef_runtime_safety(
+        env,
+        require_gripper_runtime=True,
+        expected_gripper_target_slew_profile=CANDIDATE_TARGET_SLEW_PROFILE,
+    )
     terms = env.unwrapped.action_manager._terms
     _require(list(terms) == ["arm", "finger_joint"], "live action order drift")
     arm_term = terms["arm"]
@@ -482,30 +958,7 @@ def _run_live(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any]
         reporter(), variant=args.variant, final=False
     )
 
-    replay_actions = list(actions) + [list(actions[-1])] * POST_FIXTURE_REPEAT_COUNT
-    state["stage"] = "replay_actions"
-    for step, action_values in enumerate(replay_actions):
-        state["policy_step"] = step
-        finger_term.begin_gate0_policy_step(step)
-        action = torch.tensor(
-            action_values, dtype=torch.float32, device=env.device
-        ).reshape(1, -1)
-        observation, _, terminated, truncated, _ = env.step(action, expensive=True)
-        _require(not bool(terminated[0]), f"candidate replay terminated at step {step}")
-        _require(not bool(truncated[0]), f"candidate replay truncated at step {step}")
-        record_eef_gripper_post_policy_step(env)
-
-    _require(len(replay_actions) == TOTAL_ACTION_COUNT, "candidate replay action count")
-    final_safety = validate_eef_runtime_safety(env, require_gripper_runtime=True)
-    final_candidate = validate_candidate_report(
-        reporter(), variant=args.variant, final=True
-    )
-    candidate_replay_validation = validate_candidate_replay_evidence(
-        final_safety, final_candidate, variant=args.variant
-    )
-    velocity_headroom = validate_velocity_headroom(final_safety)
-    state["policy_step"] = None
-    return {
+    failure_context = {
         "lifecycle": lifecycle,
         "repository": repository,
         "container_image": container_image,
@@ -531,6 +984,64 @@ def _run_live(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any]
         "gripper_runtime_contract": gripper_runtime_contract,
         "initial_safety": initial_safety,
         "initial_candidate": initial_candidate,
+    }
+    state["failure_context"] = validate_failure_context(
+        failure_context, variant=args.variant
+    )
+
+    replay_actions = list(actions) + [list(actions[-1])] * POST_FIXTURE_REPEAT_COUNT
+    state["stage"] = "replay_actions"
+    for step, action_values in enumerate(replay_actions):
+        state["policy_step"] = step
+        finger_term.begin_gate0_policy_step(step)
+        action = torch.tensor(
+            action_values, dtype=torch.float32, device=env.device
+        ).reshape(1, -1)
+        try:
+            observation, _, terminated, truncated, _ = env.step(action, expensive=True)
+        except DifferentialIKNumericalError as error:
+            # Preserve the primary controller exception before any secondary
+            # diagnostic operation can fail. The outer failure transaction
+            # writes this object without a ready marker or promotion artifact.
+            state["controller_abort_original_failure"] = gate0._exception_evidence(
+                error
+            )  # noqa: SLF001
+            state["stage"] = "capture_controller_abort"
+            try:
+                state["controller_abort_capture"] = _capture_controller_abort(
+                    error=error,
+                    variant=args.variant,
+                    policy_step=step,
+                    env=env,
+                    boundary=boundary,
+                    finger_term=finger_term,
+                    candidate_reporter=reporter,
+                )
+            except BaseException as capture_error:
+                state["controller_abort_capture_failure"] = gate0._exception_evidence(
+                    capture_error
+                )  # noqa: SLF001
+            raise
+        _require(not bool(terminated[0]), f"candidate replay terminated at step {step}")
+        _require(not bool(truncated[0]), f"candidate replay truncated at step {step}")
+        record_eef_gripper_post_policy_step(env)
+
+    _require(len(replay_actions) == TOTAL_ACTION_COUNT, "candidate replay action count")
+    final_safety = validate_eef_runtime_safety(
+        env,
+        require_gripper_runtime=True,
+        expected_gripper_target_slew_profile=CANDIDATE_TARGET_SLEW_PROFILE,
+    )
+    final_candidate = validate_candidate_report(
+        reporter(), variant=args.variant, final=True
+    )
+    candidate_replay_validation = validate_candidate_replay_evidence(
+        final_safety, final_candidate, variant=args.variant
+    )
+    velocity_headroom = validate_velocity_headroom(final_safety)
+    state["policy_step"] = None
+    return {
+        **failure_context,
         "final_safety": final_safety,
         "final_candidate": final_candidate,
         "candidate_replay_validation": candidate_replay_validation,
@@ -572,6 +1083,10 @@ def main() -> int:
         "stage": "launch_simulation_app",
         "policy_step": None,
         "env": None,
+        "controller_abort_original_failure": None,
+        "controller_abort_capture": None,
+        "controller_abort_capture_failure": None,
+        "failure_context": None,
     }
     simulation_app = None
     close_failures: list[dict[str, str]] = []
@@ -626,21 +1141,74 @@ def main() -> int:
         traceback.print_exception(
             type(error), error, error.__traceback__, file=sys.stderr
         )
+        controller_abort_capture = state.get("controller_abort_capture")
+        controller_abort_capture_failure = state.get("controller_abort_capture_failure")
+        original_failure = state.get("controller_abort_original_failure")
+        if controller_abort_capture is not None:
+            try:
+                validate_controller_abort_capture(
+                    controller_abort_capture,
+                    variant=getattr(args, "variant", None),
+                )
+            except BaseException as capture_validation_error:
+                controller_abort_capture_failure = gate0._exception_evidence(  # noqa: SLF001
+                    capture_validation_error
+                )
         failure_payload = {
             "schema_version": 1,
             "profile": PROFILE,
             "finalized": False,
             "passed": False,
-            "stage": "failed",
+            "stage": (
+                "failed_controller_abort_captured"
+                if controller_abort_capture is not None
+                and controller_abort_capture_failure is None
+                else "failed_controller_abort_capture_incomplete"
+                if original_failure is not None
+                else "failed"
+            ),
             "environment": gate0.ENVIRONMENT,
             "variant": getattr(args, "variant", None),
             "candidate": CANDIDATE_BY_VARIANT.get(getattr(args, "variant", None)),
             "policy_step": state.get("policy_step"),
-            "failure": gate0._exception_evidence(error),
+            "failure_context": state.get("failure_context"),
+            "failure": original_failure or gate0._exception_evidence(error),
+            "controller_abort_capture": controller_abort_capture,
+            "controller_abort_capture_failure": controller_abort_capture_failure,
             "close_failures": close_failures,
         }
         try:
-            gate0._atomic_write_immutable(args.output_json, failure_payload)
+            if original_failure is not None:
+                try:
+                    validate_failure_payload(
+                        failure_payload,
+                        variant=args.variant,
+                        require_complete_capture=(
+                            controller_abort_capture is not None
+                            and controller_abort_capture_failure is None
+                        ),
+                    )
+                except BaseException as transaction_validation_error:
+                    failure_payload["stage"] = (
+                        "failed_controller_abort_capture_incomplete"
+                    )
+                    failure_payload["controller_abort_capture_failure"] = (
+                        gate0._exception_evidence(  # noqa: SLF001
+                            transaction_validation_error
+                        )
+                    )
+                    validate_failure_payload(
+                        failure_payload,
+                        variant=args.variant,
+                        require_complete_capture=False,
+                    )
+            identity = gate0._atomic_write_immutable(args.output_json, failure_payload)
+            print(
+                "POLARIS_CONTROLLER_CANDIDATE_FAILURE_RAW="
+                f"{identity['path']};size={identity['size_bytes']};"
+                f"sha256={identity['sha256']};mode={identity['mode']}",
+                flush=True,
+            )
         except BaseException as persistence_error:
             traceback.print_exception(
                 type(persistence_error),

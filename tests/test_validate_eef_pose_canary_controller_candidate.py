@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from argparse import Namespace
 import copy
 import importlib.util
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -45,6 +47,105 @@ runtime_tests = _load_test_module(
 gripper_tests = _load_test_module(
     "test_eef_gripper_runtime.py", "test_eef_gripper_runtime_for_candidate_consumer"
 )
+
+
+def _failure_validation_args(tmp_path: Path, lifecycle: dict) -> Namespace:
+    variant = "official_lap3b"
+    launch_id = "a" * 64
+    job_id = 123
+    namespace = tmp_path / variant / f"job_{job_id}" / f"launch_{launch_id}"
+    raw_result = namespace / f"candidate-{variant}.raw.json"
+    validator.gate0._atomic_write_immutable(  # noqa: SLF001
+        raw_result,
+        {"failure_context": {"lifecycle": lifecycle}},
+    )
+    container = tmp_path / "container.sqsh"
+    container.write_bytes(b"lifecycle validation container")
+    fixture = (
+        SCRIPTS / "fixtures" / validator.gate0.EXPECTED_FIXTURES[variant]["filename"]
+    )
+    return Namespace(
+        variant=variant,
+        launch_id=launch_id,
+        job_id=job_id,
+        raw_result=raw_result,
+        polaris_repo=ROOT,
+        expected_polaris_commit="b" * 40,
+        expected_runner_sha256=validator._sha256(  # noqa: SLF001
+            SCRIPTS / "smoke_eef_pose_canary_controller_candidate.py"
+        ),
+        expected_validator_sha256=validator._sha256(  # noqa: SLF001
+            SCRIPTS / "validate_eef_pose_canary_controller_candidate.py"
+        ),
+        expected_failure_verifier_sha256=validator._sha256(  # noqa: SLF001
+            SCRIPTS / "verify_eef_pose_canary_controller_candidate_failure.py"
+        ),
+        expected_safety_validator_sha256=validator._sha256(  # noqa: SLF001
+            SCRIPTS / "finalize_eef_pose_smoke.py"
+        ),
+        expected_gate0_helper_sha256=validator._sha256(  # noqa: SLF001
+            SCRIPTS / "smoke_eef_pose_canary_trace_replay.py"
+        ),
+        expected_fixture_sha256=validator._sha256(fixture),  # noqa: SLF001
+        failure_verifier=(
+            SCRIPTS / "verify_eef_pose_canary_controller_candidate_failure.py"
+        ),
+        container_image=container,
+        expected_container_size_bytes=container.stat().st_size,
+        expected_container_sha256=validator._sha256(container),  # noqa: SLF001
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "boolean_alias"),
+    (("procid", False), ("localid", False), ("ntasks", True)),
+)
+def test_independent_failure_validation_rejects_boolean_rank_and_task_aliases(
+    tmp_path,
+    monkeypatch,
+    field,
+    boolean_alias,
+):
+    lifecycle = {
+        "profile": "slurm_single_task_srun_lifecycle_v1",
+        "launch_id": "a" * 64,
+        "job_id": 123,
+        "step_id": 4,
+        "nodelist": "l401",
+        "procid": 0,
+        "localid": 0,
+        "ntasks": 1,
+    }
+    assert (
+        validator._validate_lifecycle(  # noqa: SLF001
+            lifecycle,
+            launch_id="a" * 64,
+            job_id=123,
+            field="test lifecycle",
+        )
+        == lifecycle
+    )
+    lifecycle[field] = boolean_alias
+    args = _failure_validation_args(tmp_path, lifecycle)
+    monkeypatch.setattr(
+        validator,
+        "_repository_identity",
+        lambda path, commit: {
+            "path": str(path.resolve()),
+            "commit": commit,
+            "clean_tracked": True,
+        },
+    )
+    monkeypatch.setattr(
+        validator.candidate,
+        "validate_failure_payload",
+        lambda raw, *, variant, require_complete_capture: raw,
+    )
+    with pytest.raises(
+        validator.CandidateArtifactValidationError,
+        match="failed raw lifecycle drift",
+    ):
+        validator.validate_failure(args)
 
 
 def _initial_safety():
@@ -109,7 +210,7 @@ def test_independent_validator_closes_full_raw_and_ready_schemas():
         "outcome",
         "close_failures",
     }
-    assert validator.ACTION_PLAN["total_action_count"] == 122
+    assert validator.ACTION_PLAN["total_action_count"] == 127
 
 
 def test_validator_rehashes_every_launch_source_and_container():
@@ -136,6 +237,27 @@ def test_validator_rehashes_every_launch_source_and_container():
         assert token in source
 
 
+def test_failure_verifier_rehashes_context_and_rejects_promotion_artifacts():
+    source = (SCRIPTS / "validate_eef_pose_canary_controller_candidate.py").read_text()
+    function = source[source.index("def validate_failure(") :]
+    for token in (
+        "raw_identity = _immutable_file(args.raw_result)",
+        "candidate.validate_failure_payload(",
+        "require_complete_capture=True",
+        'args.raw_result.with_name(args.raw_result.name + ".ready.json")',
+        'f"candidate-{args.variant}.srun-status.json"',
+        'f"candidate-{args.variant}.attestation.json"',
+        '_validate_production_eval(context["production_eval"])',
+        "gate0._validate_arm_failure_runtime_evidence(",
+        "gate0.validate_gripper_tail(",
+        'target_slew.get("apply_calls") == counters["apply_calls"] - 1',
+        "expected_target_slew_profile=candidate.CANDIDATE_TARGET_SLEW_PROFILE",
+    ):
+        assert token in function
+    verifier = SCRIPTS / "verify_eef_pose_canary_controller_candidate_failure.py"
+    assert verifier.is_file()
+
+
 def test_offline_safety_consumer_closes_all_nested_schemas():
     safety = _initial_safety()
     kwargs = {
@@ -143,6 +265,9 @@ def test_offline_safety_consumer_closes_all_nested_schemas():
         "apply_calls": 0,
         "expect_closed_target": False,
         "expected_endpoint_change_count": 0,
+        "expected_gripper_target_slew_profile": (
+            validator.safety_validator.GRIPPER_TARGET_SLEW_PROFILE
+        ),
     }
     assert validator._validate_offline_safety(safety, **kwargs) is safety
     mutations = [
@@ -244,6 +369,9 @@ def test_offline_safety_matches_production_promotion_invariants():
         "apply_calls": 8,
         "expect_closed_target": False,
         "expected_endpoint_change_count": 0,
+        "expected_gripper_target_slew_profile": (
+            validator.safety_validator.GRIPPER_TARGET_SLEW_PROFILE
+        ),
     }
     assert validator._validate_offline_safety(safety, **kwargs) is safety
     mutations = [
@@ -358,3 +486,83 @@ def test_wrapper_hashes_image_before_srun_and_uses_isolated_cache():
     assert "trap cleanup_cache EXIT" in source
     assert "validate_eef_pose_canary_controller_candidate.py" in source
     assert '--expected-validator-sha256 "${CANDIDATE_VALIDATOR_SHA256}"' in source
+    assert (
+        '"${CANDIDATE_FAILURE_VERIFIER_SHA256:?required failure-verifier digest}"'
+        in source
+    )
+    verifier_hash = (
+        'sha256sum "${CANDIDATE_POLARIS_REPO}/scripts/'
+        'verify_eef_pose_canary_controller_candidate_failure.py"'
+    )
+    assert verifier_hash in source
+    handler_start = source.index("handle_failed_srun() {")
+    handler_end = source.index("\n}\n\nstarted_at_ns=", handler_start) + 2
+    failure_handler = source[handler_start:handler_end]
+    verifier_call = failure_handler.index(
+        "verify_eef_pose_canary_controller_candidate_failure.py"
+    )
+    failure_branch = source.index('if [[ "${srun_rc}" -ne 0 ]]')
+    status_call = source.index(
+        "write_eef_pose_canary_controller_candidate_srun_status.py",
+        failure_branch,
+    )
+    assert verifier_call >= 0
+    assert failure_branch < status_call
+    assert (
+        '--expected-failure-verifier-sha256 "${CANDIDATE_FAILURE_VERIFIER_SHA256}"'
+        in source
+    )
+    srun_rc_capture = source.index("srun_rc=$?")
+    success_set_e = source.index("set -e", failure_branch)
+    success_timestamp = source.index('returned_at_ns="$(date +%s%N)"', success_set_e)
+    assert srun_rc_capture < failure_branch < success_set_e < success_timestamp
+    assert source[srun_rc_capture:failure_branch].strip() == "srun_rc=$?"
+    assert 'handle_failed_srun "${srun_rc}"' in source[failure_branch:success_set_e]
+    assert 'exit "${original_srun_rc}"' in failure_handler
+    assert "failure_verify_rc=$?" in failure_handler
+
+
+def test_wrapper_failure_handler_attempts_all_diagnostics_and_preserves_srun_rc():
+    source = (SCRIPTS / "run_eef_pose_canary_controller_candidate_srun.sh").read_text()
+    handler_start = source.index("handle_failed_srun() {")
+    handler_end = source.index("\n}\n\nstarted_at_ns=", handler_start) + 2
+    handler = source[handler_start:handler_end]
+    digest = "a" * 64
+    shell = f"""
+set -uo pipefail
+set +e
+date() {{ return 31; }}
+chmod() {{ return 41; }}
+python3() {{ return 51; }}
+CANDIDATE_POLARIS_REPO=/repo
+CANDIDATE_VARIANT=official_lap3b
+CANDIDATE_LAUNCH_ID={digest}
+SLURM_JOB_ID=123
+raw_result=/output/raw.json
+CANDIDATE_POLARIS_COMMIT={"b" * 40}
+CANDIDATE_RUNNER_SHA256={digest}
+CANDIDATE_VALIDATOR_SHA256={digest}
+CANDIDATE_FAILURE_VERIFIER_SHA256={digest}
+CANDIDATE_SAFETY_VALIDATOR_SHA256={digest}
+CANDIDATE_GATE0_HELPER_SHA256={digest}
+CANDIDATE_FIXTURE_SHA256={digest}
+CANDIDATE_CONTAINER_IMAGE=/container.sqsh
+container_size_bytes=1234
+CANDIDATE_CONTAINER_SHA256={digest}
+stdout_log=/output/stdout.log
+stderr_log=/output/stderr.log
+{handler}
+handle_failed_srun 7
+"""
+    result = subprocess.run(
+        ["bash"],
+        input=shell,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 7
+    assert "failure timestamp failed rc=31" in result.stderr
+    assert "failure log chmod failed rc=41" in result.stderr
+    assert "failure verification failed rc=51" in result.stderr
+    assert "srun failed rc=7; returning original rc" in result.stderr

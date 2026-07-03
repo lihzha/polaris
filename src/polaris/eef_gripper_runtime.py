@@ -11,9 +11,11 @@ maximum-velocity setting is a hard bound on measured passive-joint velocity.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 import hashlib
 import math
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import numpy as np
@@ -77,6 +79,10 @@ GRIPPER_FOLLOWER_VELOCITY_LIMIT_FLOAT32 = 5.0
 EEF_GRIPPER_TARGET_SLEW_PROFILE = (
     "eef_binary_driver_target_slew_rate2p5_from_live_limit5_per_120hz_substep_v2"
 )
+EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE = (
+    "eef_binary_driver_target_slew_rate1p25_from_live_limit5_"
+    "per_120hz_substep_candidate_v1"
+)
 EEF_GRIPPER_TARGET_SLEW_ACTION_CLASS = "EefBinaryJointPositionTargetSlewAction"
 EEF_GRIPPER_TARGET_SLEW_RESET_PROFILE = (
     "first_apply_after_action_reset_anchor_live_driver_position_v1"
@@ -89,6 +95,14 @@ GRIPPER_TARGET_SLEW_RATE_RAD_S_FLOAT32 = float(
     np.multiply(
         np.float32(GRIPPER_DRIVER_VELOCITY_LIMIT_FLOAT32),
         np.float32(GRIPPER_TARGET_SLEW_RATE_FACTOR_FLOAT32),
+        dtype=np.float32,
+    )
+)
+GRIPPER_TARGET_SLEW_RATE_0P25_FACTOR_FLOAT32 = float(np.float32(0.25))
+GRIPPER_TARGET_SLEW_RATE_0P25_RAD_S_FLOAT32 = float(
+    np.multiply(
+        np.float32(GRIPPER_DRIVER_VELOCITY_LIMIT_FLOAT32),
+        np.float32(GRIPPER_TARGET_SLEW_RATE_0P25_FACTOR_FLOAT32),
         dtype=np.float32,
     )
 )
@@ -118,6 +132,202 @@ GRIPPER_MAX_TARGET_STEP_FLOAT32 = float(
         dtype=np.float32,
     )
 )
+GRIPPER_MAX_TARGET_STEP_0P25_FLOAT32 = float(
+    np.multiply(
+        np.float32(GRIPPER_TARGET_SLEW_RATE_0P25_RAD_S_FLOAT32),
+        np.float32(GRIPPER_TARGET_SLEW_PHYSICS_DT),
+        dtype=np.float32,
+    )
+)
+
+
+@dataclass(frozen=True)
+class _TargetSlewCloseSimulation:
+    endpoint_apply_count: int
+    limited_apply_count: int
+    nextafter_correction_count: int
+
+
+def _simulate_close_transition(
+    max_target_step_rad: float,
+) -> _TargetSlewCloseSimulation:
+    """Mirror the bounded production float32 transition through its endpoint."""
+
+    endpoint = np.float32(GRIPPER_CLOSED_TARGET_FLOAT32)
+    maximum_step = np.float32(max_target_step_rad)
+    previous = np.float32(GRIPPER_OPEN_TARGET_FLOAT32)
+    apply_count = 0
+    limited_count = 0
+    nextafter_count = 0
+    while previous != endpoint:
+        if apply_count >= 1024:
+            raise RuntimeError("EEF gripper close-transition simulation did not end")
+        delta = np.subtract(endpoint, previous, dtype=np.float32)
+        limited = bool(np.abs(delta) > maximum_step)
+        step = np.clip(delta, -maximum_step, maximum_step).astype(np.float32)
+        candidate = np.add(previous, step, dtype=np.float32)
+        next_target = candidate if limited else endpoint
+        applied_step = np.subtract(next_target, previous, dtype=np.float32)
+        if np.abs(applied_step) > maximum_step:
+            next_target = np.nextafter(
+                next_target,
+                previous,
+                dtype=np.float32,
+            )
+            nextafter_count += 1
+            applied_step = np.subtract(next_target, previous, dtype=np.float32)
+        if not (
+            np.isfinite(next_target)
+            and np.isfinite(applied_step)
+            and np.abs(applied_step) <= maximum_step
+            and previous <= next_target <= endpoint
+        ):
+            raise RuntimeError("EEF gripper close-transition simulation invariant")
+        previous = next_target
+        apply_count += 1
+        limited_count += int(limited)
+    return _TargetSlewCloseSimulation(
+        endpoint_apply_count=apply_count,
+        limited_apply_count=limited_count,
+        nextafter_correction_count=nextafter_count,
+    )
+
+
+GRIPPER_CLOSE_SETTLE_SUBSTEPS = 10
+_GRIPPER_CLOSE_TRANSITION = _simulate_close_transition(GRIPPER_MAX_TARGET_STEP_FLOAT32)
+_GRIPPER_CLOSE_TRANSITION_0P25 = _simulate_close_transition(
+    GRIPPER_MAX_TARGET_STEP_0P25_FLOAT32
+)
+GRIPPER_CLOSE_TRANSITION_APPLIES = _GRIPPER_CLOSE_TRANSITION.endpoint_apply_count
+GRIPPER_CLOSE_TRANSITION_0P25_APPLIES = (
+    _GRIPPER_CLOSE_TRANSITION_0P25.endpoint_apply_count
+)
+if _GRIPPER_CLOSE_TRANSITION != _TargetSlewCloseSimulation(38, 37, 15):
+    raise RuntimeError("Baseline EEF gripper close-transition count drift")
+if _GRIPPER_CLOSE_TRANSITION_0P25 != _TargetSlewCloseSimulation(76, 75, 41):
+    raise RuntimeError("Rate-0.25 EEF gripper close-transition count drift")
+
+
+@dataclass(frozen=True)
+class EefGripperTargetSlewProfileSpec:
+    """One closed, float32-derived EEF target-slew/interlock profile."""
+
+    profile: str
+    action_class: str
+    rate_factor_float32: float
+    rate_rad_s_float32: float
+    max_target_step_rad_float32: float
+    close_transition_applies: int
+    close_limited_applies: int
+    close_nextafter_corrections: int
+    close_interlock_profile: str
+    close_interlock_substeps: int
+
+
+def _target_slew_profile_spec(
+    *,
+    profile: str,
+    rate_factor_float32: float,
+    rate_rad_s_float32: float,
+    max_target_step_rad_float32: float,
+    close_transition_applies: int,
+    close_nextafter_corrections: int,
+) -> EefGripperTargetSlewProfileSpec:
+    close_interlock_substeps = close_transition_applies + GRIPPER_CLOSE_SETTLE_SUBSTEPS
+    return EefGripperTargetSlewProfileSpec(
+        profile=profile,
+        action_class=EEF_GRIPPER_TARGET_SLEW_ACTION_CLASS,
+        rate_factor_float32=rate_factor_float32,
+        rate_rad_s_float32=rate_rad_s_float32,
+        max_target_step_rad_float32=max_target_step_rad_float32,
+        close_transition_applies=close_transition_applies,
+        close_limited_applies=close_transition_applies - 1,
+        close_nextafter_corrections=close_nextafter_corrections,
+        close_interlock_profile=(
+            f"eef_gripper_close_hold_arm_{close_interlock_substeps}_physics_substeps_v1"
+        ),
+        close_interlock_substeps=close_interlock_substeps,
+    )
+
+
+_EEF_GRIPPER_TARGET_SLEW_PROFILES = MappingProxyType(
+    {
+        EEF_GRIPPER_TARGET_SLEW_PROFILE: _target_slew_profile_spec(
+            profile=EEF_GRIPPER_TARGET_SLEW_PROFILE,
+            rate_factor_float32=GRIPPER_TARGET_SLEW_RATE_FACTOR_FLOAT32,
+            rate_rad_s_float32=GRIPPER_TARGET_SLEW_RATE_RAD_S_FLOAT32,
+            max_target_step_rad_float32=GRIPPER_MAX_TARGET_STEP_FLOAT32,
+            close_transition_applies=GRIPPER_CLOSE_TRANSITION_APPLIES,
+            close_nextafter_corrections=(
+                _GRIPPER_CLOSE_TRANSITION.nextafter_correction_count
+            ),
+        ),
+        EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE: (
+            _target_slew_profile_spec(
+                profile=EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE,
+                rate_factor_float32=(GRIPPER_TARGET_SLEW_RATE_0P25_FACTOR_FLOAT32),
+                rate_rad_s_float32=GRIPPER_TARGET_SLEW_RATE_0P25_RAD_S_FLOAT32,
+                max_target_step_rad_float32=(GRIPPER_MAX_TARGET_STEP_0P25_FLOAT32),
+                close_transition_applies=(GRIPPER_CLOSE_TRANSITION_0P25_APPLIES),
+                close_nextafter_corrections=(
+                    _GRIPPER_CLOSE_TRANSITION_0P25.nextafter_correction_count
+                ),
+            )
+        ),
+    }
+)
+
+
+def eef_gripper_target_slew_profile(
+    profile: str,
+) -> EefGripperTargetSlewProfileSpec:
+    """Resolve one exact target-slew profile from the closed mapping."""
+
+    if type(profile) is not str or profile not in _EEF_GRIPPER_TARGET_SLEW_PROFILES:
+        raise ValueError(
+            f"Unknown PolaRiS EEF gripper target-slew profile: {profile!r}"
+        )
+    return _EEF_GRIPPER_TARGET_SLEW_PROFILES[profile]
+
+
+def select_eef_gripper_target_slew_profile(
+    *, enable_rate_0p25_candidate: bool
+) -> EefGripperTargetSlewProfileSpec:
+    """Select the baseline or the sole default-off rate candidate."""
+
+    if type(enable_rate_0p25_candidate) is not bool:
+        raise ValueError("EEF gripper rate-0.25 candidate flag must be bool")
+    profile = (
+        EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+        if enable_rate_0p25_candidate
+        else EEF_GRIPPER_TARGET_SLEW_PROFILE
+    )
+    return eef_gripper_target_slew_profile(profile)
+
+
+def validate_eef_gripper_close_arm_interlock_binding(
+    *,
+    target_slew_profile: str,
+    interlock_profile: str,
+    configured_substeps: int,
+) -> EefGripperTargetSlewProfileSpec:
+    """Bind one interlock duration to its exact installed target-slew profile."""
+
+    spec = eef_gripper_target_slew_profile(target_slew_profile)
+    if (
+        type(interlock_profile) is not str
+        or interlock_profile != spec.close_interlock_profile
+        or type(configured_substeps) is not int
+        or configured_substeps != spec.close_interlock_substeps
+    ):
+        raise ValueError(
+            "PolaRiS EEF gripper close-interlock/target-slew profile mismatch: "
+            f"target_slew={target_slew_profile!r}, "
+            f"interlock={interlock_profile!r}, substeps={configured_substeps!r}"
+        )
+    return spec
+
+
 EXPECTED_FULL_VELOCITY_LIMITS_BEFORE_WRITE = (
     *EXPECTED_ARM_VELOCITY_LIMITS_FLOAT32,
     GRIPPER_DRIVER_VELOCITY_LIMIT_FLOAT32,
@@ -662,17 +872,22 @@ def _capture_driver_actuator(robot: Any) -> dict[str, Any]:
     return fields
 
 
-def validate_eef_gripper_target_slew_static(value: Any) -> dict[str, Any]:
+def validate_eef_gripper_target_slew_static(
+    value: Any,
+    *,
+    expected_profile: str = EEF_GRIPPER_TARGET_SLEW_PROFILE,
+) -> dict[str, Any]:
     """Validate the closed EEF-only driver target-slew identity."""
 
+    profile = eef_gripper_target_slew_profile(expected_profile)
     _require(
         isinstance(value, dict) and set(value) == TARGET_SLEW_STATIC_FIELDS,
         "gripper target-slew static schema",
     )
     exact = {
-        "profile": EEF_GRIPPER_TARGET_SLEW_PROFILE,
+        "profile": profile.profile,
         "scope": "eef_pose_only_native_joint_position_unchanged_v1",
-        "action_class": EEF_GRIPPER_TARGET_SLEW_ACTION_CLASS,
+        "action_class": profile.action_class,
         "driver_joint_name": DRIVEN_GRIPPER_JOINT_NAME,
         "driver_joint_index": DRIVEN_GRIPPER_JOINT_INDEX,
         "endpoint_semantics_profile": GRIPPER_THRESHOLD_PROFILE,
@@ -693,11 +908,11 @@ def validate_eef_gripper_target_slew_static(value: Any) -> dict[str, Any]:
         "open_target_rad": GRIPPER_OPEN_TARGET_FLOAT32,
         "closed_target_rad": GRIPPER_CLOSED_TARGET_FLOAT32,
         "physical_velocity_limit_rad_s": GRIPPER_DRIVER_VELOCITY_LIMIT_FLOAT32,
-        "target_slew_rate_factor": GRIPPER_TARGET_SLEW_RATE_FACTOR_FLOAT32,
-        "target_slew_rate_rad_s": GRIPPER_TARGET_SLEW_RATE_RAD_S_FLOAT32,
+        "target_slew_rate_factor": profile.rate_factor_float32,
+        "target_slew_rate_rad_s": profile.rate_rad_s_float32,
         "physics_hz": GRIPPER_TARGET_SLEW_PHYSICS_HZ,
         "physics_dt": GRIPPER_TARGET_SLEW_PHYSICS_DT,
-        "max_target_step_rad": GRIPPER_MAX_TARGET_STEP_FLOAT32,
+        "max_target_step_rad": profile.max_target_step_rad_float32,
         "float32_tolerance_rad": GRIPPER_TARGET_SLEW_FLOAT32_TOLERANCE_RAD,
     }
     for field, expected in numeric.items():
@@ -750,15 +965,20 @@ def validate_eef_gripper_target_slew_static(value: Any) -> dict[str, Any]:
     return dict(value)
 
 
-def validate_eef_gripper_target_slew_dynamic(value: Any) -> dict[str, Any]:
+def validate_eef_gripper_target_slew_dynamic(
+    value: Any,
+    *,
+    expected_profile: str = EEF_GRIPPER_TARGET_SLEW_PROFILE,
+) -> dict[str, Any]:
     """Validate one reset-isolated target-slew counter/maximum report."""
 
+    profile = eef_gripper_target_slew_profile(expected_profile)
     _require(
         isinstance(value, dict) and set(value) == TARGET_SLEW_DYNAMIC_FIELDS,
         "gripper target-slew dynamic schema",
     )
     _require(
-        value.get("profile") == EEF_GRIPPER_TARGET_SLEW_PROFILE,
+        value.get("profile") == profile.profile,
         "gripper target-slew dynamic profile drift",
     )
     counter_fields = TARGET_SLEW_DYNAMIC_FIELDS - {
@@ -821,7 +1041,8 @@ def validate_eef_gripper_target_slew_dynamic(value: Any) -> dict[str, Any]:
         )
     _require(
         float(maxima["max_abs_target_step_rad"])
-        <= GRIPPER_MAX_TARGET_STEP_FLOAT32 + GRIPPER_TARGET_SLEW_FLOAT32_TOLERANCE_RAD,
+        <= profile.max_target_step_rad_float32
+        + GRIPPER_TARGET_SLEW_FLOAT32_TOLERANCE_RAD,
         "gripper target-slew maximum target step exceeds cap",
     )
     _require(
@@ -880,7 +1101,11 @@ def validate_eef_gripper_target_slew_dynamic(value: Any) -> dict[str, Any]:
     return dict(value)
 
 
-def validate_eef_gripper_static_contract(value: Any) -> dict[str, Any]:
+def validate_eef_gripper_static_contract(
+    value: Any,
+    *,
+    expected_target_slew_profile: str = EEF_GRIPPER_TARGET_SLEW_PROFILE,
+) -> dict[str, Any]:
     _require(
         isinstance(value, dict) and set(value) == STATIC_CONTRACT_FIELDS,
         "gripper static schema",
@@ -984,11 +1209,18 @@ def validate_eef_gripper_static_contract(value: Any) -> dict[str, Any]:
         ),
         "write changed a nonfollower or missed a follower",
     )
-    validate_eef_gripper_target_slew_static(value.get("driver_target_slew"))
+    validate_eef_gripper_target_slew_static(
+        value.get("driver_target_slew"),
+        expected_profile=expected_target_slew_profile,
+    )
     return dict(value)
 
 
-def validate_eef_gripper_dynamic_evidence(value: Any) -> dict[str, Any]:
+def validate_eef_gripper_dynamic_evidence(
+    value: Any,
+    *,
+    expected_target_slew_profile: str = EEF_GRIPPER_TARGET_SLEW_PROFILE,
+) -> dict[str, Any]:
     _require(
         isinstance(value, dict) and set(value) == DYNAMIC_EVIDENCE_FIELDS,
         "gripper dynamic schema",
@@ -999,7 +1231,10 @@ def validate_eef_gripper_dynamic_evidence(value: Any) -> dict[str, Any]:
         and value["joint_indices"] == list(GRIPPER_JOINT_INDICES),
         "gripper dynamic identity",
     )
-    validate_eef_gripper_target_slew_dynamic(value.get("driver_target_slew"))
+    validate_eef_gripper_target_slew_dynamic(
+        value.get("driver_target_slew"),
+        expected_profile=expected_target_slew_profile,
+    )
     for field in (
         "apply_entry_samples",
         "post_policy_step_samples",
@@ -1153,6 +1388,17 @@ def install_eef_gripper_runtime(env: Any, *, robot_usd_path: Path) -> dict[str, 
         callable(target_slew_reporter) and callable(target_slew_installer),
         "EEF finger action lacks target-slew runtime methods",
     )
+    target_slew_contract = target_slew_reporter()
+    _require(
+        isinstance(target_slew_contract, dict),
+        "EEF finger action returned no target-slew contract",
+    )
+    target_slew_profile = target_slew_contract.get("profile")
+    target_slew_spec = eef_gripper_target_slew_profile(target_slew_profile)
+    validate_eef_gripper_target_slew_static(
+        target_slew_contract,
+        expected_profile=target_slew_spec.profile,
+    )
     ownership = _validate_live_ownership(robot, arm_term, finger_term)
     driver = _capture_driver_actuator(robot)
     mimic = _capture_mimic_joint_contract(Path(robot_usd_path))
@@ -1212,10 +1458,13 @@ def install_eef_gripper_runtime(env: Any, *, robot_usd_path: Path) -> dict[str, 
             "articulation_indices": [0],
             "full_input": tensor_evidence(replacement),
         },
-        "driver_target_slew": target_slew_reporter(),
+        "driver_target_slew": target_slew_contract,
         "measured_velocity_is_hard_bounded_by_limit": False,
     }
-    contract = validate_eef_gripper_static_contract(contract)
+    contract = validate_eef_gripper_static_contract(
+        contract,
+        expected_target_slew_profile=target_slew_spec.profile,
+    )
     target_slew_installer(contract["driver_target_slew"])
     installer = getattr(arm_term, "install_gripper_runtime_contract", None)
     _require(
@@ -1230,7 +1479,14 @@ def validate_eef_gripper_post_reset(
 ) -> None:
     """Verify that a later reset retained the installed full PhysX tensor."""
 
-    validate_eef_gripper_static_contract(dict(expected_contract))
+    target_slew = expected_contract.get("driver_target_slew")
+    _require(isinstance(target_slew, Mapping), "missing expected target-slew profile")
+    target_slew_profile = target_slew.get("profile")
+    target_slew_spec = eef_gripper_target_slew_profile(target_slew_profile)
+    validate_eef_gripper_static_contract(
+        dict(expected_contract),
+        expected_target_slew_profile=target_slew_spec.profile,
+    )
     runtime = getattr(env, "unwrapped", env)
     robot = runtime.scene["robot"]
     current = tensor_evidence(
@@ -1256,7 +1512,10 @@ def validate_eef_gripper_post_reset(
         static_reporter() == expected_contract["driver_target_slew"],
         "post-reset gripper target-slew static drift",
     )
-    dynamic = validate_eef_gripper_target_slew_dynamic(dynamic_reporter())
+    dynamic = validate_eef_gripper_target_slew_dynamic(
+        dynamic_reporter(),
+        expected_profile=target_slew_spec.profile,
+    )
     _require(
         dynamic["process_action_calls"] == 0 and dynamic["apply_calls"] == 0,
         "post-reset gripper target-slew state was not cleared",
