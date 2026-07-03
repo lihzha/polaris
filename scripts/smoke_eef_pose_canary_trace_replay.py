@@ -643,9 +643,15 @@ def _validate_arm_failure_runtime_evidence(
         "arm failure ring is not full",
     )
     final = trace["entries"][-1]
+    expected_final_apply_index = (
+        expected_failure["policy_step"] * DECIMATION
+        + expected_failure["physics_substep"]
+        - 1
+    )
     _require(
-        final.get("policy_step") == expected_failure["policy_step"]
-        and final.get("physics_substep") == expected_failure["physics_substep"],
+        final.get("apply_index") == expected_final_apply_index
+        and final.get("policy_step") == expected_final_apply_index // DECIMATION
+        and final.get("physics_substep") == expected_final_apply_index % DECIMATION,
         "arm failure ring terminal cadence",
     )
     return dict(value)

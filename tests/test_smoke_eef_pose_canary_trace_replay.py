@@ -164,6 +164,93 @@ def test_failure_parser_pins_source_outcomes(
     assert replay.EXPECTED_FIXTURES[variant]["failure"]["evidence_sha256"] == digest
 
 
+@pytest.mark.parametrize("variant", sorted(replay.EXPECTED_FIXTURES))
+def test_arm_ring_ends_at_completed_apply_before_velocity_abort(
+    variant: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    failure = replay.EXPECTED_FIXTURES[variant]["failure"]
+    expected_apply_index = (
+        failure["policy_step"] * replay.DECIMATION + failure["physics_substep"] - 1
+    )
+
+    class BoundaryStub:
+        @staticmethod
+        def validate_failure_substep_trace(*_args: object, **_kwargs: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        replay,
+        "_load_boundary_helper",
+        lambda: (BoundaryStub(), {"sha256": "stub"}),
+    )
+    value = {
+        "policy_step": failure["policy_step"],
+        "controller_substep_trace_error": None,
+        "controller_substep_trace": {
+            "capacity": 64,
+            "entries": [
+                {
+                    "apply_index": expected_apply_index - 63 + offset,
+                    "policy_step": (expected_apply_index - 63 + offset)
+                    // replay.DECIMATION,
+                    "physics_substep": (expected_apply_index - 63 + offset)
+                    % replay.DECIMATION,
+                }
+                for offset in range(64)
+            ],
+        },
+    }
+    assert (
+        replay._validate_arm_failure_runtime_evidence(value, expected_failure=failure)
+        == value
+    )
+    assert value["controller_substep_trace"]["entries"][-1] == {
+        "apply_index": expected_apply_index,
+        "policy_step": expected_apply_index // replay.DECIMATION,
+        "physics_substep": expected_apply_index % replay.DECIMATION,
+    }
+
+
+def test_arm_ring_rejects_aborting_substep_as_completed_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    variant = "official_lap3b"
+    failure = replay.EXPECTED_FIXTURES[variant]["failure"]
+
+    class BoundaryStub:
+        @staticmethod
+        def validate_failure_substep_trace(*_args: object, **_kwargs: object) -> None:
+            return None
+
+    monkeypatch.setattr(
+        replay,
+        "_load_boundary_helper",
+        lambda: (BoundaryStub(), {"sha256": "stub"}),
+    )
+    abort_apply_index = (
+        failure["policy_step"] * replay.DECIMATION + failure["physics_substep"]
+    )
+    value = {
+        "policy_step": failure["policy_step"],
+        "controller_substep_trace_error": None,
+        "controller_substep_trace": {
+            "capacity": 64,
+            "entries": [
+                {
+                    "apply_index": abort_apply_index - 63 + offset,
+                    "policy_step": (abort_apply_index - 63 + offset)
+                    // replay.DECIMATION,
+                    "physics_substep": (abort_apply_index - 63 + offset)
+                    % replay.DECIMATION,
+                }
+                for offset in range(64)
+            ],
+        },
+    }
+    with pytest.raises(replay.Gate0ReplayValidationError, match="terminal cadence"):
+        replay._validate_arm_failure_runtime_evidence(value, expected_failure=failure)
+
+
 def test_slurm_lifecycle_requires_a_real_single_task_srun(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
