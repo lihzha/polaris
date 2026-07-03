@@ -42,6 +42,15 @@ def main(eval_args: EvalArgs):
         raise ValueError(
             "joint-velocity control mode is reserved for DroidJointVelocity"
         )
+    if eval_args.policy.client == "DroidJointVelocity" and (
+        not eval_args.runtime_contract_path
+        or not eval_args.lifecycle_ready_path
+        or not eval_args.policy.trace_path
+    ):
+        raise ValueError(
+            "DroidJointVelocity requires --runtime-contract-path and "
+            "--lifecycle-ready-path and --policy.trace-path"
+        )
     if eval_args.control_mode == "joint-velocity":
         if eval_args.expected_gripper_drive_profile != NATIVE_GRIPPER_DRIVE_PROFILE:
             raise ValueError("joint-velocity expected gripper drive profile mismatch")
@@ -75,6 +84,15 @@ def main(eval_args: EvalArgs):
         print_joint_velocity_runtime,
         validate_joint_velocity_runtime,
     )
+    from polaris.pi05_droid_native_eval_contract import (
+        PI05_DROID_NATIVE_EPISODE_STEPS,
+        configure_native_environment_timeout,
+        make_environment_runtime_contract,
+        make_close_ready_artifact,
+        make_runtime_artifact,
+        publish_immutable_json,
+        should_render_expensive,
+    )
     from polaris.utils import load_eval_initial_conditions
     from polaris.policy import InferenceClient
     from polaris.policy.droid_jointpos_client import (
@@ -92,6 +110,7 @@ def main(eval_args: EvalArgs):
         num_envs=1,
         use_fabric=True,
     )
+    configured_episode_length_seconds = None
     if eval_args.control_mode == "eef-pose":
         # Action managers are constructed by gym.make, so select the controller
         # on the config before creating the environment.
@@ -100,19 +119,29 @@ def main(eval_args: EvalArgs):
         env_cfg.scene.robot = NVIDIA_DROID_JOINT_VELOCITY.copy()
         env_cfg.actions = DroidJointVelocityActionCfg()
         env_cfg.observations = DroidJointVelocityObservationCfg()
+        configured_episode_length_seconds = configure_native_environment_timeout(
+            env_cfg
+        )
     elif eval_args.control_mode != "joint-position":
         raise ValueError(f"Unsupported control mode: {eval_args.control_mode}")
     env: ManagerBasedRLSplatEnv = gym.make(  # type: ignore[assignment]
         eval_args.environment, cfg=env_cfg
     )
+    runtime_artifact = None
+    environment_runtime_contract = None
     if eval_args.control_mode == "joint-velocity":
-        print_joint_velocity_runtime(
-            validate_joint_velocity_runtime(
-                env,
-                expected_gripper_drive_profile=(
-                    eval_args.expected_gripper_drive_profile
-                ),
-            )
+        environment_runtime_contract = make_environment_runtime_contract(
+            configured_episode_length_seconds=configured_episode_length_seconds,
+            live_max_episode_length=env.max_episode_length,
+        )
+        runtime_contract = validate_joint_velocity_runtime(
+            env,
+            expected_gripper_drive_profile=eval_args.expected_gripper_drive_profile,
+        )
+        print_joint_velocity_runtime(runtime_contract)
+        runtime_artifact = publish_immutable_json(
+            Path(eval_args.runtime_contract_path),
+            make_runtime_artifact(runtime_contract, environment_runtime_contract),
         )
 
     default_instruction, initial_conditions = load_eval_initial_conditions(
@@ -155,13 +184,22 @@ def main(eval_args: EvalArgs):
         return
 
     policy_client: InferenceClient = InferenceClient.get_client(eval_args.policy)
+    if eval_args.control_mode == "joint-velocity":
+        policy_client.bind_evaluation_runtime(environment_runtime_contract)
 
-    horizon = env.max_episode_length
+    horizon = (
+        PI05_DROID_NATIVE_EPISODE_STEPS
+        if eval_args.control_mode == "joint-velocity"
+        else env.max_episode_length
+    )
+    terminal_rollout = None
     while episode < rollouts:
         # Index the initial condition with the episode being started. The old
         # loop reset before incrementing ``episode``, repeating condition zero.
         obs, info = env.reset(object_positions=initial_conditions[episode])
         policy_client.reset()
+        if eval_args.control_mode == "joint-velocity":
+            policy_client.begin_rollout(env)
         video = []
         numerical_failure_reason = ""
         bar = tqdm.tqdm(total=horizon)
@@ -189,7 +227,11 @@ def main(eval_args: EvalArgs):
             try:
                 obs, rew, term, trunc, info = env.step(
                     torch.as_tensor(action, device=env.device).reshape(1, -1),
-                    expensive=policy_client.rerender,
+                    expensive=should_render_expensive(
+                        policy_client_name=eval_args.policy.client,
+                        render_every_step=eval_args.policy.render_every_step,
+                        needs_next_policy_render=policy_client.rerender,
+                    ),
                 )
             except (DifferentialIKNumericalError, torch.linalg.LinAlgError) as error:
                 numerical_failure_reason = f"{type(error).__name__}: {error}"
@@ -202,12 +244,23 @@ def main(eval_args: EvalArgs):
                 bar.update(1)
                 break
             if eval_args.control_mode == "joint-velocity":
-                policy_client.record_execution(obs, env)
+                policy_client.record_execution(
+                    obs,
+                    env,
+                    terminated=term,
+                    truncated=trunc,
+                )
             bar.update(1)
-            if term[0] or trunc[0]:
+            if eval_args.control_mode != "joint-velocity" and (term[0] or trunc[0]):
                 break
 
         episode_length = bar.n
+        if (
+            eval_args.control_mode == "joint-velocity"
+            and not numerical_failure_reason
+            and episode_length == PI05_DROID_NATIVE_EPISODE_STEPS
+        ):
+            terminal_rollout = policy_client.finish_rollout(env, info["rubric"])
         bar.close()
 
         if video:
@@ -223,10 +276,22 @@ def main(eval_args: EvalArgs):
             "episode": episode,
             "episode_length": episode_length,
             "success": (
-                False if numerical_failure_reason else info["rubric"]["success"]
+                False
+                if numerical_failure_reason
+                else (
+                    terminal_rollout["rubric"]["success"]
+                    if eval_args.control_mode == "joint-velocity"
+                    else info["rubric"]["success"]
+                )
             ),
             "progress": (
-                0.0 if numerical_failure_reason else info["rubric"]["progress"]
+                0.0
+                if numerical_failure_reason
+                else (
+                    terminal_rollout["rubric"]["progress"]
+                    if eval_args.control_mode == "joint-velocity"
+                    else info["rubric"]["progress"]
+                )
             ),
             "numerical_failure": bool(numerical_failure_reason),
             "numerical_failure_reason": numerical_failure_reason,
@@ -239,6 +304,26 @@ def main(eval_args: EvalArgs):
         episode += 1
 
     env.close()
+    if eval_args.control_mode == "joint-velocity":
+        if (
+            runtime_artifact is None
+            or environment_runtime_contract is None
+            or terminal_rollout is None
+            or not eval_args.policy.trace_path
+        ):
+            raise RuntimeError("Native joint-velocity close evidence is incomplete")
+        publish_immutable_json(
+            Path(eval_args.lifecycle_ready_path),
+            make_close_ready_artifact(
+                runtime_artifact=runtime_artifact,
+                runtime_path=Path(eval_args.runtime_contract_path),
+                metrics_path=csv_path,
+                trace_path=Path(eval_args.policy.trace_path),
+                video_path=run_folder / "episode_0.mp4",
+                environment_runtime_contract=environment_runtime_contract,
+                terminal_rollout=terminal_rollout,
+            ),
+        )
     simulation_app.close()
 
 

@@ -9,6 +9,89 @@ import logging
 import sys
 from pathlib import Path
 
+from polaris.pi05_droid_native_eval_contract import (
+    PI05_DROID_NATIVE_CANARY_PROFILE,
+    PI05_DROID_NATIVE_MODEL_EVAL_CONTRACT,
+    PI05_DROID_NATIVE_TRANSFORM_RUNTIME_CONTRACT,
+    publish_immutable_json,
+)
+
+
+def _class_path(value: object) -> str:
+    cls = type(value)
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def validate_official_pi05_data_config(data_config: object) -> dict[str, object]:
+    """Reject delta/absolute or joint-position transforms before weight load."""
+
+    data = getattr(data_config, "data_transforms", None)
+    model = getattr(data_config, "model_transforms", None)
+    repack = getattr(data_config, "repack_transforms", None)
+    if any(group is None for group in (data, model, repack)):
+        raise ValueError("pi05_droid transform groups are missing")
+
+    def paths(group: object, field: str) -> list[str]:
+        values = getattr(group, field, None)
+        if type(values) not in (list, tuple):
+            raise ValueError(f"pi05_droid transform group {field} is not a sequence")
+        return [_class_path(value) for value in values]
+
+    observed = {
+        "asset_id": getattr(data_config, "asset_id", None),
+        "use_quantile_norm": getattr(data_config, "use_quantile_norm", None),
+        "repack_inputs": paths(repack, "inputs"),
+        "repack_outputs": paths(repack, "outputs"),
+        "data_inputs": paths(data, "inputs"),
+        "data_outputs": paths(data, "outputs"),
+        "model_inputs": paths(model, "inputs"),
+        "model_outputs": paths(model, "outputs"),
+        "sequence_types": {
+            "repack_inputs": type(repack.inputs).__name__,
+            "repack_outputs": type(repack.outputs).__name__,
+            "data_inputs": type(data.inputs).__name__,
+            "data_outputs": type(data.outputs).__name__,
+            "model_inputs": type(model.inputs).__name__,
+            "model_outputs": type(model.outputs).__name__,
+        },
+    }
+    expected = {
+        key: PI05_DROID_NATIVE_TRANSFORM_RUNTIME_CONTRACT[key] for key in observed
+    }
+    if observed != expected:
+        raise ValueError(f"Official pi05_droid transform pipeline mismatch: {observed}")
+    data_input = data.inputs[0]
+    resize = model.inputs[1]
+    tokenizer = model.inputs[2]
+    padding = model.inputs[3]
+    if (
+        getattr(getattr(data_input, "model_type", None), "value", None) != "pi05"
+        or getattr(model.inputs[0], "prompt", "missing") is not None
+        or getattr(resize, "height", None) != 224
+        or getattr(resize, "width", None) != 224
+        or _class_path(getattr(tokenizer, "tokenizer", None))
+        != "openpi.models.tokenizer.PaligemmaTokenizer"
+        or getattr(tokenizer, "discrete_state_input", None) is not True
+        or getattr(padding, "model_action_dim", None) != 32
+    ):
+        raise ValueError("Official pi05_droid transform parameters mismatch")
+    report = {
+        **observed,
+        "droid_input_model_type": "pi05",
+        "resize": [224, 224],
+        "tokenizer": "openpi.models.tokenizer.PaligemmaTokenizer",
+        "discrete_state_input": True,
+        "model_action_dim": 32,
+        "forbidden_transforms_absent": [
+            "openpi.transforms.DeltaActions",
+            "openpi.transforms.AbsoluteActions",
+        ],
+        "output_projection": "DroidOutputs_leading8",
+    }
+    if report != PI05_DROID_NATIVE_TRANSFORM_RUNTIME_CONTRACT:
+        raise ValueError("Official pi05_droid full transform contract mismatch")
+    return report
+
 
 def _install_controlled_openpi_path(openpi_dir: Path) -> None:
     if any(
@@ -39,6 +122,7 @@ def main() -> None:
     parser.add_argument("--openpi-dir", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--serving-contract-output", type=Path, required=True)
+    parser.add_argument("--model-runtime-contract-output", type=Path, required=True)
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
@@ -99,6 +183,9 @@ def main() -> None:
             "Resolved OpenPI pi05_droid config mismatch: "
             f"expected {expected_static_contract}, got {static_contract}"
         )
+    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    transform_contract = validate_official_pi05_data_config(data_config)
+    logging.info("Verified pi05_droid transform contract: %s", transform_contract)
 
     logging.info("Verified checkpoint: %s", checkpoint_report)
     policy = policy_config.create_trained_policy(
@@ -133,6 +220,25 @@ def main() -> None:
         args.serving_contract_output, metadata
     )
     logging.info("Immutable serving contract: %s", contract_artifact)
+    model_runtime_artifact = publish_immutable_json(
+        args.model_runtime_contract_output,
+        {
+            "schema_version": 1,
+            "profile": PI05_DROID_NATIVE_CANARY_PROFILE,
+            "status": "pass",
+            "checkpoint": checkpoint_report,
+            "train_config": static_contract,
+            "transform_runtime": transform_contract,
+            "policy": {
+                "metadata": policy.metadata,
+                "sample_kwargs": policy._sample_kwargs,
+                "rng_key_data": jax.random.key_data(policy._rng).tolist(),
+            },
+            "official_model_eval_contract": PI05_DROID_NATIVE_MODEL_EVAL_CONTRACT,
+            "openpi_runtime_attestation": runtime_attestation,
+        },
+    )
+    logging.info("Immutable model runtime contract: %s", model_runtime_artifact)
 
     server = websocket_policy_server.WebsocketPolicyServer(
         policy=policy,
