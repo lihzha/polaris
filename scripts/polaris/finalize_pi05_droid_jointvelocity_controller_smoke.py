@@ -15,9 +15,19 @@ from pathlib import Path
 from typing import Any
 
 
-PROFILE = "pi05_droid_native_jointvelocity_l40s_controller_smoke_v1"
-SMOKE_PROFILE = "pi05_droid_native_jointvelocity_controller_smoke_v1"
+PROFILE = "pi05_droid_native_jointvelocity_l40s_controller_smoke_v2"
+SMOKE_PROFILE = "pi05_droid_native_jointvelocity_controller_smoke_v2"
 CONTROLLER_PROFILE = "openpi_pi05_droid_native_jointvelocity_v1"
+GRIPPER_DRIVE_PROFILE = (
+    "implicit_gripper_physx_velocity_limit5_cuda_actuator_cpu_static_physx_v1"
+)
+GRIPPER_VELOCITY_LIMIT = 5.0
+GRIPPER_EFFORT_LIMIT = 200.0
+GRIPPER_STIFFNESS = 5729.578125
+GRIPPER_DAMPING = 0.011459155939519405
+GRIPPER_PRECONDITION_STEPS = 5
+GRIPPER_PRECONDITION_POSITION_TOLERANCE = 0.02
+GRIPPER_MEASURED_VELOCITY_TOLERANCE = 0.001
 ISAACLAB_SOURCES = {
     "actions_cfg.py": "94722a5c0d6da3639b5507130d1ec2e7f62d7490e4625d4bf30ada8691ef63d4",
     "joint_actions.py": "1b3dcb55d969d886cee500e660f12331e49f8638fec98cde30d2b818a1ca1692",
@@ -27,7 +37,8 @@ ISAACLAB_SOURCES = {
     "articulation.py": "9cc03b85642c36c801ff9683e94b8ccc3fbef1178761338974b433dacc78ef75",
 }
 POLARIS_RUNTIME_SOURCES = {
-    "droid_cfg.py": "111c34d8d707f6edf31e9166c9aafd999ff3e7ea72344fc31fe5c9b8d6e175ee"
+    "droid_cfg.py": "111c34d8d707f6edf31e9166c9aafd999ff3e7ea72344fc31fe5c9b8d6e175ee",
+    "robot_cfg.py": "d514b32e07b54f98deb6d9dbc7a5201fff5337cdc4600d9351ee2a95e5c4c4c5",
 }
 JOINT_NAMES = [f"panda_joint{index}" for index in range(1, 8)]
 VELOCITY_LIMITS = [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61]
@@ -59,12 +70,14 @@ ASSETS = {
     },
 }
 SOURCE_PATHS = (
+    "scripts/eval.py",
     "scripts/smoke_joint_velocity_controller.py",
     "scripts/polaris/finalize_pi05_droid_jointvelocity_controller_smoke.py",
     "scripts/polaris/l40s_pi05_droid_jointvelocity_controller_smoke.sbatch",
     "scripts/polaris/submit_pi05_droid_jointvelocity_controller_smoke.sh",
     "src/polaris/environments/droid_cfg.py",
     "src/polaris/environments/robot_cfg.py",
+    "src/polaris/config.py",
     "src/polaris/joint_velocity_runtime.py",
     "src/polaris/joint_velocity_smoke.py",
     "src/polaris/pi05_droid_jointvelocity_contract.py",
@@ -448,6 +461,7 @@ def _validate_runtime(report: Any) -> dict[str, Any]:
         "closed_command",
         "raw_action",
         "processed_action",
+        "drive",
     }:
         raise ValueError("Runtime gripper schema mismatch")
     if gripper["action_class"] != (
@@ -480,6 +494,57 @@ def _validate_runtime(report: Any) -> dict[str, Any]:
             f"gripper {name}",
             device="cuda:0",
         )
+    gripper_drive = gripper["drive"]
+    if not isinstance(gripper_drive, dict) or set(gripper_drive) != {
+        "profile",
+        "configured",
+        "actuator",
+        "direct_physx",
+    }:
+        raise ValueError("Runtime gripper drive schema mismatch")
+    if gripper_drive["profile"] != GRIPPER_DRIVE_PROFILE:
+        raise ValueError("Runtime gripper drive profile mismatch")
+    expected_configured = {
+        "joint_names_expr": ["finger_joint"],
+        "stiffness": None,
+        "damping": None,
+        "effort_limit": GRIPPER_EFFORT_LIMIT,
+        "effort_limit_sim": GRIPPER_EFFORT_LIMIT,
+        "velocity_limit": GRIPPER_VELOCITY_LIMIT,
+        "velocity_limit_sim": GRIPPER_VELOCITY_LIMIT,
+    }
+    configured = gripper_drive["configured"]
+    if configured != expected_configured or any(
+        type(configured[key]) is not type(value)
+        for key, value in expected_configured.items()
+    ):
+        raise ValueError("Runtime configured gripper drive mismatch")
+    live_arrays = {
+        "stiffness": ((1, 1), [GRIPPER_STIFFNESS]),
+        "damping": ((1, 1), [GRIPPER_DAMPING]),
+        "effort_limit": ((1, 1), [GRIPPER_EFFORT_LIMIT]),
+        "velocity_limit": ((1, 1), [GRIPPER_VELOCITY_LIMIT]),
+    }
+    actuator_arrays = {
+        **live_arrays,
+        "effort_limit_sim": ((1, 1), [GRIPPER_EFFORT_LIMIT]),
+        "velocity_limit_sim": ((1, 1), [GRIPPER_VELOCITY_LIMIT]),
+    }
+    for surface, arrays, device in (
+        ("actuator", actuator_arrays, "cuda:0"),
+        ("direct_physx", live_arrays, "cpu"),
+    ):
+        surface_report = gripper_drive[surface]
+        if not isinstance(surface_report, dict) or set(surface_report) != set(arrays):
+            raise ValueError(f"Runtime gripper {surface} schema mismatch")
+        for name, (shape, values) in arrays.items():
+            _validate_array(
+                surface_report[name],
+                shape,
+                values,
+                f"gripper {surface} {name}",
+                device=device,
+            )
     return report
 
 
@@ -506,19 +571,25 @@ def _smoke_cases() -> list[dict[str, Any]]:
                 "label": "gripper_open",
                 "action": [0.0] * 8,
                 "kind": "gripper",
+                "precondition_finger_target": math.pi / 4.0,
                 "expected_finger_target": 0.0,
+                "expected_motion_sign": -1,
             },
             {
                 "label": "gripper_closed",
                 "action": [0.0] * 7 + [1.0],
                 "kind": "gripper",
+                "precondition_finger_target": 0.0,
                 "expected_finger_target": math.pi / 4.0,
+                "expected_motion_sign": 1,
             },
             {
                 "label": "gripper_boundary_0p5",
                 "action": [0.0] * 7 + [0.5],
                 "kind": "gripper",
+                "precondition_finger_target": math.pi / 4.0,
                 "expected_finger_target": 0.0,
+                "expected_motion_sign": -1,
                 "threshold_boundary": 0.5,
             },
             {
@@ -544,6 +615,8 @@ def _validate_smoke(payload: Any) -> dict[str, Any]:
         "environment",
         "command_magnitude",
         "settle_steps",
+        "expected_gripper_drive_profile",
+        "gripper_precondition_steps",
         "runtime_contract",
         "cases",
         "reset_probe",
@@ -561,6 +634,8 @@ def _validate_smoke(payload: Any) -> dict[str, Any]:
         "environment": "DROID-FoodBussing",
         "command_magnitude": 0.25,
         "settle_steps": 5,
+        "expected_gripper_drive_profile": GRIPPER_DRIVE_PROFILE,
+        "gripper_precondition_steps": GRIPPER_PRECONDITION_STEPS,
         "status": "pass",
         "case_count": 20,
     }
@@ -630,6 +705,11 @@ def _validate_smoke(payload: Any) -> dict[str, Any]:
         "soft_joint_position_limits",
         "finger_position_target",
         "processed_finger_position_target",
+        "finger_position_before",
+        "finger_velocity_before",
+        "finger_position_after",
+        "finger_velocity_after",
+        "finger_average_slew_rad_s",
         "terminated",
         "truncated",
     }
@@ -678,12 +758,63 @@ def _validate_smoke(payload: Any) -> dict[str, Any]:
                 value, expected_finger, rel_tol=0.0, abs_tol=1e-6
             ):
                 raise ValueError(f"Smoke case {index} {field} mismatch")
+        finger_position_before = _finite_vector(
+            [case["finger_position_before"]], 1, "finger position before"
+        )[0]
+        finger_velocity_before = _finite_vector(
+            [case["finger_velocity_before"]], 1, "finger velocity before"
+        )[0]
+        finger_position_after = _finite_vector(
+            [case["finger_position_after"]], 1, "finger position after"
+        )[0]
+        finger_velocity_after = _finite_vector(
+            [case["finger_velocity_after"]], 1, "finger velocity after"
+        )[0]
+        finger_average_slew = _finite_vector(
+            [case["finger_average_slew_rad_s"]], 1, "finger average slew"
+        )[0]
+        expected_average_slew = (finger_position_after - finger_position_before) * 15.0
+        if not math.isclose(
+            finger_average_slew,
+            expected_average_slew,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(f"Smoke case {index} finger slew mismatch")
+        if any(
+            abs(value) > GRIPPER_VELOCITY_LIMIT + GRIPPER_MEASURED_VELOCITY_TOLERANCE
+            for value in (
+                finger_velocity_before,
+                finger_velocity_after,
+                finger_average_slew,
+            )
+        ):
+            raise ValueError(f"Smoke case {index} gripper velocity limit exceeded")
+        if expected["kind"] == "gripper":
+            if not math.isclose(
+                finger_position_before,
+                expected["precondition_finger_target"],
+                rel_tol=0.0,
+                abs_tol=GRIPPER_PRECONDITION_POSITION_TOLERANCE,
+            ):
+                raise ValueError(f"Smoke case {index} gripper precondition mismatch")
+            motion_sign = expected["expected_motion_sign"]
+            if motion_sign * (finger_position_after - finger_position_before) <= 1e-4:
+                raise ValueError(f"Smoke case {index} gripper direction mismatch")
+            if motion_sign * finger_velocity_after <= 1e-4:
+                raise ValueError(
+                    f"Smoke case {index} gripper velocity direction mismatch"
+                )
     reset = payload["reset_probe"]
     if not isinstance(reset, dict) or set(reset) != {
         "default_joint_position",
         "joint_position",
         "joint_velocity",
         "joint_velocity_target",
+        "default_finger_position",
+        "finger_position",
+        "finger_velocity",
+        "finger_position_target",
     }:
         raise ValueError("Smoke reset schema mismatch")
     default = _finite_vector(reset["default_joint_position"], 7, "default q")
@@ -697,6 +828,22 @@ def _validate_smoke(payload: Any) -> dict[str, Any]:
         raise ValueError("Smoke reset position mismatch")
     if max(map(abs, reset_dq)) > 2e-2 or reset_target != [0.0] * 7:
         raise ValueError("Smoke reset velocity mismatch")
+    default_finger = _finite_vector(
+        [reset["default_finger_position"]], 1, "default finger"
+    )[0]
+    reset_finger = _finite_vector([reset["finger_position"]], 1, "reset finger")[0]
+    reset_finger_velocity = _finite_vector(
+        [reset["finger_velocity"]], 1, "reset finger velocity"
+    )[0]
+    reset_finger_target = _finite_vector(
+        [reset["finger_position_target"]], 1, "reset finger target"
+    )[0]
+    if (
+        abs(reset_finger - default_finger) > GRIPPER_PRECONDITION_POSITION_TOLERANCE
+        or abs(reset_finger_velocity) > GRIPPER_MEASURED_VELOCITY_TOLERANCE
+        or not math.isclose(reset_finger_target, 0.0, rel_tol=0.0, abs_tol=1e-6)
+    ):
+        raise ValueError("Smoke gripper reset mismatch")
     return payload
 
 
@@ -822,6 +969,8 @@ def _asset_provenance(data_dir: Path) -> dict[str, Any]:
 
 
 def _build_attestation(args: argparse.Namespace) -> dict[str, Any]:
+    if args.expected_gripper_drive_profile != GRIPPER_DRIVE_PROFILE:
+        raise ValueError("Expected gripper drive profile mismatch")
     if not (
         len(args.expected_polaris_commit) == 40
         and all(
@@ -849,6 +998,8 @@ def _build_attestation(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Completion filename does not bind job ID")
     smoke, smoke_bytes, smoke_stat = _read_canonical_json(smoke_path, "smoke artifact")
     _validate_smoke(smoke)
+    if smoke["expected_gripper_drive_profile"] != args.expected_gripper_drive_profile:
+        raise ValueError("Smoke does not bind expected gripper drive profile")
     expected_child_path = smoke_path.with_name(smoke_path.name + ".child-close.json")
     expected_ready_path = expected_child_path.with_name(
         expected_child_path.name + ".ready.json"
@@ -956,6 +1107,9 @@ def _build_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "status": "pass",
         "scope": "controller_only_no_model_or_checkpoint",
         "promotion": "forbidden_without_separate_checkpoint_canary",
+        "candidate_intent": {
+            "expected_gripper_drive_profile": args.expected_gripper_drive_profile,
+        },
         "slurm": {
             "job_id": args.job_id,
             "srun_exit_code": 0,
@@ -1075,6 +1229,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--saved-job-script", required=True)
     parser.add_argument("--polaris-repo", required=True)
     parser.add_argument("--expected-polaris-commit", required=True)
+    parser.add_argument("--expected-gripper-drive-profile", required=True)
     parser.add_argument("--container-image", required=True)
     parser.add_argument("--data-dir", required=True)
     args = parser.parse_args(argv)

@@ -15,6 +15,7 @@ set -Eeuo pipefail
 NFS_ROOT="${NFS_ROOT:-/lustre/fsw/portfolios/nvr/users/lzha}"
 : "${POLARIS_DIR:?Set POLARIS_DIR to the frozen committed PolaRiS worktree}"
 : "${EXPECTED_POLARIS_COMMIT:?Set EXPECTED_POLARIS_COMMIT to the frozen commit}"
+: "${EXPECTED_GRIPPER_DRIVE_PROFILE:?Set the expected native gripper drive profile}"
 : "${RUN_DIR:?Set RUN_DIR to one fresh controller-smoke result directory}"
 
 POLARIS_DATA_DIR="${POLARIS_DATA_DIR:-${NFS_ROOT}/data/PolaRiS-Hub}"
@@ -23,6 +24,7 @@ POLARIS_VULKAN_ICD_PATH="${POLARIS_VULKAN_ICD_PATH:-/usr/share/vulkan/icd.d/nvid
 POLARIS_CACHE_DIR="${POLARIS_CACHE_DIR:-${NFS_ROOT}/cache/polaris/runtime/jointvelocity-smoke-${SLURM_JOB_ID}}"
 EXPECTED_IMAGE_SHA256=ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d556b324a
 EXPECTED_HUB_REVISION=8c7e4103e266ef83d8b1ad2e9a63116edd5f155b
+GRIPPER_DRIVE_PROFILE=implicit_gripper_physx_velocity_limit5_cuda_actuator_cpu_static_physx_v1
 SMOKE_ARTIFACT="${RUN_DIR}/joint-velocity-smoke-${SLURM_JOB_ID}.json"
 COMPLETION="${RUN_DIR}/controller-smoke-${SLURM_JOB_ID}.completion.json"
 SRUN_STATUS="${RUN_DIR}/srun-${SLURM_JOB_ID}.status.json"
@@ -50,6 +52,8 @@ require_normalized_absolute_path() {
 
 [[ "${EXPECTED_POLARIS_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
   || die "EXPECTED_POLARIS_COMMIT must be a full lowercase commit"
+[[ "${EXPECTED_GRIPPER_DRIVE_PROFILE}" == "${GRIPPER_DRIVE_PROFILE}" ]] \
+  || die "EXPECTED_GRIPPER_DRIVE_PROFILE mismatch"
 require_normalized_absolute_path POLARIS_DIR "${POLARIS_DIR}"
 for path_contract in \
   "NFS_ROOT=${NFS_ROOT}" \
@@ -177,6 +181,7 @@ srun \
       --environment DROID-FoodBussing \
       --command-magnitude 0.25 \
       --settle-steps 5 \
+      --expected-gripper-drive-profile "${EXPECTED_GRIPPER_DRIVE_PROFILE}" \
       --device cuda:0 \
       --headless \
       --output-json "${SMOKE_ARTIFACT}"
@@ -223,6 +228,7 @@ PY
   --saved-job-script "${SAVED_JOB_SCRIPT}" \
   --polaris-repo "${POLARIS_DIR}" \
   --expected-polaris-commit "${EXPECTED_POLARIS_COMMIT}" \
+  --expected-gripper-drive-profile "${EXPECTED_GRIPPER_DRIVE_PROFILE}" \
   --container-image "${POLARIS_PYXIS_IMAGE}" \
   --data-dir "${POLARIS_DATA_DIR}"
 

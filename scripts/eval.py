@@ -16,6 +16,10 @@ from polaris.config import EvalArgs
 
 
 def main(eval_args: EvalArgs):
+    from polaris.pi05_droid_jointvelocity_contract import (
+        NATIVE_GRIPPER_DRIVE_PROFILE,
+    )
+
     if (
         eval_args.policy.client == "EgoLAPEefPose"
         and eval_args.control_mode != "eef-pose"
@@ -37,6 +41,13 @@ def main(eval_args: EvalArgs):
     ):
         raise ValueError(
             "joint-velocity control mode is reserved for DroidJointVelocity"
+        )
+    if eval_args.control_mode == "joint-velocity":
+        if eval_args.expected_gripper_drive_profile != NATIVE_GRIPPER_DRIVE_PROFILE:
+            raise ValueError("joint-velocity expected gripper drive profile mismatch")
+    elif eval_args.expected_gripper_drive_profile is not None:
+        raise ValueError(
+            "expected gripper drive profile is valid only for joint-velocity control"
         )
 
     # This must be done before importing anything from IsaacLab
@@ -95,7 +106,14 @@ def main(eval_args: EvalArgs):
         eval_args.environment, cfg=env_cfg
     )
     if eval_args.control_mode == "joint-velocity":
-        print_joint_velocity_runtime(validate_joint_velocity_runtime(env))
+        print_joint_velocity_runtime(
+            validate_joint_velocity_runtime(
+                env,
+                expected_gripper_drive_profile=(
+                    eval_args.expected_gripper_drive_profile
+                ),
+            )
+        )
 
     default_instruction, initial_conditions = load_eval_initial_conditions(
         usd=env.usd_file,

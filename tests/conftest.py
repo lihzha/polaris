@@ -9,6 +9,12 @@ from polaris.joint_velocity_smoke import (
     build_joint_velocity_smoke_cases,
 )
 from polaris.pi05_droid_jointvelocity_contract import (
+    NATIVE_GRIPPER_DAMPING,
+    NATIVE_GRIPPER_DRIVE_PROFILE,
+    NATIVE_GRIPPER_EFFORT_LIMIT,
+    NATIVE_GRIPPER_PRECONDITION_STEPS,
+    NATIVE_GRIPPER_STIFFNESS,
+    NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
     PANDA_ARM_EFFORT_LIMITS,
     PANDA_ARM_JOINT_NAMES,
     PANDA_ARM_VELOCITY_LIMITS,
@@ -42,6 +48,12 @@ def make_joint_velocity_runtime_report():
     direct_drive = {
         name: {**copy.deepcopy(value), "device": "cpu"}
         for name, value in buffered_drive.items()
+    }
+    gripper_live = {
+        "stiffness": _array_report([[NATIVE_GRIPPER_STIFFNESS]]),
+        "damping": _array_report([[NATIVE_GRIPPER_DAMPING]]),
+        "effort_limit": _array_report([[NATIVE_GRIPPER_EFFORT_LIMIT]]),
+        "velocity_limit": _array_report([[NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S]]),
     }
     report = {
         "schema_version": 1,
@@ -89,6 +101,29 @@ def make_joint_velocity_runtime_report():
             ),
             "raw_action": _array_report(np.zeros((1, 1), dtype=np.float32)),
             "processed_action": _array_report(np.zeros((1, 1), dtype=np.float32)),
+            "drive": {
+                "profile": NATIVE_GRIPPER_DRIVE_PROFILE,
+                "configured": {
+                    "joint_names_expr": ["finger_joint"],
+                    "stiffness": None,
+                    "damping": None,
+                    "effort_limit": NATIVE_GRIPPER_EFFORT_LIMIT,
+                    "effort_limit_sim": NATIVE_GRIPPER_EFFORT_LIMIT,
+                    "velocity_limit": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+                    "velocity_limit_sim": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+                },
+                "actuator": {
+                    **copy.deepcopy(gripper_live),
+                    "effort_limit_sim": _array_report([[NATIVE_GRIPPER_EFFORT_LIMIT]]),
+                    "velocity_limit_sim": _array_report(
+                        [[NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S]]
+                    ),
+                },
+                "direct_physx": {
+                    name: {**copy.deepcopy(value), "device": "cpu"}
+                    for name, value in gripper_live.items()
+                },
+            },
         },
     }
     report["runtime_sha256"] = runtime._canonical_sha256(report)
@@ -101,6 +136,14 @@ def make_joint_velocity_smoke_payload():
     for case in build_joint_velocity_smoke_cases(command_magnitude):
         action = case["action"]
         expected_finger = float(np.float32(np.pi / 4.0)) if action[7] > 0.5 else 0.0
+        if case["kind"] == "gripper":
+            finger_before = float(np.float32(case["precondition_finger_target"]))
+            finger_after = finger_before + 0.1 * case["expected_motion_sign"]
+            finger_velocity_after = 1.0 * case["expected_motion_sign"]
+        else:
+            finger_before = 0.0
+            finger_after = 0.0
+            finger_velocity_after = 0.0
         cases.append(
             {
                 **case,
@@ -113,6 +156,11 @@ def make_joint_velocity_smoke_payload():
                 "soft_joint_position_limits": [[-3.0, 3.0] for _ in range(7)],
                 "finger_position_target": expected_finger,
                 "processed_finger_position_target": expected_finger,
+                "finger_position_before": finger_before,
+                "finger_velocity_before": 0.0,
+                "finger_position_after": finger_after,
+                "finger_velocity_after": finger_velocity_after,
+                "finger_average_slew_rad_s": ((finger_after - finger_before) * 15.0),
                 "terminated": False,
                 "truncated": False,
             }
@@ -124,6 +172,8 @@ def make_joint_velocity_smoke_payload():
         "environment": "DROID-FoodBussing",
         "command_magnitude": command_magnitude,
         "settle_steps": 5,
+        "expected_gripper_drive_profile": NATIVE_GRIPPER_DRIVE_PROFILE,
+        "gripper_precondition_steps": NATIVE_GRIPPER_PRECONDITION_STEPS,
         "runtime_contract": make_joint_velocity_runtime_report(),
         "cases": cases,
         "reset_probe": {
@@ -131,6 +181,10 @@ def make_joint_velocity_smoke_payload():
             "joint_position": [0.0] * 7,
             "joint_velocity": [0.0] * 7,
             "joint_velocity_target": [0.0] * 7,
+            "default_finger_position": 0.0,
+            "finger_position": 0.0,
+            "finger_velocity": 0.0,
+            "finger_position_target": 0.0,
         },
         "lifecycle": {
             "env_close": "complete",

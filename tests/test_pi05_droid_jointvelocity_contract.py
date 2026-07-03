@@ -1,15 +1,20 @@
 import copy
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
 from polaris.pi05_droid_jointvelocity_contract import (
+    NATIVE_GRIPPER_DRIVE_PROFILE,
+    NATIVE_GRIPPER_EFFORT_LIMIT,
+    NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
     PI05_DROID_CHECKPOINT_MANIFEST_SHA256,
     PI05_DROID_CONTRACT_FILENAME,
     PI05_DROID_CONTRACT_METADATA_KEY,
     PI05_DROID_JOINTVELOCITY_PROFILE,
     PI05_DROID_OPENPI_INFERENCE_COMPATIBILITY_COMMIT,
+    PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256,
     attest_imported_openpi_modules,
     contract_sha256,
     expected_pi05_droid_jointvelocity_contract,
@@ -60,8 +65,67 @@ def test_exact_contract_binds_checkpoint_norm_openpi_action_and_control():
     assert contract["policy_output"]["execute_first"] == 8
     assert contract["control"]["position_integration"] == "forbidden"
     assert contract["control"]["velocity_drive"]["position_stiffness"] == 0.0
+    assert contract["control"]["gripper_drive"]["profile"] == (
+        NATIVE_GRIPPER_DRIVE_PROFILE
+    )
+    assert (
+        contract["control"]["gripper_drive"]["configured"]["velocity_limit_sim"]
+        == NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S
+    )
+    assert (
+        contract["control"]["gripper_drive"]["configured"]["effort_limit_sim"]
+        == NATIVE_GRIPPER_EFFORT_LIMIT
+    )
+    assert contract["control"]["gripper_drive"]["live"] == {
+        "actuator_cuda": {
+            "device": "cuda:0",
+            "dtype": "torch.float32",
+            "shape": [1, 1],
+            "stiffness": 5729.578125,
+            "damping": 0.011459155939519405,
+            "effort_limit": NATIVE_GRIPPER_EFFORT_LIMIT,
+            "effort_limit_sim": NATIVE_GRIPPER_EFFORT_LIMIT,
+            "velocity_limit": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+            "velocity_limit_sim": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+        },
+        "direct_physx_cpu": {
+            "device": "cpu",
+            "dtype": "torch.float32",
+            "shape": [1, 1],
+            "stiffness": 5729.578125,
+            "damping": 0.011459155939519405,
+            "effort_limit": NATIVE_GRIPPER_EFFORT_LIMIT,
+            "velocity_limit": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+        },
+    }
     assert contract["artifact"]["filename"] == PI05_DROID_CONTRACT_FILENAME
     assert contract["contract_sha256"] == contract_sha256(contract)
+
+
+def test_eval_profile_intent_is_required_only_for_native_jointvelocity():
+    from polaris.config import EvalArgs, PolicyArgs
+
+    joint_position = EvalArgs(
+        policy=PolicyArgs(), environment="DROID-FoodBussing", run_folder="unused"
+    )
+    assert joint_position.control_mode == "joint-position"
+    assert joint_position.expected_gripper_drive_profile is None
+
+    eval_source = (ROOT / "scripts/eval.py").read_text(encoding="utf-8")
+    assert "joint-velocity expected gripper drive profile mismatch" in eval_source
+    assert (
+        "expected gripper drive profile is valid only for joint-velocity control"
+        in eval_source
+    )
+
+
+def test_polaris_runtime_source_manifest_matches_the_exact_local_sources():
+    source_root = ROOT / "src/polaris/environments"
+    actual = {
+        filename: hashlib.sha256((source_root / filename).read_bytes()).hexdigest()
+        for filename in PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256
+    }
+    assert actual == PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256
 
 
 def test_server_metadata_rejects_contract_attestation_and_top_level_tampering():

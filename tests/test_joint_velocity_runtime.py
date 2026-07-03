@@ -6,6 +6,11 @@ import torch
 
 import polaris.joint_velocity_runtime as runtime
 from polaris.pi05_droid_jointvelocity_contract import (
+    NATIVE_GRIPPER_DAMPING,
+    NATIVE_GRIPPER_DRIVE_PROFILE,
+    NATIVE_GRIPPER_EFFORT_LIMIT,
+    NATIVE_GRIPPER_STIFFNESS,
+    NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
     PANDA_ARM_EFFORT_LIMITS,
     PANDA_ARM_JOINT_NAMES,
     PANDA_ARM_VELOCITY_LIMITS,
@@ -77,10 +82,17 @@ class _View:
 
 class _Robot:
     def __init__(self):
-        stiffness = torch.zeros((1, 7), dtype=torch.float32)
-        damping = torch.full((1, 7), 80.0, dtype=torch.float32)
-        effort = torch.tensor([PANDA_ARM_EFFORT_LIMITS], dtype=torch.float32)
-        velocity = torch.tensor([PANDA_ARM_VELOCITY_LIMITS], dtype=torch.float32)
+        stiffness = torch.zeros((1, 13), dtype=torch.float32)
+        stiffness[:, 7] = NATIVE_GRIPPER_STIFFNESS
+        damping = torch.zeros((1, 13), dtype=torch.float32)
+        damping[:, :7] = 80.0
+        damping[:, 7] = NATIVE_GRIPPER_DAMPING
+        effort = torch.zeros((1, 13), dtype=torch.float32)
+        effort[:, :7] = torch.tensor(PANDA_ARM_EFFORT_LIMITS)
+        effort[:, 7] = NATIVE_GRIPPER_EFFORT_LIMIT
+        velocity = torch.zeros((1, 13), dtype=torch.float32)
+        velocity[:, :7] = torch.tensor(PANDA_ARM_VELOCITY_LIMITS)
+        velocity[:, 7] = NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S
         self.data = SimpleNamespace(
             joint_stiffness=_DeviceTensor(stiffness, device="cuda:0"),
             joint_damping=_DeviceTensor(damping, device="cuda:0"),
@@ -93,14 +105,47 @@ class _Robot:
             _DeviceTensor(effort, device="cpu"),
             _DeviceTensor(velocity, device="cpu"),
         )
+        gripper_cfg = SimpleNamespace(
+            joint_names_expr=["finger_joint"],
+            stiffness=None,
+            damping=None,
+            effort_limit=NATIVE_GRIPPER_EFFORT_LIMIT,
+            effort_limit_sim=NATIVE_GRIPPER_EFFORT_LIMIT,
+            velocity_limit=NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+            velocity_limit_sim=NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+        )
+        gripper = ImplicitActuator()
+        gripper.cfg = gripper_cfg
+        gripper.stiffness = _DeviceTensor([[NATIVE_GRIPPER_STIFFNESS]], device="cuda:0")
+        gripper.damping = _DeviceTensor([[NATIVE_GRIPPER_DAMPING]], device="cuda:0")
+        gripper.effort_limit = _DeviceTensor(
+            [[NATIVE_GRIPPER_EFFORT_LIMIT]], device="cuda:0"
+        )
+        gripper.effort_limit_sim = _DeviceTensor(
+            [[NATIVE_GRIPPER_EFFORT_LIMIT]], device="cuda:0"
+        )
+        gripper.velocity_limit = _DeviceTensor(
+            [[NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S]], device="cuda:0"
+        )
+        gripper.velocity_limit_sim = _DeviceTensor(
+            [[NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S]], device="cuda:0"
+        )
         self.actuators = {
             "panda_shoulder": ImplicitActuator(),
             "panda_forearm": ImplicitActuator(),
+            "gripper": gripper,
         }
-        self.cfg = SimpleNamespace(actuators={"panda_shoulder": SimpleNamespace()})
+        self.cfg = SimpleNamespace(
+            actuators={
+                "panda_shoulder": SimpleNamespace(),
+                "gripper": gripper_cfg,
+            }
+        )
 
     def find_joints(self, names, preserve_order=False):
         assert preserve_order is True
+        if names == ["finger_joint"]:
+            return [7], ["finger_joint"]
         return list(range(7)), list(names)
 
 
@@ -159,9 +204,15 @@ def _stub_isaaclab(monkeypatch):
     )
 
 
+def _validate(env):
+    return runtime.validate_joint_velocity_runtime(
+        env, expected_gripper_drive_profile=NATIVE_GRIPPER_DRIVE_PROFILE
+    )
+
+
 def test_runtime_binds_action_class_order_affine_and_direct_physx_drive(monkeypatch):
     _stub_isaaclab(monkeypatch)
-    report = runtime.validate_joint_velocity_runtime(_Env())
+    report = _validate(_Env())
 
     assert report["status"] == "pass"
     assert report["profile"] == PI05_DROID_JOINTVELOCITY_PROFILE
@@ -175,6 +226,23 @@ def test_runtime_binds_action_class_order_affine_and_direct_physx_drive(monkeypa
     assert report["velocity_drive"]["direct_physx"]["stiffness"]["device"] == "cpu"
     assert report["gripper"]["open_command"]["shape"] == [1]
     assert report["gripper"]["raw_action"]["shape"] == [1, 1]
+    assert report["gripper"]["drive"]["profile"] == NATIVE_GRIPPER_DRIVE_PROFILE
+    assert report["gripper"]["drive"]["configured"] == {
+        "joint_names_expr": ["finger_joint"],
+        "stiffness": None,
+        "damping": None,
+        "effort_limit": NATIVE_GRIPPER_EFFORT_LIMIT,
+        "effort_limit_sim": NATIVE_GRIPPER_EFFORT_LIMIT,
+        "velocity_limit": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+        "velocity_limit_sim": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+    }
+    assert (
+        report["gripper"]["drive"]["actuator"]["velocity_limit_sim"]["device"]
+        == "cuda:0"
+    )
+    assert (
+        report["gripper"]["drive"]["direct_physx"]["velocity_limit"]["device"] == "cpu"
+    )
     assert report["isaaclab_version"] == "2.3.0"
     assert report["isaaclab_source_sha256"] == PI05_DROID_ISAACLAB_SOURCE_SHA256
     assert (
@@ -190,18 +258,73 @@ def test_runtime_rejects_position_stiffness_and_wrong_action_type(monkeypatch):
     env = _Env()
     env.scene["robot"].data.joint_stiffness[0, 0] = 400.0
     with pytest.raises(ValueError, match="buffered joint stiffness"):
-        runtime.validate_joint_velocity_runtime(env)
+        _validate(env)
 
     env = _Env()
     env.action_manager._terms["arm"] = SimpleNamespace()
     with pytest.raises(ValueError, match="must be Isaac Lab JointVelocityAction"):
-        runtime.validate_joint_velocity_runtime(env)
+        _validate(env)
 
 
 def test_runtime_rejects_unpinned_isaaclab(monkeypatch):
     monkeypatch.setattr(runtime, "_installed_isaaclab_version", lambda: "2.3.1")
     with pytest.raises(ValueError, match="requires Isaac Lab 2.3.0"):
+        _validate(_Env())
+
+
+def test_runtime_requires_independent_gripper_candidate_intent(monkeypatch):
+    _stub_isaaclab(monkeypatch)
+    with pytest.raises(TypeError, match="expected_gripper_drive_profile"):
         runtime.validate_joint_velocity_runtime(_Env())
+    with pytest.raises(ValueError, match="Expected native gripper drive profile"):
+        runtime.validate_joint_velocity_runtime(
+            _Env(), expected_gripper_drive_profile="legacy_ignored_velocity_limit"
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (
+            lambda env: setattr(
+                env.scene["robot"].cfg.actuators["gripper"],
+                "velocity_limit_sim",
+                None,
+            ),
+            "Configured native gripper drive mismatch",
+        ),
+        (
+            lambda env: (
+                env.scene["robot"]
+                .actuators["gripper"]
+                .velocity_limit_sim.__setitem__((0, 0), 4.0)
+            ),
+            "gripper actuator simulation velocity limit mismatch",
+        ),
+        (
+            lambda env: setattr(
+                env.scene["robot"].actuators["gripper"].effort_limit,
+                "device",
+                "cpu",
+            ),
+            "gripper actuator effort limit must be on cuda:0",
+        ),
+        (
+            lambda env: env.scene["robot"].root_physx_view.velocity.__setitem__(
+                (0, 7), 4.0
+            ),
+            "direct PhysX gripper velocity limit mismatch",
+        ),
+    ],
+)
+def test_runtime_rejects_configured_actuator_and_direct_gripper_drift(
+    monkeypatch, mutate, message
+):
+    _stub_isaaclab(monkeypatch)
+    env = _Env()
+    mutate(env)
+    with pytest.raises(ValueError, match=message):
+        _validate(env)
 
 
 @pytest.mark.parametrize(
@@ -242,14 +365,14 @@ def test_live_runtime_rejects_field_specific_device_mismatch(
     env = _Env()
     mutate(env)
     with pytest.raises(ValueError, match=message):
-        runtime.validate_joint_velocity_runtime(env)
+        _validate(env)
 
 
 def test_runtime_report_recomputes_full_contract_and_rejects_minimal_report(
     monkeypatch,
 ):
     _stub_isaaclab(monkeypatch)
-    report = runtime.validate_joint_velocity_runtime(_Env())
+    report = _validate(_Env())
     report["velocity_drive"]["direct_physx"]["damping"]["values"][0][0] = 79.0
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
         runtime.validate_joint_velocity_runtime_report(report)
@@ -271,7 +394,7 @@ def test_runtime_report_rejects_field_specific_drive_devices(
     monkeypatch, surface, field, wrong_device, message
 ):
     _stub_isaaclab(monkeypatch)
-    report = runtime.validate_joint_velocity_runtime(_Env())
+    report = _validate(_Env())
     report["velocity_drive"][surface][field]["device"] = wrong_device
     report["runtime_sha256"] = runtime._canonical_sha256(
         {key: value for key, value in report.items() if key != "runtime_sha256"}
@@ -296,17 +419,25 @@ def test_runtime_report_rejects_field_specific_drive_devices(
             ("gripper", "processed_action"),
             "gripper processed_action report must attest device cuda:0",
         ),
+        (
+            ("gripper", "drive", "actuator", "velocity_limit_sim"),
+            "gripper actuator velocity_limit_sim report must attest device cuda:0",
+        ),
+        (
+            ("gripper", "drive", "direct_physx", "effort_limit"),
+            "gripper direct_physx effort_limit report must attest device cpu",
+        ),
     ],
 )
 def test_runtime_report_rejects_cpu_action_and_gripper_tensors(
     monkeypatch, path, message
 ):
     _stub_isaaclab(monkeypatch)
-    report = runtime.validate_joint_velocity_runtime(_Env())
+    report = _validate(_Env())
     target = report
     for key in path:
         target = target[key]
-    target["device"] = "cpu"
+    target["device"] = "cuda:0" if target["device"] == "cpu" else "cpu"
     report["runtime_sha256"] = runtime._canonical_sha256(
         {key: value for key, value in report.items() if key != "runtime_sha256"}
     )

@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from polaris.pi05_droid_jointvelocity_contract import (
+    NATIVE_GRIPPER_DRIVE_PROFILE,
+    NATIVE_GRIPPER_MEASURED_VELOCITY_TOLERANCE,
+    NATIVE_GRIPPER_PRECONDITION_POSITION_TOLERANCE,
+    NATIVE_GRIPPER_PRECONDITION_STEPS,
+    NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
     PANDA_ARM_JOINT_NAMES,
     PANDA_ARM_VELOCITY_LIMITS,
     PI05_DROID_JOINTVELOCITY_PROFILE,
@@ -19,7 +24,7 @@ from polaris.pi05_droid_jointvelocity_contract import (
 from polaris.joint_velocity_runtime import validate_joint_velocity_runtime_report
 
 
-SMOKE_PROFILE = "pi05_droid_native_jointvelocity_controller_smoke_v1"
+SMOKE_PROFILE = "pi05_droid_native_jointvelocity_controller_smoke_v2"
 
 
 def build_joint_velocity_smoke_cases(
@@ -51,19 +56,25 @@ def build_joint_velocity_smoke_cases(
                 "label": "gripper_open",
                 "action": [0.0] * 8,
                 "kind": "gripper",
+                "precondition_finger_target": math.pi / 4.0,
                 "expected_finger_target": 0.0,
+                "expected_motion_sign": -1,
             },
             {
                 "label": "gripper_closed",
                 "action": [0.0] * 7 + [1.0],
                 "kind": "gripper",
+                "precondition_finger_target": 0.0,
                 "expected_finger_target": math.pi / 4.0,
+                "expected_motion_sign": 1,
             },
             {
                 "label": "gripper_boundary_0p5",
                 "action": [0.0] * 7 + [0.5],
                 "kind": "gripper",
+                "precondition_finger_target": math.pi / 4.0,
                 "expected_finger_target": 0.0,
+                "expected_motion_sign": -1,
                 "threshold_boundary": 0.5,
             },
             {
@@ -107,6 +118,8 @@ def validate_joint_velocity_smoke(
         "environment",
         "command_magnitude",
         "settle_steps",
+        "expected_gripper_drive_profile",
+        "gripper_precondition_steps",
         "runtime_contract",
         "cases",
         "reset_probe",
@@ -133,7 +146,20 @@ def validate_joint_velocity_smoke(
         raise ValueError("Velocity smoke command magnitude mismatch")
     if type(payload.get("settle_steps")) is not int or payload.get("settle_steps") != 5:
         raise ValueError("Velocity smoke settle-step contract mismatch")
+    if payload.get("expected_gripper_drive_profile") != NATIVE_GRIPPER_DRIVE_PROFILE:
+        raise ValueError("Velocity smoke expected gripper drive profile mismatch")
+    if (
+        type(payload.get("gripper_precondition_steps")) is not int
+        or payload.get("gripper_precondition_steps")
+        != NATIVE_GRIPPER_PRECONDITION_STEPS
+    ):
+        raise ValueError("Velocity smoke gripper precondition-step mismatch")
     validate_joint_velocity_runtime_report(payload.get("runtime_contract"))
+    if (
+        payload["runtime_contract"]["gripper"]["drive"]["profile"]
+        != payload["expected_gripper_drive_profile"]
+    ):
+        raise ValueError("Velocity smoke runtime gripper profile mismatch")
     lifecycle = payload.get("lifecycle")
     if require_parent_completion:
         if lifecycle != {
@@ -217,6 +243,11 @@ def validate_joint_velocity_smoke(
             "soft_joint_position_limits",
             "finger_position_target",
             "processed_finger_position_target",
+            "finger_position_before",
+            "finger_velocity_before",
+            "finger_position_after",
+            "finger_velocity_after",
+            "finger_average_slew_rad_s",
             "terminated",
             "truncated",
         }
@@ -306,6 +337,54 @@ def validate_joint_velocity_smoke(
                 abs_tol=1e-6,
             ):
                 raise ValueError(f"Velocity smoke case {index} {field} mismatch")
+        finger_position_before = _finite_vector(
+            [case.get("finger_position_before")],
+            1,
+            field=f"case {index} finger position before",
+        )[0]
+        finger_velocity_before = _finite_vector(
+            [case.get("finger_velocity_before")],
+            1,
+            field=f"case {index} finger velocity before",
+        )[0]
+        finger_position_after = _finite_vector(
+            [case.get("finger_position_after")],
+            1,
+            field=f"case {index} finger position after",
+        )[0]
+        finger_velocity_after = _finite_vector(
+            [case.get("finger_velocity_after")],
+            1,
+            field=f"case {index} finger velocity after",
+        )[0]
+        finger_average_slew = _finite_vector(
+            [case.get("finger_average_slew_rad_s")],
+            1,
+            field=f"case {index} finger average slew",
+        )[0]
+        recomputed_slew = (finger_position_after - finger_position_before) * 15.0
+        if not math.isclose(
+            finger_average_slew,
+            recomputed_slew,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise ValueError(f"Velocity smoke case {index} finger slew mismatch")
+        maximum_gripper_velocity = (
+            NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S
+            + NATIVE_GRIPPER_MEASURED_VELOCITY_TOLERANCE
+        )
+        if any(
+            abs(value) > maximum_gripper_velocity
+            for value in (
+                finger_velocity_before,
+                finger_velocity_after,
+                finger_average_slew,
+            )
+        ):
+            raise ValueError(
+                f"Velocity smoke case {index} exceeded the gripper velocity limit"
+            )
         if expected_case["kind"] == "gripper" and not math.isclose(
             expected_finger_target,
             expected_case["expected_finger_target"],
@@ -313,6 +392,25 @@ def validate_joint_velocity_smoke(
             abs_tol=1e-12,
         ):
             raise ValueError(f"Velocity smoke case {index} gripper plan mismatch")
+        if expected_case["kind"] == "gripper":
+            if not math.isclose(
+                finger_position_before,
+                expected_case["precondition_finger_target"],
+                rel_tol=0.0,
+                abs_tol=NATIVE_GRIPPER_PRECONDITION_POSITION_TOLERANCE,
+            ):
+                raise ValueError(
+                    f"Velocity smoke case {index} gripper precondition mismatch"
+                )
+            motion_sign = expected_case["expected_motion_sign"]
+            if motion_sign * (finger_position_after - finger_position_before) <= 1e-4:
+                raise ValueError(
+                    f"Velocity smoke case {index} gripper position direction mismatch"
+                )
+            if motion_sign * finger_velocity_after <= 1e-4:
+                raise ValueError(
+                    f"Velocity smoke case {index} gripper velocity direction mismatch"
+                )
 
     reset = payload.get("reset_probe")
     if not isinstance(reset, dict) or set(reset) != {
@@ -320,6 +418,10 @@ def validate_joint_velocity_smoke(
         "joint_position",
         "joint_velocity",
         "joint_velocity_target",
+        "default_finger_position",
+        "finger_position",
+        "finger_velocity",
+        "finger_position_target",
     }:
         raise ValueError("Velocity smoke is missing its reset probe")
     default_q = _finite_vector(
@@ -339,6 +441,25 @@ def validate_joint_velocity_smoke(
         raise ValueError("Velocity smoke reset left excessive joint velocity")
     if reset_target != [0.0] * 7:
         raise ValueError("Velocity smoke reset did not install a zero velocity target")
+    default_finger = _finite_vector(
+        [reset.get("default_finger_position")], 1, field="reset default finger"
+    )[0]
+    reset_finger = _finite_vector(
+        [reset.get("finger_position")], 1, field="reset finger position"
+    )[0]
+    reset_finger_velocity = _finite_vector(
+        [reset.get("finger_velocity")], 1, field="reset finger velocity"
+    )[0]
+    reset_finger_target = _finite_vector(
+        [reset.get("finger_position_target")], 1, field="reset finger target"
+    )[0]
+    if (
+        abs(reset_finger - default_finger)
+        > NATIVE_GRIPPER_PRECONDITION_POSITION_TOLERANCE
+        or abs(reset_finger_velocity) > NATIVE_GRIPPER_MEASURED_VELOCITY_TOLERANCE
+        or not math.isclose(reset_finger_target, 0.0, rel_tol=0.0, abs_tol=1e-6)
+    ):
+        raise ValueError("Velocity smoke reset did not restore the gripper")
 
     validated = copy.deepcopy(payload)
     expected_status = (

@@ -13,6 +13,7 @@ SBATCH_SCRIPT="${SBATCH_SCRIPT:-${SCRIPT_DIR}/l40s_pi05_droid_jointvelocity_cont
 OUTPUT_ROOT="${OUTPUT_ROOT:-${NFS_ROOT}/results/polaris-pi05-jointvelocity/controller-smoke}"
 LOG_ROOT="${LOG_ROOT:-${NFS_ROOT}/slurm_logs/polaris-pi05-jointvelocity}"
 EXPECTED_IMAGE_SHA256=ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d556b324a
+EXPECTED_GRIPPER_DRIVE_PROFILE=implicit_gripper_physx_velocity_limit5_cuda_actuator_cpu_static_physx_v1
 
 die() {
   echo "ERROR: $*" >&2
@@ -85,7 +86,7 @@ mkdir "${RUN_DIR}"
 
 job_id="$(sbatch --parsable \
   --output="${LOG_ROOT}/pi05_jv_ctrl_smoke-%j.out" \
-  --export="ALL,NFS_ROOT=${NFS_ROOT},POLARIS_DIR=${POLARIS_DIR},EXPECTED_POLARIS_COMMIT=${POLARIS_COMMIT},POLARIS_DATA_DIR=${POLARIS_DATA_DIR},POLARIS_PYXIS_IMAGE=${POLARIS_PYXIS_IMAGE},RUN_DIR=${RUN_DIR}" \
+  --export="ALL,NFS_ROOT=${NFS_ROOT},POLARIS_DIR=${POLARIS_DIR},EXPECTED_POLARIS_COMMIT=${POLARIS_COMMIT},EXPECTED_GRIPPER_DRIVE_PROFILE=${EXPECTED_GRIPPER_DRIVE_PROFILE},POLARIS_DATA_DIR=${POLARIS_DATA_DIR},POLARIS_PYXIS_IMAGE=${POLARIS_PYXIS_IMAGE},RUN_DIR=${RUN_DIR}" \
   "${SBATCH_SCRIPT}")"
 [[ "${job_id}" =~ ^[0-9]+$ ]] || die "Invalid sbatch job ID: ${job_id}"
 printf 'submitted_job_id=%s\n' "${job_id}"
@@ -94,7 +95,7 @@ printf 'submitted_job_id=%s\n' "${job_id}"
 export SUBMISSION_RECORD="${RUN_DIR}/submission-${job_id}.json"
 export JOB_ID="${job_id}"
 export POLARIS_COMMIT POLARIS_DIR RUN_DIR SBATCH_SCRIPT
-export POLARIS_PYXIS_IMAGE POLARIS_DATA_DIR
+export POLARIS_PYXIS_IMAGE POLARIS_DATA_DIR EXPECTED_GRIPPER_DRIVE_PROFILE
 /usr/bin/python3 - <<'PY'
 import hashlib
 import json
@@ -113,6 +114,9 @@ value = {
     "promotion": "forbidden_without_separate_checkpoint_canary",
     "job_id": int(os.environ["JOB_ID"]),
     "polaris_commit": os.environ["POLARIS_COMMIT"],
+    "expected_gripper_drive_profile": os.environ[
+        "EXPECTED_GRIPPER_DRIVE_PROFILE"
+    ],
     "polaris_dir": str(polaris_dir),
     "polaris_dir_resolved": str(polaris_dir.resolve()),
     "run_dir": str(run_dir),

@@ -6,6 +6,8 @@ from isaaclab.assets import ArticulationCfg
 
 from polaris.utils import DATA_PATH
 from polaris.pi05_droid_jointvelocity_contract import (
+    NATIVE_GRIPPER_EFFORT_LIMIT,
+    NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
     PANDA_ARM_VELOCITY_DRIVE_DAMPING,
     PANDA_ARM_VELOCITY_DRIVE_STIFFNESS,
 )
@@ -95,6 +97,15 @@ def make_nvidia_droid_joint_velocity_cfg() -> ArticulationCfg:
         velocity_limit_sim=2.61,
         stiffness=PANDA_ARM_VELOCITY_DRIVE_STIFFNESS,
         damping=PANDA_ARM_VELOCITY_DRIVE_DAMPING,
+    )
+    config.actuators["gripper"] = ImplicitActuatorCfg(
+        joint_names_expr=["finger_joint"],
+        stiffness=None,
+        damping=None,
+        effort_limit=NATIVE_GRIPPER_EFFORT_LIMIT,
+        effort_limit_sim=NATIVE_GRIPPER_EFFORT_LIMIT,
+        velocity_limit=NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+        velocity_limit_sim=NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
     )
     return config
 

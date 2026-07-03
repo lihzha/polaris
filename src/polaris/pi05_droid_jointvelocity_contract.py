@@ -49,6 +49,7 @@ PI05_DROID_ISAACLAB_SOURCE_SHA256 = {
 }
 PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256 = {
     "droid_cfg.py": "111c34d8d707f6edf31e9166c9aafd999ff3e7ea72344fc31fe5c9b8d6e175ee",
+    "robot_cfg.py": "d514b32e07b54f98deb6d9dbc7a5201fff5337cdc4600d9351ee2a95e5c4c4c5",
 }
 
 PANDA_ARM_JOINT_NAMES = tuple(f"panda_joint{index}" for index in range(1, 8))
@@ -56,6 +57,16 @@ PANDA_ARM_VELOCITY_LIMITS = (2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61)
 PANDA_ARM_EFFORT_LIMITS = (87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0)
 PANDA_ARM_VELOCITY_DRIVE_STIFFNESS = 0.0
 PANDA_ARM_VELOCITY_DRIVE_DAMPING = 80.0
+NATIVE_GRIPPER_DRIVE_PROFILE = (
+    "implicit_gripper_physx_velocity_limit5_cuda_actuator_cpu_static_physx_v1"
+)
+NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S = 5.0
+NATIVE_GRIPPER_EFFORT_LIMIT = 200.0
+NATIVE_GRIPPER_STIFFNESS = 5729.578125
+NATIVE_GRIPPER_DAMPING = 0.011459155939519405
+NATIVE_GRIPPER_PRECONDITION_STEPS = 5
+NATIVE_GRIPPER_PRECONDITION_POSITION_TOLERANCE = 0.02
+NATIVE_GRIPPER_MEASURED_VELOCITY_TOLERANCE = 0.001
 
 _OPENPI_SOURCE_SHA256 = {
     "docs/norm_stats.md": (
@@ -563,6 +574,47 @@ def expected_pi05_droid_jointvelocity_contract(
                 "velocity_damping": PANDA_ARM_VELOCITY_DRIVE_DAMPING,
                 "effort_limit_sim": list(PANDA_ARM_EFFORT_LIMITS),
                 "velocity_limit_sim": list(PANDA_ARM_VELOCITY_LIMITS),
+            },
+            "gripper_drive": {
+                "profile": NATIVE_GRIPPER_DRIVE_PROFILE,
+                "joint_name": "finger_joint",
+                "configured": {
+                    "stiffness": None,
+                    "damping": None,
+                    "effort_limit": NATIVE_GRIPPER_EFFORT_LIMIT,
+                    "effort_limit_sim": NATIVE_GRIPPER_EFFORT_LIMIT,
+                    "velocity_limit": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+                    "velocity_limit_sim": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+                },
+                "live": {
+                    "actuator_cuda": {
+                        "device": "cuda:0",
+                        "dtype": "torch.float32",
+                        "shape": [1, 1],
+                        "stiffness": NATIVE_GRIPPER_STIFFNESS,
+                        "damping": NATIVE_GRIPPER_DAMPING,
+                        "effort_limit": NATIVE_GRIPPER_EFFORT_LIMIT,
+                        "effort_limit_sim": NATIVE_GRIPPER_EFFORT_LIMIT,
+                        "velocity_limit": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+                        "velocity_limit_sim": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+                    },
+                    "direct_physx_cpu": {
+                        "device": "cpu",
+                        "dtype": "torch.float32",
+                        "shape": [1, 1],
+                        "stiffness": NATIVE_GRIPPER_STIFFNESS,
+                        "damping": NATIVE_GRIPPER_DAMPING,
+                        "effort_limit": NATIVE_GRIPPER_EFFORT_LIMIT,
+                        "velocity_limit": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+                    },
+                },
+                "precondition_steps": NATIVE_GRIPPER_PRECONDITION_STEPS,
+                "precondition_position_tolerance": (
+                    NATIVE_GRIPPER_PRECONDITION_POSITION_TOLERANCE
+                ),
+                "measured_velocity_tolerance": (
+                    NATIVE_GRIPPER_MEASURED_VELOCITY_TOLERANCE
+                ),
             },
         },
     }

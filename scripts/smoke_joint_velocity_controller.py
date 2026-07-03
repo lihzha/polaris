@@ -288,11 +288,15 @@ def _run_capture(args_cli, env, runtime_contract) -> dict:
         build_joint_velocity_smoke_cases,
     )
     from polaris.pi05_droid_jointvelocity_contract import (
+        NATIVE_GRIPPER_DRIVE_PROFILE,
+        NATIVE_GRIPPER_PRECONDITION_STEPS,
         PANDA_ARM_JOINT_NAMES,
         PI05_DROID_JOINTVELOCITY_PROFILE,
     )
 
     root_env = getattr(env, "unwrapped", env)
+    if args_cli.expected_gripper_drive_profile != NATIVE_GRIPPER_DRIVE_PROFILE:
+        raise ValueError("Smoke expected gripper drive profile mismatch")
     robot = root_env.scene["robot"]
     finger_term = root_env.action_manager._terms["finger_joint"]
     arm_ids, arm_names = robot.find_joints(
@@ -317,12 +321,27 @@ def _run_capture(args_cli, env, runtime_contract) -> dict:
             )
             if bool(terminated[0]) or bool(truncated[0]):
                 raise RuntimeError(f"Smoke settle ended for {case['label']}")
+        if case["kind"] == "gripper" and case["precondition_finger_target"] > 0.5:
+            precondition_action = zero_action.clone()
+            precondition_action[:, 7] = 1.0
+            for _ in range(NATIVE_GRIPPER_PRECONDITION_STEPS):
+                observation, _, terminated, truncated, _ = env.step(
+                    precondition_action, expensive=False
+                )
+                if bool(terminated[0]) or bool(truncated[0]):
+                    raise RuntimeError(
+                        f"Smoke gripper precondition ended for {case['label']}"
+                    )
         q_before = numpy(observation["policy"]["arm_joint_pos"])[0]
         dq_before = numpy(observation["policy"]["arm_joint_vel"])[0]
+        finger_position_before = float(numpy(robot.data.joint_pos[:, finger_ids])[0, 0])
+        finger_velocity_before = float(numpy(robot.data.joint_vel[:, finger_ids])[0, 0])
         action = torch.tensor(case["action"], device=env.device).reshape(1, -1)
         observation, _, terminated, truncated, _ = env.step(action, expensive=False)
         q_after = numpy(observation["policy"]["arm_joint_pos"])[0]
         dq_after = numpy(observation["policy"]["arm_joint_vel"])[0]
+        finger_position_after = float(numpy(robot.data.joint_pos[:, finger_ids])[0, 0])
+        finger_velocity_after = float(numpy(robot.data.joint_vel[:, finger_ids])[0, 0])
         arm_term = root_env.action_manager._terms["arm"]
         result = {
             **case,
@@ -342,6 +361,13 @@ def _run_capture(args_cli, env, runtime_contract) -> dict:
             ),
             "processed_finger_position_target": float(
                 numpy(finger_term.processed_actions)[0, 0]
+            ),
+            "finger_position_before": finger_position_before,
+            "finger_velocity_before": finger_velocity_before,
+            "finger_position_after": finger_position_after,
+            "finger_velocity_after": finger_velocity_after,
+            "finger_average_slew_rad_s": (
+                (finger_position_after - finger_position_before) * 15.0
             ),
             "terminated": bool(terminated[0]),
             "truncated": bool(truncated[0]),
@@ -365,6 +391,14 @@ def _run_capture(args_cli, env, runtime_contract) -> dict:
         "joint_velocity_target": numpy(robot.data.joint_vel_target[:, arm_ids])[
             0
         ].tolist(),
+        "default_finger_position": float(
+            numpy(robot.data.default_joint_pos[:, finger_ids])[0, 0]
+        ),
+        "finger_position": float(numpy(robot.data.joint_pos[:, finger_ids])[0, 0]),
+        "finger_velocity": float(numpy(robot.data.joint_vel[:, finger_ids])[0, 0]),
+        "finger_position_target": float(
+            numpy(robot.data.joint_pos_target[:, finger_ids])[0, 0]
+        ),
     }
     return {
         "schema_version": 1,
@@ -373,6 +407,8 @@ def _run_capture(args_cli, env, runtime_contract) -> dict:
         "environment": args_cli.environment,
         "command_magnitude": args_cli.command_magnitude,
         "settle_steps": args_cli.settle_steps,
+        "expected_gripper_drive_profile": args_cli.expected_gripper_drive_profile,
+        "gripper_precondition_steps": NATIVE_GRIPPER_PRECONDITION_STEPS,
         "runtime_contract": runtime_contract,
         "cases": results,
         "reset_probe": reset_probe,
@@ -386,6 +422,7 @@ def _kit_child_main(argv: list[str]) -> int:
     parser.add_argument("--environment", default="DROID-FoodBussing")
     parser.add_argument("--command-magnitude", type=float, default=0.25)
     parser.add_argument("--settle-steps", type=int, default=5)
+    parser.add_argument("--expected-gripper-drive-profile", required=True)
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--kit-child", action="store_true")
     parser.add_argument("--raw-json", type=Path, required=True)
@@ -423,7 +460,10 @@ def _kit_child_main(argv: list[str]) -> int:
         env_cfg.observations = DroidJointVelocityObservationCfg()
         env = gym.make(args_cli.environment, cfg=env_cfg)
         stage = "validate_joint_velocity_runtime"
-        runtime_contract = validate_joint_velocity_runtime(env)
+        runtime_contract = validate_joint_velocity_runtime(
+            env,
+            expected_gripper_drive_profile=args_cli.expected_gripper_drive_profile,
+        )
         stage = "run_controller_capture"
         payload = _run_capture(args_cli, env, runtime_contract)
         if payload is None:

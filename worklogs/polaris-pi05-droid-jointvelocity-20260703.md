@@ -273,3 +273,44 @@
   controller gate is rerun. An EEF-only canary cannot independently qualify
   the native action mode or its changed source.
 - No model, checkpoint canary, or full checkpoint evaluation was launched.
+
+## Native gripper-limit remediation candidate (not launched)
+
+- The native-only articulation copy now replaces its gripper actuator with an
+  explicit simulation-side velocity limit of `5.0` rad/s and effort limit of
+  `200.0`. Both legacy and `_sim` fields are authored for pinned Isaac Lab
+  2.3 compatibility. The shared `NVIDIA_DROID` object used by joint-position
+  and EEF evaluation is unchanged; an Isaac-stub regression test proves the
+  copied native actuator is distinct and that the shared config has no newly
+  authored `_sim` fields.
+- Candidate intent is named
+  `implicit_gripper_physx_velocity_limit5_cuda_actuator_cpu_static_physx_v1`.
+  The serving contract declares the configured fields and the exact live
+  float32 `[1,1]` CUDA actuator and CPU direct-PhysX stiffness, damping,
+  effort, and velocity surfaces. Runtime validation independently reads both
+  surfaces and rejects missing, device-swapped, or value-swapped fields. The
+  exact `robot_cfg.py` source digest is pinned alongside `droid_cfg.py`.
+- Controller smoke profile v2 preconditions and physically moves the gripper
+  for open, closed, and boundary-`0.5` cases. It records before/after finger
+  position and velocity, recomputes one-step slew at the attested 15 Hz policy
+  rate, checks the 5 rad/s limit, checks motion direction, and verifies reset
+  state and target. The independent finalizer repeats these checks rather than
+  importing the runtime validator.
+- The candidate profile is explicit and required across the submitter export,
+  sbatch worker, controller CLI, smoke artifact, finalizer CLI, and completion
+  `candidate_intent`. Omission and the legacy ignored-limit profile are covered
+  by fail-closed runtime, smoke, CLI, and static launch-contract tests. Full
+  joint-velocity evaluation also requires the exact candidate profile, while
+  joint-position and EEF modes reject that profile argument.
+- Host validation after the contract expansion: 49 focused tests passed; all
+  host-runnable tests passed with 81 tests plus 5 subtests. The one
+  `robust_differential_ik` module still requires Isaac Lab and cannot collect
+  in the host venv. Ruff check/format for all changed Python files, Python
+  compilation, Bash syntax, ShellCheck, and `git diff --check` passed. The
+  whole-tree Ruff baseline still has nine unrelated pre-existing findings in
+  the splat renderer and environment package initializer.
+- This candidate remains uncommitted and unpushed at the independent-review
+  boundary. No source deployment, controller rerun, policy server, model,
+  checkpoint canary, or full evaluation has been launched. Job `1098174`
+  remains valid only for its earlier arm/native-target controller scope and
+  remains non-promotable for authoritative checkpoint evaluation.

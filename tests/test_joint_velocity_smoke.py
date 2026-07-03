@@ -7,6 +7,10 @@ from polaris.joint_velocity_smoke import (
     build_joint_velocity_smoke_cases,
     validate_joint_velocity_smoke,
 )
+from polaris.pi05_droid_jointvelocity_contract import (
+    NATIVE_GRIPPER_DRIVE_PROFILE,
+    NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+)
 
 
 def test_smoke_plan_covers_hold_signed_joints_gripper_boundary_reset_and_limits():
@@ -21,7 +25,9 @@ def test_smoke_plan_covers_hold_signed_joints_gripper_boundary_reset_and_limits(
         "label": "gripper_boundary_0p5",
         "action": [0.0] * 7 + [0.5],
         "kind": "gripper",
+        "precondition_finger_target": math.pi / 4.0,
         "expected_finger_target": 0.0,
+        "expected_motion_sign": -1,
         "threshold_boundary": 0.5,
     }
 
@@ -32,6 +38,7 @@ def test_smoke_validator_recomputes_full_runtime_direction_targets_and_reset(
     validated = validate_joint_velocity_smoke(valid_joint_velocity_smoke_payload)
     assert validated["status"] == "pass"
     assert validated["case_count"] == 20
+    assert validated["expected_gripper_drive_profile"] == NATIVE_GRIPPER_DRIVE_PROFILE
 
     wrong_direction = copy.deepcopy(valid_joint_velocity_smoke_payload)
     wrong_direction["cases"][1]["joint_position_after"][0] *= -1
@@ -52,6 +59,34 @@ def test_smoke_validator_recomputes_full_runtime_direction_targets_and_reset(
     wrong_processed_gripper["cases"][0]["processed_finger_position_target"] = 0.1
     with pytest.raises(ValueError, match="processed_finger_position_target mismatch"):
         validate_joint_velocity_smoke(wrong_processed_gripper)
+
+    wrong_slew = copy.deepcopy(valid_joint_velocity_smoke_payload)
+    closed = next(
+        case for case in wrong_slew["cases"] if case["label"] == "gripper_closed"
+    )
+    closed["finger_velocity_after"] = NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S + 0.1
+    with pytest.raises(ValueError, match="exceeded the gripper velocity limit"):
+        validate_joint_velocity_smoke(wrong_slew)
+
+    wrong_motion = copy.deepcopy(valid_joint_velocity_smoke_payload)
+    opened = next(
+        case for case in wrong_motion["cases"] if case["label"] == "gripper_open"
+    )
+    opened["finger_position_after"] = opened["finger_position_before"] + 0.1
+    opened["finger_velocity_after"] = 1.0
+    opened["finger_average_slew_rad_s"] = 1.5
+    with pytest.raises(ValueError, match="gripper position direction mismatch"):
+        validate_joint_velocity_smoke(wrong_motion)
+
+    wrong_intent = copy.deepcopy(valid_joint_velocity_smoke_payload)
+    wrong_intent["expected_gripper_drive_profile"] = "legacy_ignored_velocity_limit"
+    with pytest.raises(ValueError, match="expected gripper drive profile mismatch"):
+        validate_joint_velocity_smoke(wrong_intent)
+
+    missing_intent = copy.deepcopy(valid_joint_velocity_smoke_payload)
+    del missing_intent["expected_gripper_drive_profile"]
+    with pytest.raises(ValueError, match="schema mismatch"):
+        validate_joint_velocity_smoke(missing_intent)
 
     leaked_reset = copy.deepcopy(valid_joint_velocity_smoke_payload)
     leaked_reset["reset_probe"]["joint_velocity_target"][0] = 0.25

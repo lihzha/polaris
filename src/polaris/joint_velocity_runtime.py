@@ -13,6 +13,11 @@ from typing import Any
 import numpy as np
 
 from polaris.pi05_droid_jointvelocity_contract import (
+    NATIVE_GRIPPER_DAMPING,
+    NATIVE_GRIPPER_DRIVE_PROFILE,
+    NATIVE_GRIPPER_EFFORT_LIMIT,
+    NATIVE_GRIPPER_STIFFNESS,
+    NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
     PANDA_ARM_EFFORT_LIMITS,
     PANDA_ARM_JOINT_NAMES,
     PANDA_ARM_VELOCITY_DRIVE_DAMPING,
@@ -261,6 +266,7 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
         "closed_command",
         "raw_action",
         "processed_action",
+        "drive",
     }:
         raise ValueError("Joint-velocity gripper report schema mismatch")
     if gripper["action_class"] != _BINARY_GRIPPER_ACTION_CLASS:
@@ -288,6 +294,60 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
             field=f"gripper {name}",
             expected_device=_CUDA_DEVICE,
         )
+    drive = gripper["drive"]
+    if not isinstance(drive, dict) or set(drive) != {
+        "profile",
+        "configured",
+        "actuator",
+        "direct_physx",
+    }:
+        raise ValueError("Joint-velocity gripper drive schema mismatch")
+    if drive["profile"] != NATIVE_GRIPPER_DRIVE_PROFILE:
+        raise ValueError("Joint-velocity gripper drive profile mismatch")
+    configured = drive["configured"]
+    expected_configured = {
+        "joint_names_expr": ["finger_joint"],
+        "stiffness": None,
+        "damping": None,
+        "effort_limit": NATIVE_GRIPPER_EFFORT_LIMIT,
+        "effort_limit_sim": NATIVE_GRIPPER_EFFORT_LIMIT,
+        "velocity_limit": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+        "velocity_limit_sim": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+    }
+    if configured != expected_configured or any(
+        type(configured[key]) is not type(value)
+        for key, value in expected_configured.items()
+    ):
+        raise ValueError("Joint-velocity gripper configured drive mismatch")
+    expected_live = {
+        "stiffness": np.asarray([[NATIVE_GRIPPER_STIFFNESS]], dtype=np.float32),
+        "damping": np.asarray([[NATIVE_GRIPPER_DAMPING]], dtype=np.float32),
+        "effort_limit": np.asarray([[NATIVE_GRIPPER_EFFORT_LIMIT]], dtype=np.float32),
+        "velocity_limit": np.asarray(
+            [[NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S]], dtype=np.float32
+        ),
+    }
+    expected_actuator = {
+        **expected_live,
+        "effort_limit_sim": expected_live["effort_limit"],
+        "velocity_limit_sim": expected_live["velocity_limit"],
+    }
+    for surface, expected_arrays, expected_device in (
+        ("actuator", expected_actuator, _CUDA_DEVICE),
+        ("direct_physx", expected_live, _CPU_DEVICE),
+    ):
+        surface_report = drive[surface]
+        if not isinstance(surface_report, dict) or set(surface_report) != set(
+            expected_arrays
+        ):
+            raise ValueError(f"Joint-velocity gripper {surface} schema mismatch")
+        for name, expected in expected_arrays.items():
+            _validate_array_report(
+                surface_report[name],
+                expected,
+                field=f"gripper {surface} {name}",
+                expected_device=expected_device,
+            )
     return copy.deepcopy(report)
 
 
@@ -336,22 +396,37 @@ def _verify_isaaclab_sources(
 
 
 def _verify_polaris_sources(*, finger_term: Any) -> dict[str, str]:
-    source_path_string = inspect.getsourcefile(type(finger_term))
-    if source_path_string is None:
-        raise ValueError("Cannot resolve PolaRiS gripper action source")
-    source_path = Path(source_path_string)
-    if source_path.is_symlink() or not source_path.is_file():
-        raise ValueError(f"PolaRiS runtime source is not regular: {source_path}")
-    digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
-    expected = PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256["droid_cfg.py"]
-    if digest != expected:
-        raise ValueError(f"PolaRiS DROID action source mismatch: {digest}")
-    return {"droid_cfg.py": digest}
+    from polaris.environments import robot_cfg
+
+    objects = {
+        "droid_cfg.py": type(finger_term),
+        "robot_cfg.py": robot_cfg.make_nvidia_droid_joint_velocity_cfg,
+    }
+    actual: dict[str, str] = {}
+    for source_name, source_object in objects.items():
+        source_path_string = inspect.getsourcefile(source_object)
+        if source_path_string is None:
+            raise ValueError(f"Cannot resolve PolaRiS runtime source {source_name}")
+        source_path = Path(source_path_string)
+        if source_path.is_symlink() or not source_path.is_file():
+            raise ValueError(f"PolaRiS runtime source is not regular: {source_path}")
+        digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+        expected = PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256[source_name]
+        if digest != expected:
+            raise ValueError(
+                f"PolaRiS runtime source mismatch for {source_name}: {digest}"
+            )
+        actual[source_name] = digest
+    return actual
 
 
-def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
+def validate_joint_velocity_runtime(
+    env: Any, *, expected_gripper_drive_profile: str
+) -> dict[str, Any]:
     """Fail closed unless action and PhysX drive semantics match the profile."""
 
+    if expected_gripper_drive_profile != NATIVE_GRIPPER_DRIVE_PROFILE:
+        raise ValueError("Expected native gripper drive profile mismatch")
     root_env = getattr(env, "unwrapped", env)
     isaaclab_version = _installed_isaaclab_version()
     if isaaclab_version != PI05_DROID_ISAACLAB_VERSION:
@@ -452,13 +527,40 @@ def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
     )
     if tuple(joint_names) != PANDA_ARM_JOINT_NAMES:
         raise ValueError(f"Articulation joint order mismatch: {joint_names}")
+    finger_ids, finger_names = robot.find_joints(["finger_joint"], preserve_order=True)
+    if finger_names != ["finger_joint"] or len(finger_ids) != 1:
+        raise ValueError(f"Articulation gripper joint mismatch: {finger_names}")
 
-    for actuator_name in ("panda_shoulder", "panda_forearm"):
+    for actuator_name in ("panda_shoulder", "panda_forearm", "gripper"):
         actuator = robot.actuators[actuator_name]
         if _class_path(actuator) != _IMPLICIT_ACTUATOR_CLASS:
             raise ValueError(
                 f"{actuator_name} must use ImplicitActuator; got {_class_path(actuator)}"
             )
+    gripper_cfg = robot.cfg.actuators["gripper"]
+    configured_gripper = {
+        "joint_names_expr": list(gripper_cfg.joint_names_expr),
+        "stiffness": gripper_cfg.stiffness,
+        "damping": gripper_cfg.damping,
+        "effort_limit": gripper_cfg.effort_limit,
+        "effort_limit_sim": gripper_cfg.effort_limit_sim,
+        "velocity_limit": gripper_cfg.velocity_limit,
+        "velocity_limit_sim": gripper_cfg.velocity_limit_sim,
+    }
+    expected_configured_gripper = {
+        "joint_names_expr": ["finger_joint"],
+        "stiffness": None,
+        "damping": None,
+        "effort_limit": NATIVE_GRIPPER_EFFORT_LIMIT,
+        "effort_limit_sim": NATIVE_GRIPPER_EFFORT_LIMIT,
+        "velocity_limit": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+        "velocity_limit_sim": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+    }
+    if configured_gripper != expected_configured_gripper or any(
+        type(configured_gripper[key]) is not type(value)
+        for key, value in expected_configured_gripper.items()
+    ):
+        raise ValueError("Configured native gripper drive mismatch")
     isaaclab_source_sha256 = _verify_isaaclab_sources(
         arm_term=arm_term,
         finger_term=finger_term,
@@ -528,6 +630,81 @@ def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
             expected_device=_CPU_DEVICE,
         ),
     }
+    gripper_actuator = robot.actuators["gripper"]
+    expected_gripper_stiffness = np.asarray(
+        [[NATIVE_GRIPPER_STIFFNESS]], dtype=np.float32
+    )
+    expected_gripper_damping = np.asarray([[NATIVE_GRIPPER_DAMPING]], dtype=np.float32)
+    expected_gripper_effort = np.asarray(
+        [[NATIVE_GRIPPER_EFFORT_LIMIT]], dtype=np.float32
+    )
+    expected_gripper_velocity = np.asarray(
+        [[NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S]], dtype=np.float32
+    )
+    gripper_actuator_drive = {
+        "stiffness": _require_float32_array(
+            gripper_actuator.stiffness,
+            expected_gripper_stiffness,
+            field="gripper actuator stiffness",
+            expected_device=_CUDA_DEVICE,
+        ),
+        "damping": _require_float32_array(
+            gripper_actuator.damping,
+            expected_gripper_damping,
+            field="gripper actuator damping",
+            expected_device=_CUDA_DEVICE,
+        ),
+        "effort_limit": _require_float32_array(
+            gripper_actuator.effort_limit,
+            expected_gripper_effort,
+            field="gripper actuator effort limit",
+            expected_device=_CUDA_DEVICE,
+        ),
+        "effort_limit_sim": _require_float32_array(
+            gripper_actuator.effort_limit_sim,
+            expected_gripper_effort,
+            field="gripper actuator simulation effort limit",
+            expected_device=_CUDA_DEVICE,
+        ),
+        "velocity_limit": _require_float32_array(
+            gripper_actuator.velocity_limit,
+            expected_gripper_velocity,
+            field="gripper actuator velocity limit",
+            expected_device=_CUDA_DEVICE,
+        ),
+        "velocity_limit_sim": _require_float32_array(
+            gripper_actuator.velocity_limit_sim,
+            expected_gripper_velocity,
+            field="gripper actuator simulation velocity limit",
+            expected_device=_CUDA_DEVICE,
+        ),
+    }
+    gripper_direct_drive = {
+        "stiffness": _require_float32_array(
+            view.get_dof_stiffnesses()[:, finger_ids],
+            expected_gripper_stiffness,
+            field="direct PhysX gripper stiffness",
+            expected_device=_CPU_DEVICE,
+        ),
+        "damping": _require_float32_array(
+            view.get_dof_dampings()[:, finger_ids],
+            expected_gripper_damping,
+            field="direct PhysX gripper damping",
+            expected_device=_CPU_DEVICE,
+        ),
+        "effort_limit": _require_float32_array(
+            view.get_dof_max_forces()[:, finger_ids],
+            expected_gripper_effort,
+            field="direct PhysX gripper effort limit",
+            expected_device=_CPU_DEVICE,
+        ),
+        "velocity_limit": _require_float32_array(
+            view.get_dof_max_velocities()[:, finger_ids],
+            expected_gripper_velocity,
+            field="direct PhysX gripper velocity limit",
+            expected_device=_CPU_DEVICE,
+        ),
+    }
 
     report: dict[str, Any] = {
         "schema_version": 1,
@@ -562,6 +739,12 @@ def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
             "closed_command": gripper_closed,
             "raw_action": gripper_raw,
             "processed_action": gripper_processed,
+            "drive": {
+                "profile": expected_gripper_drive_profile,
+                "configured": configured_gripper,
+                "actuator": gripper_actuator_drive,
+                "direct_physx": gripper_direct_drive,
+            },
         },
     }
     report["runtime_sha256"] = _canonical_sha256(report)

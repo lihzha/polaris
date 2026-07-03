@@ -117,6 +117,7 @@ def _argv(
     commit,
     image,
     data_dir,
+    gripper_profile=finalizer.GRIPPER_DRIVE_PROFILE,
 ):
     return [
         mode,
@@ -136,6 +137,8 @@ def _argv(
         str(repository),
         "--expected-polaris-commit",
         commit,
+        "--expected-gripper-drive-profile",
+        gripper_profile,
         "--container-image",
         str(image),
         "--data-dir",
@@ -186,6 +189,9 @@ def test_strict_l40s_finalizer_publishes_and_reverifies_controller_only_status(
     assert attestation["status"] == "pass"
     assert attestation["scope"] == "controller_only_no_model_or_checkpoint"
     assert attestation["promotion"] == "forbidden_without_separate_checkpoint_canary"
+    assert attestation["candidate_intent"] == {
+        "expected_gripper_drive_profile": finalizer.GRIPPER_DRIVE_PROFILE
+    }
     assert attestation["smoke_artifact"]["case_count"] == 20
     assert attestation["source"]["standalone_git_directory"] is True
     assert attestation["source"]["detached_head"] is True
@@ -197,6 +203,18 @@ def test_strict_l40s_finalizer_publishes_and_reverifies_controller_only_status(
     verify_arguments = arguments.copy()
     verify_arguments[0] = "verify"
     assert finalizer.main(verify_arguments) == 0
+
+    wrong_profile = verify_arguments.copy()
+    profile_index = wrong_profile.index("--expected-gripper-drive-profile") + 1
+    wrong_profile[profile_index] = "legacy_ignored_velocity_limit"
+    with pytest.raises(ValueError, match="Expected gripper drive profile mismatch"):
+        finalizer.main(wrong_profile)
+
+    missing_profile = verify_arguments.copy()
+    profile_flag = missing_profile.index("--expected-gripper-drive-profile")
+    del missing_profile[profile_flag : profile_flag + 2]
+    with pytest.raises(SystemExit):
+        finalizer.main(missing_profile)
 
     completion.chmod(0o644)
     tampered = json.loads(completion.read_bytes())
@@ -339,6 +357,27 @@ def test_submit_and_sbatch_reject_gitfiles_before_git_provenance_queries():
         < submit_index
     )
     assert 'realpath -sm -- "${value}"' in submit_source
+    assert finalizer.GRIPPER_DRIVE_PROFILE in submit_source
+    assert finalizer.GRIPPER_DRIVE_PROFILE in (
+        repository
+        / "scripts/polaris/l40s_pi05_droid_jointvelocity_controller_smoke.sbatch"
+    ).read_text(encoding="utf-8")
+    sbatch_source = (
+        repository
+        / "scripts/polaris/l40s_pi05_droid_jointvelocity_controller_smoke.sbatch"
+    ).read_text(encoding="utf-8")
+    controller_source = (
+        repository / "scripts/smoke_joint_velocity_controller.py"
+    ).read_text(encoding="utf-8")
+    assert ': "${EXPECTED_GRIPPER_DRIVE_PROFILE:?' in sbatch_source
+    assert (
+        '[[ "${EXPECTED_GRIPPER_DRIVE_PROFILE}" == "${GRIPPER_DRIVE_PROFILE}" ]]'
+        in (sbatch_source)
+    )
+    assert 'parser.add_argument("--expected-gripper-drive-profile", required=True)' in (
+        controller_source
+    )
+    assert "expected_gripper_drive_profile" in submit_source
     for field in (
         "polaris_dir_resolved",
         "run_dir_resolved",
