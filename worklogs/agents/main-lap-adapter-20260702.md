@@ -440,3 +440,26 @@
   gain/target/effort reconstruction above. Full Isaac tests and one immutable
   L40S diagnostic replay remain mandatory before choosing any numeric braking
   law or launching official/reasoning checkpoint canaries.
+- Committed and pushed the reviewed diagnostic as PolaRiS
+  `9a3c12d6188906bab504d5de8bc346218c4ee71e`; the clean detached L40S deploy is
+  `/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-trace-v9-9a3c12d`.
+  Test-only job `1098093` was canceled while still pending after its pinned
+  pool3 node was consumed by a four-GPU job; it never started and produced no
+  runtime artifact. The independently reviewed replacement wrapper changes
+  only the node pin to idle `pool0-00013`, is mode 0444 with SHA-256
+  `acac1e8ef869bb0a10064d7a444ee174c60ebc4ff70946b8fdd6c5a2c50687cc`,
+  and launched as job `1098094`. It runs the full Isaac/host gates and the
+  exact replay only; its success condition is an immutable, internally valid
+  expected velocity-abort trace with no teardown error, ready marker, or
+  attestation. No model, checkpoint, server, or downstream chain is involved.
+- Job `1098094` is non-promotable regardless of its replay result: its Isaac
+  pytest process found that Isaac preloads a conflicting top-level `scripts`
+  module, so collection failed when the new cross-contract test used a normal
+  `from scripts ...` import. The existing bootstrap then returned step status
+  zero despite pytest's collection error, allowing the wrapper to continue.
+  The repair loads the runner contract by exact file path under a unique module
+  name and makes the bootstrap capture pytest/teardown failures, flush logs,
+  and use `os._exit` with the exact resulting code after Kit closes. Six host
+  regressions bind pytest exit codes 0/1/2/4/5 and close-failure override;
+  updated local gates pass 118 host tests plus 22 subtests and 14 focused
+  controller tests. A clean-commit L40S rerun is required.

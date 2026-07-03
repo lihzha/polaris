@@ -1,4 +1,5 @@
 import inspect
+import importlib.util
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,7 +10,6 @@ import pytest
 from isaaclab.controllers.differential_ik import DifferentialIKController
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 import polaris.robust_differential_ik as robust_ik
-from scripts import smoke_eef_pose_boundary_replay as boundary_smoke
 from polaris.robust_differential_ik import (
     DifferentialIKNumericalError,
     RobustDifferentialIKController,
@@ -27,6 +27,21 @@ from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_RAD
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_RAD
+
+
+_BOUNDARY_SMOKE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "scripts"
+    / "smoke_eef_pose_boundary_replay.py"
+)
+_BOUNDARY_SMOKE_SPEC = importlib.util.spec_from_file_location(
+    "polaris_boundary_smoke_contract",
+    _BOUNDARY_SMOKE_PATH,
+)
+if _BOUNDARY_SMOKE_SPEC is None or _BOUNDARY_SMOKE_SPEC.loader is None:
+    raise RuntimeError(f"Cannot load boundary smoke contract: {_BOUNDARY_SMOKE_PATH}")
+boundary_smoke = importlib.util.module_from_spec(_BOUNDARY_SMOKE_SPEC)
+_BOUNDARY_SMOKE_SPEC.loader.exec_module(boundary_smoke)
 
 
 def _controller(controller_type, *, damping=0.01):
