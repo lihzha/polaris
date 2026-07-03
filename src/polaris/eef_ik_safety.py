@@ -13,6 +13,16 @@ EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE = (
     "panda_velocity_physxlimit_solveriter1_wristenergybrake_candidate_v1"
 )
 EEF_IK_APPLY_CADENCE = "physics_substep"
+# Default-off controller-repair candidates.  The nominal arm target keeps a
+# five-percent command margin below the live PhysX velocity limit, while the
+# close interlock holds the arm for the 38-substep EEF gripper target ramp plus
+# ten settling substeps.  Neither candidate changes the physical joint limits.
+ARM_SLEW_HEADROOM_CANDIDATE_PROFILE = "panda_nominal_target_slew_0p95_physical_limit_v1"
+ARM_SLEW_HEADROOM_RATIO = 0.95
+GRIPPER_CLOSE_ARM_INTERLOCK_CANDIDATE_PROFILE = (
+    "eef_gripper_close_hold_arm_48_physics_substeps_v1"
+)
+GRIPPER_CLOSE_ARM_INTERLOCK_SUBSTEPS = 48
 CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD = 1e-5
 TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE = "eef_physx_inner_hardlimit_one_substep_v2"
 PHYSX_HARD_LIMIT_PROFILE = "outer_minus_one_velocity_substep_v1"

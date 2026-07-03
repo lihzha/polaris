@@ -1347,6 +1347,22 @@ def _validate_safety_report(
     )
     _require(
         all(
+            math.isclose(
+                violation,
+                max(-clearance, 0.0),
+                rel_tol=0.0,
+                abs_tol=1e-6,
+            )
+            for violation, clearance in zip(
+                maxima["current_joint_soft_limit_violation_rad"],
+                maxima["minimum_outer_joint_clearance_rad"],
+                strict=True,
+            )
+        ),
+        f"{field}.outer violation/clearance evidence",
+    )
+    _require(
+        all(
             actual <= bound + 1e-6
             for actual, bound in zip(
                 maxima["applied_delta_joint_pos_rad"], EXPECTED_MAX_DELTA, strict=True

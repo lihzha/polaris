@@ -31,14 +31,26 @@ from isaaclab.utils.math import compute_pose_error
 from pxr import PhysxSchema
 from pxr import UsdPhysics
 
+from polaris.eef_controller_repair import advance_gripper_close_arm_interlock
+from polaris.eef_controller_repair import (
+    bound_joint_position_target as _bound_joint_position_target,
+)
+from polaris.eef_controller_repair import (
+    DISABLED_GRIPPER_CLOSE_ARM_INTERLOCK_TRANSITION,
+)
+from polaris.eef_controller_repair import GripperCloseArmInterlockTransition
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE
 from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
+from polaris.eef_ik_safety import ARM_SLEW_HEADROOM_CANDIDATE_PROFILE
+from polaris.eef_ik_safety import ARM_SLEW_HEADROOM_RATIO
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+from polaris.eef_ik_safety import GRIPPER_CLOSE_ARM_INTERLOCK_CANDIDATE_PROFILE
+from polaris.eef_ik_safety import GRIPPER_CLOSE_ARM_INTERLOCK_SUBSTEPS
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import format_current_joint_velocity_abort_message
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
@@ -237,68 +249,6 @@ def _eef_quaternion_norm_is_valid(
         (norms - 1.0).abs() <= EEF_QUATERNION_UNIT_NORM_TOLERANCE
     )
     return norms, valid
-
-
-def _bound_joint_position_target(
-    joint_pos: torch.Tensor,
-    raw_joint_pos_target: torch.Tensor,
-    max_delta_joint_pos: torch.Tensor,
-    soft_joint_pos_limits: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Slew-limit and soft-limit one finite joint-position target.
-
-    Returns the safe target, the raw joint delta, a per-joint slew-limit mask,
-    and a per-joint position-limit mask. All tensors retain the input batch
-    dimension so callers can aggregate safety evidence per environment.
-    """
-
-    raw_delta_joint_pos = raw_joint_pos_target - joint_pos
-    applied_delta_joint_pos = torch.clamp(
-        raw_delta_joint_pos,
-        min=-max_delta_joint_pos,
-        max=max_delta_joint_pos,
-    )
-    slew_limited = raw_delta_joint_pos.abs() > max_delta_joint_pos
-    bounded_target = joint_pos + applied_delta_joint_pos
-    # Preserve the inherited healthy DLS target bit-for-bit. Reconstructing an
-    # unguarded target as q + (target - q) can move it by one float32 ULP.
-    slew_limited_target = torch.where(
-        slew_limited, bounded_target, raw_joint_pos_target
-    )
-    lower = soft_joint_pos_limits[..., 0]
-    upper = soft_joint_pos_limits[..., 1]
-    # Keep every commanded position one maximum physics-substep motion inside
-    # the articulation limit. Exact-bound targets can overshoot the live
-    # float32 limit slightly under the implicit actuator even when the DLS
-    # output is finite. The velocity-derived guard band makes the actuator
-    # brake before that boundary while preserving inherited healthy targets
-    # bit-for-bit whenever this guard is inactive.
-    target_lower = lower + max_delta_joint_pos
-    target_upper = upper - max_delta_joint_pos
-    # If PhysX reports a current position only microscopically outside the
-    # outer limit but still within the named current-state tolerance, retain
-    # the slew bound while commanding inward. This recovery allowance is at
-    # most that same tolerance and disappears as soon as q is back in range.
-    target_lower_effective = target_lower - torch.clamp(
-        lower - joint_pos,
-        min=0.0,
-        max=CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD,
-    )
-    target_upper_effective = target_upper + torch.clamp(
-        joint_pos - upper,
-        min=0.0,
-        max=CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD,
-    )
-    position_limited = (slew_limited_target < target_lower_effective) | (
-        slew_limited_target > target_upper_effective
-    )
-    clipped_target = torch.clamp(
-        slew_limited_target,
-        min=target_lower_effective,
-        max=target_upper_effective,
-    )
-    safe_target = torch.where(position_limited, clipped_target, slew_limited_target)
-    return safe_target, raw_delta_joint_pos, slew_limited, position_limited
 
 
 @dataclass(frozen=True)
@@ -656,6 +606,26 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 "PolaRiS EEF wrist energy-brake candidate requires exactly "
                 "one environment"
             )
+        arm_slew_headroom_enabled = self.cfg.enable_arm_slew_headroom
+        if type(arm_slew_headroom_enabled) is not bool:
+            raise ValueError("PolaRiS EEF arm-slew headroom enable flag must be bool")
+        self._arm_slew_headroom_enabled = arm_slew_headroom_enabled
+        close_interlock_enabled = self.cfg.enable_gripper_close_arm_interlock
+        if type(close_interlock_enabled) is not bool:
+            raise ValueError("PolaRiS EEF close-interlock enable flag must be bool")
+        self._gripper_close_arm_interlock_enabled = close_interlock_enabled
+        if self._gripper_close_arm_interlock_enabled and self.num_envs != 1:
+            raise ValueError(
+                "PolaRiS EEF close-interlock candidate requires exactly one environment"
+            )
+        if (
+            self._gripper_close_arm_interlock_enabled
+            and self._wrist_energy_brake_enabled
+        ):
+            raise ValueError(
+                "PolaRiS EEF close-interlock and wrist-energy-brake candidates "
+                "cannot be combined"
+            )
         self._safety_profile = (
             EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
             if self._wrist_energy_brake_enabled
@@ -732,6 +702,15 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 "PolaRiS EEF IK cached joint limits do not match PhysX readback"
             )
         self._max_delta_joint_pos = self._joint_velocity_limits * self._physics_dt
+        self._nominal_max_delta_joint_pos = self._max_delta_joint_pos * (
+            ARM_SLEW_HEADROOM_RATIO if self._arm_slew_headroom_enabled else 1.0
+        )
+        if not (
+            torch.isfinite(self._nominal_max_delta_joint_pos).all()
+            and (self._nominal_max_delta_joint_pos > 0.0).all()
+            and (self._nominal_max_delta_joint_pos <= self._max_delta_joint_pos).all()
+        ):
+            raise ValueError("PolaRiS EEF nominal arm-slew bound is invalid")
 
         articulation_props = getattr(
             getattr(self._asset.cfg, "spawn", None),
@@ -1045,9 +1024,26 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._wrist_energy_brake_previous_target_valid[selected] = False
         self._wrist_energy_brake_reversal_detection_armed[selected] = False
 
+    def _reset_gripper_close_arm_interlock_state(self) -> None:
+        """Clear the default-off close/motion interlock lifecycle."""
+
+        self._gripper_close_arm_interlock_remaining = 0
+        self._gripper_close_arm_interlock_observed_endpoint_change_count = 0
+        self._gripper_close_arm_interlock_endpoint_observed = False
+        self._gripper_close_arm_interlock_activation_count = 0
+        self._gripper_close_arm_interlock_active_apply_count = 0
+        self._gripper_close_arm_interlock_released_apply_count = 0
+        self._gripper_close_arm_interlock_max_abs_active_delta = torch.zeros_like(
+            self._max_delta_joint_pos[0]
+        )
+        self._gripper_close_arm_interlock_max_abs_released_delta = torch.zeros_like(
+            self._max_delta_joint_pos[0]
+        )
+
     def _reset_episode_safety_state(self, episode_index: int | None) -> None:
         counter_dtype = torch.int64
         self._active_episode_index = episode_index
+        self._reset_gripper_close_arm_interlock_state()
         self._apply_call_count = 0
         self._slew_limit_event_count = torch.zeros(
             (), dtype=counter_dtype, device=self.device
@@ -1197,6 +1193,66 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._gripper_runtime_static = validated
         self._gripper_target_slew_term = finger_term
         self._reset_gripper_runtime_evidence()
+
+    def _next_gripper_close_arm_interlock_transition(
+        self,
+    ) -> GripperCloseArmInterlockTransition:
+        """Read the bound binary endpoint and stage one interlock transition."""
+
+        if not self._gripper_close_arm_interlock_enabled:
+            return advance_gripper_close_arm_interlock(
+                enabled=False,
+                previous_endpoint_change_count=(
+                    self._gripper_close_arm_interlock_observed_endpoint_change_count
+                ),
+                current_endpoint_change_count=(
+                    self._gripper_close_arm_interlock_observed_endpoint_change_count
+                ),
+                endpoint_observed_before_apply=(
+                    self._gripper_close_arm_interlock_endpoint_observed
+                ),
+                endpoint_is_closed=False,
+                remaining_before_apply=self._gripper_close_arm_interlock_remaining,
+            )
+        finger_term = getattr(self, "_gripper_target_slew_term", None)
+        if finger_term is None:
+            raise ValueError(
+                "PolaRiS EEF close interlock requires the installed gripper term"
+            )
+        endpoint = getattr(finger_term, "_gripper_target_slew_endpoint", None)
+        endpoint_seen = getattr(finger_term, "_gripper_target_slew_endpoint_seen", None)
+        close_command = getattr(finger_term, "_close_command", None)
+        open_command = getattr(finger_term, "_open_command", None)
+        endpoint_change_count = getattr(
+            finger_term, "_gripper_target_slew_endpoint_change_count", None
+        )
+        if (
+            endpoint_seen is not True
+            or not isinstance(endpoint, torch.Tensor)
+            or not isinstance(close_command, torch.Tensor)
+            or not isinstance(open_command, torch.Tensor)
+            or endpoint.shape != (self.num_envs, 1)
+            or endpoint.dtype != self._asset.data.joint_pos.dtype
+            or endpoint.device != torch.device(self.device)
+            or type(endpoint_change_count) is not int
+            or endpoint_change_count < 0
+        ):
+            raise ValueError("PolaRiS EEF close-interlock endpoint state drift")
+        endpoint_is_closed = torch.equal(endpoint, close_command)
+        if not endpoint_is_closed and not torch.equal(endpoint, open_command):
+            raise ValueError("PolaRiS EEF close interlock requires a binary endpoint")
+        return advance_gripper_close_arm_interlock(
+            enabled=True,
+            previous_endpoint_change_count=(
+                self._gripper_close_arm_interlock_observed_endpoint_change_count
+            ),
+            current_endpoint_change_count=endpoint_change_count,
+            endpoint_observed_before_apply=(
+                self._gripper_close_arm_interlock_endpoint_observed
+            ),
+            endpoint_is_closed=endpoint_is_closed,
+            remaining_before_apply=self._gripper_close_arm_interlock_remaining,
+        )
 
     def _reset_gripper_runtime_evidence(self) -> None:
         dtype = self._asset.data.joint_pos.dtype
@@ -1403,6 +1459,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         super().reset(env_ids)
         if self._wrist_energy_brake_enabled:
             self._reset_wrist_energy_brake_state(env_ids)
+        self._reset_gripper_close_arm_interlock_state()
 
     def _soft_joint_pos_limits(self) -> torch.Tensor:
         return self._asset.data.soft_joint_pos_limits[:, self._joint_ids, :]
@@ -1972,6 +2029,11 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 post_joint_vel=self._asset.data.joint_vel[:, self._joint_ids],
             )
         self._apply_call_count += 1
+        close_interlock_transition = (
+            self._next_gripper_close_arm_interlock_transition()
+            if self._gripper_close_arm_interlock_enabled
+            else DISABLED_GRIPPER_CLOSE_ARM_INTERLOCK_TRANSITION
+        )
         ee_pos_curr, ee_quat_curr = self._compute_frame_pose()
         joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
         joint_vel = self._asset.data.joint_vel[:, self._joint_ids]
@@ -2215,8 +2277,9 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             _bound_joint_position_target(
                 joint_pos,
                 raw_joint_pos_target,
-                self._max_delta_joint_pos,
+                self._nominal_max_delta_joint_pos,
                 soft_limits,
+                target_guard_band_delta_joint_pos=self._max_delta_joint_pos,
             )
         )
         wrist_energy_brake_result = None
@@ -2235,6 +2298,14 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             safe_target = wrist_energy_brake_result.applied_target
         else:
             safe_target = nominal_safe_target
+        if close_interlock_transition.active:
+            safe_target, _, _, _ = _bound_joint_position_target(
+                joint_pos,
+                joint_pos,
+                self._nominal_max_delta_joint_pos,
+                soft_limits,
+                target_guard_band_delta_joint_pos=self._max_delta_joint_pos,
+            )
         applied_delta = safe_target - joint_pos
         raw_target_violation = torch.maximum(
             torch.clamp(lower - raw_joint_pos_target, min=0.0),
@@ -2267,7 +2338,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         ).any(dim=-1)
         post_clamp_slew_invalid = (
             applied_delta.abs()
-            > self._max_delta_joint_pos + JOINT_SLEW_FLOAT32_TOLERANCE_RAD
+            > self._nominal_max_delta_joint_pos + JOINT_SLEW_FLOAT32_TOLERANCE_RAD
         ).any(dim=-1)
         self._post_clamp_target_violation_count += post_clamp_target_invalid.sum()
         self._max_raw_delta_joint_pos = torch.maximum(
@@ -2386,6 +2457,40 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             self._joint_ids,
         )
         self._asset.set_joint_position_target(safe_target, self._joint_ids)
+        activation_count_after_apply = (
+            self._gripper_close_arm_interlock_activation_count
+            + close_interlock_transition.activation_count_delta
+        )
+        self._gripper_close_arm_interlock_remaining = (
+            close_interlock_transition.remaining_after_successful_apply
+        )
+        self._gripper_close_arm_interlock_observed_endpoint_change_count = (
+            close_interlock_transition.observed_endpoint_change_count
+        )
+        self._gripper_close_arm_interlock_endpoint_observed = (
+            close_interlock_transition.endpoint_observed_after_successful_apply
+        )
+        self._gripper_close_arm_interlock_activation_count += (
+            close_interlock_transition.activation_count_delta
+        )
+        self._gripper_close_arm_interlock_active_apply_count += int(
+            close_interlock_transition.active
+        )
+        if close_interlock_transition.active:
+            self._gripper_close_arm_interlock_max_abs_active_delta = torch.maximum(
+                self._gripper_close_arm_interlock_max_abs_active_delta,
+                applied_delta[0].abs(),
+            )
+        if (
+            self._gripper_close_arm_interlock_enabled
+            and activation_count_after_apply > 0
+            and not close_interlock_transition.active
+        ):
+            self._gripper_close_arm_interlock_released_apply_count += 1
+            self._gripper_close_arm_interlock_max_abs_released_delta = torch.maximum(
+                self._gripper_close_arm_interlock_max_abs_released_delta,
+                applied_delta[0].abs(),
+            )
         if self._wrist_energy_brake_enabled:
             if wrist_energy_brake_result is None:
                 raise ValueError("PolaRiS EEF wrist energy-brake transition is absent")
@@ -2439,6 +2544,80 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 desired_eef_quaternion=self._ik_controller.ee_quat_des,
                 pose_error=pose_error,
             )
+
+    def controller_repair_candidate_report(self) -> dict[str, object]:
+        """Return isolated evidence without changing the production report schema."""
+
+        expected_nominal = self._max_delta_joint_pos * (
+            ARM_SLEW_HEADROOM_RATIO if self._arm_slew_headroom_enabled else 1.0
+        )
+        if not torch.equal(expected_nominal, self._nominal_max_delta_joint_pos):
+            raise ValueError("PolaRiS EEF nominal arm-slew candidate state drift")
+        if not self._gripper_close_arm_interlock_enabled and (
+            self._gripper_close_arm_interlock_remaining != 0
+            or self._gripper_close_arm_interlock_activation_count != 0
+            or self._gripper_close_arm_interlock_active_apply_count != 0
+            or self._gripper_close_arm_interlock_released_apply_count != 0
+            or self._gripper_close_arm_interlock_endpoint_observed
+            or bool(
+                self._gripper_close_arm_interlock_max_abs_active_delta.any()
+                .detach()
+                .cpu()
+                .item()
+            )
+            or bool(
+                self._gripper_close_arm_interlock_max_abs_released_delta.any()
+                .detach()
+                .cpu()
+                .item()
+            )
+        ):
+            raise ValueError("Disabled PolaRiS EEF close interlock has evidence")
+        return {
+            "arm_slew_headroom": {
+                "enabled": self._arm_slew_headroom_enabled,
+                "profile": ARM_SLEW_HEADROOM_CANDIDATE_PROFILE,
+                "ratio": ARM_SLEW_HEADROOM_RATIO,
+                "physical_max_delta_joint_pos_rad": self._max_delta_joint_pos[0]
+                .detach()
+                .cpu()
+                .tolist(),
+                "nominal_max_delta_joint_pos_rad": (
+                    self._nominal_max_delta_joint_pos[0].detach().cpu().tolist()
+                ),
+            },
+            "gripper_close_arm_interlock": {
+                "enabled": self._gripper_close_arm_interlock_enabled,
+                "profile": GRIPPER_CLOSE_ARM_INTERLOCK_CANDIDATE_PROFILE,
+                "configured_substeps": GRIPPER_CLOSE_ARM_INTERLOCK_SUBSTEPS,
+                "remaining_substeps": self._gripper_close_arm_interlock_remaining,
+                "observed_endpoint_change_count": (
+                    self._gripper_close_arm_interlock_observed_endpoint_change_count
+                ),
+                "endpoint_observed": (
+                    self._gripper_close_arm_interlock_endpoint_observed
+                ),
+                "activation_count": (
+                    self._gripper_close_arm_interlock_activation_count
+                ),
+                "active_apply_count": (
+                    self._gripper_close_arm_interlock_active_apply_count
+                ),
+                "max_abs_active_delta_joint_pos_rad": (
+                    self._gripper_close_arm_interlock_max_abs_active_delta.detach()
+                    .cpu()
+                    .tolist()
+                ),
+                "released_apply_count": (
+                    self._gripper_close_arm_interlock_released_apply_count
+                ),
+                "max_abs_released_delta_joint_pos_rad": (
+                    self._gripper_close_arm_interlock_max_abs_released_delta.detach()
+                    .cpu()
+                    .tolist()
+                ),
+            },
+        }
 
     def safety_report(self) -> dict[str, object]:
         """Return JSON-serializable evidence for the active rollout."""
@@ -2808,5 +2987,11 @@ class RobustDifferentialInverseKinematicsActionCfg(
 
     enable_wrist_energy_brake: bool = False
     """Enable the isolated wrist transient diagnostic candidate."""
+
+    enable_arm_slew_headroom: bool = False
+    """Use 95% of the physical per-substep arm velocity bound."""
+
+    enable_gripper_close_arm_interlock: bool = False
+    """Hold the arm during the bounded EEF gripper-close ramp."""
 
     class_type = RobustDifferentialInverseKinematicsAction
