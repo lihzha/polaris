@@ -25,10 +25,15 @@ from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
+from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
+from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+from polaris.eef_ik_safety import PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT
+from polaris.eef_ik_safety import PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT
+from polaris.eef_ik_safety import PANDA_EEF_PHYSX_SOLVER_TYPE
 from polaris.eef_ik_safety import (
     PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256,
 )
@@ -112,6 +117,11 @@ def _runtime_fixture():
         "physx_derived_soft_limit_profile": PHYSX_DERIVED_SOFT_LIMIT_PROFILE,
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": ARM_VELOCITY_TARGET_PROFILE,
+        "articulation_solver_profile": ARTICULATION_SOLVER_PROFILE,
+        "articulation_solver_readback": ARTICULATION_SOLVER_READBACK,
+        "physx_solver_type": PANDA_EEF_PHYSX_SOLVER_TYPE,
+        "solver_position_iteration_count": (PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT),
+        "solver_velocity_iteration_count": (PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT),
         "joint_velocity_limit_tolerance_rad_s": JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S,
         "eef_quaternion_unit_norm_tolerance": EEF_QUATERNION_UNIT_NORM_TOLERANCE,
         "joint_slew_float32_tolerance_rad": JOINT_SLEW_FLOAT32_TOLERANCE_RAD,
@@ -802,6 +812,20 @@ def test_runtime_safety_rejects_drift_and_unbounded_applied_delta():
     env.unwrapped.action_manager._terms["arm"].safety_report = lambda: drifted
     with pytest.raises(ValueError, match="apply_actions_cadence"):
         validate_eef_runtime_safety(env)
+
+    for field, value in (
+        ("articulation_solver_profile", "wrong"),
+        ("articulation_solver_readback", "wrong"),
+        ("physx_solver_type", 0),
+        ("solver_position_iteration_count", 32),
+        ("solver_velocity_iteration_count", 0),
+    ):
+        env, _ = _runtime_fixture()
+        drifted = env.unwrapped.action_manager._terms["arm"].safety_report()
+        drifted[field] = value
+        env.unwrapped.action_manager._terms["arm"].safety_report = lambda: drifted
+        with pytest.raises(ValueError, match=field):
+            validate_eef_runtime_safety(env)
 
     env, _ = _runtime_fixture()
     unsafe = env.unwrapped.action_manager._terms["arm"].safety_report()

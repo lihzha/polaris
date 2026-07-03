@@ -16,6 +16,8 @@ from scipy.spatial.transform import Rotation
 
 from polaris.config import LAP_EEF_FRAME
 from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
+from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
+from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
@@ -24,6 +26,9 @@ from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+from polaris.eef_ik_safety import PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT
+from polaris.eef_ik_safety import PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT
+from polaris.eef_ik_safety import PANDA_EEF_PHYSX_SOLVER_TYPE
 from polaris.eef_ik_safety import (
     PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256,
 )
@@ -112,6 +117,11 @@ SAFETY_STATIC_FIELDS = (
     "physx_derived_soft_limit_profile",
     "physx_hard_limit_write_count",
     "arm_velocity_target_profile",
+    "articulation_solver_profile",
+    "articulation_solver_readback",
+    "physx_solver_type",
+    "solver_position_iteration_count",
+    "solver_velocity_iteration_count",
     "joint_velocity_limit_tolerance_rad_s",
     "eef_quaternion_unit_norm_tolerance",
     "joint_slew_float32_tolerance_rad",
@@ -401,6 +411,11 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         "physx_derived_soft_limit_profile": PHYSX_DERIVED_SOFT_LIMIT_PROFILE,
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": ARM_VELOCITY_TARGET_PROFILE,
+        "articulation_solver_profile": ARTICULATION_SOLVER_PROFILE,
+        "articulation_solver_readback": ARTICULATION_SOLVER_READBACK,
+        "physx_solver_type": PANDA_EEF_PHYSX_SOLVER_TYPE,
+        "solver_position_iteration_count": (PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT),
+        "solver_velocity_iteration_count": (PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT),
         "decimation": CANONICAL_DECIMATION,
         "joint_names": list(CANONICAL_ARM_JOINTS),
     }

@@ -148,6 +148,11 @@ SAFETY_FIELDS = {
     "physx_derived_soft_limit_profile",
     "physx_hard_limit_write_count",
     "arm_velocity_target_profile",
+    "articulation_solver_profile",
+    "articulation_solver_readback",
+    "physx_solver_type",
+    "solver_position_iteration_count",
+    "solver_velocity_iteration_count",
     "joint_velocity_limit_tolerance_rad_s",
     "eef_quaternion_unit_norm_tolerance",
     "joint_slew_float32_tolerance_rad",
@@ -437,7 +442,7 @@ def _validate_safety_report(
     else:
         _exact_int(report.get("episode_index"), episode_index, f"{field}.episode_index")
     for name, expected in (
-        ("profile", "panda_velocity_physxlimit_v3"),
+        ("profile", "panda_velocity_physxlimit_solveriter1_v4"),
         ("apply_actions_cadence", "physics_substep"),
         (
             "target_soft_limit_guard_band_profile",
@@ -449,6 +454,14 @@ def _validate_safety_report(
             "isaaclab_midpoint_range_factor1_float32_v1",
         ),
         ("arm_velocity_target_profile", "zero_per_physics_substep_v1"),
+        (
+            "articulation_solver_profile",
+            "tgs_position64_velocity1_eef_only_v1",
+        ),
+        (
+            "articulation_solver_readback",
+            "composed_usd_physx_articulation_api_all_env_roots_v1",
+        ),
         ("target_joint_pos_limits_float32_sha256", EXPECTED_TARGET_DIGEST),
         ("physx_hard_joint_pos_limits_float32_sha256", EXPECTED_TARGET_DIGEST),
         (
@@ -461,6 +474,21 @@ def _validate_safety_report(
             type(report.get(name)) is str and report[name] == expected,
             f"{field}.{name}",
         )
+    _exact_int(
+        report.get("physx_solver_type"),
+        1,
+        f"{field}.physx_solver_type",
+    )
+    _exact_int(
+        report.get("solver_position_iteration_count"),
+        64,
+        f"{field}.solver_position_iteration_count",
+    )
+    _exact_int(
+        report.get("solver_velocity_iteration_count"),
+        1,
+        f"{field}.solver_velocity_iteration_count",
+    )
     for name, expected in (
         ("physics_dt", 1.0 / 120.0),
         ("control_dt", 1.0 / 15.0),

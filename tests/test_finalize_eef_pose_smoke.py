@@ -65,7 +65,7 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
         max_raw["safe_joint_pos_target_rad"] = _diagnostic_vector(safe_target)
     return {
         "episode_index": episode_index,
-        "profile": "panda_velocity_physxlimit_v3",
+        "profile": "panda_velocity_physxlimit_solveriter1_v4",
         "apply_actions_cadence": "physics_substep",
         "physics_dt": 1.0 / 120.0,
         "control_dt": 1.0 / 15.0,
@@ -80,6 +80,13 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
         ),
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": "zero_per_physics_substep_v1",
+        "articulation_solver_profile": "tgs_position64_velocity1_eef_only_v1",
+        "articulation_solver_readback": (
+            "composed_usd_physx_articulation_api_all_env_roots_v1"
+        ),
+        "physx_solver_type": 1,
+        "solver_position_iteration_count": 64,
+        "solver_velocity_iteration_count": 1,
         "joint_velocity_limit_tolerance_rad_s": 1e-5,
         "eef_quaternion_unit_norm_tolerance": 1e-3,
         "joint_slew_float32_tolerance_rad": 1e-6,
@@ -310,6 +317,16 @@ def test_raw_smoke_gate_requires_pending_full_evidence():
     raw = _valid_raw_result()
     raw["raw_ik_safety_capture"]["arm_velocity_target_rad_s"][4] = 1e-3
     with pytest.raises(finalizer.VerificationError, match="velocity_target"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["raw_ik_safety_capture"]["solver_velocity_iteration_count"] = 0
+    with pytest.raises(finalizer.VerificationError, match="solver_velocity"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["raw_ik_safety_capture"]["physx_solver_type"] = 0
+    with pytest.raises(finalizer.VerificationError, match="physx_solver_type"):
         finalizer._verify_raw(raw)
 
     raw = _valid_raw_result()

@@ -6,15 +6,23 @@ from isaaclab.assets import ArticulationCfg
 
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+from polaris.eef_ik_safety import PANDA_EEF_PHYSX_SOLVER_TYPE
+from polaris.eef_ik_safety import PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT
+from polaris.eef_ik_safety import PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT
 from polaris.utils import DATA_PATH
 
 
-def configure_eef_pose_joint_safety(robot_cfg: ArticulationCfg) -> ArticulationCfg:
+def configure_eef_pose_joint_safety(
+    robot_cfg: ArticulationCfg, *, physx_cfg
+) -> ArticulationCfg:
     """Enable explicit PhysX arm limits only for EEF-pose evaluation.
 
     Isaac Lab 2.3 intentionally ignores the legacy ``velocity_limit`` field on
     implicit actuators unless ``velocity_limit_sim`` is set. Keeping this
     mutation in the EEF setup path preserves native joint-position semantics.
+    One articulation velocity iteration is also required so PhysX resolves
+    drives and velocity limits instead of relying exclusively on the TGS
+    position iterations.
     """
 
     limits = {
@@ -36,6 +44,17 @@ def configure_eef_pose_joint_safety(robot_cfg: ArticulationCfg) -> ArticulationC
             ) from error
         actuator.velocity_limit_sim = values["velocity"]
         actuator.effort_limit_sim = values["effort"]
+
+    articulation_props = robot_cfg.spawn.articulation_props
+    if articulation_props is None:
+        raise ValueError("DROID robot config has no articulation properties")
+    articulation_props.solver_position_iteration_count = (
+        PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT
+    )
+    articulation_props.solver_velocity_iteration_count = (
+        PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT
+    )
+    physx_cfg.solver_type = PANDA_EEF_PHYSX_SOLVER_TYPE
     return robot_cfg
 
 

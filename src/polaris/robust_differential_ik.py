@@ -14,8 +14,10 @@ import hashlib
 import math
 
 import omni.log
+import omni.usd
 import torch
 
+import isaaclab.sim as sim_utils
 from isaaclab.controllers.differential_ik import DifferentialIKController
 from isaaclab.envs.mdp.actions.actions_cfg import (
     DifferentialInverseKinematicsActionCfg,
@@ -25,9 +27,13 @@ from isaaclab.envs.mdp.actions.task_space_actions import (
 )
 from isaaclab.utils import configclass
 from isaaclab.utils.math import compute_pose_error
+from pxr import PhysxSchema
+from pxr import UsdPhysics
 
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
 from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
+from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
+from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
@@ -35,6 +41,9 @@ from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
 from polaris.eef_ik_safety import PHYSX_DERIVED_SOFT_LIMIT_PROFILE
 from polaris.eef_ik_safety import PHYSX_HARD_LIMIT_PROFILE
+from polaris.eef_ik_safety import PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT
+from polaris.eef_ik_safety import PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT
+from polaris.eef_ik_safety import PANDA_EEF_PHYSX_SOLVER_TYPE
 from polaris.eef_ik_safety import TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
 
 
@@ -60,6 +69,90 @@ def _require_finite(value: torch.Tensor, *, field: str) -> None:
             f"PolaRiS EEF IK safety received non-finite {field}; "
             f"aborting rollout (max_abs_finite={max_abs:g})"
         )
+
+
+def _read_articulation_solver_iteration_counts(
+    asset,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Read composed PhysX articulation solver attributes for every env root.
+
+    The pinned ``omni.physics.tensors`` articulation view does not expose a
+    post-parser solver-iteration getter. Querying every concrete composed USD
+    root therefore verifies the exact parser input rather than pretending the
+    higher-level Isaac Sim Core wrapper is a tensor-state readback.
+    """
+
+    stage = omni.usd.get_context().get_stage()
+    if stage is None:
+        raise ValueError("PolaRiS EEF IK could not access the live USD stage")
+    asset_prims = sim_utils.find_matching_prims(asset.cfg.prim_path, stage=stage)
+    expected_count = int(asset.root_physx_view.count)
+    if len(asset_prims) != expected_count:
+        raise ValueError(
+            "PolaRiS EEF IK articulation asset-root count mismatch: "
+            f"expected={expected_count}, actual={len(asset_prims)}"
+        )
+
+    relative_root_path = getattr(asset.cfg, "articulation_root_prim_path", None)
+    articulation_roots = []
+    for asset_prim in asset_prims:
+        asset_path = asset_prim.GetPath().pathString
+        if relative_root_path is None:
+            matches = sim_utils.get_all_matching_child_prims(
+                asset_path,
+                predicate=lambda prim: prim.HasAPI(UsdPhysics.ArticulationRootAPI),
+                stage=stage,
+            )
+            if len(matches) != 1:
+                raise ValueError(
+                    "PolaRiS EEF IK requires exactly one articulation root "
+                    f"under {asset_path!r}; found={len(matches)}"
+                )
+            articulation_root = matches[0]
+        else:
+            root_path = (
+                f"{asset_path.rstrip('/')}/{str(relative_root_path).lstrip('/')}"
+            )
+            articulation_root = stage.GetPrimAtPath(root_path)
+            if not articulation_root.IsValid() or not articulation_root.HasAPI(
+                UsdPhysics.ArticulationRootAPI
+            ):
+                raise ValueError(
+                    "PolaRiS EEF IK configured articulation root is invalid: "
+                    f"{root_path!r}"
+                )
+        if not articulation_root.HasAPI(PhysxSchema.PhysxArticulationAPI):
+            raise ValueError(
+                "PolaRiS EEF IK articulation root lacks PhysxArticulationAPI: "
+                f"{articulation_root.GetPath().pathString!r}"
+            )
+        articulation_roots.append(articulation_root)
+
+    articulation_roots.sort(key=lambda prim: prim.GetPath().pathString)
+    root_paths = [prim.GetPath().pathString for prim in articulation_roots]
+    if len(root_paths) != expected_count or len(set(root_paths)) != expected_count:
+        raise ValueError("PolaRiS EEF IK articulation-root identity drift")
+
+    position_counts: list[int] = []
+    velocity_counts: list[int] = []
+    for articulation_root in articulation_roots:
+        schema = PhysxSchema.PhysxArticulationAPI(articulation_root)
+        position_attr = schema.GetSolverPositionIterationCountAttr()
+        velocity_attr = schema.GetSolverVelocityIterationCountAttr()
+        if not (
+            position_attr.HasAuthoredValueOpinion()
+            and velocity_attr.HasAuthoredValueOpinion()
+        ):
+            raise ValueError(
+                "PolaRiS EEF IK articulation solver attributes are unauthored"
+            )
+        position_value = position_attr.Get()
+        velocity_value = velocity_attr.Get()
+        if position_value is None or velocity_value is None:
+            raise ValueError("PolaRiS EEF IK articulation solver values are absent")
+        position_counts.append(int(position_value))
+        velocity_counts.append(int(velocity_value))
+    return tuple(position_counts), tuple(velocity_counts)
 
 
 def _eef_quaternion_norm_is_valid(
@@ -382,6 +475,14 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._physics_dt = float(env.physics_dt)
         self._control_dt = float(env.step_dt)
         self._decimation = int(env.cfg.decimation)
+        self._physx_cfg = env.cfg.sim.physx
+        self._physx_solver_type = int(self._physx_cfg.solver_type)
+        if self._physx_solver_type != PANDA_EEF_PHYSX_SOLVER_TYPE:
+            raise ValueError(
+                "PolaRiS EEF IK requires the TGS PhysX solver "
+                f"(type={PANDA_EEF_PHYSX_SOLVER_TYPE}); "
+                f"live={self._physx_solver_type}"
+            )
         if (
             self._physics_dt <= 0.0
             or self._decimation <= 0
@@ -405,6 +506,16 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._joint_effort_limits = self._asset.data.joint_effort_limits[
             :, self._joint_ids
         ].clone()
+        physx_joint_velocity_limits = (
+            self._asset.root_physx_view.get_dof_max_velocities()
+            .to(self._asset.device)[:, self._joint_ids]
+            .clone()
+        )
+        physx_joint_effort_limits = (
+            self._asset.root_physx_view.get_dof_max_forces()
+            .to(self._asset.device)[:, self._joint_ids]
+            .clone()
+        )
         _require_finite(
             self._joint_velocity_limits, field="configured joint velocity limits"
         )
@@ -418,7 +529,59 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 "PolaRiS EEF IK safety requires positive live joint velocity "
                 "and effort limits"
             )
+        if not (
+            torch.equal(physx_joint_velocity_limits, self._joint_velocity_limits)
+            and torch.equal(physx_joint_effort_limits, self._joint_effort_limits)
+        ):
+            raise ValueError(
+                "PolaRiS EEF IK cached joint limits do not match PhysX readback"
+            )
         self._max_delta_joint_pos = self._joint_velocity_limits * self._physics_dt
+
+        articulation_props = getattr(
+            getattr(self._asset.cfg, "spawn", None),
+            "articulation_props",
+            None,
+        )
+        if articulation_props is None:
+            raise ValueError(
+                "PolaRiS EEF IK safety requires articulation solver properties"
+            )
+        configured_position_iterations = int(
+            articulation_props.solver_position_iteration_count
+        )
+        configured_velocity_iterations = int(
+            articulation_props.solver_velocity_iteration_count
+        )
+        if (
+            configured_position_iterations != PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT
+            or configured_velocity_iterations
+            != PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT
+        ):
+            raise ValueError(
+                "PolaRiS EEF IK articulation solver configuration mismatch: "
+                f"position={configured_position_iterations!r}, "
+                f"velocity={configured_velocity_iterations!r}"
+            )
+        (
+            self._solver_position_iteration_counts,
+            self._solver_velocity_iteration_counts,
+        ) = _read_articulation_solver_iteration_counts(self._asset)
+        if (
+            len(self._solver_position_iteration_counts) != self.num_envs
+            or len(self._solver_velocity_iteration_counts) != self.num_envs
+            or any(
+                count != PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT
+                for count in self._solver_position_iteration_counts
+            )
+            or any(
+                count != PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT
+                for count in self._solver_velocity_iteration_counts
+            )
+        ):
+            raise ValueError(
+                "PolaRiS EEF IK composed articulation solver readback mismatch"
+            )
 
         soft_limits = self._soft_joint_pos_limits()
         _require_finite(soft_limits, field="soft joint position limits")
@@ -1028,6 +1191,9 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
     def safety_report(self) -> dict[str, object]:
         """Return JSON-serializable evidence for the active rollout."""
 
+        live_physx_solver_type = int(self._physx_cfg.solver_type)
+        if live_physx_solver_type != self._physx_solver_type:
+            raise ValueError("PolaRiS EEF live PhysX solver type drifted")
         soft_limits = self._soft_joint_position_limits
         target_limits = self._physx_hard_joint_position_limits
         physx_hard_limit_readback = self._asset.root_physx_view.get_dof_limits().to(
@@ -1038,6 +1204,20 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             :, self._joint_ids, :
         ]
         live_velocity_target = self._asset.data.joint_vel_target[:, self._joint_ids]
+        live_joint_velocity_limits = (
+            self._asset.root_physx_view.get_dof_max_velocities()
+            .to(self._asset.device)[:, self._joint_ids]
+            .clone()
+        )
+        live_joint_effort_limits = (
+            self._asset.root_physx_view.get_dof_max_forces()
+            .to(self._asset.device)[:, self._joint_ids]
+            .clone()
+        )
+        (
+            live_solver_position_iterations,
+            live_solver_velocity_iterations,
+        ) = _read_articulation_solver_iteration_counts(self._asset)
         if not (
             torch.equal(physx_hard_limit_readback, target_limits)
             and torch.equal(mirror_hard_limits, target_limits)
@@ -1055,6 +1235,19 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             )
         if not torch.equal(live_velocity_target, self._zero_joint_velocity_target):
             raise ValueError("PolaRiS EEF live arm velocity target is not exactly zero")
+        if not (
+            torch.equal(live_joint_velocity_limits, self._joint_velocity_limits)
+            and torch.equal(live_joint_effort_limits, self._joint_effort_limits)
+        ):
+            raise ValueError("PolaRiS EEF live PhysX joint-limit readback drifted")
+        if not (
+            live_solver_position_iterations == self._solver_position_iteration_counts
+            and live_solver_velocity_iterations
+            == self._solver_velocity_iteration_counts
+        ):
+            raise ValueError(
+                "PolaRiS EEF composed articulation solver readback drifted"
+            )
         soft_limit_bytes = (
             soft_limits[0].detach().cpu().numpy().astype("<f4", copy=False).tobytes()
         )
@@ -1124,16 +1317,21 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             "physx_derived_soft_limit_profile": PHYSX_DERIVED_SOFT_LIMIT_PROFILE,
             "physx_hard_limit_write_count": self._physx_hard_limit_write_count,
             "arm_velocity_target_profile": ARM_VELOCITY_TARGET_PROFILE,
+            "articulation_solver_profile": ARTICULATION_SOLVER_PROFILE,
+            "articulation_solver_readback": ARTICULATION_SOLVER_READBACK,
+            "physx_solver_type": live_physx_solver_type,
+            "solver_position_iteration_count": live_solver_position_iterations[0],
+            "solver_velocity_iteration_count": live_solver_velocity_iterations[0],
             "joint_velocity_limit_tolerance_rad_s": JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S,
             "eef_quaternion_unit_norm_tolerance": EEF_QUATERNION_UNIT_NORM_TOLERANCE,
             "joint_slew_float32_tolerance_rad": JOINT_SLEW_FLOAT32_TOLERANCE_RAD,
             "soft_joint_pos_limit_factor": self._soft_joint_pos_limit_factor,
             "joint_names": list(self._joint_names),
-            "joint_velocity_limits_rad_s": self._joint_velocity_limits[0]
+            "joint_velocity_limits_rad_s": live_joint_velocity_limits[0]
             .detach()
             .cpu()
             .tolist(),
-            "joint_effort_limits": self._joint_effort_limits[0].detach().cpu().tolist(),
+            "joint_effort_limits": live_joint_effort_limits[0].detach().cpu().tolist(),
             "max_delta_joint_pos_rad": self._max_delta_joint_pos[0]
             .detach()
             .cpu()

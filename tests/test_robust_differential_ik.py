@@ -1,11 +1,13 @@
 import inspect
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import pytest
 
 from isaaclab.controllers.differential_ik import DifferentialIKController
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
+import polaris.robust_differential_ik as robust_ik
 from polaris.robust_differential_ik import (
     DifferentialIKNumericalError,
     RobustDifferentialIKController,
@@ -20,6 +22,7 @@ from polaris.robust_differential_ik import (
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_RAD
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_RAD
 
@@ -213,9 +216,21 @@ class _LimitData:
 class _LimitRootView:
     def __init__(self, limits):
         self.limits = limits
+        self.max_velocities = torch.tensor(
+            [PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S], dtype=torch.float32
+        )
+        self.max_forces = torch.tensor(
+            [PANDA_EEF_JOINT_EFFORT_LIMITS], dtype=torch.float32
+        )
 
     def get_dof_limits(self):
         return self.limits
+
+    def get_dof_max_velocities(self):
+        return self.max_velocities
+
+    def get_dof_max_forces(self):
+        return self.max_forces
 
 
 class _LimitCfg:
@@ -264,6 +279,115 @@ class _LimitAsset:
             self.root_physx_view.limits[0, 0, 0] += 1e-3
         if self.corrupt_soft:
             self.data.soft_joint_pos_limits[0, 0, 0] += 1e-3
+
+
+class _SolverAttr:
+    def __init__(self, value, *, authored=True):
+        self.value = value
+        self.authored = authored
+
+    def HasAuthoredValueOpinion(self):
+        return self.authored
+
+    def Get(self):
+        return self.value
+
+
+class _SolverApi:
+    def __init__(
+        self, position, velocity, *, position_authored=True, velocity_authored=True
+    ):
+        self.position = _SolverAttr(position, authored=position_authored)
+        self.velocity = _SolverAttr(velocity, authored=velocity_authored)
+
+    def GetSolverPositionIterationCountAttr(self):
+        return self.position
+
+    def GetSolverVelocityIterationCountAttr(self):
+        return self.velocity
+
+
+class _SolverPrim:
+    def __init__(self, path, api=None):
+        self.path = path
+        self.api = api
+
+    def GetPath(self):
+        return SimpleNamespace(pathString=self.path)
+
+    def HasAPI(self, _schema):
+        return self.api is not None
+
+
+def _install_solver_schema_fakes(monkeypatch, apis):
+    stage = object()
+    asset_prims = [
+        _SolverPrim(f"/World/envs/env_{index}/robot") for index in range(len(apis))
+    ]
+    roots = {
+        prim.path: _SolverPrim(f"{prim.path}/panda_link0", api)
+        for prim, api in zip(asset_prims, apis, strict=True)
+    }
+    monkeypatch.setattr(
+        robust_ik.omni.usd,
+        "get_context",
+        lambda: SimpleNamespace(get_stage=lambda: stage),
+    )
+    monkeypatch.setattr(
+        robust_ik.sim_utils,
+        "find_matching_prims",
+        lambda _expression, *, stage: asset_prims,
+    )
+    monkeypatch.setattr(
+        robust_ik.sim_utils,
+        "get_all_matching_child_prims",
+        lambda path, *, predicate, stage: [roots[path]],
+    )
+    monkeypatch.setattr(
+        robust_ik,
+        "PhysxSchema",
+        SimpleNamespace(PhysxArticulationAPI=lambda prim: prim.api),
+    )
+    monkeypatch.setattr(
+        robust_ik,
+        "UsdPhysics",
+        SimpleNamespace(ArticulationRootAPI=object()),
+    )
+    return SimpleNamespace(
+        cfg=SimpleNamespace(
+            prim_path="/World/envs/env_.*/robot",
+            articulation_root_prim_path=None,
+        ),
+        root_physx_view=SimpleNamespace(count=len(apis)),
+    )
+
+
+def test_solver_schema_readback_covers_every_authored_articulation_root(monkeypatch):
+    asset = _install_solver_schema_fakes(
+        monkeypatch,
+        [_SolverApi(64, 1), _SolverApi(64, 1)],
+    )
+
+    position, velocity = robust_ik._read_articulation_solver_iteration_counts(asset)
+
+    assert position == (64, 64)
+    assert velocity == (1, 1)
+
+
+@pytest.mark.parametrize(
+    "api",
+    [
+        _SolverApi(64, 1, position_authored=False),
+        _SolverApi(64, 1, velocity_authored=False),
+    ],
+)
+def test_solver_schema_readback_rejects_fallback_but_unauthored_values(
+    monkeypatch, api
+):
+    asset = _install_solver_schema_fakes(monkeypatch, [api])
+
+    with pytest.raises(ValueError, match="unauthored"):
+        robust_ik._read_articulation_solver_iteration_counts(asset)
 
 
 def _canonical_limit_inputs():
@@ -369,7 +493,7 @@ def test_eef_physx_limit_install_rejects_prewrite_outer_identity_drift():
         )
 
 
-def test_safety_report_rejects_live_velocity_target_mutation():
+def test_safety_report_rejects_live_velocity_target_mutation(monkeypatch):
     prewrite_hard, outer, max_delta = _canonical_limit_inputs()
     asset = _LimitAsset(prewrite_hard)
     hard, derived_soft = _install_eef_physx_position_limits(
@@ -384,15 +508,72 @@ def test_safety_report_rejects_live_velocity_target_mutation():
 
     action = object.__new__(RobustDifferentialInverseKinematicsAction)
     action._asset = asset
+    action._physx_cfg = SimpleNamespace(solver_type=1)
+    action._physx_solver_type = 1
     action._joint_ids = list(range(7))
     action._soft_joint_position_limits = outer
     action._physx_hard_joint_position_limits = hard
     action._physx_derived_soft_joint_position_limits = derived_soft
     action._zero_joint_velocity_target = torch.zeros((1, 7), dtype=torch.float32)
+    action._joint_velocity_limits = asset.root_physx_view.max_velocities.clone()
+    action._joint_effort_limits = asset.root_physx_view.max_forces.clone()
+    action._solver_position_iteration_counts = (64,)
+    action._solver_velocity_iteration_counts = (1,)
+    monkeypatch.setattr(
+        robust_ik,
+        "_read_articulation_solver_iteration_counts",
+        lambda _asset: ((64,), (1,)),
+    )
 
     with pytest.raises(
         ValueError, match="live arm velocity target is not exactly zero"
     ):
+        action.safety_report()
+
+
+def test_safety_report_rejects_physx_solver_type_drift():
+    action = object.__new__(RobustDifferentialInverseKinematicsAction)
+    action._physx_cfg = SimpleNamespace(solver_type=0)
+    action._physx_solver_type = 1
+
+    with pytest.raises(ValueError, match="PhysX solver type drifted"):
+        action.safety_report()
+
+
+@pytest.mark.parametrize("limit_field", ["max_velocities", "max_forces"])
+def test_safety_report_rejects_live_physx_joint_limit_drift(monkeypatch, limit_field):
+    prewrite_hard, outer, max_delta = _canonical_limit_inputs()
+    asset = _LimitAsset(prewrite_hard)
+    hard, derived_soft = _install_eef_physx_position_limits(
+        asset,
+        joint_ids=list(range(7)),
+        outer_limits=outer,
+        max_delta_joint_pos=max_delta,
+        soft_limit_factor=1.0,
+    )
+    asset.data.joint_vel_target = torch.zeros((1, 7), dtype=torch.float32)
+
+    action = object.__new__(RobustDifferentialInverseKinematicsAction)
+    action._asset = asset
+    action._physx_cfg = SimpleNamespace(solver_type=1)
+    action._physx_solver_type = 1
+    action._joint_ids = list(range(7))
+    action._soft_joint_position_limits = outer
+    action._physx_hard_joint_position_limits = hard
+    action._physx_derived_soft_joint_position_limits = derived_soft
+    action._zero_joint_velocity_target = torch.zeros((1, 7), dtype=torch.float32)
+    action._joint_velocity_limits = asset.root_physx_view.max_velocities.clone()
+    action._joint_effort_limits = asset.root_physx_view.max_forces.clone()
+    action._solver_position_iteration_counts = (64,)
+    action._solver_velocity_iteration_counts = (1,)
+    monkeypatch.setattr(
+        robust_ik,
+        "_read_articulation_solver_iteration_counts",
+        lambda _asset: ((64,), (1,)),
+    )
+    getattr(asset.root_physx_view, limit_field)[0, 0] += 1e-3
+
+    with pytest.raises(ValueError, match="live PhysX joint-limit readback drifted"):
         action.safety_report()
 
 
@@ -535,22 +716,45 @@ def test_eef_velocity_and_effort_limits_are_scoped_to_eef_setup():
     eef_cfg = NVIDIA_DROID.copy()
     assert native_cfg.actuators["panda_shoulder"].velocity_limit_sim is None
     assert native_cfg.actuators["panda_forearm"].velocity_limit_sim is None
+    assert native_cfg.spawn.articulation_props.solver_position_iteration_count == 64
+    assert native_cfg.spawn.articulation_props.solver_velocity_iteration_count == 0
 
     eval_source = (Path(__file__).parents[1] / "scripts" / "eval.py").read_text()
     eef_branch = eval_source.index('if eval_args.control_mode == "eef-pose":')
     configure_call = eval_source.index(
-        "configure_eef_pose_joint_safety(env_cfg.scene.robot)"
+        "configure_eef_pose_joint_safety(\n            env_cfg.scene.robot,"
     )
     native_branch = eval_source.index(
         'elif eval_args.control_mode != "joint-position":'
     )
     assert eef_branch < configure_call < native_branch
 
-    configure_eef_pose_joint_safety(eef_cfg)
+    native_physx_cfg = SimpleNamespace(solver_type=0)
+    eef_physx_cfg = SimpleNamespace(solver_type=0)
+    configure_eef_pose_joint_safety(eef_cfg, physx_cfg=eef_physx_cfg)
 
     assert eef_cfg.actuators["panda_shoulder"].velocity_limit_sim == 2.175
     assert eef_cfg.actuators["panda_shoulder"].effort_limit_sim == 87.0
     assert eef_cfg.actuators["panda_forearm"].velocity_limit_sim == 2.61
     assert eef_cfg.actuators["panda_forearm"].effort_limit_sim == 12.0
+    assert eef_cfg.spawn.articulation_props.solver_position_iteration_count == 64
+    assert eef_cfg.spawn.articulation_props.solver_velocity_iteration_count == 1
+    assert eef_physx_cfg.solver_type == 1
     assert native_cfg.actuators["panda_shoulder"].velocity_limit_sim is None
     assert native_cfg.actuators["panda_forearm"].velocity_limit_sim is None
+    assert native_cfg.spawn.articulation_props.solver_position_iteration_count == 64
+    assert native_cfg.spawn.articulation_props.solver_velocity_iteration_count == 0
+    assert native_physx_cfg.solver_type == 0
+
+
+def test_eef_pose_config_rejects_missing_articulation_properties():
+    from polaris.environments.robot_cfg import NVIDIA_DROID
+    from polaris.environments.robot_cfg import configure_eef_pose_joint_safety
+
+    cfg = NVIDIA_DROID.copy()
+    cfg.spawn.articulation_props = None
+    with pytest.raises(ValueError, match="no articulation properties"):
+        configure_eef_pose_joint_safety(
+            cfg,
+            physx_cfg=SimpleNamespace(solver_type=0),
+        )

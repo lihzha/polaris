@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay the official LAP-3B boundary failure and stress the v5 EEF guard.
+"""Replay the official LAP-3B boundary failure with the EEF solver fix.
 
 This is a standalone Isaac smoke.  It does not start a policy server or load a
 checkpoint: the committed fixture contains the exact absolute PolaRiS actions
@@ -30,7 +30,7 @@ import zlib
 
 ENVIRONMENT = "DROID-FoodBussing"
 FIXTURE_PROFILE = "official_lap3b_foodbussing_v3_boundary_actions_v1"
-SMOKE_PROFILE = "panda_joint5_upper_guardband_boundary_replay_v1"
+SMOKE_PROFILE = "panda_joint5_upper_solveriter1_boundary_replay_v2"
 FIXTURE_PATH = (
     Path(__file__).resolve().parent
     / "fixtures"
@@ -164,6 +164,11 @@ SAFETY_FIELDS = {
     "physx_derived_soft_limit_profile",
     "physx_hard_limit_write_count",
     "arm_velocity_target_profile",
+    "articulation_solver_profile",
+    "articulation_solver_readback",
+    "physx_solver_type",
+    "solver_position_iteration_count",
+    "solver_velocity_iteration_count",
     "joint_velocity_limit_tolerance_rad_s",
     "eef_quaternion_unit_norm_tolerance",
     "joint_slew_float32_tolerance_rad",
@@ -573,12 +578,12 @@ def _validate_diagnostic_vector(value: Any, field: str) -> list[float]:
 def validate_safety_static(
     report: dict[str, Any], *, episode_index: int | None
 ) -> None:
-    """Validate the closed v5 safety schema and every immutable static field."""
+    """Validate the closed solver-iteration safety schema and static fields."""
 
     _require(isinstance(report, dict) and set(report) == SAFETY_FIELDS, "safety schema")
     _require(report.get("episode_index") == episode_index, "safety episode index")
     exact = {
-        "profile": "panda_velocity_physxlimit_v3",
+        "profile": "panda_velocity_physxlimit_solveriter1_v4",
         "apply_actions_cadence": "physics_substep",
         "physics_dt": 1.0 / 120.0,
         "control_dt": 1.0 / 15.0,
@@ -593,6 +598,13 @@ def validate_safety_static(
         ),
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": "zero_per_physics_substep_v1",
+        "articulation_solver_profile": "tgs_position64_velocity1_eef_only_v1",
+        "articulation_solver_readback": (
+            "composed_usd_physx_articulation_api_all_env_roots_v1"
+        ),
+        "physx_solver_type": 1,
+        "solver_position_iteration_count": 64,
+        "solver_velocity_iteration_count": 1,
         "joint_velocity_limit_tolerance_rad_s": 1e-5,
         "eef_quaternion_unit_norm_tolerance": 1e-3,
         "joint_slew_float32_tolerance_rad": 1e-6,
@@ -941,7 +953,7 @@ def validate_boundary_result(
     validate_safety_static(safety, episode_index=0)
     _require(safety.get("episode_index") == 0, "boundary safety episode")
     _require(
-        safety.get("profile") == "panda_velocity_physxlimit_v3",
+        safety.get("profile") == "panda_velocity_physxlimit_solveriter1_v4",
         "boundary safety profile",
     )
     _require(
@@ -1206,7 +1218,10 @@ def validate_success_payload(payload: dict[str, Any]) -> dict[str, Any]:
         ("dls_damping", 0.01),
         ("arm_scale", 1.0),
         ("action_dim", 7),
-        ("ik_safety_profile", "panda_velocity_physxlimit_v3"),
+        (
+            "ik_safety_profile",
+            "panda_velocity_physxlimit_solveriter1_v4",
+        ),
     ):
         _require(runtime_frame.get(field) == expected, f"payload frame {field}")
     _require(
@@ -1322,17 +1337,59 @@ def _capture_failure_runtime_evidence(env: Any, *, policy_step: Any) -> dict[str
     reporter = getattr(arm_term, "episode_safety_report", None)
     if not callable(reporter):
         raise ValueError("Live EEF action has no failure-safe episode reporter")
+    cached_joint_pos = robot.data.joint_pos[:, joint_ids][0]
+    cached_joint_vel = robot.data.joint_vel[:, joint_ids][0]
+    physx_joint_pos = robot.root_physx_view.get_dof_positions().to(robot.device)[
+        :, joint_ids
+    ][0]
+    physx_joint_vel = robot.root_physx_view.get_dof_velocities().to(robot.device)[
+        :, joint_ids
+    ][0]
+    physx_velocity_limits = robot.root_physx_view.get_dof_max_velocities().to(
+        robot.device
+    )[:, joint_ids][0]
+    physx_effort_limits = robot.root_physx_view.get_dof_max_forces().to(robot.device)[
+        :, joint_ids
+    ][0]
+    computed_torque = getattr(robot.data, "computed_torque", None)
+    applied_torque = getattr(robot.data, "applied_torque", None)
+    sim_timestamp = getattr(robot.data, "_sim_timestamp", None)
+    if isinstance(sim_timestamp, bool) or not isinstance(sim_timestamp, (int, float)):
+        sim_timestamp = None
+    elif not math.isfinite(float(sim_timestamp)):
+        sim_timestamp = None
+    else:
+        sim_timestamp = float(sim_timestamp)
     return {
         "policy_step": policy_step,
         "arm_joint_names": list(arm_term._joint_names),
-        "arm_joint_pos_rad": _finite_vector_evidence(
-            robot.data.joint_pos[:, joint_ids][0]
-        ),
-        "arm_joint_vel_rad_s": _finite_vector_evidence(
-            robot.data.joint_vel[:, joint_ids][0]
-        ),
+        "articulation_data_sim_timestamp": sim_timestamp,
+        "arm_joint_pos_rad": _finite_vector_evidence(cached_joint_pos),
+        "arm_joint_vel_rad_s": _finite_vector_evidence(cached_joint_vel),
         "arm_joint_target_rad": _finite_vector_evidence(
             robot.data.joint_pos_target[:, joint_ids][0]
+        ),
+        "physx_arm_joint_pos_rad": _finite_vector_evidence(physx_joint_pos),
+        "physx_arm_joint_vel_rad_s": _finite_vector_evidence(physx_joint_vel),
+        "cached_minus_physx_arm_joint_pos_rad": _finite_vector_evidence(
+            cached_joint_pos - physx_joint_pos
+        ),
+        "cached_minus_physx_arm_joint_vel_rad_s": _finite_vector_evidence(
+            cached_joint_vel - physx_joint_vel
+        ),
+        "physx_arm_velocity_limits_rad_s": _finite_vector_evidence(
+            physx_velocity_limits
+        ),
+        "physx_arm_effort_limits": _finite_vector_evidence(physx_effort_limits),
+        "arm_computed_torque": (
+            None
+            if computed_torque is None
+            else _finite_vector_evidence(computed_torque[:, joint_ids][0])
+        ),
+        "arm_applied_torque": (
+            None
+            if applied_torque is None
+            else _finite_vector_evidence(applied_torque[:, joint_ids][0])
         ),
         # Deliberately bypass the success-path runtime validator here. A
         # violated invariant is why this failure-only capture runs; the raw
@@ -1372,7 +1429,10 @@ def _run_boundary_replay(
         use_fabric=True,
     )
     env_cfg.actions = EefPoseActionCfg()
-    configure_eef_pose_joint_safety(env_cfg.scene.robot)
+    configure_eef_pose_joint_safety(
+        env_cfg.scene.robot,
+        physx_cfg=env_cfg.sim.physx,
+    )
     env = gym.make(ENVIRONMENT, cfg=env_cfg)
     state["env"] = env
     runtime_protocol = validate_ego_lap_runtime_protocol(env)

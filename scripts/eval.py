@@ -64,7 +64,10 @@ def main(eval_args: EvalArgs):
         # Action managers are constructed by gym.make, so select the controller
         # on the config before creating the environment.
         env_cfg.actions = EefPoseActionCfg()
-        configure_eef_pose_joint_safety(env_cfg.scene.robot)
+        configure_eef_pose_joint_safety(
+            env_cfg.scene.robot,
+            physx_cfg=env_cfg.sim.physx,
+        )
         frame_cfg = env_cfg.scene.lap_ee_frame
         target_cfg = frame_cfg.target_frames[0]
         observed_source = frame_cfg.prim_path

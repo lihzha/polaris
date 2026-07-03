@@ -25,6 +25,9 @@ class _FakeTensor:
     def cpu(self):
         return self
 
+    def to(self, _device):
+        return self
+
     def flatten(self):
         return self
 
@@ -33,6 +36,14 @@ class _FakeTensor:
 
     def __getitem__(self, _index):
         return self
+
+    def __sub__(self, other):
+        return _FakeTensor(
+            [
+                left - right
+                for left, right in zip(self._values, other._values, strict=True)
+            ]
+        )
 
 
 def test_failure_vector_evidence_replaces_nonfinite_values_with_null() -> None:
@@ -63,9 +74,31 @@ def test_failure_runtime_capture_uses_raw_action_term_report() -> None:
         joint_pos = _FakeTensor([0.1] * 7)
         joint_vel = _FakeTensor([3.0] + [0.0] * 6)
         joint_pos_target = _FakeTensor([0.2] * 7)
+        computed_torque = _FakeTensor([1.0] * 7)
+        applied_torque = _FakeTensor([2.0] * 7)
+        _sim_timestamp = 1.25
+
+    class _RootView:
+        @staticmethod
+        def get_dof_positions():
+            return _FakeTensor([0.1] * 7)
+
+        @staticmethod
+        def get_dof_velocities():
+            return _FakeTensor([3.0] + [0.0] * 6)
+
+        @staticmethod
+        def get_dof_max_velocities():
+            return _FakeTensor(list(smoke.EXPECTED_VELOCITY_LIMITS_RAD_S))
+
+        @staticmethod
+        def get_dof_max_forces():
+            return _FakeTensor(list(smoke.EXPECTED_EFFORT_LIMITS))
 
     class _Robot:
         data = _RobotData()
+        root_physx_view = _RootView()
+        device = "cpu"
 
     class _ActionManager:
         _terms = {"arm": _ArmTerm()}
@@ -85,6 +118,10 @@ def test_failure_runtime_capture_uses_raw_action_term_report() -> None:
 
     assert evidence["policy_step"] == 115
     assert evidence["arm_joint_vel_rad_s"]["values"] == [3.0] + [0.0] * 6
+    assert evidence["physx_arm_joint_vel_rad_s"]["values"] == [3.0] + [0.0] * 6
+    assert evidence["cached_minus_physx_arm_joint_vel_rad_s"]["values"] == [0.0] * 7
+    assert evidence["articulation_data_sim_timestamp"] == 1.25
+    assert evidence["arm_computed_torque"]["values"] == [1.0] * 7
     assert evidence["ik_safety"] is expected_report
 
 
@@ -150,7 +187,7 @@ def _safety_report(*, episode_index=0, apply_calls=smoke.EXPECTED_APPLY_CALLS):
     )
     return {
         "episode_index": episode_index,
-        "profile": "panda_velocity_physxlimit_v3",
+        "profile": "panda_velocity_physxlimit_solveriter1_v4",
         "apply_actions_cadence": "physics_substep",
         "physics_dt": 1.0 / 120.0,
         "control_dt": 1.0 / 15.0,
@@ -165,6 +202,13 @@ def _safety_report(*, episode_index=0, apply_calls=smoke.EXPECTED_APPLY_CALLS):
         ),
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": "zero_per_physics_substep_v1",
+        "articulation_solver_profile": "tgs_position64_velocity1_eef_only_v1",
+        "articulation_solver_readback": (
+            "composed_usd_physx_articulation_api_all_env_roots_v1"
+        ),
+        "physx_solver_type": 1,
+        "solver_position_iteration_count": 64,
+        "solver_velocity_iteration_count": 1,
         "joint_velocity_limit_tolerance_rad_s": 1e-5,
         "eef_quaternion_unit_norm_tolerance": 1e-3,
         "joint_slew_float32_tolerance_rad": 1e-6,
@@ -326,7 +370,7 @@ def _success_payload():
             "gripper_threshold_profile": (
                 "closed_positive_ge_0p5_inverse_open_gt_0p5_v1"
             ),
-            "ik_safety_profile": "panda_velocity_physxlimit_v3",
+            "ik_safety_profile": "panda_velocity_physxlimit_solveriter1_v4",
             "action_dim": 7,
         },
         "initial_ik_safety_capture": _safety_report(episode_index=None, apply_calls=0),
@@ -470,6 +514,16 @@ def test_boundary_evidence_accepts_exact_full_state_dwell():
                 4, 1e-3
             ),
             "velocity target drift",
+        ),
+        (
+            lambda boundary, safety: safety.__setitem__(
+                "solver_velocity_iteration_count", 0
+            ),
+            "solver_velocity_iteration_count",
+        ),
+        (
+            lambda boundary, safety: safety.__setitem__("physx_solver_type", 0),
+            "physx_solver_type",
         ),
     ],
 )

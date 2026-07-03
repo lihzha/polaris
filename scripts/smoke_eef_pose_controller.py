@@ -221,7 +221,10 @@ def main(state: dict[str, object]) -> int:
         use_fabric=True,
     )
     env_cfg.actions = EefPoseActionCfg()
-    configure_eef_pose_joint_safety(env_cfg.scene.robot)
+    configure_eef_pose_joint_safety(
+        env_cfg.scene.robot,
+        physx_cfg=env_cfg.sim.physx,
+    )
     env = gym.make(args_cli.environment, cfg=env_cfg)
     state["env"] = env
 
