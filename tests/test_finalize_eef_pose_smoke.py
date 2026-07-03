@@ -174,6 +174,99 @@ def _gripper_static():
     }
 
 
+def _candidate_gripper_static():
+    contract = _gripper_static()
+    profile = finalizer.GRIPPER_TARGET_SLEW_PROFILES[
+        finalizer.GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+    ]
+    contract["driver_target_slew"].update(
+        {
+            "profile": profile["profile"],
+            "target_slew_rate_factor": profile["rate_factor"],
+            "target_slew_rate_rad_s": profile["rate_rad_s"],
+            "max_target_step_rad": profile["max_target_step_rad"],
+        }
+    )
+    followers = []
+    for source in contract["mimic_joint_contract"]["followers"]:
+        source_snapshot = {
+            "natural_frequency_rad_s": source["natural_frequency_hz"],
+            "damping_ratio": source["damping_ratio"],
+        }
+        target_snapshot = {
+            "natural_frequency_rad_s": 100.0,
+            "damping_ratio": finalizer._float32(1.2),  # noqa: SLF001
+        }
+        axis = source["mimic_axis"]
+        structure = {
+            "applied_mimic_api": f"PhysxMimicJointAPI:{axis}",
+            "reference_joint_path": (
+                "/World/envs/env_0/robot/Gripper/Robotiq_2F_85/Joints/finger_joint"
+            ),
+            "gearing": source["gearing"],
+            "offset": 0.0,
+            "exclude_from_articulation": source["exclude_from_articulation"],
+        }
+        followers.append(
+            {
+                "joint_name": source["joint_name"],
+                "joint_index": source["joint_index"],
+                "live_prim_path": (
+                    "/World/envs/env_0/robot"
+                    + source["prim_path"].removeprefix("/panda")
+                ),
+                "mimic_axis": axis,
+                "natural_frequency_attribute": (
+                    f"physxMimicJoint:{axis}:naturalFrequency"
+                ),
+                "damping_ratio_attribute": (f"physxMimicJoint:{axis}:dampingRatio"),
+                "source": copy.deepcopy(source_snapshot),
+                "before_spawn_write": copy.deepcopy(source_snapshot),
+                "before_spawn_structure": copy.deepcopy(structure),
+                "natural_frequency_write_count": 1,
+                "damping_ratio_write_count": 1,
+                "after_spawn_write": copy.deepcopy(target_snapshot),
+                "after_spawn_structure": copy.deepcopy(structure),
+                "post_reset_composed_usd_readback": copy.deepcopy(target_snapshot),
+                "post_reset_composed_usd_structure": copy.deepcopy(structure),
+            }
+        )
+    contract["mimic_compliance"] = {
+        "profile": finalizer.GRIPPER_MIMIC_COMPLIANCE_PROFILE,
+        "enabled": True,
+        "scope": "eef_rate0p25_candidate_only_source_usd_immutable_v1",
+        "timing": "after_original_usd_spawn_before_articulation_initialization_v1",
+        "setter": "UsdAttribute.Set_default_float_v1",
+        "live_root_profile": "single_composed_world_env0_robot_root_v1",
+        "live_root_path": "/World/envs/env_0/robot",
+        "original_spawn_func": {
+            "module": "isaaclab.sim.spawners.from_files.from_files",
+            "qualname": "spawn_from_usd",
+            "name": "spawn_from_usd",
+        },
+        "overlay_func": {
+            "module": "polaris.eef_gripper_runtime",
+            "qualname": "eef_mimic_compliance_spawn_overlay",
+            "name": "eef_mimic_compliance_spawn_overlay",
+        },
+        "original_spawn_call_count": 1,
+        "overlay_call_count": 1,
+        "physics_hz": 120.0,
+        "physics_dt": 1.0 / 120.0,
+        "target_natural_frequency_rad_s": 100.0,
+        "target_damping_ratio": finalizer._float32(1.2),  # noqa: SLF001
+        "frequency_timestep_product": 5.0 / 6.0,
+        "follower_count": 5,
+        "natural_frequency_write_count": 5,
+        "damping_ratio_write_count": 5,
+        "total_write_count": 10,
+        "source_usd_sha256": contract["mimic_joint_contract"]["robot_usd_sha256"],
+        "source_usd_unchanged_after_spawn_overlay": True,
+        "followers": followers,
+    }
+    return contract
+
+
 def _gripper_dynamic(apply_calls, *, closed, endpoint_changes=0):
     post_samples = apply_calls // 8
     vector = [0.0] * 6
@@ -573,6 +666,63 @@ def _attestation_args(tmp_path: Path, monkeypatch) -> Namespace:
             saved_job.read_bytes()
         ).hexdigest(),
     )
+
+
+def test_host_gripper_static_validator_accepts_only_candidate_bound_compliance():
+    baseline = _gripper_static()
+    finalizer._validate_gripper_static(baseline, field="baseline")
+    with pytest.raises(finalizer.VerificationError, match="schema drift"):
+        finalizer._validate_gripper_static(
+            baseline,
+            field="candidate",
+            expected_target_slew_profile=(
+                finalizer.GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+        )
+
+    candidate_contract = _candidate_gripper_static()
+    finalizer._validate_gripper_static(
+        candidate_contract,
+        field="candidate",
+        expected_target_slew_profile=(
+            finalizer.GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+        ),
+    )
+    with pytest.raises(finalizer.VerificationError, match="schema drift"):
+        finalizer._validate_gripper_static(candidate_contract, field="baseline")
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "match"),
+    [
+        (("total_write_count",), True, "total_write_count"),
+        (("target_damping_ratio",), 1.0, "target/cadence"),
+        (
+            ("followers", 0, "natural_frequency_write_count"),
+            0,
+            "natural_frequency_write_count",
+        ),
+        (
+            ("followers", 0, "post_reset_composed_usd_readback", "damping_ratio"),
+            0.0,
+            "post_reset_composed_usd_readback values",
+        ),
+    ],
+)
+def test_host_gripper_static_validator_rejects_compliance_tampering(path, value, match):
+    contract = _candidate_gripper_static()
+    target = contract["mimic_compliance"]
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(finalizer.VerificationError, match=match):
+        finalizer._validate_gripper_static(
+            contract,
+            field="candidate",
+            expected_target_slew_profile=(
+                finalizer.GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+        )
 
 
 def test_raw_smoke_gate_requires_pending_full_evidence():

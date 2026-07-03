@@ -201,6 +201,60 @@ GRIPPER_RUNTIME_STATIC_FIELDS = {
     "driver_target_slew",
     "measured_velocity_is_hard_bounded_by_limit",
 }
+GRIPPER_MIMIC_COMPLIANCE_FIELD = "mimic_compliance"
+GRIPPER_MIMIC_COMPLIANCE_FIELDS = {
+    "profile",
+    "enabled",
+    "scope",
+    "timing",
+    "setter",
+    "live_root_profile",
+    "live_root_path",
+    "original_spawn_func",
+    "overlay_func",
+    "original_spawn_call_count",
+    "overlay_call_count",
+    "physics_hz",
+    "physics_dt",
+    "target_natural_frequency_rad_s",
+    "target_damping_ratio",
+    "frequency_timestep_product",
+    "follower_count",
+    "natural_frequency_write_count",
+    "damping_ratio_write_count",
+    "total_write_count",
+    "source_usd_sha256",
+    "source_usd_unchanged_after_spawn_overlay",
+    "followers",
+}
+GRIPPER_MIMIC_COMPLIANCE_FOLLOWER_FIELDS = {
+    "joint_name",
+    "joint_index",
+    "live_prim_path",
+    "mimic_axis",
+    "natural_frequency_attribute",
+    "damping_ratio_attribute",
+    "source",
+    "before_spawn_write",
+    "before_spawn_structure",
+    "natural_frequency_write_count",
+    "damping_ratio_write_count",
+    "after_spawn_write",
+    "after_spawn_structure",
+    "post_reset_composed_usd_readback",
+    "post_reset_composed_usd_structure",
+}
+GRIPPER_MIMIC_COMPLIANCE_SNAPSHOT_FIELDS = {
+    "natural_frequency_rad_s",
+    "damping_ratio",
+}
+GRIPPER_MIMIC_COMPLIANCE_STRUCTURE_FIELDS = {
+    "applied_mimic_api",
+    "reference_joint_path",
+    "gearing",
+    "offset",
+    "exclude_from_articulation",
+}
 GRIPPER_RUNTIME_DYNAMIC_FIELDS = {
     "profile",
     "joint_names",
@@ -272,6 +326,9 @@ GRIPPER_TARGET_SLEW_PROFILE = (
 GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE = (
     "eef_binary_driver_target_slew_rate1p25_from_live_limit5_"
     "per_120hz_substep_candidate_v1"
+)
+GRIPPER_MIMIC_COMPLIANCE_PROFILE = (
+    "robotiq_2f85_live_physx_mimic_frequency100_damping1p2_candidate_v1"
 )
 GRIPPER_TARGET_SLEW_ACTION_CLASS = "EefBinaryJointPositionTargetSlewAction"
 GRIPPER_TARGET_SLEW_RESET_PROFILE = (
@@ -803,6 +860,151 @@ def _validate_gripper_target_slew_static(
     )
 
 
+def _validate_gripper_mimic_compliance(
+    value: Any,
+    *,
+    source_mimic: dict[str, Any],
+    field: str,
+) -> None:
+    contract = _object(value, field)
+    _require(
+        set(contract) == GRIPPER_MIMIC_COMPLIANCE_FIELDS,
+        f"{field} schema drift",
+    )
+    exact = {
+        "profile": GRIPPER_MIMIC_COMPLIANCE_PROFILE,
+        "enabled": True,
+        "scope": "eef_rate0p25_candidate_only_source_usd_immutable_v1",
+        "timing": "after_original_usd_spawn_before_articulation_initialization_v1",
+        "setter": "UsdAttribute.Set_default_float_v1",
+        "live_root_profile": "single_composed_world_env0_robot_root_v1",
+        "live_root_path": "/World/envs/env_0/robot",
+        "original_spawn_func": {
+            "module": "isaaclab.sim.spawners.from_files.from_files",
+            "qualname": "spawn_from_usd",
+            "name": "spawn_from_usd",
+        },
+        "overlay_func": {
+            "module": "polaris.eef_gripper_runtime",
+            "qualname": "eef_mimic_compliance_spawn_overlay",
+            "name": "eef_mimic_compliance_spawn_overlay",
+        },
+        "original_spawn_call_count": 1,
+        "overlay_call_count": 1,
+        "follower_count": 5,
+        "natural_frequency_write_count": 5,
+        "damping_ratio_write_count": 5,
+        "total_write_count": 10,
+        "source_usd_sha256": (
+            "d8379925b103963dbf3e7c85bcc4ae101b81b7c1d7dabe7d2e964f41d069ec44"
+        ),
+        "source_usd_unchanged_after_spawn_overlay": True,
+    }
+    for name, expected in exact.items():
+        _require(
+            _typed_equal(contract.get(name), expected),
+            f"{field}.{name}",
+        )
+    for name, expected in {
+        "physics_hz": 120.0,
+        "physics_dt": 1.0 / 120.0,
+        "frequency_timestep_product": 5.0 / 6.0,
+    }.items():
+        _require(
+            type(contract.get(name)) is float and contract[name] == expected,
+            f"{field}.{name}",
+        )
+    _require(
+        _same_float32(contract.get("target_natural_frequency_rad_s"), 100.0)
+        and _same_float32(contract.get("target_damping_ratio"), _float32(1.2))
+        and contract["physics_dt"] * contract["target_natural_frequency_rad_s"]
+        == contract["frequency_timestep_product"],
+        f"{field} target/cadence",
+    )
+    source_followers = _list(
+        source_mimic.get("followers"),
+        f"{field}.source_followers",
+        length=5,
+    )
+    followers = _list(contract.get("followers"), f"{field}.followers", length=5)
+    for index, (source, follower) in enumerate(
+        zip(source_followers, followers, strict=True)
+    ):
+        _require(
+            set(follower) == GRIPPER_MIMIC_COMPLIANCE_FOLLOWER_FIELDS,
+            f"{field}.followers[{index}] schema drift",
+        )
+        axis = source["mimic_axis"]
+        expected_live_path = "/World/envs/env_0/robot" + source[
+            "prim_path"
+        ].removeprefix("/panda")
+        expected_identity = {
+            "joint_name": source["joint_name"],
+            "joint_index": source["joint_index"],
+            "live_prim_path": expected_live_path,
+            "mimic_axis": axis,
+            "natural_frequency_attribute": (f"physxMimicJoint:{axis}:naturalFrequency"),
+            "damping_ratio_attribute": f"physxMimicJoint:{axis}:dampingRatio",
+            "natural_frequency_write_count": 1,
+            "damping_ratio_write_count": 1,
+        }
+        for name, expected in expected_identity.items():
+            _require(
+                _typed_equal(follower.get(name), expected),
+                f"{field}.followers[{index}].{name}",
+            )
+        expected_structure = {
+            "applied_mimic_api": f"PhysxMimicJointAPI:{axis}",
+            "reference_joint_path": (
+                "/World/envs/env_0/robot/Gripper/Robotiq_2F_85/Joints/finger_joint"
+            ),
+            "gearing": source["gearing"],
+            "offset": 0.0,
+            "exclude_from_articulation": source["exclude_from_articulation"],
+        }
+        for structure_name in (
+            "before_spawn_structure",
+            "after_spawn_structure",
+            "post_reset_composed_usd_structure",
+        ):
+            structure = _object(
+                follower.get(structure_name),
+                f"{field}.followers[{index}].{structure_name}",
+            )
+            _require(
+                set(structure) == GRIPPER_MIMIC_COMPLIANCE_STRUCTURE_FIELDS
+                and _typed_equal(structure, expected_structure),
+                f"{field}.followers[{index}].{structure_name} values",
+            )
+        for snapshot_name, expected_frequency, expected_damping in (
+            (
+                "source",
+                source["natural_frequency_hz"],
+                source["damping_ratio"],
+            ),
+            (
+                "before_spawn_write",
+                source["natural_frequency_hz"],
+                source["damping_ratio"],
+            ),
+            ("after_spawn_write", 100.0, _float32(1.2)),
+            ("post_reset_composed_usd_readback", 100.0, _float32(1.2)),
+        ):
+            snapshot = _object(
+                follower.get(snapshot_name),
+                f"{field}.followers[{index}].{snapshot_name}",
+            )
+            _require(
+                set(snapshot) == GRIPPER_MIMIC_COMPLIANCE_SNAPSHOT_FIELDS
+                and _same_float32(
+                    snapshot.get("natural_frequency_rad_s"),
+                    expected_frequency,
+                )
+                and _same_float32(snapshot.get("damping_ratio"), expected_damping),
+                f"{field}.followers[{index}].{snapshot_name} values",
+            )
+
+
 def _validate_gripper_static(
     value: Any,
     *,
@@ -810,7 +1012,10 @@ def _validate_gripper_static(
     expected_target_slew_profile: str = GRIPPER_TARGET_SLEW_PROFILE,
 ) -> None:
     contract = _object(value, field)
-    _require(set(contract) == GRIPPER_RUNTIME_STATIC_FIELDS, f"{field} schema drift")
+    expected_static_fields = set(GRIPPER_RUNTIME_STATIC_FIELDS)
+    if expected_target_slew_profile == GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE:
+        expected_static_fields.add(GRIPPER_MIMIC_COMPLIANCE_FIELD)
+    _require(set(contract) == expected_static_fields, f"{field} schema drift")
     exact = {
         "profile": GRIPPER_RUNTIME_PROFILE,
         "joint_names": EXPECTED_DROID_JOINT_NAMES,
@@ -946,6 +1151,12 @@ def _validate_gripper_static(
             and _same_float32(item.get("natural_frequency_hz"), expected[2])
             and _same_float32(item.get("damping_ratio"), expected[3]),
             f"{field}.mimic follower {index} values",
+        )
+    if expected_target_slew_profile == GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE:
+        _validate_gripper_mimic_compliance(
+            contract.get(GRIPPER_MIMIC_COMPLIANCE_FIELD),
+            source_mimic=mimic,
+            field=f"{field}.mimic_compliance",
         )
 
     before_values = [*EXPECTED_VELOCITY_LIMITS, 5.0, *([174.53292846679688] * 5)]

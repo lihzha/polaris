@@ -4,12 +4,16 @@ The physical articulation contains one driven ``finger_joint`` and five
 passive PhysX mimic joints.  Isaac Lab exposes static PhysX drive properties on
 CPU while cached articulation state and implicit-actuator tensors live on CUDA.
 This module preserves that distinction and performs the one production write
-needed by the passive followers.  It deliberately does not claim that a PhysX
-maximum-velocity setting is a hard bound on measured passive-joint velocity.
+needed by the passive followers.  The isolated rate-0.25 candidate additionally
+wraps the existing USD spawner and authors compliant mimic parameters only
+after the composed clone exists and before articulation initialization.  It
+deliberately does not claim that a PhysX maximum-velocity setting is a hard
+bound on measured passive-joint velocity.
 """
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
@@ -36,6 +40,39 @@ EEF_GRIPPER_DEVICE_PARTITION_PROFILE = (
     "nvidia_droid_cuda_dynamic_actuator_cpu_static_physx_v1"
 )
 EEF_GRIPPER_MIMIC_PROFILE = "robotiq_2f85_source_usd_physx_mimic_joint_v1"
+EEF_GRIPPER_MIMIC_COMPLIANCE_PROFILE = (
+    "robotiq_2f85_live_physx_mimic_frequency100_damping1p2_candidate_v1"
+)
+EEF_GRIPPER_MIMIC_COMPLIANCE_SCOPE = (
+    "eef_rate0p25_candidate_only_source_usd_immutable_v1"
+)
+EEF_GRIPPER_MIMIC_COMPLIANCE_TIMING = (
+    "after_original_usd_spawn_before_articulation_initialization_v1"
+)
+EEF_GRIPPER_MIMIC_COMPLIANCE_SETTER = "UsdAttribute.Set_default_float_v1"
+EEF_GRIPPER_MIMIC_COMPLIANCE_LIVE_ROOT_PROFILE = (
+    "single_composed_world_env0_robot_root_v1"
+)
+EEF_GRIPPER_MIMIC_COMPLIANCE_ORIGINAL_SPAWN_IDENTITY = {
+    "module": "isaaclab.sim.spawners.from_files.from_files",
+    "qualname": "spawn_from_usd",
+    "name": "spawn_from_usd",
+}
+EEF_GRIPPER_MIMIC_COMPLIANCE_OVERLAY_IDENTITY = {
+    "module": "polaris.eef_gripper_runtime",
+    "qualname": "eef_mimic_compliance_spawn_overlay",
+    "name": "eef_mimic_compliance_spawn_overlay",
+}
+EEF_GRIPPER_MIMIC_COMPLIANCE_PHYSICS_HZ = 120.0
+EEF_GRIPPER_MIMIC_COMPLIANCE_PHYSICS_DT = 1.0 / EEF_GRIPPER_MIMIC_COMPLIANCE_PHYSICS_HZ
+EEF_GRIPPER_MIMIC_COMPLIANCE_NATURAL_FREQUENCY_RAD_S_FLOAT32 = float(np.float32(100.0))
+EEF_GRIPPER_MIMIC_COMPLIANCE_DAMPING_RATIO_FLOAT32 = float(np.float32(1.2))
+EEF_GRIPPER_MIMIC_COMPLIANCE_FREQUENCY_TIMESTEP_PRODUCT = 5.0 / 6.0
+EEF_GRIPPER_MIMIC_COMPLIANCE_FOLLOWER_COUNT = 5
+EEF_GRIPPER_MIMIC_COMPLIANCE_TOTAL_WRITE_COUNT = (
+    2 * EEF_GRIPPER_MIMIC_COMPLIANCE_FOLLOWER_COUNT
+)
+EEF_GRIPPER_MIMIC_COMPLIANCE_EXPECTED_LIVE_ROOT = "/World/envs/env_0/robot"
 GRIPPER_APPLY_ENTRY_SAMPLES_PER_POLICY_STEP = 8
 GRIPPER_INTERLEAVED_SAMPLES_PER_POLICY_STEP = (
     GRIPPER_APPLY_ENTRY_SAMPLES_PER_POLICY_STEP + 1
@@ -394,6 +431,60 @@ MIMIC_JOINT_ENTRY_FIELDS = {
     "natural_frequency_hz",
     "damping_ratio",
 }
+MIMIC_COMPLIANCE_CALLABLE_IDENTITY_FIELDS = {"module", "qualname", "name"}
+MIMIC_COMPLIANCE_SNAPSHOT_FIELDS = {
+    "natural_frequency_rad_s",
+    "damping_ratio",
+}
+MIMIC_COMPLIANCE_STRUCTURE_FIELDS = {
+    "applied_mimic_api",
+    "reference_joint_path",
+    "gearing",
+    "offset",
+    "exclude_from_articulation",
+}
+MIMIC_COMPLIANCE_FOLLOWER_FIELDS = {
+    "joint_name",
+    "joint_index",
+    "live_prim_path",
+    "mimic_axis",
+    "natural_frequency_attribute",
+    "damping_ratio_attribute",
+    "source",
+    "before_spawn_write",
+    "before_spawn_structure",
+    "natural_frequency_write_count",
+    "damping_ratio_write_count",
+    "after_spawn_write",
+    "after_spawn_structure",
+    "post_reset_composed_usd_readback",
+    "post_reset_composed_usd_structure",
+}
+MIMIC_COMPLIANCE_CONTRACT_FIELDS = {
+    "profile",
+    "enabled",
+    "scope",
+    "timing",
+    "setter",
+    "live_root_profile",
+    "live_root_path",
+    "original_spawn_func",
+    "overlay_func",
+    "original_spawn_call_count",
+    "overlay_call_count",
+    "physics_hz",
+    "physics_dt",
+    "target_natural_frequency_rad_s",
+    "target_damping_ratio",
+    "frequency_timestep_product",
+    "follower_count",
+    "natural_frequency_write_count",
+    "damping_ratio_write_count",
+    "total_write_count",
+    "source_usd_sha256",
+    "source_usd_unchanged_after_spawn_overlay",
+    "followers",
+}
 WRITE_CONTRACT_FIELDS = {
     "profile",
     "setter",
@@ -421,6 +512,7 @@ STATIC_CONTRACT_FIELDS = {
     "driver_target_slew",
     "measured_velocity_is_hard_bounded_by_limit",
 }
+MIMIC_COMPLIANCE_STATIC_FIELD = "mimic_compliance"
 DRIVER_ACTUATOR_FIELDS = {
     "cfg_velocity_limit",
     "cfg_velocity_limit_sim",
@@ -713,6 +805,21 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_exact_mimic_api_instance(prim: Any, *, axis: str, field: str) -> str:
+    get_applied_schemas = getattr(prim, "GetAppliedSchemas", None)
+    _require(callable(get_applied_schemas), f"{field} applied schemas")
+    applied = [str(token) for token in get_applied_schemas()]
+    expected = f"PhysxMimicJointAPI:{axis}"
+    mimic_instances = [
+        token for token in applied if token.startswith("PhysxMimicJointAPI:")
+    ]
+    _require(
+        mimic_instances == [expected],
+        f"{field} exact applied mimic API instance drift",
+    )
+    return expected
+
+
 def _capture_mimic_joint_contract(robot_usd_path: Path) -> dict[str, Any]:
     from pxr import Usd  # noqa: PLC0415
 
@@ -746,6 +853,11 @@ def _capture_mimic_joint_contract(robot_usd_path: Path) -> dict[str, Any]:
     }
     for specification in expected["followers"]:
         prim, excluded = static_joint(specification["prim_path"])
+        _validate_exact_mimic_api_instance(
+            prim,
+            axis=specification["mimic_axis"],
+            field=f"source mimic {specification['joint_name']}",
+        )
         namespace = f"physxMimicJoint:{specification['mimic_axis']}"
         references = prim.GetRelationship(f"{namespace}:referenceJoint").GetTargets()
         _require(
@@ -770,6 +882,833 @@ def _capture_mimic_joint_contract(robot_usd_path: Path) -> dict[str, Any]:
             }
         )
     return validate_mimic_joint_contract(result)
+
+
+def _callable_identity(value: Any) -> dict[str, str]:
+    _require(callable(value), "mimic compliance spawn callable")
+    identity = {
+        "module": getattr(value, "__module__", None),
+        "qualname": getattr(value, "__qualname__", None),
+        "name": getattr(value, "__name__", None),
+    }
+    _require(
+        set(identity) == MIMIC_COMPLIANCE_CALLABLE_IDENTITY_FIELDS
+        and all(type(item) is str and bool(item) for item in identity.values()),
+        "mimic compliance spawn callable identity",
+    )
+    return identity
+
+
+def _expected_original_spawn_func() -> Any:
+    from isaaclab.sim.spawners.from_files.from_files import (  # noqa: PLC0415
+        spawn_from_usd,
+    )
+
+    return spawn_from_usd
+
+
+def _validate_original_spawn_func(value: Any) -> dict[str, str]:
+    _require(
+        value is _expected_original_spawn_func(),
+        "mimic compliance original spawn callable object drift",
+    )
+    identity = _callable_identity(value)
+    _require(
+        _typed_equal(
+            identity,
+            EEF_GRIPPER_MIMIC_COMPLIANCE_ORIGINAL_SPAWN_IDENTITY,
+        ),
+        "mimic compliance original spawn callable identity drift",
+    )
+    return identity
+
+
+def _current_live_stage_and_robot_roots(prim_path: str) -> tuple[Any, list[Any]]:
+    import omni.usd  # noqa: PLC0415
+    import isaaclab.sim as sim_utils  # noqa: PLC0415
+
+    _require(type(prim_path) is str and bool(prim_path), "live robot prim expression")
+    stage = omni.usd.get_context().get_stage()
+    _require(stage is not None, "mimic compliance live USD stage")
+    roots = list(sim_utils.find_matching_prims(prim_path, stage=stage))
+    roots.sort(key=lambda prim: prim.GetPath().pathString)
+    return stage, roots
+
+
+def _prim_path_string(prim: Any) -> str:
+    path = prim.GetPath()
+    value = getattr(path, "pathString", None)
+    if value is None:
+        value = str(path)
+    _require(type(value) is str and value.startswith("/"), "live prim path")
+    return value
+
+
+def _mimic_attribute_names(axis: str) -> tuple[str, str]:
+    _require(axis in {"rotX", "rotY", "rotZ"}, "live mimic axis")
+    namespace = f"physxMimicJoint:{axis}"
+    return f"{namespace}:naturalFrequency", f"{namespace}:dampingRatio"
+
+
+def _mimic_float_attribute(prim: Any, name: str, *, field: str) -> Any:
+    attribute = prim.GetAttribute(name)
+    _require(bool(attribute), f"missing {field} attribute")
+    get_type_name = getattr(attribute, "GetTypeName", None)
+    _require(callable(get_type_name), f"missing {field} attribute type")
+    _require(str(get_type_name()) == "float", f"{field} attribute type drift")
+    return attribute
+
+
+def _mimic_bool_attribute(prim: Any, name: str, *, field: str) -> Any:
+    attribute = prim.GetAttribute(name)
+    _require(bool(attribute), f"missing {field} attribute")
+    get_type_name = getattr(attribute, "GetTypeName", None)
+    _require(callable(get_type_name), f"missing {field} attribute type")
+    _require(str(get_type_name()) == "bool", f"{field} attribute type drift")
+    return attribute
+
+
+def _mimic_numeric_value(attribute: Any, *, field: str) -> float:
+    value = attribute.Get()
+    _require(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value)),
+        f"{field} finite scalar",
+    )
+    return float(value)
+
+
+def _mimic_live_structure(
+    *,
+    prim: Any,
+    specification: Mapping[str, Any],
+    live_root: str,
+) -> dict[str, Any]:
+    axis = specification["mimic_axis"]
+    applied_api = _validate_exact_mimic_api_instance(
+        prim,
+        axis=axis,
+        field=f"live mimic {specification['joint_name']}",
+    )
+    namespace = f"physxMimicJoint:{axis}"
+    relationship = prim.GetRelationship(f"{namespace}:referenceJoint")
+    _require(bool(relationship), f"live mimic {specification['joint_name']} reference")
+    targets = list(relationship.GetTargets())
+    _require(
+        len(targets) == 1,
+        f"live mimic {specification['joint_name']} reference count",
+    )
+    target_path = getattr(targets[0], "pathString", None)
+    if target_path is None:
+        target_path = str(targets[0])
+    expected_driver_path = live_root + _expected_mimic_joint_contract()[
+        "driver_joint_prim_path"
+    ].removeprefix("/panda")
+    gearing_attribute = _mimic_float_attribute(
+        prim,
+        f"{namespace}:gearing",
+        field=f"{specification['joint_name']} gearing",
+    )
+    offset_attribute = _mimic_float_attribute(
+        prim,
+        f"{namespace}:offset",
+        field=f"{specification['joint_name']} offset",
+    )
+    exclusion_attribute = _mimic_bool_attribute(
+        prim,
+        "physics:excludeFromArticulation",
+        field=f"{specification['joint_name']} exclusion",
+    )
+    gearing = _mimic_numeric_value(
+        gearing_attribute,
+        field=f"{specification['joint_name']} gearing",
+    )
+    offset = _mimic_numeric_value(
+        offset_attribute,
+        field=f"{specification['joint_name']} offset",
+    )
+    excluded = exclusion_attribute.Get()
+    _require(
+        type(target_path) is str
+        and target_path == expected_driver_path
+        and _same_float32(gearing, specification["gearing"])
+        and _same_float32(offset, 0.0)
+        and type(excluded) is bool
+        and excluded is specification["exclude_from_articulation"],
+        f"live mimic {specification['joint_name']} source structure drift",
+    )
+    return {
+        "applied_mimic_api": applied_api,
+        "reference_joint_path": target_path,
+        "gearing": gearing,
+        "offset": offset,
+        "exclude_from_articulation": excluded,
+    }
+
+
+def _mimic_snapshot(
+    *, natural_frequency: float, damping_ratio: float
+) -> dict[str, float]:
+    return {
+        "natural_frequency_rad_s": float(natural_frequency),
+        "damping_ratio": float(damping_ratio),
+    }
+
+
+def _live_mimic_bindings(
+    *, stage: Any, roots: Sequence[Any], source_contract: Mapping[str, Any]
+) -> tuple[str, list[dict[str, Any]]]:
+    """Resolve the five composed follower attributes without authoring values."""
+
+    source = validate_mimic_joint_contract(dict(source_contract))
+    _require(len(roots) == 1, "mimic compliance live robot root count")
+    live_root = _prim_path_string(roots[0])
+    _require(
+        live_root == EEF_GRIPPER_MIMIC_COMPLIANCE_EXPECTED_LIVE_ROOT,
+        "mimic compliance live robot root path drift",
+    )
+    bindings: list[dict[str, Any]] = []
+    for specification in source["followers"]:
+        source_path = specification["prim_path"]
+        _require(
+            type(source_path) is str and source_path.startswith("/panda/"),
+            "mimic compliance source follower path",
+        )
+        live_path = live_root + source_path.removeprefix("/panda")
+        prim = stage.GetPrimAtPath(live_path)
+        _require(
+            bool(prim)
+            and prim.IsValid()
+            and _prim_path_string(prim) == live_path
+            and prim.GetTypeName() == "PhysicsRevoluteJoint",
+            f"mimic compliance live follower prim drift: {live_path}",
+        )
+        frequency_name, damping_name = _mimic_attribute_names(
+            specification["mimic_axis"]
+        )
+        frequency_attribute = _mimic_float_attribute(
+            prim,
+            frequency_name,
+            field=f"{specification['joint_name']} natural frequency",
+        )
+        damping_attribute = _mimic_float_attribute(
+            prim,
+            damping_name,
+            field=f"{specification['joint_name']} damping ratio",
+        )
+        structure = _mimic_live_structure(
+            prim=prim,
+            specification=specification,
+            live_root=live_root,
+        )
+        bindings.append(
+            {
+                "source": specification,
+                "prim": prim,
+                "live_prim_path": live_path,
+                "natural_frequency_attribute_name": frequency_name,
+                "damping_ratio_attribute_name": damping_name,
+                "natural_frequency_attribute": frequency_attribute,
+                "damping_ratio_attribute": damping_attribute,
+                "structure": structure,
+            }
+        )
+    _require(
+        len(bindings) == EEF_GRIPPER_MIMIC_COMPLIANCE_FOLLOWER_COUNT,
+        "mimic compliance follower count",
+    )
+    return live_root, bindings
+
+
+def _read_live_mimic_snapshots(
+    *, stage: Any, roots: Sequence[Any], source_contract: Mapping[str, Any]
+) -> tuple[str, list[dict[str, Any]]]:
+    live_root, bindings = _live_mimic_bindings(
+        stage=stage,
+        roots=roots,
+        source_contract=source_contract,
+    )
+    snapshots: list[dict[str, Any]] = []
+    for binding in bindings:
+        snapshots.append(
+            {
+                "joint_name": binding["source"]["joint_name"],
+                "joint_index": binding["source"]["joint_index"],
+                "live_prim_path": binding["live_prim_path"],
+                "mimic_axis": binding["source"]["mimic_axis"],
+                "natural_frequency_attribute": binding[
+                    "natural_frequency_attribute_name"
+                ],
+                "damping_ratio_attribute": binding["damping_ratio_attribute_name"],
+                "snapshot": _mimic_snapshot(
+                    natural_frequency=_mimic_numeric_value(
+                        binding["natural_frequency_attribute"],
+                        field=f"{binding['source']['joint_name']} natural frequency",
+                    ),
+                    damping_ratio=_mimic_numeric_value(
+                        binding["damping_ratio_attribute"],
+                        field=f"{binding['source']['joint_name']} damping ratio",
+                    ),
+                ),
+                "structure": copy.deepcopy(binding["structure"]),
+            }
+        )
+    return live_root, snapshots
+
+
+def _write_spawned_mimic_compliance(
+    *, stage: Any, roots: Sequence[Any], source_contract: Mapping[str, Any]
+) -> tuple[str, list[dict[str, Any]]]:
+    """Author the ten candidate values before articulation initialization."""
+
+    live_root, bindings = _live_mimic_bindings(
+        stage=stage,
+        roots=roots,
+        source_contract=source_contract,
+    )
+    # Phase 1: validate all five source states before authoring any opinion.
+    prepared: list[dict[str, Any]] = []
+    for binding in bindings:
+        source = binding["source"]
+        before = _mimic_snapshot(
+            natural_frequency=_mimic_numeric_value(
+                binding["natural_frequency_attribute"],
+                field=f"{source['joint_name']} pre-write natural frequency",
+            ),
+            damping_ratio=_mimic_numeric_value(
+                binding["damping_ratio_attribute"],
+                field=f"{source['joint_name']} pre-write damping ratio",
+            ),
+        )
+        _require(
+            _same_float32(
+                before["natural_frequency_rad_s"],
+                source["natural_frequency_hz"],
+            )
+            and _same_float32(before["damping_ratio"], source["damping_ratio"]),
+            f"mimic compliance pre-write/source drift: {source['joint_name']}",
+        )
+        prepared.append(
+            {
+                "binding": binding,
+                "before": before,
+                "before_structure": copy.deepcopy(binding["structure"]),
+            }
+        )
+
+    # Phase 2: perform exactly two writes per fully validated follower.
+    for item in prepared:
+        binding = item["binding"]
+        source = binding["source"]
+        frequency_result = binding["natural_frequency_attribute"].Set(
+            EEF_GRIPPER_MIMIC_COMPLIANCE_NATURAL_FREQUENCY_RAD_S_FLOAT32
+        )
+        damping_result = binding["damping_ratio_attribute"].Set(
+            EEF_GRIPPER_MIMIC_COMPLIANCE_DAMPING_RATIO_FLOAT32
+        )
+        _require(
+            type(frequency_result) is bool
+            and frequency_result is True
+            and type(damping_result) is bool
+            and damping_result is True,
+            f"mimic compliance USD write failed: {source['joint_name']}",
+        )
+
+    # Phase 3: read all values and untouched structure after all ten writes.
+    followers: list[dict[str, Any]] = []
+    for item in prepared:
+        binding = item["binding"]
+        source = binding["source"]
+        before = item["before"]
+        after = _mimic_snapshot(
+            natural_frequency=_mimic_numeric_value(
+                binding["natural_frequency_attribute"],
+                field=f"{source['joint_name']} post-write natural frequency",
+            ),
+            damping_ratio=_mimic_numeric_value(
+                binding["damping_ratio_attribute"],
+                field=f"{source['joint_name']} post-write damping ratio",
+            ),
+        )
+        _require(
+            _same_float32(
+                after["natural_frequency_rad_s"],
+                EEF_GRIPPER_MIMIC_COMPLIANCE_NATURAL_FREQUENCY_RAD_S_FLOAT32,
+            )
+            and _same_float32(
+                after["damping_ratio"],
+                EEF_GRIPPER_MIMIC_COMPLIANCE_DAMPING_RATIO_FLOAT32,
+            ),
+            f"mimic compliance post-write readback drift: {source['joint_name']}",
+        )
+        after_structure = _mimic_live_structure(
+            prim=binding["prim"],
+            specification=source,
+            live_root=live_root,
+        )
+        _require(
+            _typed_equal(after_structure, item["before_structure"]),
+            f"mimic compliance post-write structure drift: {source['joint_name']}",
+        )
+        followers.append(
+            {
+                "joint_name": source["joint_name"],
+                "joint_index": source["joint_index"],
+                "live_prim_path": binding["live_prim_path"],
+                "mimic_axis": source["mimic_axis"],
+                "natural_frequency_attribute": binding[
+                    "natural_frequency_attribute_name"
+                ],
+                "damping_ratio_attribute": binding["damping_ratio_attribute_name"],
+                "source": _mimic_snapshot(
+                    natural_frequency=source["natural_frequency_hz"],
+                    damping_ratio=source["damping_ratio"],
+                ),
+                "before_spawn_write": before,
+                "before_spawn_structure": item["before_structure"],
+                "natural_frequency_write_count": 1,
+                "damping_ratio_write_count": 1,
+                "after_spawn_write": after,
+                "after_spawn_structure": after_structure,
+                "post_reset_composed_usd_readback": None,
+                "post_reset_composed_usd_structure": None,
+            }
+        )
+    return live_root, followers
+
+
+def _validate_mimic_compliance_snapshot(
+    value: Any,
+    *,
+    expected_natural_frequency: float,
+    expected_damping_ratio: float,
+    field: str,
+) -> dict[str, Any]:
+    _require(
+        isinstance(value, dict) and set(value) == MIMIC_COMPLIANCE_SNAPSHOT_FIELDS,
+        f"{field} schema",
+    )
+    _require(
+        _same_float32(value.get("natural_frequency_rad_s"), expected_natural_frequency)
+        and _same_float32(value.get("damping_ratio"), expected_damping_ratio),
+        f"{field} values",
+    )
+    return dict(value)
+
+
+def _validate_mimic_compliance_structure(
+    value: Any,
+    *,
+    source: Mapping[str, Any],
+    field: str,
+) -> dict[str, Any]:
+    _require(
+        isinstance(value, dict) and set(value) == MIMIC_COMPLIANCE_STRUCTURE_FIELDS,
+        f"{field} schema",
+    )
+    expected_reference = (
+        EEF_GRIPPER_MIMIC_COMPLIANCE_EXPECTED_LIVE_ROOT
+        + _expected_mimic_joint_contract()["driver_joint_prim_path"].removeprefix(
+            "/panda"
+        )
+    )
+    _require(
+        value.get("applied_mimic_api") == f"PhysxMimicJointAPI:{source['mimic_axis']}"
+        and value.get("reference_joint_path") == expected_reference
+        and _same_float32(value.get("gearing"), source["gearing"])
+        and _same_float32(value.get("offset"), 0.0)
+        and type(value.get("exclude_from_articulation")) is bool
+        and value.get("exclude_from_articulation")
+        is source["exclude_from_articulation"],
+        f"{field} values",
+    )
+    return dict(value)
+
+
+def validate_eef_gripper_mimic_compliance(
+    value: Any,
+    *,
+    source_contract: Mapping[str, Any],
+    require_post_reset_composed_usd_readback: bool = True,
+) -> dict[str, Any]:
+    """Validate the candidate-only pre-PhysX mimic-compliance transaction."""
+
+    _require(
+        type(require_post_reset_composed_usd_readback) is bool,
+        "mimic compliance post-reset requirement",
+    )
+    source = validate_mimic_joint_contract(dict(source_contract))
+    _require(
+        isinstance(value, dict) and set(value) == MIMIC_COMPLIANCE_CONTRACT_FIELDS,
+        "mimic compliance contract schema",
+    )
+    exact = {
+        "profile": EEF_GRIPPER_MIMIC_COMPLIANCE_PROFILE,
+        "enabled": True,
+        "scope": EEF_GRIPPER_MIMIC_COMPLIANCE_SCOPE,
+        "timing": EEF_GRIPPER_MIMIC_COMPLIANCE_TIMING,
+        "setter": EEF_GRIPPER_MIMIC_COMPLIANCE_SETTER,
+        "live_root_profile": EEF_GRIPPER_MIMIC_COMPLIANCE_LIVE_ROOT_PROFILE,
+        "live_root_path": EEF_GRIPPER_MIMIC_COMPLIANCE_EXPECTED_LIVE_ROOT,
+        "original_spawn_func": EEF_GRIPPER_MIMIC_COMPLIANCE_ORIGINAL_SPAWN_IDENTITY,
+        "overlay_func": EEF_GRIPPER_MIMIC_COMPLIANCE_OVERLAY_IDENTITY,
+        "original_spawn_call_count": 1,
+        "overlay_call_count": 1,
+        "follower_count": EEF_GRIPPER_MIMIC_COMPLIANCE_FOLLOWER_COUNT,
+        "natural_frequency_write_count": (EEF_GRIPPER_MIMIC_COMPLIANCE_FOLLOWER_COUNT),
+        "damping_ratio_write_count": EEF_GRIPPER_MIMIC_COMPLIANCE_FOLLOWER_COUNT,
+        "total_write_count": EEF_GRIPPER_MIMIC_COMPLIANCE_TOTAL_WRITE_COUNT,
+        "source_usd_sha256": EXPECTED_ROBOT_USD_SHA256,
+        "source_usd_unchanged_after_spawn_overlay": True,
+    }
+    for name, expected in exact.items():
+        _require(
+            _typed_equal(value.get(name), expected),
+            f"mimic compliance {name} drift",
+        )
+    for name, expected in {
+        "physics_hz": EEF_GRIPPER_MIMIC_COMPLIANCE_PHYSICS_HZ,
+        "physics_dt": EEF_GRIPPER_MIMIC_COMPLIANCE_PHYSICS_DT,
+        "frequency_timestep_product": (
+            EEF_GRIPPER_MIMIC_COMPLIANCE_FREQUENCY_TIMESTEP_PRODUCT
+        ),
+    }.items():
+        actual = value.get(name)
+        _require(
+            isinstance(actual, (int, float))
+            and not isinstance(actual, bool)
+            and math.isfinite(float(actual))
+            and float(actual) == float(expected),
+            f"mimic compliance {name} drift",
+        )
+    _require(
+        _same_float32(
+            value.get("target_natural_frequency_rad_s"),
+            EEF_GRIPPER_MIMIC_COMPLIANCE_NATURAL_FREQUENCY_RAD_S_FLOAT32,
+        )
+        and _same_float32(
+            value.get("target_damping_ratio"),
+            EEF_GRIPPER_MIMIC_COMPLIANCE_DAMPING_RATIO_FLOAT32,
+        ),
+        "mimic compliance target float32 drift",
+    )
+    _require(
+        value["physics_dt"] * value["target_natural_frequency_rad_s"]
+        == value["frequency_timestep_product"],
+        "mimic compliance frequency/timestep product drift",
+    )
+    followers = value.get("followers")
+    _require(
+        isinstance(followers, list)
+        and len(followers) == EEF_GRIPPER_MIMIC_COMPLIANCE_FOLLOWER_COUNT,
+        "mimic compliance follower list",
+    )
+    for index, follower in enumerate(followers):
+        _require(
+            isinstance(follower, dict)
+            and set(follower) == MIMIC_COMPLIANCE_FOLLOWER_FIELDS,
+            f"mimic compliance follower {index} schema",
+        )
+        expected_source = source["followers"][index]
+        frequency_name, damping_name = _mimic_attribute_names(
+            expected_source["mimic_axis"]
+        )
+        expected_live_path = (
+            EEF_GRIPPER_MIMIC_COMPLIANCE_EXPECTED_LIVE_ROOT
+            + expected_source["prim_path"].removeprefix("/panda")
+        )
+        expected_identity = {
+            "joint_name": expected_source["joint_name"],
+            "joint_index": expected_source["joint_index"],
+            "live_prim_path": expected_live_path,
+            "mimic_axis": expected_source["mimic_axis"],
+            "natural_frequency_attribute": frequency_name,
+            "damping_ratio_attribute": damping_name,
+            "natural_frequency_write_count": 1,
+            "damping_ratio_write_count": 1,
+        }
+        for name, expected in expected_identity.items():
+            _require(
+                type(follower.get(name)) is type(expected)
+                and follower.get(name) == expected,
+                f"mimic compliance follower {index} {name} drift",
+            )
+        _validate_mimic_compliance_snapshot(
+            follower.get("source"),
+            expected_natural_frequency=expected_source["natural_frequency_hz"],
+            expected_damping_ratio=expected_source["damping_ratio"],
+            field=f"mimic compliance follower {index} source",
+        )
+        _validate_mimic_compliance_snapshot(
+            follower.get("before_spawn_write"),
+            expected_natural_frequency=expected_source["natural_frequency_hz"],
+            expected_damping_ratio=expected_source["damping_ratio"],
+            field=f"mimic compliance follower {index} before",
+        )
+        before_structure = _validate_mimic_compliance_structure(
+            follower.get("before_spawn_structure"),
+            source=expected_source,
+            field=f"mimic compliance follower {index} before structure",
+        )
+        _validate_mimic_compliance_snapshot(
+            follower.get("after_spawn_write"),
+            expected_natural_frequency=(
+                EEF_GRIPPER_MIMIC_COMPLIANCE_NATURAL_FREQUENCY_RAD_S_FLOAT32
+            ),
+            expected_damping_ratio=(EEF_GRIPPER_MIMIC_COMPLIANCE_DAMPING_RATIO_FLOAT32),
+            field=f"mimic compliance follower {index} after",
+        )
+        after_structure = _validate_mimic_compliance_structure(
+            follower.get("after_spawn_structure"),
+            source=expected_source,
+            field=f"mimic compliance follower {index} after structure",
+        )
+        _require(
+            _typed_equal(before_structure, after_structure),
+            f"mimic compliance follower {index} spawn structure changed",
+        )
+        post_reset = follower.get("post_reset_composed_usd_readback")
+        post_reset_composed_usd_structure = follower.get(
+            "post_reset_composed_usd_structure"
+        )
+        if require_post_reset_composed_usd_readback:
+            _validate_mimic_compliance_snapshot(
+                post_reset,
+                expected_natural_frequency=(
+                    EEF_GRIPPER_MIMIC_COMPLIANCE_NATURAL_FREQUENCY_RAD_S_FLOAT32
+                ),
+                expected_damping_ratio=(
+                    EEF_GRIPPER_MIMIC_COMPLIANCE_DAMPING_RATIO_FLOAT32
+                ),
+                field=f"mimic compliance follower {index} post-reset",
+            )
+            validated_post_reset_composed_usd_structure = _validate_mimic_compliance_structure(
+                post_reset_composed_usd_structure,
+                source=expected_source,
+                field=f"mimic compliance follower {index} post-reset composed-USD structure",
+            )
+            _require(
+                _typed_equal(
+                    validated_post_reset_composed_usd_structure,
+                    before_structure,
+                ),
+                f"mimic compliance follower {index} post-reset composed-USD structure changed",
+            )
+        else:
+            _require(
+                post_reset is None and post_reset_composed_usd_structure is None,
+                f"mimic compliance follower {index} premature post-reset composed-USD readback",
+            )
+    return dict(value)
+
+
+def configure_eef_gripper_mimic_compliance_spawn_overlay(
+    spawn_cfg: Any,
+    *,
+    target_slew_profile: str,
+) -> Any:
+    """Install the sole candidate overlay while leaving baseline config untouched."""
+
+    profile = eef_gripper_target_slew_profile(target_slew_profile)
+    original_func = getattr(spawn_cfg, "func", None)
+    original_identity = _validate_original_spawn_func(original_func)
+    if profile.profile == EEF_GRIPPER_TARGET_SLEW_PROFILE:
+        return original_func
+    _require(
+        profile.profile == EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE,
+        "mimic compliance target-slew profile binding",
+    )
+
+    def overlay(
+        prim_path: str,
+        cfg: Any,
+        translation: tuple[float, float, float] | None = None,
+        orientation: tuple[float, float, float, float] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        _require(
+            getattr(overlay, "_eef_mimic_compliance_overlay_call_count") == 0,
+            "mimic compliance spawn overlay called more than once",
+        )
+        overlay._eef_mimic_compliance_overlay_call_count = 1
+        source_before = _capture_mimic_joint_contract(Path(cfg.usd_path))
+        result = original_func(
+            prim_path,
+            cfg,
+            translation=translation,
+            orientation=orientation,
+            **kwargs,
+        )
+        overlay._eef_mimic_compliance_original_spawn_call_count = 1
+        stage, roots = _current_live_stage_and_robot_roots(prim_path)
+        live_root, followers = _write_spawned_mimic_compliance(
+            stage=stage,
+            roots=roots,
+            source_contract=source_before,
+        )
+        source_after = _capture_mimic_joint_contract(Path(cfg.usd_path))
+        _require(
+            _typed_equal(source_before, source_after),
+            "mimic compliance source USD changed during live overlay",
+        )
+        evidence = {
+            "profile": EEF_GRIPPER_MIMIC_COMPLIANCE_PROFILE,
+            "enabled": True,
+            "scope": EEF_GRIPPER_MIMIC_COMPLIANCE_SCOPE,
+            "timing": EEF_GRIPPER_MIMIC_COMPLIANCE_TIMING,
+            "setter": EEF_GRIPPER_MIMIC_COMPLIANCE_SETTER,
+            "live_root_profile": EEF_GRIPPER_MIMIC_COMPLIANCE_LIVE_ROOT_PROFILE,
+            "live_root_path": live_root,
+            "original_spawn_func": original_identity,
+            "overlay_func": _callable_identity(overlay),
+            "original_spawn_call_count": 1,
+            "overlay_call_count": 1,
+            "physics_hz": EEF_GRIPPER_MIMIC_COMPLIANCE_PHYSICS_HZ,
+            "physics_dt": EEF_GRIPPER_MIMIC_COMPLIANCE_PHYSICS_DT,
+            "target_natural_frequency_rad_s": (
+                EEF_GRIPPER_MIMIC_COMPLIANCE_NATURAL_FREQUENCY_RAD_S_FLOAT32
+            ),
+            "target_damping_ratio": (
+                EEF_GRIPPER_MIMIC_COMPLIANCE_DAMPING_RATIO_FLOAT32
+            ),
+            "frequency_timestep_product": (
+                EEF_GRIPPER_MIMIC_COMPLIANCE_FREQUENCY_TIMESTEP_PRODUCT
+            ),
+            "follower_count": EEF_GRIPPER_MIMIC_COMPLIANCE_FOLLOWER_COUNT,
+            "natural_frequency_write_count": (
+                EEF_GRIPPER_MIMIC_COMPLIANCE_FOLLOWER_COUNT
+            ),
+            "damping_ratio_write_count": (EEF_GRIPPER_MIMIC_COMPLIANCE_FOLLOWER_COUNT),
+            "total_write_count": EEF_GRIPPER_MIMIC_COMPLIANCE_TOTAL_WRITE_COUNT,
+            "source_usd_sha256": EXPECTED_ROBOT_USD_SHA256,
+            "source_usd_unchanged_after_spawn_overlay": True,
+            "followers": followers,
+        }
+        validate_eef_gripper_mimic_compliance(
+            evidence,
+            source_contract=source_after,
+            require_post_reset_composed_usd_readback=False,
+        )
+        overlay._eef_mimic_compliance_source_before = copy.deepcopy(source_before)
+        overlay._eef_mimic_compliance_source_after = copy.deepcopy(source_after)
+        overlay._eef_mimic_compliance_spawn_evidence = copy.deepcopy(evidence)
+        return result
+
+    overlay.__name__ = EEF_GRIPPER_MIMIC_COMPLIANCE_OVERLAY_IDENTITY["name"]
+    overlay.__qualname__ = EEF_GRIPPER_MIMIC_COMPLIANCE_OVERLAY_IDENTITY["qualname"]
+    overlay._eef_mimic_compliance_target_slew_profile = profile.profile
+    overlay._eef_mimic_compliance_original_func = original_func
+    overlay._eef_mimic_compliance_original_spawn_call_count = 0
+    overlay._eef_mimic_compliance_overlay_call_count = 0
+    overlay._eef_mimic_compliance_source_before = None
+    overlay._eef_mimic_compliance_source_after = None
+    overlay._eef_mimic_compliance_spawn_evidence = None
+    _require(
+        _typed_equal(
+            _callable_identity(overlay),
+            EEF_GRIPPER_MIMIC_COMPLIANCE_OVERLAY_IDENTITY,
+        ),
+        "mimic compliance overlay callable identity drift",
+    )
+    spawn_cfg.func = overlay
+    _require(spawn_cfg.func is overlay, "mimic compliance overlay installation failed")
+    return overlay
+
+
+def _post_reset_mimic_compliance_contract(
+    *, robot: Any, source_contract: Mapping[str, Any]
+) -> dict[str, Any]:
+    overlay = getattr(getattr(robot.cfg, "spawn", None), "func", None)
+    _require(
+        _typed_equal(
+            _callable_identity(overlay),
+            EEF_GRIPPER_MIMIC_COMPLIANCE_OVERLAY_IDENTITY,
+        ),
+        "mimic compliance installed overlay identity drift",
+    )
+    original = getattr(overlay, "_eef_mimic_compliance_original_func", None)
+    _validate_original_spawn_func(original)
+    _require(
+        getattr(overlay, "_eef_mimic_compliance_target_slew_profile", None)
+        == EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+        and type(
+            getattr(overlay, "_eef_mimic_compliance_original_spawn_call_count", None)
+        )
+        is int
+        and getattr(overlay, "_eef_mimic_compliance_original_spawn_call_count") == 1
+        and type(getattr(overlay, "_eef_mimic_compliance_overlay_call_count", None))
+        is int
+        and getattr(overlay, "_eef_mimic_compliance_overlay_call_count") == 1,
+        "mimic compliance overlay lifecycle drift",
+    )
+    source = validate_mimic_joint_contract(dict(source_contract))
+    source_before = getattr(overlay, "_eef_mimic_compliance_source_before", None)
+    source_after = getattr(overlay, "_eef_mimic_compliance_source_after", None)
+    _require(
+        _typed_equal(source_before, source) and _typed_equal(source_after, source),
+        "mimic compliance source USD identity drift after reset",
+    )
+    evidence = copy.deepcopy(
+        getattr(overlay, "_eef_mimic_compliance_spawn_evidence", None)
+    )
+    validate_eef_gripper_mimic_compliance(
+        evidence,
+        source_contract=source,
+        require_post_reset_composed_usd_readback=False,
+    )
+    stage, roots = _current_live_stage_and_robot_roots(robot.cfg.prim_path)
+    live_root, snapshots = _read_live_mimic_snapshots(
+        stage=stage,
+        roots=roots,
+        source_contract=source,
+    )
+    _require(
+        live_root == evidence["live_root_path"]
+        and len(snapshots) == len(evidence["followers"]),
+        "mimic compliance post-reset live identity drift",
+    )
+    for follower, snapshot in zip(evidence["followers"], snapshots, strict=True):
+        identity_fields = {
+            "joint_name",
+            "joint_index",
+            "live_prim_path",
+            "mimic_axis",
+            "natural_frequency_attribute",
+            "damping_ratio_attribute",
+        }
+        _require(
+            all(follower[name] == snapshot[name] for name in identity_fields),
+            "mimic compliance post-reset follower identity drift",
+        )
+        follower["post_reset_composed_usd_readback"] = snapshot["snapshot"]
+        follower["post_reset_composed_usd_structure"] = snapshot["structure"]
+    return validate_eef_gripper_mimic_compliance(
+        evidence,
+        source_contract=source,
+        require_post_reset_composed_usd_readback=True,
+    )
+
+
+def _validate_post_reset_mimic_compliance_readback(
+    *,
+    robot: Any,
+    source_contract: Mapping[str, Any],
+    expected_contract: Mapping[str, Any],
+) -> None:
+    expected = validate_eef_gripper_mimic_compliance(
+        dict(expected_contract),
+        source_contract=source_contract,
+        require_post_reset_composed_usd_readback=True,
+    )
+    current = _post_reset_mimic_compliance_contract(
+        robot=robot,
+        source_contract=source_contract,
+    )
+    _require(
+        _typed_equal(current, expected),
+        "mimic compliance later-reset readback drift",
+    )
 
 
 def _direct_static_physx_tensor(robot: Any, getter_name: str) -> Any:
@@ -1115,8 +2054,12 @@ def validate_eef_gripper_static_contract(
     *,
     expected_target_slew_profile: str = EEF_GRIPPER_TARGET_SLEW_PROFILE,
 ) -> dict[str, Any]:
+    target_slew_spec = eef_gripper_target_slew_profile(expected_target_slew_profile)
+    expected_fields = set(STATIC_CONTRACT_FIELDS)
+    if target_slew_spec.profile == EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE:
+        expected_fields.add(MIMIC_COMPLIANCE_STATIC_FIELD)
     _require(
-        isinstance(value, dict) and set(value) == STATIC_CONTRACT_FIELDS,
+        isinstance(value, dict) and set(value) == expected_fields,
         "gripper static schema",
     )
     exact = {
@@ -1170,7 +2113,13 @@ def validate_eef_gripper_static_contract(
         and driver["cfg_effort_limit"] == driver["cfg_effort_limit_sim"] == 200.0,
         "driver cfg evidence drift",
     )
-    validate_mimic_joint_contract(value.get("mimic_joint_contract"))
+    mimic_contract = validate_mimic_joint_contract(value.get("mimic_joint_contract"))
+    if target_slew_spec.profile == EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE:
+        validate_eef_gripper_mimic_compliance(
+            value.get(MIMIC_COMPLIANCE_STATIC_FIELD),
+            source_contract=mimic_contract,
+            require_post_reset_composed_usd_readback=True,
+        )
     before = validate_tensor_evidence(
         value.get("velocity_limits_before_write"),
         field="velocity limits before write",
@@ -1220,7 +2169,7 @@ def validate_eef_gripper_static_contract(
     )
     validate_eef_gripper_target_slew_static(
         value.get("driver_target_slew"),
-        expected_profile=expected_target_slew_profile,
+        expected_profile=target_slew_spec.profile,
     )
     return dict(value)
 
@@ -1411,6 +2360,12 @@ def install_eef_gripper_runtime(env: Any, *, robot_usd_path: Path) -> dict[str, 
     ownership = _validate_live_ownership(robot, arm_term, finger_term)
     driver = _capture_driver_actuator(robot)
     mimic = _capture_mimic_joint_contract(Path(robot_usd_path))
+    mimic_compliance = None
+    if target_slew_spec.profile == EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE:
+        mimic_compliance = _post_reset_mimic_compliance_contract(
+            robot=robot,
+            source_contract=mimic,
+        )
     before_tensor = _direct_static_physx_tensor(robot, "get_dof_max_velocities")
     before = validate_tensor_evidence(
         tensor_evidence(before_tensor),
@@ -1470,6 +2425,8 @@ def install_eef_gripper_runtime(env: Any, *, robot_usd_path: Path) -> dict[str, 
         "driver_target_slew": target_slew_contract,
         "measured_velocity_is_hard_bounded_by_limit": False,
     }
+    if mimic_compliance is not None:
+        contract[MIMIC_COMPLIANCE_STATIC_FIELD] = mimic_compliance
     contract = validate_eef_gripper_static_contract(
         contract,
         expected_target_slew_profile=target_slew_spec.profile,
@@ -1498,6 +2455,12 @@ def validate_eef_gripper_post_reset(
     )
     runtime = getattr(env, "unwrapped", env)
     robot = runtime.scene["robot"]
+    if target_slew_spec.profile == EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE:
+        _validate_post_reset_mimic_compliance_readback(
+            robot=robot,
+            source_contract=expected_contract["mimic_joint_contract"],
+            expected_contract=expected_contract[MIMIC_COMPLIANCE_STATIC_FIELD],
+        )
     current = tensor_evidence(
         _direct_static_physx_tensor(robot, "get_dof_max_velocities")
     )

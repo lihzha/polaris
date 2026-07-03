@@ -50,6 +50,22 @@ def _target_slew_static():
     }
 
 
+def _candidate_target_slew_static():
+    value = _target_slew_static()
+    specification = runtime.eef_gripper_target_slew_profile(
+        runtime.EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+    )
+    value.update(
+        {
+            "profile": specification.profile,
+            "target_slew_rate_factor": specification.rate_factor_float32,
+            "target_slew_rate_rad_s": specification.rate_rad_s_float32,
+            "max_target_step_rad": specification.max_target_step_rad_float32,
+        }
+    )
+    return value
+
+
 def _target_slew_dynamic(*, process_calls=1, apply_calls=1):
     return {
         "profile": runtime.EEF_GRIPPER_TARGET_SLEW_PROFILE,
@@ -213,6 +229,188 @@ class _FakePhysxView:
         self.velocity_limits = values.clone()
 
 
+class _FakePath:
+    def __init__(self, path):
+        self.pathString = path
+
+    def __str__(self):
+        return self.pathString
+
+
+class _FakeAttribute:
+    def __init__(self, value, *, type_name="float", set_result=True):
+        self.value = value
+        self.type_name = type_name
+        self.set_result = set_result
+        self.set_calls = []
+
+    def __bool__(self):
+        return True
+
+    def GetTypeName(self):
+        return self.type_name
+
+    def Get(self):
+        return self.value
+
+    def Set(self, value):
+        self.set_calls.append(value)
+        if self.set_result:
+            self.value = np.float32(value).item()
+        return self.set_result
+
+
+class _FakeRelationship:
+    def __init__(self, targets):
+        self.targets = [_FakePath(path) for path in targets]
+
+    def __bool__(self):
+        return True
+
+    def GetTargets(self):
+        return list(self.targets)
+
+
+class _FakePrim:
+    def __init__(
+        self,
+        path,
+        *,
+        type_name,
+        attributes=None,
+        applied_schemas=None,
+        relationships=None,
+    ):
+        self.path = path
+        self.type_name = type_name
+        self.attributes = attributes or {}
+        self.applied_schemas = list(applied_schemas or [])
+        self.relationships = relationships or {}
+
+    def __bool__(self):
+        return True
+
+    def IsValid(self):
+        return True
+
+    def GetPath(self):
+        return _FakePath(self.path)
+
+    def GetTypeName(self):
+        return self.type_name
+
+    def GetAttribute(self, name):
+        return self.attributes.get(name)
+
+    def GetAppliedSchemas(self):
+        return list(self.applied_schemas)
+
+    def GetRelationship(self, name):
+        return self.relationships.get(name)
+
+
+class _FakeStage:
+    def __init__(self, prims):
+        self.prims = {prim.path: prim for prim in prims}
+
+    def GetPrimAtPath(self, path):
+        return self.prims.get(path)
+
+
+def _fake_live_mimic_stage():
+    source = runtime._expected_mimic_joint_contract()
+    root_path = runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_EXPECTED_LIVE_ROOT
+    root = _FakePrim(root_path, type_name="Xform")
+    followers = []
+    driver_path = root_path + source["driver_joint_prim_path"].removeprefix("/panda")
+    for specification in source["followers"]:
+        live_path = root_path + specification["prim_path"].removeprefix("/panda")
+        frequency_name, damping_name = runtime._mimic_attribute_names(
+            specification["mimic_axis"]
+        )
+        followers.append(
+            _FakePrim(
+                live_path,
+                type_name="PhysicsRevoluteJoint",
+                attributes={
+                    frequency_name: _FakeAttribute(
+                        specification["natural_frequency_hz"]
+                    ),
+                    damping_name: _FakeAttribute(specification["damping_ratio"]),
+                    f"physxMimicJoint:{specification['mimic_axis']}:gearing": (
+                        _FakeAttribute(specification["gearing"])
+                    ),
+                    f"physxMimicJoint:{specification['mimic_axis']}:offset": (
+                        _FakeAttribute(0.0)
+                    ),
+                    "physics:excludeFromArticulation": _FakeAttribute(
+                        specification["exclude_from_articulation"],
+                        type_name="bool",
+                    ),
+                },
+                applied_schemas=[f"PhysxMimicJointAPI:{specification['mimic_axis']}"],
+                relationships={
+                    f"physxMimicJoint:{specification['mimic_axis']}:referenceJoint": (
+                        _FakeRelationship([driver_path])
+                    )
+                },
+            )
+        )
+    stage = _FakeStage([root, *followers])
+    return source, stage, root, followers
+
+
+def _candidate_compliance_contract(followers, *, post_reset=True):
+    serialized = copy.deepcopy(followers)
+    if post_reset:
+        for follower in serialized:
+            follower["post_reset_composed_usd_readback"] = copy.deepcopy(
+                follower["after_spawn_write"]
+            )
+            follower["post_reset_composed_usd_structure"] = copy.deepcopy(
+                follower["after_spawn_structure"]
+            )
+    return {
+        "profile": runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_PROFILE,
+        "enabled": True,
+        "scope": runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_SCOPE,
+        "timing": runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_TIMING,
+        "setter": runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_SETTER,
+        "live_root_profile": runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_LIVE_ROOT_PROFILE,
+        "live_root_path": runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_EXPECTED_LIVE_ROOT,
+        "original_spawn_func": copy.deepcopy(
+            runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_ORIGINAL_SPAWN_IDENTITY
+        ),
+        "overlay_func": copy.deepcopy(
+            runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_OVERLAY_IDENTITY
+        ),
+        "original_spawn_call_count": 1,
+        "overlay_call_count": 1,
+        "physics_hz": runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_PHYSICS_HZ,
+        "physics_dt": runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_PHYSICS_DT,
+        "target_natural_frequency_rad_s": (
+            runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_NATURAL_FREQUENCY_RAD_S_FLOAT32
+        ),
+        "target_damping_ratio": (
+            runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_DAMPING_RATIO_FLOAT32
+        ),
+        "frequency_timestep_product": (
+            runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_FREQUENCY_TIMESTEP_PRODUCT
+        ),
+        "follower_count": runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_FOLLOWER_COUNT,
+        "natural_frequency_write_count": (
+            runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_FOLLOWER_COUNT
+        ),
+        "damping_ratio_write_count": (
+            runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_FOLLOWER_COUNT
+        ),
+        "total_write_count": (runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_TOTAL_WRITE_COUNT),
+        "source_usd_sha256": runtime.EXPECTED_ROBOT_USD_SHA256,
+        "source_usd_unchanged_after_spawn_overlay": True,
+        "followers": serialized,
+    }
+
+
 class _FakeArmTerm:
     def __init__(self):
         self.installed = None
@@ -303,6 +501,297 @@ def test_installer_performs_one_full_cpu_write_and_later_reset_only_reads(
 
     runtime.validate_eef_gripper_post_reset(env, contract)
     assert len(view.setter_calls) == 1
+
+
+def test_spawn_overlay_writes_exact_ten_float_attributes_and_post_reset_reads_only(
+    monkeypatch, tmp_path
+):
+    source, stage, root, follower_prims = _fake_live_mimic_stage()
+    original_calls = []
+
+    def original(prim_path, cfg, **kwargs):
+        original_calls.append((prim_path, cfg, kwargs))
+        return root
+
+    original.__module__ = runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_ORIGINAL_SPAWN_IDENTITY[
+        "module"
+    ]
+    original.__qualname__ = (
+        runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_ORIGINAL_SPAWN_IDENTITY["qualname"]
+    )
+    original.__name__ = runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_ORIGINAL_SPAWN_IDENTITY[
+        "name"
+    ]
+    monkeypatch.setattr(runtime, "_expected_original_spawn_func", lambda: original)
+    monkeypatch.setattr(
+        runtime,
+        "_capture_mimic_joint_contract",
+        lambda _path: copy.deepcopy(source),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_current_live_stage_and_robot_roots",
+        lambda _path: (stage, [root]),
+    )
+    spawn_cfg = SimpleNamespace(
+        func=original,
+        usd_path=tmp_path / "immutable-source.usd",
+    )
+    overlay = runtime.configure_eef_gripper_mimic_compliance_spawn_overlay(
+        spawn_cfg,
+        target_slew_profile=(
+            runtime.EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+        ),
+    )
+    result = overlay(
+        runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_EXPECTED_LIVE_ROOT,
+        spawn_cfg,
+        translation=(0.0, 0.0, 0.0),
+        orientation=(1.0, 0.0, 0.0, 0.0),
+    )
+    assert result is root
+    assert len(original_calls) == 1
+    attributes = [
+        attribute
+        for prim in follower_prims
+        for name, attribute in prim.attributes.items()
+        if name.endswith((":naturalFrequency", ":dampingRatio"))
+    ]
+    assert len(attributes) == 10
+    assert all(len(attribute.set_calls) == 1 for attribute in attributes)
+
+    robot = SimpleNamespace(
+        cfg=SimpleNamespace(
+            prim_path=runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_EXPECTED_LIVE_ROOT,
+            spawn=spawn_cfg,
+        )
+    )
+    contract = runtime._post_reset_mimic_compliance_contract(  # noqa: SLF001
+        robot=robot,
+        source_contract=source,
+    )
+    assert contract["total_write_count"] == 10
+    assert all(
+        follower["post_reset_composed_usd_readback"] == follower["after_spawn_write"]
+        for follower in contract["followers"]
+    )
+    assert all(len(attribute.set_calls) == 1 for attribute in attributes)
+
+    runtime._validate_post_reset_mimic_compliance_readback(  # noqa: SLF001
+        robot=robot,
+        source_contract=source,
+        expected_contract=contract,
+    )
+    assert all(len(attribute.set_calls) == 1 for attribute in attributes)
+
+
+def test_baseline_spawn_configuration_is_bitwise_untouched_and_writes_nothing(
+    monkeypatch,
+):
+    source, _, _, follower_prims = _fake_live_mimic_stage()
+
+    def original(*_args, **_kwargs):
+        return None
+
+    original.__module__ = runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_ORIGINAL_SPAWN_IDENTITY[
+        "module"
+    ]
+    original.__qualname__ = (
+        runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_ORIGINAL_SPAWN_IDENTITY["qualname"]
+    )
+    original.__name__ = runtime.EEF_GRIPPER_MIMIC_COMPLIANCE_ORIGINAL_SPAWN_IDENTITY[
+        "name"
+    ]
+    monkeypatch.setattr(runtime, "_expected_original_spawn_func", lambda: original)
+    spawn_cfg = SimpleNamespace(func=original, usd_path="/unused.usd")
+    returned = runtime.configure_eef_gripper_mimic_compliance_spawn_overlay(
+        spawn_cfg,
+        target_slew_profile=runtime.EEF_GRIPPER_TARGET_SLEW_PROFILE,
+    )
+    assert returned is original
+    assert spawn_cfg.func is original
+    assert source == runtime._expected_mimic_joint_contract()  # noqa: SLF001
+    assert all(
+        attribute.set_calls == []
+        for prim in follower_prims
+        for attribute in prim.attributes.values()
+    )
+
+
+def test_mimic_compliance_prevalidates_all_attribute_types_before_any_write():
+    source, stage, root, follower_prims = _fake_live_mimic_stage()
+    bad_attribute = next(iter(follower_prims[-1].attributes.values()))
+    bad_attribute.type_name = "double"
+    with pytest.raises(ValueError, match="attribute type drift"):
+        runtime._write_spawned_mimic_compliance(  # noqa: SLF001
+            stage=stage,
+            roots=[root],
+            source_contract=source,
+        )
+    assert all(
+        attribute.set_calls == []
+        for prim in follower_prims
+        for attribute in prim.attributes.values()
+    )
+
+
+def test_mimic_compliance_late_source_value_drift_causes_zero_writes():
+    source, stage, root, follower_prims = _fake_live_mimic_stage()
+    last = follower_prims[-1]
+    frequency_name, _ = runtime._mimic_attribute_names(  # noqa: SLF001
+        source["followers"][-1]["mimic_axis"]
+    )
+    last.attributes[frequency_name].value = 999.0
+    with pytest.raises(ValueError, match="pre-write/source drift"):
+        runtime._write_spawned_mimic_compliance(  # noqa: SLF001
+            stage=stage,
+            roots=[root],
+            source_contract=source,
+        )
+    assert all(
+        attribute.set_calls == []
+        for prim in follower_prims
+        for attribute in prim.attributes.values()
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        (
+            lambda _source, prim: setattr(
+                prim, "applied_schemas", ["PhysxMimicJointAPI:rotY"]
+            ),
+            "applied mimic API",
+        ),
+        (
+            lambda source, prim: prim.relationships.__setitem__(
+                f"physxMimicJoint:{source['mimic_axis']}:referenceJoint",
+                _FakeRelationship(["/World/wrong"]),
+            ),
+            "source structure drift",
+        ),
+        (
+            lambda source, prim: setattr(
+                prim.attributes[f"physxMimicJoint:{source['mimic_axis']}:gearing"],
+                "value",
+                2.0,
+            ),
+            "source structure drift",
+        ),
+        (
+            lambda _source, prim: setattr(
+                prim.attributes["physics:excludeFromArticulation"],
+                "value",
+                True,
+            ),
+            "source structure drift",
+        ),
+    ],
+)
+def test_mimic_compliance_rejects_live_api_reference_gearing_and_exclusion_drift(
+    mutation, match
+):
+    source, stage, root, follower_prims = _fake_live_mimic_stage()
+    mutation(source["followers"][-1], follower_prims[-1])
+    with pytest.raises(ValueError, match=match):
+        runtime._write_spawned_mimic_compliance(  # noqa: SLF001
+            stage=stage,
+            roots=[root],
+            source_contract=source,
+        )
+    assert all(
+        attribute.set_calls == []
+        for prim in follower_prims
+        for attribute in prim.attributes.values()
+    )
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "match"),
+    [
+        (("total_write_count",), True, "total_write_count drift"),
+        (
+            ("target_damping_ratio",),
+            1.0,
+            "target float32 drift",
+        ),
+        (
+            ("followers", 0, "live_prim_path"),
+            "/World/wrong",
+            "live_prim_path drift",
+        ),
+        (
+            ("followers", 0, "post_reset_composed_usd_readback", "damping_ratio"),
+            0.0,
+            "post-reset values",
+        ),
+    ],
+)
+def test_mimic_compliance_contract_rejects_schema_type_and_value_tampering(
+    path, value, match
+):
+    source, stage, root, _ = _fake_live_mimic_stage()
+    _, followers = runtime._write_spawned_mimic_compliance(  # noqa: SLF001
+        stage=stage,
+        roots=[root],
+        source_contract=source,
+    )
+    contract = _candidate_compliance_contract(followers)
+    target = contract
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(ValueError, match=match):
+        runtime.validate_eef_gripper_mimic_compliance(
+            contract,
+            source_contract=source,
+        )
+
+
+def test_mimic_compliance_contract_schema_is_closed():
+    source, stage, root, _ = _fake_live_mimic_stage()
+    _, followers = runtime._write_spawned_mimic_compliance(  # noqa: SLF001
+        stage=stage,
+        roots=[root],
+        source_contract=source,
+    )
+    contract = _candidate_compliance_contract(followers)
+    contract["hidden"] = True
+    with pytest.raises(ValueError, match="contract schema"):
+        runtime.validate_eef_gripper_mimic_compliance(
+            contract,
+            source_contract=source,
+        )
+
+
+def test_candidate_static_contract_requires_compliance_and_baseline_forbids_it():
+    source, stage, root, _ = _fake_live_mimic_stage()
+    _, followers = runtime._write_spawned_mimic_compliance(  # noqa: SLF001
+        stage=stage,
+        roots=[root],
+        source_contract=source,
+    )
+    candidate_contract = _static_contract()
+    candidate_contract["driver_target_slew"] = _candidate_target_slew_static()
+    candidate_contract["mimic_compliance"] = _candidate_compliance_contract(followers)
+    assert runtime.validate_eef_gripper_static_contract(
+        candidate_contract,
+        expected_target_slew_profile=(
+            runtime.EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+        ),
+    )
+    with pytest.raises(ValueError, match="gripper static schema"):
+        runtime.validate_eef_gripper_static_contract(candidate_contract)
+
+    candidate_contract.pop("mimic_compliance")
+    with pytest.raises(ValueError, match="gripper static schema"):
+        runtime.validate_eef_gripper_static_contract(
+            candidate_contract,
+            expected_target_slew_profile=(
+                runtime.EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+        )
 
 
 @pytest.mark.parametrize(

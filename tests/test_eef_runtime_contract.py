@@ -341,7 +341,10 @@ def _attach_stub_gripper_runtime(
     target_apply_calls,
 ):
     apply_calls = safety["counters"]["apply_calls"]
-    safety["gripper_runtime_static"] = {"profile": "stub-static"}
+    safety["gripper_runtime_static"] = {
+        "profile": "stub-static",
+        "driver_target_slew": {"profile": "stub-target-slew"},
+    }
     safety["gripper_runtime_dynamic"] = {
         "apply_entry_samples": apply_calls,
         "post_policy_step_samples": post_policy_step_samples,
@@ -1631,15 +1634,21 @@ def test_episode_safety_cadence_binds_success_and_failure_substep():
 
 
 def test_episode_cadence_cross_binds_gripper_target_slew_action_order(monkeypatch):
+    observed_profiles = []
+
+    def validate_stub(value, **kwargs):
+        observed_profiles.append(kwargs.get("expected_target_slew_profile"))
+        return value
+
     monkeypatch.setattr(
         runtime_contract_module,
         "validate_eef_gripper_static_contract",
-        lambda value: value,
+        validate_stub,
     )
     monkeypatch.setattr(
         runtime_contract_module,
         "validate_eef_gripper_dynamic_evidence",
-        lambda value: value,
+        validate_stub,
     )
 
     completed_safety = _attach_stub_gripper_runtime(
@@ -1653,6 +1662,8 @@ def test_episode_cadence_cross_binds_gripper_target_slew_action_order(monkeypatc
         episode_result=_episode_result(),
     )
     assert completed["apply_calls"] == 16
+    assert observed_profiles == ["stub-target-slew"] * 3
+    observed_profiles.clear()
 
     # ActionManager applies arm before finger. On an arm abort at the third
     # zero-indexed substep, arm evidence includes the failed 11th apply entry,
@@ -1668,6 +1679,8 @@ def test_episode_cadence_cross_binds_gripper_target_slew_action_order(monkeypatc
         episode_result=_episode_result(numerical_failure=True),
     )
     assert failed["failed_physics_substep"] == 2
+    assert observed_profiles == ["stub-target-slew"] * 3
+    observed_profiles.clear()
 
     drifted = copy.deepcopy(failed_safety)
     drifted["gripper_runtime_dynamic"]["driver_target_slew"]["apply_calls"] = 11

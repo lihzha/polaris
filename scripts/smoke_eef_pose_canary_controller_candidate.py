@@ -3,11 +3,12 @@
 
 This is a model-free promotion gate. Both variants use one identical default-
 off controller profile: 0.95 nominal arm slew, factor-0.25 gripper target slew,
-and the profile-bound 86-substep fixed activation-anchor close interlock. After
-the 120 content-pinned actions, seven repeats of the final recorded action give
-the official close transition exactly 96 applies: 86 anchored and 10 released.
-The open reasoning fixture proves the same static controller identity without
-activating the close interlock.
+the profile-bound 86-substep fixed activation-anchor close interlock, and the
+pre-articulation PhysX mimic-compliance overlay (100 rad/s, damping ratio 1.2).
+After the 120 content-pinned actions, seven repeats of the final recorded
+action give the official close transition exactly 96 applies: 86 anchored and
+10 released. The open reasoning fixture proves the same static controller and
+mimic-compliance identity without activating the close interlock.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from typing import Any
 import smoke_eef_pose_canary_trace_replay as gate0
 
 
-PROFILE = "polaris_eef_canary_controller_candidate_replay_v2"
+PROFILE = "polaris_eef_canary_controller_candidate_replay_v3"
 FIXTURE_ACTION_COUNT = 120
 POST_FIXTURE_REPEAT_COUNT = 7
 TOTAL_ACTION_COUNT = FIXTURE_ACTION_COUNT + POST_FIXTURE_REPEAT_COUNT
@@ -34,6 +35,55 @@ CANDIDATE_TARGET_SLEW_PROFILE = (
     "per_120hz_substep_candidate_v1"
 )
 CANDIDATE_TARGET_SLEW_MAX_STEP_RAD = 0.010416666977107525
+CANDIDATE_MIMIC_COMPLIANCE_PROFILE = (
+    "robotiq_2f85_live_physx_mimic_frequency100_damping1p2_candidate_v1"
+)
+MIMIC_COMPLIANCE_FIELDS = {
+    "profile",
+    "enabled",
+    "scope",
+    "timing",
+    "setter",
+    "live_root_profile",
+    "live_root_path",
+    "original_spawn_func",
+    "overlay_func",
+    "original_spawn_call_count",
+    "overlay_call_count",
+    "physics_hz",
+    "physics_dt",
+    "target_natural_frequency_rad_s",
+    "target_damping_ratio",
+    "frequency_timestep_product",
+    "follower_count",
+    "natural_frequency_write_count",
+    "damping_ratio_write_count",
+    "total_write_count",
+    "source_usd_sha256",
+    "source_usd_unchanged_after_spawn_overlay",
+    "followers",
+}
+MIMIC_COMPLIANCE_FOLLOWER_FIELDS = {
+    "joint_name",
+    "joint_index",
+    "live_prim_path",
+    "mimic_axis",
+    "natural_frequency_attribute",
+    "damping_ratio_attribute",
+    "source",
+    "before_spawn_write",
+    "before_spawn_structure",
+    "natural_frequency_write_count",
+    "damping_ratio_write_count",
+    "after_spawn_write",
+    "after_spawn_structure",
+    "post_reset_composed_usd_readback",
+    "post_reset_composed_usd_structure",
+}
+MIMIC_COMPLIANCE_SNAPSHOT_FIELDS = {
+    "natural_frequency_rad_s",
+    "damping_ratio",
+}
 
 
 def _float32(value: float) -> float:
@@ -99,7 +149,9 @@ CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS = CANDIDATE_CLOSE_TRANSITION_APPLIES + 10
 CANDIDATE_CLOSE_INTERLOCK_PROFILE = (
     "eef_gripper_close_fixed_activation_anchor_86_physics_substeps_v2"
 )
-CANDIDATE_PROFILE = "arm_slew_0p95_plus_gripper_rate0p25_fixed_anchor86_v2"
+CANDIDATE_PROFILE = (
+    "arm_slew_0p95_gripper_rate0p25_fixed_anchor86_mimic100_damping1p2_v3"
+)
 CANDIDATE_BY_VARIANT = {
     "official_lap3b": CANDIDATE_PROFILE,
     "reasoning_43075": CANDIDATE_PROFILE,
@@ -151,7 +203,7 @@ ZERO_SAFETY_COUNTERS = {
     "post_clamp_target_violations",
 }
 CONTROLLER_ABORT_CAPTURE_PROFILE = (
-    "polaris_eef_controller_candidate_transactional_abort_capture_v2"
+    "polaris_eef_controller_candidate_transactional_abort_capture_v3"
 )
 CONTROLLER_ABORT_CAPTURE_FIELDS = {
     "profile",
@@ -218,6 +270,150 @@ def _typed_equal(left: Any, right: Any) -> bool:
             for actual, expected in zip(left, right, strict=True)
         )
     return bool(left == right)
+
+
+def validate_candidate_mimic_compliance(
+    gripper_contract: Any,
+) -> dict[str, Any]:
+    """Independently bind the pre-articulation compliance write transaction."""
+
+    _require(isinstance(gripper_contract, dict), "candidate gripper static contract")
+    source = gripper_contract.get("mimic_joint_contract")
+    compliance = gripper_contract.get("mimic_compliance")
+    _require(
+        isinstance(source, dict)
+        and isinstance(source.get("followers"), list)
+        and len(source["followers"]) == 5,
+        "candidate mimic source contract",
+    )
+    _require(
+        isinstance(compliance, dict)
+        and set(compliance) == MIMIC_COMPLIANCE_FIELDS
+        and compliance.get("profile") == CANDIDATE_MIMIC_COMPLIANCE_PROFILE
+        and compliance.get("enabled") is True
+        and compliance.get("scope")
+        == "eef_rate0p25_candidate_only_source_usd_immutable_v1"
+        and compliance.get("timing")
+        == "after_original_usd_spawn_before_articulation_initialization_v1"
+        and compliance.get("setter") == "UsdAttribute.Set_default_float_v1"
+        and compliance.get("live_root_profile")
+        == "single_composed_world_env0_robot_root_v1"
+        and compliance.get("live_root_path") == "/World/envs/env_0/robot"
+        and compliance.get("original_spawn_func")
+        == {
+            "module": "isaaclab.sim.spawners.from_files.from_files",
+            "qualname": "spawn_from_usd",
+            "name": "spawn_from_usd",
+        }
+        and compliance.get("overlay_func")
+        == {
+            "module": "polaris.eef_gripper_runtime",
+            "qualname": "eef_mimic_compliance_spawn_overlay",
+            "name": "eef_mimic_compliance_spawn_overlay",
+        }
+        and compliance.get("original_spawn_call_count") == 1
+        and compliance.get("overlay_call_count") == 1
+        and compliance.get("follower_count") == 5
+        and compliance.get("natural_frequency_write_count") == 5
+        and compliance.get("damping_ratio_write_count") == 5
+        and compliance.get("total_write_count") == 10
+        and compliance.get("source_usd_sha256") == source.get("robot_usd_sha256")
+        and compliance.get("source_usd_unchanged_after_spawn_overlay") is True,
+        "candidate mimic-compliance transaction identity drift",
+    )
+    _require(
+        all(
+            type(compliance.get(name)) is float
+            for name in (
+                "physics_hz",
+                "physics_dt",
+                "target_natural_frequency_rad_s",
+                "target_damping_ratio",
+                "frequency_timestep_product",
+            )
+        )
+        and compliance.get("physics_hz") == 120.0
+        and compliance.get("physics_dt") == 1.0 / 120.0
+        and _float32(compliance.get("target_natural_frequency_rad_s")) == 100.0
+        and _float32(compliance.get("target_damping_ratio")) == _float32(1.2)
+        and compliance.get("frequency_timestep_product") == 5.0 / 6.0
+        and compliance["physics_dt"] * compliance["target_natural_frequency_rad_s"]
+        == compliance["frequency_timestep_product"],
+        "candidate mimic-compliance cadence/value drift",
+    )
+    followers = compliance.get("followers")
+    _require(
+        isinstance(followers, list) and len(followers) == 5,
+        "candidate mimic-compliance followers",
+    )
+    for index, (source_follower, follower) in enumerate(
+        zip(source["followers"], followers, strict=True)
+    ):
+        axis = source_follower.get("mimic_axis")
+        expected_live_path = "/World/envs/env_0/robot" + source_follower.get(
+            "prim_path", ""
+        ).removeprefix("/panda")
+        expected_frequency_attribute = f"physxMimicJoint:{axis}:naturalFrequency"
+        expected_damping_attribute = f"physxMimicJoint:{axis}:dampingRatio"
+        expected_structure = {
+            "applied_mimic_api": f"PhysxMimicJointAPI:{axis}",
+            "reference_joint_path": (
+                "/World/envs/env_0/robot/Gripper/Robotiq_2F_85/Joints/finger_joint"
+            ),
+            "gearing": source_follower.get("gearing"),
+            "offset": 0.0,
+            "exclude_from_articulation": False,
+        }
+        _require(
+            isinstance(follower, dict)
+            and set(follower) == MIMIC_COMPLIANCE_FOLLOWER_FIELDS
+            and follower.get("joint_name") == source_follower.get("joint_name")
+            and follower.get("joint_index") == source_follower.get("joint_index")
+            and follower.get("live_prim_path") == expected_live_path
+            and follower.get("mimic_axis") == axis
+            and follower.get("natural_frequency_attribute")
+            == expected_frequency_attribute
+            and follower.get("damping_ratio_attribute") == expected_damping_attribute
+            and follower.get("natural_frequency_write_count") == 1
+            and follower.get("damping_ratio_write_count") == 1,
+            f"candidate mimic-compliance follower {index} identity drift",
+        )
+        for field in (
+            "before_spawn_structure",
+            "after_spawn_structure",
+            "post_reset_composed_usd_structure",
+        ):
+            _require(
+                _typed_equal(follower.get(field), expected_structure),
+                f"candidate mimic-compliance follower {index} {field} drift",
+            )
+        for field in ("source", "before_spawn_write"):
+            snapshot = follower.get(field)
+            _require(
+                isinstance(snapshot, dict)
+                and set(snapshot) == MIMIC_COMPLIANCE_SNAPSHOT_FIELDS
+                and type(snapshot.get("natural_frequency_rad_s")) is float
+                and type(snapshot.get("damping_ratio")) is float
+                and type(source_follower.get("natural_frequency_hz")) is float
+                and type(source_follower.get("damping_ratio")) is float
+                and _float32(snapshot.get("natural_frequency_rad_s"))
+                == _float32(source_follower.get("natural_frequency_hz"))
+                and _float32(snapshot.get("damping_ratio"))
+                == _float32(source_follower.get("damping_ratio")),
+                f"candidate mimic-compliance follower {index} {field} drift",
+            )
+        for field in ("after_spawn_write", "post_reset_composed_usd_readback"):
+            snapshot = follower.get(field)
+            _require(
+                isinstance(snapshot, dict)
+                and set(snapshot) == MIMIC_COMPLIANCE_SNAPSHOT_FIELDS
+                and type(snapshot.get("natural_frequency_rad_s")) is float
+                and type(snapshot.get("damping_ratio")) is float
+                and _float32(snapshot.get("natural_frequency_rad_s")) == 100.0
+                and _float32(snapshot.get("damping_ratio")) == _float32(1.2),
+                f"candidate mimic-compliance follower {index} {field} drift",
+            )
+    return dict(compliance)
 
 
 def validate_failure_context(value: Any, *, variant: str) -> dict[str, Any]:
@@ -330,6 +526,7 @@ def validate_failure_context(value: Any, *, variant: str) -> dict[str, Any]:
         == CANDIDATE_TARGET_SLEW_PROFILE,
         "failure-context gripper target-slew drift",
     )
+    validate_candidate_mimic_compliance(gripper_contract)
     initial_safety = value.get("initial_safety")
     _require(
         isinstance(initial_safety, dict)
@@ -667,6 +864,7 @@ def validate_controller_abort_capture(value: Any, *, variant: str) -> dict[str, 
         and isinstance(active_safety.get("current_joint_velocity_abort"), dict),
         "controller-abort active/current-abort safety drift",
     )
+    validate_candidate_mimic_compliance(active_safety.get("gripper_runtime_static"))
     active_candidate = validate_candidate_report(
         value.get("active_candidate"), variant=variant, final=None
     )
@@ -847,6 +1045,9 @@ def validate_candidate_replay_evidence(
 
     gripper = safety.get("gripper_runtime_dynamic")
     _require(isinstance(gripper, dict), "candidate gripper dynamic evidence")
+    mimic_compliance = validate_candidate_mimic_compliance(
+        safety.get("gripper_runtime_static")
+    )
     _require(
         gripper.get("apply_entry_samples") == TOTAL_ACTION_COUNT * gate0.DECIMATION
         and gripper.get("post_policy_step_samples") == TOTAL_ACTION_COUNT
@@ -877,7 +1078,7 @@ def validate_candidate_replay_evidence(
     )
     interlock = report["gripper_close_arm_interlock"]
     return {
-        "profile": "polaris_eef_candidate_exact_cadence_anchor_and_bound_v2",
+        "profile": ("polaris_eef_candidate_exact_cadence_anchor_bound_mimic100_1p2_v3"),
         "arm_apply_calls": counters["apply_calls"],
         "gripper_apply_calls": driver["apply_calls"],
         "process_action_calls": driver["process_action_calls"],
@@ -886,6 +1087,14 @@ def validate_candidate_replay_evidence(
         "target_slew_limited_apply_count": expected_limited,
         "target_slew_endpoint_reached_apply_count": driver[
             "endpoint_reached_apply_count"
+        ],
+        "mimic_compliance_profile": mimic_compliance["profile"],
+        "mimic_compliance_total_write_count": mimic_compliance["total_write_count"],
+        "mimic_compliance_post_reset_composed_usd_readback_count": len(
+            mimic_compliance["followers"]
+        ),
+        "mimic_compliance_frequency_timestep_product": mimic_compliance[
+            "frequency_timestep_product"
         ],
         "slew_limit_events": counters["slew_limit_events"],
         "anchor_capture_count": interlock["anchor_capture_count"],
@@ -1033,6 +1242,7 @@ def _run_live(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any]
 
     import polaris.environments  # noqa: F401, PLC0415
     from polaris.eef_gripper_runtime import (  # noqa: PLC0415
+        configure_eef_gripper_mimic_compliance_spawn_overlay,
         install_eef_gripper_runtime,
         record_eef_gripper_post_policy_step,
     )
@@ -1094,6 +1304,10 @@ def _run_live(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any]
         env_cfg.scene.robot,
         physx_cfg=env_cfg.sim.physx,
         enable_gripper_velocity_limit=True,
+    )
+    configure_eef_gripper_mimic_compliance_spawn_overlay(
+        env_cfg.scene.robot.spawn,
+        target_slew_profile=CANDIDATE_TARGET_SLEW_PROFILE,
     )
     robot_usd_path = Path(env_cfg.scene.robot.spawn.usd_path)
     env = gym.make(gate0.ENVIRONMENT, cfg=env_cfg)

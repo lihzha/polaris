@@ -31,6 +31,162 @@ def _load_script(name: str):
 candidate = _load_script("smoke_eef_pose_canary_controller_candidate")
 
 
+def _candidate_gripper_static():
+    source_specs = (
+        ("right_outer_knuckle_joint", 8, "rotZ", -1.0, 1_000_000.0, 0.0),
+        (
+            "left_inner_finger_joint",
+            9,
+            "rotX",
+            1.0,
+            1_000.0,
+            0.05000000074505806,
+        ),
+        (
+            "right_inner_finger_joint",
+            10,
+            "rotX",
+            -1.0,
+            1_000.0,
+            0.05000000074505806,
+        ),
+        (
+            "left_inner_finger_knuckle_joint",
+            11,
+            "rotX",
+            1.0,
+            1_000.0,
+            0.05000000074505806,
+        ),
+        (
+            "right_inner_finger_knuckle_joint",
+            12,
+            "rotX",
+            1.0,
+            1_000.0,
+            0.05000000074505806,
+        ),
+    )
+    source_followers = []
+    compliance_followers = []
+    for name, index, axis, gearing, frequency, damping in source_specs:
+        source_path = f"/panda/Gripper/Robotiq_2F_85/Joints/{name}"
+        source_followers.append(
+            {
+                "joint_name": name,
+                "joint_index": index,
+                "prim_path": source_path,
+                "mimic_axis": axis,
+                "gearing": gearing,
+                "exclude_from_articulation": False,
+                "natural_frequency_hz": frequency,
+                "damping_ratio": damping,
+            }
+        )
+        source_snapshot = {
+            "natural_frequency_rad_s": frequency,
+            "damping_ratio": damping,
+        }
+        target_snapshot = {
+            "natural_frequency_rad_s": 100.0,
+            "damping_ratio": candidate._float32(1.2),  # noqa: SLF001
+        }
+        compliance_followers.append(
+            {
+                "joint_name": name,
+                "joint_index": index,
+                "live_prim_path": (
+                    "/World/envs/env_0/robot" + source_path.removeprefix("/panda")
+                ),
+                "mimic_axis": axis,
+                "natural_frequency_attribute": (
+                    f"physxMimicJoint:{axis}:naturalFrequency"
+                ),
+                "damping_ratio_attribute": (f"physxMimicJoint:{axis}:dampingRatio"),
+                "source": copy.deepcopy(source_snapshot),
+                "before_spawn_write": copy.deepcopy(source_snapshot),
+                "before_spawn_structure": {
+                    "applied_mimic_api": f"PhysxMimicJointAPI:{axis}",
+                    "reference_joint_path": (
+                        "/World/envs/env_0/robot/Gripper/Robotiq_2F_85/"
+                        "Joints/finger_joint"
+                    ),
+                    "gearing": gearing,
+                    "offset": 0.0,
+                    "exclude_from_articulation": False,
+                },
+                "natural_frequency_write_count": 1,
+                "damping_ratio_write_count": 1,
+                "after_spawn_write": copy.deepcopy(target_snapshot),
+                "after_spawn_structure": {
+                    "applied_mimic_api": f"PhysxMimicJointAPI:{axis}",
+                    "reference_joint_path": (
+                        "/World/envs/env_0/robot/Gripper/Robotiq_2F_85/"
+                        "Joints/finger_joint"
+                    ),
+                    "gearing": gearing,
+                    "offset": 0.0,
+                    "exclude_from_articulation": False,
+                },
+                "post_reset_composed_usd_readback": copy.deepcopy(target_snapshot),
+                "post_reset_composed_usd_structure": {
+                    "applied_mimic_api": f"PhysxMimicJointAPI:{axis}",
+                    "reference_joint_path": (
+                        "/World/envs/env_0/robot/Gripper/Robotiq_2F_85/"
+                        "Joints/finger_joint"
+                    ),
+                    "gearing": gearing,
+                    "offset": 0.0,
+                    "exclude_from_articulation": False,
+                },
+            }
+        )
+    source = {
+        "robot_usd_sha256": (
+            "d8379925b103963dbf3e7c85bcc4ae101b81b7c1d7dabe7d2e964f41d069ec44"
+        ),
+        "followers": source_followers,
+    }
+    compliance = {
+        "profile": candidate.CANDIDATE_MIMIC_COMPLIANCE_PROFILE,
+        "enabled": True,
+        "scope": "eef_rate0p25_candidate_only_source_usd_immutable_v1",
+        "timing": "after_original_usd_spawn_before_articulation_initialization_v1",
+        "setter": "UsdAttribute.Set_default_float_v1",
+        "live_root_profile": "single_composed_world_env0_robot_root_v1",
+        "live_root_path": "/World/envs/env_0/robot",
+        "original_spawn_func": {
+            "module": "isaaclab.sim.spawners.from_files.from_files",
+            "qualname": "spawn_from_usd",
+            "name": "spawn_from_usd",
+        },
+        "overlay_func": {
+            "module": "polaris.eef_gripper_runtime",
+            "qualname": "eef_mimic_compliance_spawn_overlay",
+            "name": "eef_mimic_compliance_spawn_overlay",
+        },
+        "original_spawn_call_count": 1,
+        "overlay_call_count": 1,
+        "physics_hz": 120.0,
+        "physics_dt": 1.0 / 120.0,
+        "target_natural_frequency_rad_s": 100.0,
+        "target_damping_ratio": candidate._float32(1.2),  # noqa: SLF001
+        "frequency_timestep_product": 5.0 / 6.0,
+        "follower_count": 5,
+        "natural_frequency_write_count": 5,
+        "damping_ratio_write_count": 5,
+        "total_write_count": 10,
+        "source_usd_sha256": source["robot_usd_sha256"],
+        "source_usd_unchanged_after_spawn_overlay": True,
+        "followers": compliance_followers,
+    }
+    return {
+        "driver_target_slew": {"profile": candidate.CANDIDATE_TARGET_SLEW_PROFILE},
+        "mimic_joint_contract": source,
+        "mimic_compliance": compliance,
+    }
+
+
 def _candidate_report(*, official: bool, final: bool):
     physical = [0.018125, 0.018125, 0.018125, 0.018125, 0.02175, 0.02175, 0.02175]
     nominal = [value * 0.95 for value in physical]
@@ -123,9 +279,7 @@ def _failure_context():
         "localid": 0,
         "ntasks": 1,
     }
-    gripper_contract = {
-        "driver_target_slew": {"profile": candidate.CANDIDATE_TARGET_SLEW_PROFILE}
-    }
+    gripper_contract = _candidate_gripper_static()
     return {
         "lifecycle": lifecycle,
         "repository": {
@@ -213,6 +367,7 @@ def _final_safety(*, official: bool):
         "joint_velocity_limits_rad_s": [2.175] * 4 + [2.61] * 3,
         "guard_diagnostics": [],
         "current_joint_velocity_abort": None,
+        "gripper_runtime_static": _candidate_gripper_static(),
         "gripper_runtime_dynamic": {
             "apply_entry_samples": 1016,
             "post_policy_step_samples": 127,
@@ -372,10 +527,15 @@ def test_runner_binds_exact_fixture_plus_seven_action_release_probe():
         )
         == 1
     )
+    assert source.count("configure_eef_gripper_mimic_compliance_spawn_overlay(") == 1
     assert "list(actions) + [list(actions[-1])] * POST_FIXTURE_REPEAT_COUNT" in source
     assert "record_eef_gripper_post_policy_step(env)" in source
     assert source.count("validate_eef_runtime_safety(") == 2
     assert source.count("expected_gripper_target_slew_profile=") == 2
+    production_eval_source = (SCRIPTS / "eval.py").read_text()
+    assert "configure_eef_gripper_mimic_compliance_spawn_overlay" not in (
+        production_eval_source
+    )
 
 
 def test_candidate_report_schema_is_closed():
@@ -409,7 +569,7 @@ def test_candidate_replay_evidence_binds_exact_cadence_and_nominal_slew(variant)
         _final_safety(official=official), report, variant=variant
     )
     assert summary == {
-        "profile": "polaris_eef_candidate_exact_cadence_anchor_and_bound_v2",
+        "profile": ("polaris_eef_candidate_exact_cadence_anchor_bound_mimic100_1p2_v3"),
         "arm_apply_calls": 1016,
         "gripper_apply_calls": 1016,
         "process_action_calls": 127,
@@ -417,6 +577,10 @@ def test_candidate_replay_evidence_binds_exact_cadence_and_nominal_slew(variant)
         "target_slew_profile": candidate.CANDIDATE_TARGET_SLEW_PROFILE,
         "target_slew_limited_apply_count": 75 if official else 0,
         "target_slew_endpoint_reached_apply_count": 941 if official else 1016,
+        "mimic_compliance_profile": candidate.CANDIDATE_MIMIC_COMPLIANCE_PROFILE,
+        "mimic_compliance_total_write_count": 10,
+        "mimic_compliance_post_reset_composed_usd_readback_count": 5,
+        "mimic_compliance_frequency_timestep_product": 5.0 / 6.0,
         "slew_limit_events": 10,
         "anchor_capture_count": 1 if official else 0,
         "anchor_target_apply_count": 86 if official else 0,
@@ -499,6 +663,7 @@ def _abort_capture(monkeypatch):
     arm = {
         "ik_safety": {
             "current_joint_velocity_abort": {"profile": "captured"},
+            "gripper_runtime_static": _candidate_gripper_static(),
             "gripper_runtime_dynamic": {"driver_target_slew": target},
         },
         "controller_substep_trace": {"entries": ["validated"]},

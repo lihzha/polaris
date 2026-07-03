@@ -921,6 +921,19 @@ def _gripper_runtime_enabled_from_safety(safety: Mapping[str, Any]) -> bool:
     return static_present
 
 
+def _gripper_target_slew_profile_from_safety(safety: Mapping[str, Any]) -> str:
+    static = safety.get("gripper_runtime_static")
+    if not isinstance(static, Mapping):
+        raise ValueError("Gripper target-slew profile has no static contract")
+    target_slew = static.get("driver_target_slew")
+    if not isinstance(target_slew, Mapping):
+        raise ValueError("Gripper target-slew static section is absent")
+    profile = target_slew.get("profile")
+    if type(profile) is not str or not profile:
+        raise ValueError("Gripper target-slew profile is invalid")
+    return profile
+
+
 def _canonical_wrist_energy_brake_threshold() -> np.ndarray:
     max_delta = np.asarray(
         PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S,
@@ -2340,9 +2353,14 @@ def _validate_episode_safety_evidence_shape(
         raise ValueError("Episode safety environment/apply substeps disagree")
     apply_calls = counters["apply_calls"]
     if gripper_runtime_enabled:
-        validate_eef_gripper_static_contract(safety["gripper_runtime_static"])
+        gripper_target_slew_profile = _gripper_target_slew_profile_from_safety(safety)
+        validate_eef_gripper_static_contract(
+            safety["gripper_runtime_static"],
+            expected_target_slew_profile=gripper_target_slew_profile,
+        )
         gripper_dynamic = validate_eef_gripper_dynamic_evidence(
-            safety["gripper_runtime_dynamic"]
+            safety["gripper_runtime_dynamic"],
+            expected_target_slew_profile=gripper_target_slew_profile,
         )
         if gripper_dynamic["apply_entry_samples"] != apply_calls:
             raise ValueError("Episode gripper/apply sample counts disagree")
@@ -2563,8 +2581,10 @@ def validate_episode_safety_cadence(
     )
     numerical_failure = result["numerical_failure"]
     if "gripper_runtime_dynamic" in safety:
+        gripper_target_slew_profile = _gripper_target_slew_profile_from_safety(safety)
         gripper_dynamic = validate_eef_gripper_dynamic_evidence(
-            safety["gripper_runtime_dynamic"]
+            safety["gripper_runtime_dynamic"],
+            expected_target_slew_profile=gripper_target_slew_profile,
         )
         expected_post_samples = (
             episode_length - 1 if numerical_failure else episode_length
@@ -2956,6 +2976,11 @@ def aggregate_episode_safety(
     gripper_maxima = {
         field: [0.0] * 6 for field in GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS
     }
+    gripper_target_slew_profile = (
+        _gripper_target_slew_profile_from_safety(live_template)
+        if gripper_runtime_enabled
+        else None
+    )
     episodes = []
     for sidecar in sidecars:
         safety = sidecar.get("safety")
@@ -2992,7 +3017,8 @@ def aggregate_episode_safety(
             ]
         if gripper_runtime_enabled:
             dynamic = validate_eef_gripper_dynamic_evidence(
-                safety.get("gripper_runtime_dynamic")
+                safety.get("gripper_runtime_dynamic"),
+                expected_target_slew_profile=gripper_target_slew_profile,
             )
             for field in GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS:
                 gripper_maxima[field] = [
@@ -3077,6 +3103,11 @@ def _validate_runtime_aggregate_consistency(
     expected_gripper_maxima = {
         field: [0.0] * 6 for field in GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS
     }
+    gripper_target_slew_profile = (
+        _gripper_target_slew_profile_from_safety(ik_safety)
+        if gripper_runtime_enabled
+        else None
+    )
     for episode in episodes:
         result = canonical_episode_result(episode["episode_result"])
         if result != episode["episode_result"] or (
@@ -3143,7 +3174,8 @@ def _validate_runtime_aggregate_consistency(
 
         if gripper_runtime_enabled:
             dynamic = validate_eef_gripper_dynamic_evidence(
-                episode["gripper_runtime_dynamic"]
+                episode["gripper_runtime_dynamic"],
+                expected_target_slew_profile=gripper_target_slew_profile,
             )
             for field in GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS:
                 expected_gripper_maxima[field] = [
@@ -3187,7 +3219,13 @@ def atomic_write_runtime_contract(
         gripper_runtime_enabled=gripper_runtime_enabled,
     )
     if gripper_runtime_enabled:
-        validate_eef_gripper_static_contract(ik_safety["gripper_runtime_static"])
+        gripper_target_slew_profile = _gripper_target_slew_profile_from_safety(
+            ik_safety
+        )
+        validate_eef_gripper_static_contract(
+            ik_safety["gripper_runtime_static"],
+            expected_target_slew_profile=gripper_target_slew_profile,
+        )
     if frame.get("ik_safety_profile") != ik_safety.get("profile"):
         raise ValueError("Runtime frame and aggregate EEF IK safety profiles disagree")
     payload = {
