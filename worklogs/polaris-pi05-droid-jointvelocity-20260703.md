@@ -314,3 +314,80 @@
   checkpoint canary, or full evaluation has been launched. Job `1098174`
   remains valid only for its earlier arm/native-target controller scope and
   remains non-promotable for authoritative checkpoint evaluation.
+
+## 2026-07-03 — native gripper-cap controller gate 1098204
+
+- The independently reviewed candidate was committed and pushed as
+  `5e2947fc900838715859cf8d2476410527737924`, tree
+  `e1d9f72c9fc61362ba5b42c9b9ab2c525f6e9857`, on
+  `lihzha/codex/pi05-droid-native-jointvelocity-v1-20260703`. The accepted
+  combined tracked-plus-new-test candidate hash was
+  `8121586b4383c15484ab09127e0b6a989d918b51ec68e6d3ae1574404096760e`.
+- Launch source was a new detached, clean standalone clone declared at
+  `/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-pi05-jv-5e2947fc9008-standalone-v4`
+  and resolved at
+  `/lustre/fs11/portfolios/nvr/projects/nvr_lpr_rvp/users/lzha/src/PolaRiS-pi05-jv-5e2947fc9008-standalone-v4`.
+  Its Git and common directories were the clone-local `.git`, no alternates
+  were present, and OpenPI was explicitly active over HTTPS at
+  `bd70b8f4011e85b3f3b0f039f12113f78718e7bf`.
+  Unrelated GLM and OpenPI nested submodules remained uninitialized.
+- The mode-`0444`, one-link, 3,633-byte frozen launch wrapper has SHA-256
+  `105e103e6b12b1fbb4c4b4ef7d82af70f3988e9713508fa05f6058db47041527`
+  at
+  `/lustre/fsw/portfolios/nvr/users/lzha/launchers/polaris-pi05-jointvelocity/5e2947fc9008-controller-v2-gripper-cap/submit.sh`.
+  It bound the commit, tree, OpenPI pin, candidate profile, and fresh result,
+  log, and cache namespaces before invoking the committed public submitter.
+- Slurm job `1098204` completed `0:0` in 3m16s on one NVIDIA L40S at
+  `pool0-00005`; its container step completed `0:0` in 2m57s with MaxRSS
+  30,782,140 KiB. The one-link 15,333-byte log has SHA-256
+  `f4c21d955c2673f479d6c9a02821fe0b7ba8a1fee3d7d37231831ffa59842cea`
+  at
+  `/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris-pi05-jointvelocity/controller-v2-5e2947fc9008-gripper-cap/pi05_jv_ctrl_smoke-1098204.out`.
+  Its only errors were the established headless NGX-context messages; no
+  traceback, child failure, contract mismatch, or nonzero status occurred.
+- The strict finalizer published and live-reverified the mode-`0444`, one-link,
+  15,744-byte completion, SHA-256
+  `778594b8eea64d6c2fb031d43af53539e07014af218e8e2c60751cb0d399a657`.
+  It records profile `pi05_droid_native_jointvelocity_l40s_controller_smoke_v2`,
+  exact candidate intent
+  `implicit_gripper_physx_velocity_limit5_cuda_actuator_cpu_static_physx_v1`,
+  scope `controller_only_no_model_or_checkpoint`, and promotion forbidden
+  without a separate checkpoint canary. The failure sidecar is absent.
+- Live runtime SHA-256
+  `c7e932ca9f697cd02825fb06ee5fa5c0f168af73309026e91d844f16fd3729eb`
+  proves configured gripper legacy and simulation effort/velocity limits of
+  `200.0` and `5.0`; CUDA float32 `[1,1]` actuator stiffness
+  `5729.578125`, damping `0.011459155939519405`, effort legacy/sim `200.0`,
+  and velocity legacy/sim `5.0`; and the same four effective static values
+  from the CPU direct-PhysX view. Isaac Lab was exactly `2.3.0`, both PolaRiS
+  source hashes matched, and the arm CUDA/CPU velocity-drive contract remained
+  unchanged.
+- All 20 cases passed. Gripper open and boundary `0.5` moved from
+  `0.7853981853` toward target `0` with endpoint velocity `-4.9728875160`
+  rad/s and average slew `-4.9784392118` rad/s. Closed moved from `0` toward
+  float32 pi/4 with endpoint velocity `4.9801592827` rad/s and average slew
+  `4.9713331461` rad/s. Directions, targets, and the 5 rad/s cap all matched;
+  reset restored finger position/target/velocity to exact zero. Hold was exact
+  zero, all fourteen signed arm cases had correct position and measured-
+  velocity directions, and the positive/negative limit cases remained near
+  +/-1 rad/s without termination or truncation.
+- Lifecycle evidence binds completed `env.close()`, immediate
+  `SimulationApp.close()` invocation, child exit zero, immutable child/ready
+  evidence, stdlib-parent publication, zero srun status, exact L40S inventory,
+  and the saved committed sbatch. Image SHA-256 remained
+  `ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d556b324a`;
+  PolaRiS-Hub revision and all three asset/metadata hashes revalidated.
+- All eight immutable result files and the authoritative log were copied with
+  identical hashes to
+  `/home/lzha/code/shared_artifacts/polaris-pi05-native-controller-cap-1098204/`.
+  Its mode-`0444` manifest has SHA-256
+  `50fcd8ab562e8dc5c1cda18d04443f11ab7b46458fd5460f24e403ab958ec0db`.
+  The job cache contained 30,703,445 bytes, 74 files, 45 directories, no
+  symlinks, and a zero-byte `ov/_cache.lock`; it was removed and verified
+  absent through both NFS aliases after terminal inspection. Remote source and
+  OpenPI remained clean, detached, exact, and alternates-free.
+- This completes the native controller/gripper-cap gate only. No policy
+  server, model, checkpoint inference, checkpoint canary, or full evaluation
+  was launched. Checkpoint work remains blocked pending separate main and
+  native-evaluation review; job `1098204` cannot itself establish policy
+  success or checkpoint promotion.
