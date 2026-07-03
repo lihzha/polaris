@@ -33,7 +33,7 @@ EXPECTED_FIXTURE_SHA256 = (
 diagnostic: Any | None = None
 
 
-ATTESTATION_PROFILE = "gripper_impulse_post_kit_staged_attestation_v5"
+ATTESTATION_PROFILE = "gripper_impulse_post_kit_staged_attestation_v6"
 ATTESTATION_FIELDS = {
     "schema_version",
     "profile",
@@ -98,6 +98,19 @@ SLURM_FIELDS = {
 }
 SLURM_SNAPSHOT_PROFILE = "immutable_scontrol_show_job_oneliner_v1"
 SUBMODULE_STATUS_PROFILE = "exact_pinned_uninitialized_gitlinks_v1"
+REPOSITORY_LAYOUT_PROFILE = "standalone_detached_clone_inroot_git_directory_v1"
+REPOSITORY_FIELDS = {
+    "path",
+    "top_level",
+    "commit",
+    "clean",
+    "head_state",
+    "layout_profile",
+    "git_dir",
+    "git_common_dir",
+    "submodule_status",
+    "submodules",
+}
 EXPECTED_UNINITIALIZED_SUBMODULE_GITLINKS = (
     (
         "src/diff-surfel-rasterization/third_party/glm",
@@ -318,6 +331,58 @@ def _require_diagnostic() -> Any:
     return diagnostic
 
 
+def _validate_standalone_repository_layout(repo: Path) -> dict[str, str]:
+    """Reject linked worktrees and any Git metadata outside the mounted repo."""
+
+    repo = _canonical_target(repo)
+    git_entry = repo / ".git"
+    try:
+        git_metadata = os.lstat(git_entry)
+    except FileNotFoundError as error:
+        raise GripperImpulseFinalizationError(
+            f"PolaRiS standalone clone is missing in-root .git directory: {git_entry}"
+        ) from error
+    _require(
+        stat.S_ISDIR(git_metadata.st_mode),
+        "PolaRiS .git must be a real in-root directory, not a gitdir file or symlink",
+    )
+    expected_git_dir = _normalized_absolute(git_entry)
+    _require(
+        _canonical_target(git_entry) == expected_git_dir,
+        "PolaRiS .git directory resolves outside the repository",
+    )
+
+    absolute_git_dir_text = _git(repo, "rev-parse", "--absolute-git-dir")
+    common_git_dir_text = _git(repo, "rev-parse", "--git-common-dir")
+    _require(
+        bool(absolute_git_dir_text) and bool(common_git_dir_text),
+        "PolaRiS Git directory query returned an empty path",
+    )
+    absolute_git_dir_path = Path(absolute_git_dir_text)
+    _require(
+        absolute_git_dir_path.is_absolute(),
+        "PolaRiS absolute Git directory query returned a relative path",
+    )
+    absolute_git_dir = _canonical_target(absolute_git_dir_path)
+    common_git_dir_path = Path(common_git_dir_text)
+    if not common_git_dir_path.is_absolute():
+        common_git_dir_path = repo / common_git_dir_path
+    common_git_dir = _canonical_target(common_git_dir_path)
+    _require(
+        absolute_git_dir == expected_git_dir,
+        "PolaRiS Git directory is not the real in-root .git directory",
+    )
+    _require(
+        common_git_dir == expected_git_dir,
+        "PolaRiS common Git directory is external to the standalone clone",
+    )
+    return {
+        "layout_profile": REPOSITORY_LAYOUT_PROFILE,
+        "git_dir": str(absolute_git_dir),
+        "git_common_dir": str(common_git_dir),
+    }
+
+
 def _validate_submodule_status(value: Any) -> dict[str, Any]:
     _require(type(value) is str, "Git submodule status must be text")
     lines = value.splitlines()
@@ -356,10 +421,13 @@ def _validate_repository(args: argparse.Namespace) -> dict[str, Any]:
         field="expected PolaRiS commit",
         length=40,
     )
+    layout = _validate_standalone_repository_layout(repo)
     top_level = _canonical_target(Path(_git(repo, "rev-parse", "--show-toplevel")))
     _require(top_level == repo, "PolaRiS repo is not the exact Git top level")
     commit = _git(repo, "rev-parse", "HEAD")
     _require(commit == args.expected_polaris_commit, "PolaRiS commit mismatch")
+    head_name = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    _require(head_name == "HEAD", "PolaRiS standalone clone HEAD is not detached")
     status = _git(
         repo,
         "-c",
@@ -372,14 +440,18 @@ def _validate_repository(args: argparse.Namespace) -> dict[str, Any]:
     _require(status == "", "PolaRiS repo is dirty")
     submodule_status = _git(repo, "submodule", "status", "--recursive")
     submodules = _validate_submodule_status(submodule_status)
-    return {
+    result = {
         "path": str(repo),
         "top_level": str(top_level),
         "commit": commit,
         "clean": True,
+        "head_state": "detached",
+        **layout,
         "submodule_status": submodule_status,
         "submodules": submodules,
     }
+    _require(set(result) == REPOSITORY_FIELDS, "PolaRiS repository schema")
+    return result
 
 
 def _bootstrap_trusted_sources(args: argparse.Namespace) -> Any:
@@ -1223,6 +1295,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_source_preflight_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Fail closed unless PolaRiS is a clean standalone detached clone "
+            "whose real .git directory is contained inside the mounted repository."
+        )
+    )
+    parser.add_argument("--source-preflight", action="store_true", required=True)
+    parser.add_argument("--polaris-repo", type=Path, required=True)
+    parser.add_argument("--expected-polaris-commit", required=True)
+    return parser
+
+
 def _require_action_paths(args: argparse.Namespace) -> None:
     input_list = [
         _normalized_absolute(path)
@@ -1307,7 +1392,19 @@ def _require_action_paths(args: argparse.Namespace) -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     global diagnostic
-    args = build_parser().parse_args(list(sys.argv[1:] if argv is None else argv))
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if "--source-preflight" in raw_argv:
+        args = build_source_preflight_parser().parse_args(raw_argv)
+        repository = _validate_repository(args)
+        print(
+            "POLARIS_GRIPPER_IMPULSE_SOURCE_PREFLIGHT="
+            f"profile={repository['layout_profile']};"
+            f"repo={repository['path']};git_dir={repository['git_dir']};"
+            f"commit={repository['commit']}",
+            flush=True,
+        )
+        return 0
+    args = build_parser().parse_args(raw_argv)
     diagnostic = _bootstrap_trusted_sources(args)
     module = _require_diagnostic()
     _require_action_paths(args)

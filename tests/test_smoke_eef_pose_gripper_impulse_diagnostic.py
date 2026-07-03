@@ -170,6 +170,8 @@ def test_stdlib_video_probe_binds_single_stream_fps_duration_and_full_decode(
                 "avg_frame_rate": "15/1",
                 "r_frame_rate": "15/1",
                 "duration": "7.800000",
+                "duration_ts": 119808,
+                "time_base": "1/15360",
             }
         ],
         "format": {"duration": "7.800000"},
@@ -190,10 +192,124 @@ def test_stdlib_video_probe_binds_single_stream_fps_duration_and_full_decode(
     }
     assert [call[0][0] for call in calls] == ["ffprobe", "ffmpeg"]
     assert "-select_streams" not in calls[0][0]
+    show_entries = calls[0][0][calls[0][0].index("-show_entries") + 1]
+    assert "duration,duration_ts,time_base" in show_entries
     assert calls[1][0][-2:] == ["null", "-"]
 
 
-@pytest.mark.parametrize("case", ["second_stream", "wrong_fps", "wrong_duration"])
+@pytest.mark.parametrize("format_duration", ["7.933333", "7.934000"])
+def test_stdlib_video_probe_accepts_119_frames_with_canonical_container_rounding(
+    monkeypatch, tmp_path: Path, format_duration: str
+):
+    payload = {
+        "streams": [
+            {
+                "index": 0,
+                "codec_type": "video",
+                "width": 448,
+                "height": 224,
+                "nb_read_frames": "119",
+                "avg_frame_rate": "15/1",
+                "r_frame_rate": "15/1",
+                "duration": "7.933333",
+                "duration_ts": 121856,
+                "time_base": "1/15360",
+            }
+        ],
+        "format": {"duration": format_duration},
+    }
+
+    def run(argv, **_kwargs):
+        return SimpleNamespace(
+            stdout=json.dumps(payload) if argv[0] == "ffprobe" else b"",
+            stderr="" if argv[0] == "ffprobe" else b"",
+        )
+
+    monkeypatch.setattr(diagnostic.subprocess, "run", run)
+    assert diagnostic._probe_video_stdlib(  # noqa: SLF001
+        tmp_path / "capture.mp4"
+    ) == {"frame_count": 119, "height": 224, "width": 448}
+
+
+def test_stdlib_video_probe_rejects_genuine_119_frame_tick_cadence_mismatch(
+    monkeypatch, tmp_path: Path
+):
+    payload = {
+        "streams": [
+            {
+                "index": 0,
+                "codec_type": "video",
+                "width": 448,
+                "height": 224,
+                "nb_read_frames": "119",
+                "avg_frame_rate": "15/1",
+                "r_frame_rate": "15/1",
+                "duration": "7.933333",
+                # 118 frames at the declared time base, despite decoding 119.
+                "duration_ts": 120832,
+                "time_base": "1/15360",
+            }
+        ],
+        "format": {"duration": "7.934000"},
+    }
+    monkeypatch.setattr(
+        diagnostic.subprocess,
+        "run",
+        lambda _argv, **_kwargs: SimpleNamespace(stdout=json.dumps(payload), stderr=""),
+    )
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="duration_ts/time_base cadence",
+    ):
+        diagnostic._probe_video_stdlib(tmp_path / "capture.mp4")  # noqa: SLF001
+
+
+@pytest.mark.parametrize("format_duration", ["7.933000", "7.935000"])
+def test_stdlib_video_probe_rejects_noncanonical_119_frame_container_rounding(
+    monkeypatch, tmp_path: Path, format_duration: str
+):
+    payload = {
+        "streams": [
+            {
+                "index": 0,
+                "codec_type": "video",
+                "width": 448,
+                "height": 224,
+                "nb_read_frames": "119",
+                "avg_frame_rate": "15/1",
+                "r_frame_rate": "15/1",
+                "duration": "7.933333",
+                "duration_ts": 121856,
+                "time_base": "1/15360",
+            }
+        ],
+        "format": {"duration": format_duration},
+    }
+    monkeypatch.setattr(
+        diagnostic.subprocess,
+        "run",
+        lambda _argv, **_kwargs: SimpleNamespace(stdout=json.dumps(payload), stderr=""),
+    )
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="stream-or-millisecond-ceiling",
+    ):
+        diagnostic._probe_video_stdlib(tmp_path / "capture.mp4")  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "second_stream",
+        "wrong_fps",
+        "wrong_stream_duration",
+        "wrong_duration_ts",
+        "wrong_time_base",
+        "wrong_format_duration",
+        "missing_time_base",
+        "extra_stream_field",
+    ],
+)
 def test_stdlib_video_probe_fails_closed_on_stream_cadence_drift(
     monkeypatch, tmp_path: Path, case: str
 ):
@@ -206,14 +322,26 @@ def test_stdlib_video_probe_fails_closed_on_stream_cadence_drift(
         "avg_frame_rate": "15/1",
         "r_frame_rate": "15/1",
         "duration": "7.800000",
+        "duration_ts": 119808,
+        "time_base": "1/15360",
     }
     payload = {"streams": [stream], "format": {"duration": "7.800000"}}
     if case == "second_stream":
         payload["streams"].append({"index": 1, "codec_type": "audio"})
     elif case == "wrong_fps":
         stream["avg_frame_rate"] = "30/1"
-    else:
-        payload["format"]["duration"] = "8.0"
+    elif case == "wrong_stream_duration":
+        stream["duration"] = "7.799000"
+    elif case == "wrong_duration_ts":
+        stream["duration_ts"] = 120832
+    elif case == "wrong_time_base":
+        stream["time_base"] = "1/1000"
+    elif case == "wrong_format_duration":
+        payload["format"]["duration"] = "7.801000"
+    elif case == "missing_time_base":
+        del stream["time_base"]
+    elif case == "extra_stream_field":
+        stream["start_time"] = "0.000000"
     monkeypatch.setattr(
         diagnostic.subprocess,
         "run",

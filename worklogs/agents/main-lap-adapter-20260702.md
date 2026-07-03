@@ -767,3 +767,40 @@
   match the 13-DOF/18-body articulation. The diagnostic must now enforce this
   exact field partition and compare actuator/static-PhysX values while
   excluding only their intentionally different device labels.
+
+## 2026-07-03 — corrected gripper pair 1098164/1098165 failed closed in publication
+
+- Parallel L40S jobs `1098164` (`pol_gi_exact2`, `pool0-00013`) and `1098165`
+  (`pol_gi_delay2`, `pool0-00027`) are terminal `FAILED 1:0` and no longer in
+  `squeue`. Job `1098164` ran from 03:46:16 to 03:49:44 PDT; job `1098165`
+  ran from 03:46:17 to 03:49:29 PDT. Their authoritative log SHA-256 values
+  are respectively
+  `22d6ed001bd53290acbf4092f8c1a9afae813d6d54b8591712c6b489ca7f593b`
+  and
+  `722d3c530bb1e909f3c7a86cde3c0f71a75305515629d7f5daf1b2ecdbc1c6e5`.
+- The exact runtime in `1098164` completed and published immutable raw, ready,
+  video, runtime-exit, and outer-srun evidence. Its capture records the allowed
+  velocity-guard outcome and a 117-frame 448x224 video at 15 fps. Host
+  finalization then failed before attestation because the deployed source was
+  a linked Git worktree: its `.git` file referenced an administrative gitdir
+  under an unmounted external checkout, so `git rev-parse --show-toplevel`
+  exited 128 in the finalizer container. The validator status is `1`; no
+  attestation exists. This is usable raw diagnostic evidence but not a
+  provenance-complete promoted capture.
+- The delayed runtime in `1098165` reached temporary video publication, where
+  the old host probe rejected the frame-count/container-duration predicate.
+  It published only an immutable invalid `capture.json` plus exact failure
+  runtime/outer-srun status; no video, ready marker, validator status, or
+  attestation survives. The temporary MP4 was unlinked, and the failed-capture
+  schema does not preserve its frame count or ffprobe duration. The expected
+  119-frame count is source-derived rather than cryptographically bound by
+  this attempt and is not reported as observed job evidence.
+- Both attempts therefore failed closed, and the exact-versus-delay causal
+  pair is incomplete: there is no authoritative conclusion about whether the
+  close command caused the velocity guard. The next deployment must use a
+  truly standalone clean detached clone with a real in-root `.git` directory,
+  and both launch preflight and finalization must reject linked worktrees or
+  external Git/common-Git directories. Video cadence validation must bind
+  decoded stream ticks and time base rationally while accepting only the
+  canonical ffprobe stream-duration or MP4 millisecond-ceiling container
+  representation.

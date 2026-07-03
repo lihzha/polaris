@@ -22,6 +22,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import select
 import signal
 import stat
@@ -72,10 +73,10 @@ exec(  # noqa: S102 - execute only the bootstrap-verified exact source bytes.
 
 ENVIRONMENT = boundary.ENVIRONMENT
 FIXTURE_PROFILE = boundary.FIXTURE_PROFILE
-DIAGNOSTIC_PROFILE = "foodbussing_gripper_close_impulse_exact_delay1_v3"
+DIAGNOSTIC_PROFILE = "foodbussing_gripper_close_impulse_exact_delay1_v4"
 FINGER_TRACE_PROFILE = "gripper_apply_causal_tail_all_links_device_partition_v3"
 ACTION_PLAN_PROFILE = "foodbussing_first_close_exact_or_delay1_v1"
-VIDEO_PROFILE = "lap_model_view_external_then_rot180_wrist_224x448_v1"
+VIDEO_PROFILE = "lap_model_view_external_then_rot180_wrist_224x448_rational_cadence_v2"
 GRIPPER_DRIVE_PROFILE = "implicit_gripper_effort200_cuda_actuator_cpu_static_physx_v3"
 SOLVER_CHANGE_PROFILE = "eef_pose_solver_velocity_iterations_0_to_1_v1"
 MODES = ("exact", "delay_first_close_one_step")
@@ -93,6 +94,8 @@ TRACE_CAPACITY = 48
 VIDEO_FPS = 15
 VIDEO_HEIGHT = 224
 VIDEO_WIDTH = 448
+FFPROBE_DURATION_DECIMAL_PLACES = 6
+MP4_CONTAINER_DURATION_TICKS_PER_SECOND = 1000
 GRIPPER_OPEN_TARGET_RAD = 0.0
 GRIPPER_CLOSED_TARGET_RAD = math.pi / 4
 REFERENCE_EXACT_FAILURE_POLICY_STEP = 115
@@ -3151,7 +3154,8 @@ def _probe_video_stdlib(path: Path) -> dict[str, int]:
             "-show_entries",
             (
                 "stream=index,codec_type,width,height,nb_read_frames,"
-                "avg_frame_rate,r_frame_rate,duration:format=duration"
+                "avg_frame_rate,r_frame_rate,duration,duration_ts,time_base:"
+                "format=duration"
             ),
             "-of",
             "json",
@@ -3167,6 +3171,22 @@ def _probe_video_stdlib(path: Path) -> dict[str, int]:
     _require(isinstance(streams, list) and len(streams) == 1, "ffprobe video stream")
     stream = streams[0]
     _require(isinstance(stream, dict), "ffprobe video stream schema")
+    _require(
+        set(stream)
+        == {
+            "index",
+            "codec_type",
+            "width",
+            "height",
+            "nb_read_frames",
+            "avg_frame_rate",
+            "r_frame_rate",
+            "duration",
+            "duration_ts",
+            "time_base",
+        },
+        "ffprobe video stream closed schema",
+    )
     _require(
         type(stream.get("index")) is int
         and stream.get("index") == 0
@@ -3197,21 +3217,68 @@ def _probe_video_stdlib(path: Path) -> dict[str, int]:
             raise GripperImpulseDiagnosticError(f"ffprobe video {field}") from error
         _require(frame_rate == Fraction(VIDEO_FPS, 1), f"ffprobe video {field}")
     format_record = decoded.get("format")
-    _require(isinstance(format_record, dict), "ffprobe format schema")
-    try:
-        duration = float(format_record["duration"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise GripperImpulseDiagnosticError("ffprobe video duration") from error
     _require(
-        math.isfinite(duration)
-        and duration > 0.0
-        and math.isclose(
-            duration,
-            result["frame_count"] / VIDEO_FPS,
-            rel_tol=0.0,
-            abs_tol=1e-6,
-        ),
-        "ffprobe video frame-count/duration cadence",
+        isinstance(format_record, dict) and set(format_record) == {"duration"},
+        "ffprobe format closed schema",
+    )
+    try:
+        time_base_text = stream["time_base"]
+        _require(
+            isinstance(time_base_text, str)
+            and re.fullmatch(r"[1-9][0-9]*/[1-9][0-9]*", time_base_text) is not None,
+            "ffprobe video time_base grammar",
+        )
+        time_base = Fraction(time_base_text)
+        duration_ts = stream["duration_ts"]
+        _require(
+            type(duration_ts) is int and duration_ts > 0,
+            "ffprobe video duration_ts",
+        )
+        decimal_pattern = (
+            rf"(?:0|[1-9][0-9]*)\.[0-9]{{{FFPROBE_DURATION_DECIMAL_PLACES}}}"
+        )
+        stream_duration_text = stream["duration"]
+        format_duration_text = format_record["duration"]
+        _require(
+            isinstance(stream_duration_text, str)
+            and re.fullmatch(decimal_pattern, stream_duration_text) is not None,
+            "ffprobe video stream duration grammar",
+        )
+        _require(
+            isinstance(format_duration_text, str)
+            and re.fullmatch(decimal_pattern, format_duration_text) is not None,
+            "ffprobe video format duration grammar",
+        )
+        stream_duration = Fraction(stream_duration_text)
+        format_duration = Fraction(format_duration_text)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError) as error:
+        raise GripperImpulseDiagnosticError(
+            "ffprobe video rational duration"
+        ) from error
+    expected_duration = Fraction(result["frame_count"], VIDEO_FPS)
+    decoded_tick_duration = duration_ts * time_base
+    stream_decimal_half_quantum = Fraction(1, 2 * (10**FFPROBE_DURATION_DECIMAL_PLACES))
+    expected_container_duration = Fraction(
+        (
+            expected_duration.numerator * MP4_CONTAINER_DURATION_TICKS_PER_SECOND
+            + expected_duration.denominator
+            - 1
+        )
+        // expected_duration.denominator,
+        MP4_CONTAINER_DURATION_TICKS_PER_SECOND,
+    )
+    _require(
+        decoded_tick_duration == expected_duration,
+        "ffprobe video frame-count/duration_ts/time_base cadence",
+    )
+    _require(
+        stream_duration > 0
+        and abs(stream_duration - expected_duration) <= stream_decimal_half_quantum,
+        "ffprobe video rational stream duration cadence",
+    )
+    _require(
+        format_duration in {stream_duration, expected_container_duration},
+        "ffprobe video canonical stream-or-millisecond-ceiling container duration",
     )
     subprocess.run(
         [

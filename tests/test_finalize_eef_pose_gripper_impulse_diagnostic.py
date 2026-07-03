@@ -367,6 +367,152 @@ def test_submodule_status_rejects_state_commit_path_and_grammar_drift(mutation):
         finalizer._validate_submodule_status("\n".join(mutation(lines)))
 
 
+def test_standalone_repository_layout_requires_real_inroot_git_directory(
+    monkeypatch, tmp_path
+):
+    repo = tmp_path / "polaris"
+    git_dir = repo / ".git"
+    git_dir.mkdir(parents=True)
+
+    def fake_git(_repo, *arguments):
+        if arguments == ("rev-parse", "--absolute-git-dir"):
+            return str(git_dir)
+        if arguments == ("rev-parse", "--git-common-dir"):
+            return ".git"
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(finalizer, "_git", fake_git)
+    assert finalizer._validate_standalone_repository_layout(repo) == {  # noqa: SLF001
+        "layout_profile": finalizer.REPOSITORY_LAYOUT_PROFILE,
+        "git_dir": str(git_dir),
+        "git_common_dir": str(git_dir),
+    }
+
+
+@pytest.mark.parametrize("kind", ["gitdir_file", "symlink"])
+def test_standalone_repository_layout_rejects_linked_worktree_or_symlink(
+    monkeypatch, tmp_path, kind
+):
+    repo = tmp_path / "polaris"
+    repo.mkdir()
+    external = tmp_path / "external.git"
+    external.mkdir()
+    if kind == "gitdir_file":
+        (repo / ".git").write_text(f"gitdir: {external}\n")
+    else:
+        (repo / ".git").symlink_to(external, target_is_directory=True)
+    monkeypatch.setattr(
+        finalizer,
+        "_git",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("Git must not run for a rejected .git entry")
+        ),
+    )
+    with pytest.raises(
+        finalizer.GripperImpulseFinalizationError, match="real in-root directory"
+    ):
+        finalizer._validate_standalone_repository_layout(repo)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("external_field", ["git_dir", "git_common_dir"])
+def test_standalone_repository_layout_rejects_external_git_metadata(
+    monkeypatch, tmp_path, external_field
+):
+    repo = tmp_path / "polaris"
+    git_dir = repo / ".git"
+    git_dir.mkdir(parents=True)
+    external = tmp_path / "external.git"
+
+    def fake_git(_repo, *arguments):
+        if arguments == ("rev-parse", "--absolute-git-dir"):
+            return str(external if external_field == "git_dir" else git_dir)
+        if arguments == ("rev-parse", "--git-common-dir"):
+            return str(external) if external_field == "git_common_dir" else ".git"
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(finalizer, "_git", fake_git)
+    with pytest.raises(
+        finalizer.GripperImpulseFinalizationError, match="Git directory"
+    ):
+        finalizer._validate_standalone_repository_layout(repo)  # noqa: SLF001
+
+
+def test_repository_contract_rejects_attached_branch_head(monkeypatch, tmp_path):
+    repo = tmp_path / "polaris"
+    repo.mkdir()
+    commit = "a" * 40
+    monkeypatch.setattr(
+        finalizer,
+        "_validate_standalone_repository_layout",
+        lambda _repo: {
+            "layout_profile": finalizer.REPOSITORY_LAYOUT_PROFILE,
+            "git_dir": str(repo / ".git"),
+            "git_common_dir": str(repo / ".git"),
+        },
+    )
+
+    def fake_git(_repo, *arguments):
+        if arguments == ("rev-parse", "--show-toplevel"):
+            return str(repo)
+        if arguments == ("rev-parse", "HEAD"):
+            return commit
+        if arguments == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return "main"
+        raise AssertionError(arguments)
+
+    monkeypatch.setattr(finalizer, "_git", fake_git)
+    with pytest.raises(finalizer.GripperImpulseFinalizationError, match="not detached"):
+        finalizer._validate_repository(  # noqa: SLF001
+            Namespace(polaris_repo=repo, expected_polaris_commit=commit)
+        )
+
+
+def test_source_preflight_cli_uses_same_standalone_repository_contract(
+    monkeypatch, tmp_path, capsys
+):
+    repo = tmp_path / "polaris"
+    commit = "a" * 40
+    expected = {
+        "path": str(repo),
+        "top_level": str(repo),
+        "commit": commit,
+        "clean": True,
+        "head_state": "detached",
+        "layout_profile": finalizer.REPOSITORY_LAYOUT_PROFILE,
+        "git_dir": str(repo / ".git"),
+        "git_common_dir": str(repo / ".git"),
+        "submodule_status": _expected_submodule_status(),
+        "submodules": finalizer._validate_submodule_status(
+            _expected_submodule_status()
+        ),
+    }
+    monkeypatch.setattr(finalizer, "_validate_repository", lambda _args: expected)
+    monkeypatch.setattr(
+        finalizer,
+        "_bootstrap_trusted_sources",
+        lambda _args: (_ for _ in ()).throw(
+            AssertionError("source preflight must run before diagnostic bootstrap")
+        ),
+    )
+    assert (
+        finalizer.main(
+            [
+                "--source-preflight",
+                "--polaris-repo",
+                str(repo),
+                "--expected-polaris-commit",
+                commit,
+            ]
+        )
+        == 0
+    )
+    assert capsys.readouterr().out == (
+        "POLARIS_GRIPPER_IMPULSE_SOURCE_PREFLIGHT="
+        f"profile={finalizer.REPOSITORY_LAYOUT_PROFILE};repo={repo};"
+        f"git_dir={repo / '.git'};commit={commit}\n"
+    )
+
+
 def test_source_provenance_binds_import_repo_and_all_hashes(monkeypatch):
     diagnostic = diagnostic_module
     repo = finalizer.DIAGNOSTIC_PATH.parent.parent
@@ -386,10 +532,24 @@ def test_source_provenance_binds_import_repo_and_all_hashes(monkeypatch):
         expected_boundary_sha256=boundary_identity["sha256"],
         expected_fixture_sha256=fixture_identity["sha256"],
     )
+    layout = {
+        "layout_profile": finalizer.REPOSITORY_LAYOUT_PROFILE,
+        "git_dir": str(repo / ".git"),
+        "git_common_dir": str(repo / ".git"),
+    }
+    monkeypatch.setattr(
+        finalizer,
+        "_validate_standalone_repository_layout",
+        lambda _repo: dict(layout),
+    )
 
     def fake_git(_repo, *arguments):
+        if arguments == ("rev-parse", "--show-toplevel"):
+            return str(repo)
         if arguments == ("rev-parse", "HEAD"):
             return commit
+        if arguments == ("rev-parse", "--abbrev-ref", "HEAD"):
+            return "HEAD"
         if arguments == ("submodule", "status", "--recursive"):
             return _expected_submodule_status()
         return ""
@@ -410,6 +570,8 @@ def test_source_provenance_binds_import_repo_and_all_hashes(monkeypatch):
         "top_level": str(repo),
         "commit": commit,
         "clean": True,
+        "head_state": "detached",
+        **layout,
         "submodule_status": _expected_submodule_status(),
         "submodules": {
             "profile": finalizer.SUBMODULE_STATUS_PROFILE,
@@ -436,9 +598,13 @@ def test_source_provenance_binds_import_repo_and_all_hashes(monkeypatch):
                 str(repo)
                 if arguments == ("rev-parse", "--show-toplevel")
                 else (
-                    _expected_submodule_status()
-                    if arguments == ("submodule", "status", "--recursive")
-                    else ("dirty" if "status" in arguments else "")
+                    "HEAD"
+                    if arguments == ("rev-parse", "--abbrev-ref", "HEAD")
+                    else (
+                        _expected_submodule_status()
+                        if arguments == ("submodule", "status", "--recursive")
+                        else ("dirty" if "status" in arguments else "")
+                    )
                 )
             )
         ),
@@ -465,6 +631,10 @@ def test_bootstrap_hashes_every_source_before_diagnostic_import(monkeypatch):
             "top_level": str(repo),
             "commit": "a" * 40,
             "clean": True,
+            "head_state": "detached",
+            "layout_profile": finalizer.REPOSITORY_LAYOUT_PROFILE,
+            "git_dir": str(repo / ".git"),
+            "git_common_dir": str(repo / ".git"),
             "submodule_status": _expected_submodule_status(),
             "submodules": finalizer._validate_submodule_status(
                 _expected_submodule_status()
