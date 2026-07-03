@@ -463,3 +463,46 @@
   regressions bind pytest exit codes 0/1/2/4/5 and close-failure override;
   updated local gates pass 118 host tests plus 22 subtests and 14 focused
   controller tests. A clean-commit L40S rerun is required.
+
+## 2026-07-02 — fail-closed Isaac test transport repair
+
+- Although job `1098094` cannot certify the test gate, its replay produced a
+  scientifically useful immutable expected-failure trace at
+  `controller_diagnostics_v9/9a3c12d-factor1-trace64/boundary-trace-1098094.json`,
+  mode 0444, SHA-256
+  `8c926bc8421e27414631f5266399dc52121ffb3b53e4419c2cfa39eaecbaf5e7`.
+  The 64 entries cover apply calls 858 through 921 before the velocity guard
+  aborted apply 922 (policy 115/substep 2). The terminal transition is an
+  abrupt coupled wrist impulse despite small position deltas and unsaturated
+  approximate PD effort: joint 5 `-0.090587 -> +2.223634`, joint 6
+  `+0.103990 -> -0.651813`, and joint 7 `+0.077781 -> -2.892737` rad/s.
+  Only two of 448 joint entries saturated, both during an earlier healthy
+  reversal, so neither magnitude headroom nor coherent velocity targets
+  explain or safely repair the transient.
+- Clean follow-up job `1098095` used PolaRiS commit
+  `3b3dcc1a6ec4db8c8a143a8826efd0fdf6f9716e`. Real-Isaac collection ran and
+  exposed two test-fixture defects: assigning read-only `ActionTerm.num_envs`
+  and missing `_debug_vis_handle` on bare allocations. It reported `12 failed,
+  37 passed` and printed `ISAAC_PYTEST_EXIT_CODE=1`, but Slurm/Pyxis still
+  recorded the step as `COMPLETED|0:0`; the wrapper incorrectly printed
+  `TRACE_ISAAC_UNIT_TEST_RC=0`. Host tests then passed (`124 passed, 22
+  subtests`). The replay step was canceled before completion, and no raw trace,
+  ready marker, or attestation exists. The only result artifact is immutable
+  wrapper `boundary-trace-1098095.sbatch`, SHA-256
+  `1cecc0a0e6335b18defbbb1febdb63f2c85d6e08b2aa7e7bca4e2586e3df69b1`;
+  log SHA-256 is
+  `fdf4bc4ffd614cb9347f629506ba6430d9f9ec9637f45e1679fec23966bb35af`.
+- Commit `058694d` centralizes all bare action fixtures around the real Isaac
+  `_env` property contract and initializes `_debug_vis_handle` first. It also
+  makes the bootstrap publish a final post-close/post-flush exit code through
+  an exclusive, fsynced, mode-0444 hard-link commit point. The fixed temporary
+  path and final path are non-overwriting; any missing, leftover, malformed,
+  or nonzero artifact is reserved for wrapper rejection even if Pyxis masks
+  the process code. Unit tests cover exact pytest codes 0/1/2/4/5, import,
+  pytest, close, reporting and flush failures, write/fsync/link failure,
+  existing and dangling destinations, and unlink failure. Two independent
+  read-only reviews accepted the real-Isaac fixture and sidecar producer.
+  Local gates pass 140 host tests plus 22 subtests, Ruff format/check,
+  `py_compile`, and `git diff --check`. A new immutable wrapper must require
+  both zero `srun` status and exact `0\n` sidecar after host directory fsync,
+  then run the full real-Isaac suite and expected-failure replay.
