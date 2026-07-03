@@ -652,3 +652,49 @@
   collection and the immutable baseline/candidate target-surface A/B remain
   required before this experiment can be called a repair or used for
   checkpoint evaluation.
+
+## 2026-07-03 — wrist-energy brake A/B is valid negative evidence
+
+- Commit `426ad821ec300e13febd4895151ae2c959d6d6a0` passed its fail-closed
+  L40S test gate in job `1098125`: the deliberate pytest-exit-5 probe was
+  rejected, all 74 real-Isaac tests passed with an immutable exact `0\n`
+  sidecar, and the host suite passed 188 tests plus 2 skips and 22 subtests.
+  The saved wrapper SHA-256 is
+  `924b5862a52243e4f248aacadda2677800ab7dda51f0d8e02a40f4e49e1a2d62`;
+  the log SHA-256 is
+  `9ce0b86f1f79aac8543e755f4480c61454ebba711edc75430f4c4519b1fb3ce5`.
+- Immutable parallel L40S jobs `1098126` (baseline, `pool0-00013`) and
+  `1098127` (candidate, `pool0-00027`) both started at 00:35 PDT and ended in
+  188/190 seconds. Their parent/batch jobs completed `0:0`; each replay step
+  intentionally returned `1:0`, and the corresponding wrapper accepted only
+  a strictly validated `DifferentialIKInvariantError` velocity-abort artifact
+  before exiting zero. Both nodes are idle, all job processes are reaped, and
+  the clean deployed checkout remains exactly `426ad821`.
+- Baseline raw JSON is immutable mode 0444, single-link, SHA-256
+  `d24ede878efe7b841bbaa1fd097c4595a6b5c9c5e2b4a4068b8e12753efdb13f`;
+  its saved wrapper SHA-256 is
+  `54f21abb9e94ab2903518d50ec8c28760416e198ad19ea965cb2e5d93d57ad6f`.
+  It reproduces the preserved v13 runtime evidence and 64-entry causal trace
+  exactly: the only full-payload difference is the source path/line in the
+  traceback. The guard aborts apply 922 at policy step 115/substep 2 after
+  joint 7 reaches `-2.8927373886` rad/s against its `2.6099998951` limit.
+- Candidate raw JSON is immutable mode 0444, single-link, SHA-256
+  `a73b584b1c46a505c6cd8812e74841aa882b3c39bb4992a19bdc26be8f07d163`;
+  its saved wrapper SHA-256 is
+  `3d41260a8526f36c983b4a88727462e0ccf2db5c26e2c11940d894c91623d610`.
+  Strict candidate-history and failure-trace validation accepts 14 triggers,
+  28 active substeps, 49 attempted/effective projected targets, a closed
+  latch, and zero dropped evidence. Nevertheless it aborts at the same policy
+  step and apply: joint 7 reaches `-2.8293285370` rad/s and joint 5 reaches
+  `+2.4241445065` rad/s. The joint-7 limit excess falls by 22.43 percent, but
+  remains unsafe; no ready marker or attestation exists and the candidate is
+  rejected for a model canary.
+- The terminal candidate transition falsifies positive per-joint spring power
+  as a sufficient causal model. At apply 921 all three approximate wrist drive
+  contributions have net dissipative power, yet PhysX produces the coupled
+  velocity impulse. The committed 378-action fixture adds a more specific
+  diagnostic lead: policy step 115 is its first and only gripper command
+  transition (`0 -> 1`, open to closed). The next experiment must isolate the
+  gripper drive/contact impulse and record live gripper targets/state/drive and
+  link-contact evidence; another threshold-only wrist-brake tune is not
+  justified by these results.
