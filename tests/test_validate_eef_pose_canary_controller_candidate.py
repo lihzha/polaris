@@ -49,18 +49,28 @@ gripper_tests = _load_test_module(
 )
 
 
-def _failure_validation_args(tmp_path: Path, lifecycle: dict) -> Namespace:
+def _failure_validation_args(
+    tmp_path: Path,
+    lifecycle: dict,
+    *,
+    container_image: Path | None = None,
+    context_fields: dict | None = None,
+) -> Namespace:
     variant = "official_lap3b"
     launch_id = "a" * 64
     job_id = 123
     namespace = tmp_path / variant / f"job_{job_id}" / f"launch_{launch_id}"
     raw_result = namespace / f"candidate-{variant}.raw.json"
+    context = {"lifecycle": lifecycle}
+    if context_fields is not None:
+        context.update(context_fields)
     validator.gate0._atomic_write_immutable(  # noqa: SLF001
         raw_result,
-        {"failure_context": {"lifecycle": lifecycle}},
+        {"failure_context": context},
     )
-    container = tmp_path / "container.sqsh"
-    container.write_bytes(b"lifecycle validation container")
+    container = container_image or tmp_path / "container.sqsh"
+    if container_image is None:
+        container.write_bytes(b"lifecycle validation container")
     fixture = (
         SCRIPTS / "fixtures" / validator.gate0.EXPECTED_FIXTURES[variant]["filename"]
     )
@@ -94,6 +104,228 @@ def _failure_validation_args(tmp_path: Path, lifecycle: dict) -> Namespace:
         expected_container_size_bytes=container.stat().st_size,
         expected_container_sha256=validator._sha256(container),  # noqa: SLF001
     )
+
+
+def _container_file(path: Path, content: bytes = b"immutable container") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+def test_container_contract_preserves_parent_symlink_lexical_alias(tmp_path):
+    canonical = _container_file(tmp_path / "fs11" / "container.sqsh")
+    alias_directory = tmp_path / "fsw"
+    alias_directory.symlink_to(canonical.parent, target_is_directory=True)
+    lexical_alias = alias_directory / canonical.name
+    assert lexical_alias.is_file()
+    assert not lexical_alias.is_symlink()
+    assert lexical_alias.resolve() == canonical
+    digest = validator._sha256(canonical)  # noqa: SLF001
+    live = validator._validate_container_file(  # noqa: SLF001
+        lexical_alias,
+        expected_size_bytes=canonical.stat().st_size,
+        expected_sha256=digest,
+    )
+    recorded = validator.candidate.validate_container_argument(
+        str(canonical),
+        size_bytes=canonical.stat().st_size,
+        sha256=digest,
+    )
+    assert live["path"] == str(lexical_alias)
+    assert (
+        validator._validate_recorded_container(  # noqa: SLF001
+            recorded,
+            live,
+            field="container",
+        )
+        is recorded
+    )
+
+
+def test_container_contract_accepts_hardlink_samefile_alias(tmp_path):
+    recorded_path = _container_file(tmp_path / "fsw" / "container.sqsh")
+    live_alias = tmp_path / "fs11" / "container.sqsh"
+    live_alias.parent.mkdir(parents=True)
+    live_alias.hardlink_to(recorded_path)
+    digest = validator._sha256(recorded_path)  # noqa: SLF001
+    live = validator._validate_container_file(  # noqa: SLF001
+        live_alias,
+        expected_size_bytes=recorded_path.stat().st_size,
+        expected_sha256=digest,
+    )
+    recorded = validator.candidate.validate_container_argument(
+        str(recorded_path),
+        size_bytes=recorded_path.stat().st_size,
+        sha256=digest,
+    )
+    assert live["path"] == str(live_alias)
+    assert (
+        validator._validate_recorded_container(  # noqa: SLF001
+            recorded,
+            live,
+            field="container",
+        )
+        is recorded
+    )
+
+
+def test_container_contract_rejects_symlink_input_and_wrong_identity(tmp_path):
+    container = _container_file(tmp_path / "container.sqsh")
+    symlink = tmp_path / "container-link.sqsh"
+    symlink.symlink_to(container)
+    digest = validator._sha256(container)  # noqa: SLF001
+    with pytest.raises(
+        validator.CandidateArtifactValidationError,
+        match="regular non-symlink",
+    ):
+        validator._validate_container_file(  # noqa: SLF001
+            symlink,
+            expected_size_bytes=container.stat().st_size,
+            expected_sha256=digest,
+        )
+    with pytest.raises(
+        validator.CandidateArtifactValidationError,
+        match="path must be absolute",
+    ):
+        validator._validate_container_file(  # noqa: SLF001
+            Path("container.sqsh"),
+            expected_size_bytes=container.stat().st_size,
+            expected_sha256=digest,
+        )
+    for size_bytes, sha256 in (
+        (container.stat().st_size + 1, digest),
+        (container.stat().st_size, "f" * 64),
+    ):
+        with pytest.raises(
+            validator.CandidateArtifactValidationError,
+            match="content identity drift",
+        ):
+            validator._validate_container_file(  # noqa: SLF001
+                container,
+                expected_size_bytes=size_bytes,
+                expected_sha256=sha256,
+            )
+
+
+def test_container_contract_rejects_copy_and_record_tampering(tmp_path):
+    recorded_path = _container_file(tmp_path / "recorded" / "container.sqsh")
+    alias = tmp_path / "alias" / "container.sqsh"
+    alias.parent.mkdir(parents=True)
+    alias.hardlink_to(recorded_path)
+    independent_copy = _container_file(
+        tmp_path / "copy" / "container.sqsh",
+        recorded_path.read_bytes(),
+    )
+    symlink = tmp_path / "recorded-symlink.sqsh"
+    symlink.symlink_to(recorded_path)
+    digest = validator._sha256(recorded_path)  # noqa: SLF001
+    live = validator._validate_container_file(  # noqa: SLF001
+        alias,
+        expected_size_bytes=alias.stat().st_size,
+        expected_sha256=digest,
+    )
+    recorded = validator.candidate.validate_container_argument(
+        str(recorded_path),
+        size_bytes=recorded_path.stat().st_size,
+        sha256=digest,
+    )
+    mutations = (
+        lambda value: value.update(profile="wrong-profile"),
+        lambda value: value.update(size_bytes=value["size_bytes"] + 1),
+        lambda value: value.update(size_bytes=True),
+        lambda value: value.update(sha256="f" * 64),
+        lambda value: value.update(path="relative/container.sqsh"),
+        lambda value: value.update(path=123),
+        lambda value: value.update(path=str(symlink)),
+        lambda value: value.update(hidden=True),
+    )
+    for mutation in mutations:
+        tampered = copy.deepcopy(recorded)
+        mutation(tampered)
+        with pytest.raises(validator.CandidateArtifactValidationError):
+            validator._validate_recorded_container(  # noqa: SLF001
+                tampered,
+                live,
+                field="container",
+            )
+
+    copied_live = validator._validate_container_file(  # noqa: SLF001
+        independent_copy,
+        expected_size_bytes=independent_copy.stat().st_size,
+        expected_sha256=digest,
+    )
+    with pytest.raises(
+        validator.CandidateArtifactValidationError,
+        match="not the same file",
+    ):
+        validator._validate_recorded_container(  # noqa: SLF001
+            recorded,
+            copied_live,
+            field="container",
+        )
+
+
+def test_failure_validation_accepts_container_alias_before_later_checks(
+    tmp_path,
+    monkeypatch,
+):
+    canonical = _container_file(
+        tmp_path / "fs11" / "projects" / "users" / "container.sqsh"
+    )
+    alias_directory = tmp_path / "fsw" / "users"
+    alias_directory.parent.mkdir(parents=True)
+    alias_directory.symlink_to(canonical.parent, target_is_directory=True)
+    lexical_alias = alias_directory / canonical.name
+    assert lexical_alias.resolve() == canonical
+    digest = validator._sha256(canonical)  # noqa: SLF001
+    lifecycle = {
+        "profile": "slurm_single_task_srun_lifecycle_v1",
+        "launch_id": "a" * 64,
+        "job_id": 123,
+        "step_id": 4,
+        "nodelist": "l401",
+        "procid": 0,
+        "localid": 0,
+        "ntasks": 1,
+    }
+    recorded_container = validator.candidate.validate_container_argument(
+        str(lexical_alias),
+        size_bytes=canonical.stat().st_size,
+        sha256=digest,
+    )
+    args = _failure_validation_args(
+        tmp_path,
+        lifecycle,
+        container_image=lexical_alias,
+        context_fields={
+            "repository": {
+                "path": str(ROOT.resolve()),
+                "commit": "b" * 40,
+                "clean_tracked": True,
+            },
+            "container_image": recorded_container,
+            "production_eval": None,
+        },
+    )
+    monkeypatch.setattr(
+        validator,
+        "_repository_identity",
+        lambda path, commit: {
+            "path": str(path.resolve()),
+            "commit": commit,
+            "clean_tracked": True,
+        },
+    )
+    monkeypatch.setattr(
+        validator.candidate,
+        "validate_failure_payload",
+        lambda raw, *, variant, require_complete_capture: raw,
+    )
+    with pytest.raises(
+        validator.CandidateArtifactValidationError,
+        match="production eval must be an object",
+    ):
+        validator.validate_failure(args)
 
 
 @pytest.mark.parametrize(
@@ -221,7 +453,7 @@ def test_validator_rehashes_every_launch_source_and_container():
         '"safety_validator": (',
         '"gate0_helper": (',
         '"fixture": (',
-        "_sha256(container) == args.expected_container_sha256",
+        "_sha256(path) == expected_sha256",
         "set(raw) == RAW_FIELDS",
         "set(ready) == READY_FIELDS",
         "validate_candidate_replay_evidence(",
@@ -235,6 +467,8 @@ def test_validator_rehashes_every_launch_source_and_container():
         "_validate_runtime_frame(",
     ):
         assert token in source
+    assert source.count("container_record = _validate_container_file(") == 2
+    assert source.count("_validate_recorded_container(") == 3
 
 
 def test_failure_verifier_rehashes_context_and_rejects_promotion_artifacts():

@@ -171,6 +171,72 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _validate_container_file(
+    path: Path,
+    *,
+    expected_size_bytes: int,
+    expected_sha256: str,
+) -> dict[str, Any]:
+    """Validate one lexical absolute container path without resolving aliases."""
+
+    _require(
+        isinstance(path, Path) and path.is_absolute(),
+        "container path must be absolute",
+    )
+    _require(
+        path.is_file() and not path.is_symlink(),
+        "container must be a regular non-symlink file",
+    )
+    _require(
+        path.stat().st_size == expected_size_bytes and _sha256(path) == expected_sha256,
+        "container content identity drift",
+    )
+    return candidate.validate_container_argument(
+        str(path),
+        size_bytes=expected_size_bytes,
+        sha256=expected_sha256,
+    )
+
+
+def _validate_recorded_container(
+    recorded: Any,
+    live: dict[str, Any],
+    *,
+    field: str,
+) -> dict[str, Any]:
+    """Bind a recorded lexical path to the same live container file."""
+
+    _require(
+        isinstance(recorded, dict) and set(recorded) == set(live),
+        f"{field} schema drift",
+    )
+    _require(
+        all(
+            _typed_equal(recorded.get(name), live[name])
+            for name in ("profile", "size_bytes", "sha256")
+        ),
+        f"{field} content identity drift",
+    )
+    recorded_path_value = recorded.get("path")
+    _require(
+        type(recorded_path_value) is str
+        and recorded_path_value.startswith("/")
+        and "\x00" not in recorded_path_value,
+        f"{field} path drift",
+    )
+    recorded_path = Path(recorded_path_value)
+    _require(
+        recorded_path.is_file() and not recorded_path.is_symlink(),
+        f"{field} path must be a regular non-symlink file",
+    )
+    try:
+        same_file = os.path.samefile(recorded_path, live["path"])
+    except OSError:
+        same_file = False
+    _require(same_file, f"{field} path is not the same file")
+    return recorded
+
+
 def _immutable_file(path: Path, *, expected_mode: int = 0o444) -> dict[str, Any]:
     _require(path.is_file() and not path.is_symlink(), f"missing/linked file: {path}")
     metadata = path.stat()
@@ -439,20 +505,10 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
             f"imported module differs from hashed source: {source_name}",
         )
 
-    container = args.container_image
-    _require(
-        container.is_file() and not container.is_symlink(),
-        "container must be a regular non-symlink file",
-    )
-    _require(
-        container.stat().st_size == args.expected_container_size_bytes
-        and _sha256(container) == args.expected_container_sha256,
-        "container content identity drift",
-    )
-    container_record = candidate.validate_container_argument(
-        str(container),
-        size_bytes=args.expected_container_size_bytes,
-        sha256=args.expected_container_sha256,
+    container_record = _validate_container_file(
+        args.container_image,
+        expected_size_bytes=args.expected_container_size_bytes,
+        expected_sha256=args.expected_container_sha256,
     )
 
     raw_identity = _immutable_file(args.raw_result)
@@ -503,9 +559,10 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         and os.path.samefile(recorded_repository.get("path"), repository["path"]),
         "recorded repository identity drift",
     )
-    _require(
-        _typed_equal(raw.get("container_image"), container_record),
-        "container record value/type drift",
+    _validate_recorded_container(
+        raw.get("container_image"),
+        container_record,
+        field="container record",
     )
 
     _validate_production_eval(raw.get("production_eval"))
@@ -732,20 +789,10 @@ def validate_failure(args: argparse.Namespace) -> dict[str, Any]:
             f"imported module differs from hashed source: {source_name}",
         )
 
-    container = args.container_image.resolve()
-    _require(
-        container.is_file() and not container.is_symlink(),
-        "container must be a regular non-symlink file",
-    )
-    _require(
-        container.stat().st_size == args.expected_container_size_bytes
-        and _sha256(container) == args.expected_container_sha256,
-        "container content identity drift",
-    )
-    container_record = candidate.validate_container_argument(
-        str(container),
-        size_bytes=args.expected_container_size_bytes,
-        sha256=args.expected_container_sha256,
+    container_record = _validate_container_file(
+        args.container_image,
+        expected_size_bytes=args.expected_container_size_bytes,
+        expected_sha256=args.expected_container_sha256,
     )
 
     raw_identity = _immutable_file(args.raw_result)
@@ -787,9 +834,10 @@ def validate_failure(args: argparse.Namespace) -> dict[str, Any]:
         and os.path.samefile(recorded_repository["path"], repository["path"]),
         "failed raw repository drift",
     )
-    _require(
-        _typed_equal(context["container_image"], container_record),
-        "failed raw container drift",
+    _validate_recorded_container(
+        context["container_image"],
+        container_record,
+        field="failed raw container",
     )
     _validate_production_eval(context["production_eval"])
     live_fixture_identity, live_fixture_payload, live_actions = (
