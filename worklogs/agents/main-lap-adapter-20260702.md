@@ -393,3 +393,50 @@
   binds the hard-limit profile/digest/write count/readback and zero-velocity
   profile; per-episode maxima bind hard-limit solver slop, absolute velocity,
   and canonical outer clearance.
+
+## 2026-07-02 — velocity-limit transient diagnosis
+
+- The v5 standalone matrix passed, but exact official-action boundary replay
+  `1098049` on the retained TGS 64-position/1-velocity-iteration controller
+  failed closed at apply call 923 (policy step 115, physics substep 2): joint
+  7 reached `-2.8927373886` rad/s against the live `2.6099998951` limit.
+  Direct PhysX q/dq matched the Isaac cache bit-for-bit. Four velocity
+  iterations (`1098051`) were worse, reaching joint-5/joint-7 ratios of
+  1.132/1.295 times their limits; this solver variant is rejected.
+- A separately reviewed fixed 0.8 position-target slew candidate, PolaRiS
+  `bc4890854e8c758b9278de772f09a229b2b95764`, preserved the physical hard
+  envelope, zero velocity target, 400/80 gains, effort limits and strict
+  pre-DLS qdot abort. Its boundary job `1098074` passed 38 Isaac tests and 105
+  host tests plus 22 subtests, then failed at apply 936 (policy 116/substep 7)
+  with joint 5 at `-3.7024555206` rad/s and joint 7 at `+3.6261839867` rad/s.
+  The immutable mode-0444 JSON SHA-256 is
+  `9d812bdf05d1fc4e0284d1c1860c6a4f37b4b1e22cb3c7287b871e1301bafebc`.
+  It had zero position/recovery events and exact target bounds, disproving a
+  monotonic fixed-slew repair; no lower scalar slew or checkpoint rerun is
+  authorized.
+- Isaac Lab 2.3 source inspection established the missing phase information:
+  captured q/dq is the current post-physics state, while `computed_torque` and
+  `applied_torque` are the preceding `write_data_to_sim` call's approximate
+  implicit-PD preclip/postclip buffers, not actual PhysX drive torque. The
+  terminal artifact alone therefore cannot select a brake threshold or
+  distinguish coherent velocity-reference control from a qdot-opposing target
+  projection.
+- This branch restores the exact retained factor-1/TGS-64/1 source revision
+  and adds a boundary-only, default-disabled 64-substep device ring. Each
+  completed entry causally binds pre/post q/dq and float32 deltas, previous/raw/
+  accepted position targets, zero velocity and feed-forward targets, current/
+  desired EEF poses and pose error, and Isaac's approximate preclip/postclip
+  efforts. The producer binds direct PhysX and mirror readbacks for 400/80
+  gains and `[87,87,87,87,12,12,12]` effort limits. The runner independently
+  reconstructs every float32 PD computation and clip, enforces contiguous
+  ring/index/transition identities, the exact velocity-abort guard, cached vs
+  direct PhysX terminal state, and terminal target/effort-buffer identity.
+  Standard safety reports, sidecars, success payloads and native/pi05 control
+  remain unchanged.
+- Local gates pass: 37 boundary-runner tests, 14 focused controller tests under
+  lightweight Isaac stubs, Ruff, Ruff format, `py_compile`, and `git diff
+  --check`. Two independent read-only reviews accept the causal producer/ring;
+  one initial NO-GO on stale-effort validation was resolved by the exact live
+  gain/target/effort reconstruction above. Full Isaac tests and one immutable
+  L40S diagnostic replay remain mandatory before choosing any numeric braking
+  law or launching official/reasoning checkpoint canaries.

@@ -41,10 +41,60 @@ from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
 from polaris.eef_ik_safety import PHYSX_DERIVED_SOFT_LIMIT_PROFILE
 from polaris.eef_ik_safety import PHYSX_HARD_LIMIT_PROFILE
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT
 from polaris.eef_ik_safety import PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT
 from polaris.eef_ik_safety import PANDA_EEF_PHYSX_SOLVER_TYPE
 from polaris.eef_ik_safety import TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
+
+
+FAILURE_SUBSTEP_TRACE_CAPACITY = 64
+FAILURE_SUBSTEP_TRACE_DECIMATION = 8
+FAILURE_SUBSTEP_TRACE_PROFILE = "eef_applied_substep_ring_last64_v1"
+FAILURE_SUBSTEP_TRACE_EFFORT_SEMANTICS = (
+    "isaaclab_implicit_actuator_approximate_pd_preclip_and_effortlimit_clipped_v1"
+)
+FAILURE_SUBSTEP_TRACE_JOINT_DRIVE_STIFFNESS = (400.0,) * 7
+FAILURE_SUBSTEP_TRACE_JOINT_DRIVE_DAMPING = (80.0,) * 7
+FAILURE_SUBSTEP_TRACE_PHASE_CONTRACT = {
+    "joint_state": "apply_actions_entry_cached_after_previous_scene_update_v1",
+    "post_joint_state": (
+        "next_apply_actions_entry_cached_after_command_physics_and_scene_update_v1"
+    ),
+    "joint_state_delta": "post_joint_state_minus_pre_joint_state_v1",
+    "current_eef_pose": "apply_actions_entry_before_pose_error_and_dls_v1",
+    "desired_eef_pose": "controller_command_live_at_apply_actions_entry_v1",
+    "pose_error": "position_and_axis_angle_after_pose_error_before_dls_v1",
+    "previous_target": "apply_actions_entry_before_current_target_setters_v1",
+    "raw_dls_target": "after_dls_before_safety_bounding_v1",
+    "new_target": "after_safety_bounding_and_both_target_setters_returned_v1",
+    "new_velocity_target": "zero_target_after_velocity_setter_returned_v1",
+    "new_effort_target": "zero_feedforward_live_at_write_data_to_sim_v1",
+    "effort": (
+        "isaaclab_write_data_to_sim_for_new_target_before_physics_"
+        "observed_at_next_apply_actions_entry_v1"
+    ),
+}
+FAILURE_SUBSTEP_TRACE_VECTOR_WIDTHS = {
+    "joint_pos_rad": 7,
+    "joint_vel_rad_s": 7,
+    "post_joint_pos_rad": 7,
+    "post_joint_vel_rad_s": 7,
+    "delta_joint_pos_rad": 7,
+    "delta_joint_vel_rad_s": 7,
+    "previous_joint_pos_target_rad": 7,
+    "raw_dls_joint_pos_target_rad": 7,
+    "new_joint_pos_target_rad": 7,
+    "new_joint_vel_target_rad_s": 7,
+    "new_joint_effort_target_nm": 7,
+    "current_eef_position_m": 3,
+    "current_eef_quaternion_wxyz": 4,
+    "desired_eef_position_m": 3,
+    "desired_eef_quaternion_wxyz": 4,
+    "pose_error_position_m_axis_angle_rad": 6,
+    "approximate_pd_effort_preclip_nm": 7,
+    "approximate_pd_effort_postclip_nm": 7,
+}
 
 
 class DifferentialIKNumericalError(RuntimeError):
@@ -467,6 +517,16 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
+        trace_enabled = self.cfg.enable_failure_substep_trace
+        if type(trace_enabled) is not bool:
+            raise ValueError(
+                "PolaRiS EEF failure substep trace enable flag must be bool"
+            )
+        self._failure_substep_trace_enabled = trace_enabled
+        if self._failure_substep_trace_enabled and self.num_envs != 1:
+            raise ValueError(
+                "PolaRiS EEF failure substep trace requires exactly one environment"
+            )
         self._ik_controller = RobustDifferentialIKController(
             cfg=self.cfg.controller,
             num_envs=self.num_envs,
@@ -610,7 +670,197 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._physx_hard_limit_write_count = 1
         self._zero_joint_velocity_target = torch.zeros_like(self._max_delta_joint_pos)
         self._max_guard_diagnostics = 32
+        if self._failure_substep_trace_enabled:
+            self._initialize_failure_substep_trace()
         self._reset_episode_safety_state(episode_index=None)
+
+    def _validated_failure_substep_trace_drive_tensors(
+        self,
+    ) -> dict[str, torch.Tensor]:
+        """Return exact live Panda drive tensors or reject contract drift."""
+
+        expected_shape = (self.num_envs, self._num_joints)
+        expected_device = torch.device(self.device)
+        expected_dtype = self._asset.data.joint_pos.dtype
+        specifications = {
+            "joint_drive_stiffness": (
+                "joint_stiffness",
+                "get_dof_stiffnesses",
+                FAILURE_SUBSTEP_TRACE_JOINT_DRIVE_STIFFNESS,
+            ),
+            "joint_drive_damping": (
+                "joint_damping",
+                "get_dof_dampings",
+                FAILURE_SUBSTEP_TRACE_JOINT_DRIVE_DAMPING,
+            ),
+            "joint_effort_limits": (
+                "joint_effort_limits",
+                "get_dof_max_forces",
+                PANDA_EEF_JOINT_EFFORT_LIMITS,
+            ),
+        }
+        live_tensors: dict[str, torch.Tensor] = {}
+        for field, (
+            asset_field,
+            readback_method,
+            expected_values,
+        ) in specifications.items():
+            full_value = getattr(self._asset.data, asset_field, None)
+            if not isinstance(full_value, torch.Tensor):
+                raise ValueError(
+                    "PolaRiS EEF failure substep trace requires live "
+                    f"{asset_field} tensor"
+                )
+            try:
+                mirror_value = full_value[:, self._joint_ids]
+            except (IndexError, RuntimeError) as error:
+                raise ValueError(
+                    "PolaRiS EEF failure substep trace live drive tensor "
+                    f"shape/device/dtype drift: field={field!r}"
+                ) from error
+            getter = getattr(self._asset.root_physx_view, readback_method, None)
+            if not callable(getter):
+                raise ValueError(
+                    "PolaRiS EEF failure substep trace requires direct PhysX "
+                    f"drive readback: field={field!r}"
+                )
+            try:
+                readback_value = getter().to(self._asset.device)[:, self._joint_ids]
+            except (AttributeError, IndexError, RuntimeError) as error:
+                raise ValueError(
+                    "PolaRiS EEF failure substep trace live drive tensor "
+                    f"shape/device/dtype drift: field={field!r}"
+                ) from error
+            if (
+                tuple(mirror_value.shape) != expected_shape
+                or mirror_value.device != expected_device
+                or mirror_value.dtype != expected_dtype
+                or tuple(readback_value.shape) != expected_shape
+                or readback_value.device != expected_device
+                or readback_value.dtype != expected_dtype
+            ):
+                raise ValueError(
+                    "PolaRiS EEF failure substep trace live drive tensor "
+                    f"shape/device/dtype drift: field={field!r}, "
+                    f"expected_shape={expected_shape!r}, "
+                    f"mirror_shape={tuple(mirror_value.shape)!r}, "
+                    f"readback_shape={tuple(readback_value.shape)!r}, "
+                    f"expected_device={expected_device!r}, "
+                    f"mirror_device={mirror_value.device!r}, "
+                    f"readback_device={readback_value.device!r}, "
+                    f"expected_dtype={expected_dtype!r}, "
+                    f"mirror_dtype={mirror_value.dtype!r}, "
+                    f"readback_dtype={readback_value.dtype!r}"
+                )
+            if not torch.equal(mirror_value, readback_value):
+                raise ValueError(
+                    "PolaRiS EEF failure substep trace live drive "
+                    f"mirror/readback mismatch: field={field!r}"
+                )
+            expected = torch.tensor(
+                expected_values,
+                dtype=expected_dtype,
+                device=expected_device,
+            ).expand(self.num_envs, -1)
+            if not torch.equal(readback_value, expected):
+                raise ValueError(
+                    "PolaRiS EEF failure substep trace live drive value drift: "
+                    f"field={field!r}"
+                )
+            live_tensors[field] = readback_value
+        return live_tensors
+
+    def _validated_failure_substep_trace_zero_effort_target(self) -> torch.Tensor:
+        """Return the live zero feed-forward target or reject contract drift."""
+
+        full_value = getattr(self._asset.data, "joint_effort_target", None)
+        if not isinstance(full_value, torch.Tensor):
+            raise ValueError(
+                "PolaRiS EEF failure substep trace requires a live "
+                "joint_effort_target tensor"
+            )
+        try:
+            selected = full_value[:, self._joint_ids]
+        except (IndexError, RuntimeError) as error:
+            raise ValueError(
+                "PolaRiS EEF failure substep trace requires live "
+                "joint_effort_target with controller shape/device/dtype"
+            ) from error
+        if (
+            tuple(selected.shape) != (self.num_envs, self._num_joints)
+            or selected.device != torch.device(self.device)
+            or selected.dtype != self._asset.data.joint_pos.dtype
+        ):
+            raise ValueError(
+                "PolaRiS EEF failure substep trace requires live "
+                "joint_effort_target with controller shape/device/dtype"
+            )
+        if not torch.equal(selected, torch.zeros_like(selected)):
+            raise ValueError(
+                "PolaRiS EEF failure substep trace requires an exactly "
+                "zero live joint effort target"
+            )
+        return selected
+
+    def _initialize_failure_substep_trace(self) -> None:
+        """Allocate the optional failure-only ring without any host transfers."""
+
+        if self._decimation != FAILURE_SUBSTEP_TRACE_DECIMATION:
+            raise ValueError(
+                "PolaRiS EEF failure substep trace requires exactly eight "
+                f"physics substeps per policy step; live={self._decimation!r}"
+            )
+        if self._num_joints != 7 or len(self._joint_names) != 7:
+            raise ValueError(
+                "PolaRiS EEF failure substep trace requires exactly seven "
+                "ordered Panda arm joints"
+            )
+        self._validated_failure_substep_trace_drive_tensors()
+        self._validated_failure_substep_trace_zero_effort_target()
+        joint_dtype = self._asset.data.joint_pos.dtype
+        self._failure_substep_trace_buffers = {
+            field: torch.empty(
+                (
+                    FAILURE_SUBSTEP_TRACE_CAPACITY,
+                    self.num_envs,
+                    width,
+                ),
+                dtype=joint_dtype,
+                device=self.device,
+            )
+            for field, width in FAILURE_SUBSTEP_TRACE_VECTOR_WIDTHS.items()
+        }
+        self._failure_substep_trace_apply_indices = torch.empty(
+            FAILURE_SUBSTEP_TRACE_CAPACITY,
+            dtype=torch.int64,
+            device=self.device,
+        )
+
+        for field in ("computed_torque", "applied_torque"):
+            value = getattr(self._asset.data, field, None)
+            selected = (
+                value[:, self._joint_ids] if isinstance(value, torch.Tensor) else None
+            )
+            if (
+                selected is None
+                or tuple(selected.shape) != (self.num_envs, self._num_joints)
+                or selected.device != torch.device(self.device)
+                or selected.dtype != joint_dtype
+            ):
+                raise ValueError(
+                    "PolaRiS EEF failure substep trace requires live "
+                    f"{field} with controller shape/device/dtype"
+                )
+
+    def _reset_failure_substep_trace_state(self) -> None:
+        """Clear ring lifecycle state for one isolated rollout."""
+
+        self._failure_substep_trace_total_completed = 0
+        self._failure_substep_trace_pending_slot: int | None = None
+        self._failure_substep_trace_pending_apply_index: int | None = None
+        self._failure_substep_trace_apply_indices.fill_(-1)
+        for buffer in self._failure_substep_trace_buffers.values():
+            buffer.fill_(float("nan"))
 
     def _reset_episode_safety_state(self, episode_index: int | None) -> None:
         counter_dtype = torch.int64
@@ -693,6 +943,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._max_raw_delta_diagnostic_jacobian_max_abs = torch.tensor(
             0.0, dtype=torch.float64, device=self.device
         )
+        if self._failure_substep_trace_enabled:
+            self._reset_failure_substep_trace_state()
 
     def begin_safety_episode(self, episode_index: int) -> None:
         """Start isolated safety accounting for one rollout."""
@@ -721,6 +973,279 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             ],
             "finite_mask": finite_mask,
             "finite_count": sum(finite_mask),
+        }
+
+    @staticmethod
+    def _failure_substep_trace_vector(
+        values: list[float],
+    ) -> dict[str, object]:
+        raw_values = [float(item) for item in values]
+        finite_mask = [math.isfinite(item) for item in raw_values]
+        return {
+            "values": [
+                item if finite else None
+                for item, finite in zip(raw_values, finite_mask, strict=True)
+            ],
+            "finite_mask": finite_mask,
+            "finite_count": sum(finite_mask),
+        }
+
+    def _copy_failure_substep_trace_value(
+        self,
+        *,
+        field: str,
+        slot: int,
+        value: torch.Tensor,
+    ) -> None:
+        buffer = self._failure_substep_trace_buffers[field]
+        expected_shape = (self.num_envs, buffer.shape[-1])
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(
+                "PolaRiS EEF failure substep trace tensor shape drift: "
+                f"field={field!r}, expected={expected_shape!r}, "
+                f"actual={tuple(value.shape)!r}"
+            )
+        if value.device != buffer.device or value.dtype != buffer.dtype:
+            raise ValueError(
+                "PolaRiS EEF failure substep trace tensor device/dtype drift: "
+                f"field={field!r}, expected_device={buffer.device!r}, "
+                f"actual_device={value.device!r}, expected_dtype={buffer.dtype!r}, "
+                f"actual_dtype={value.dtype!r}"
+            )
+        buffer[slot].copy_(value)
+
+    def _finalize_pending_failure_substep_trace(
+        self,
+        *,
+        post_joint_pos: torch.Tensor,
+        post_joint_vel: torch.Tensor,
+    ) -> None:
+        """Attach causal post-physics state and prior actuator effort."""
+
+        if not self._failure_substep_trace_enabled:
+            return
+        slot = self._failure_substep_trace_pending_slot
+        if slot is None:
+            if self._failure_substep_trace_pending_apply_index is not None:
+                raise ValueError(
+                    "PolaRiS EEF failure substep trace pending identity drift"
+                )
+            return
+        if self._failure_substep_trace_pending_apply_index is None:
+            raise ValueError(
+                "PolaRiS EEF failure substep trace pending index is absent"
+            )
+        if (
+            slot
+            != self._failure_substep_trace_total_completed
+            % FAILURE_SUBSTEP_TRACE_CAPACITY
+            or self._failure_substep_trace_pending_apply_index
+            != self._failure_substep_trace_total_completed
+        ):
+            raise ValueError(
+                "PolaRiS EEF failure substep trace pending lifecycle drift"
+            )
+
+        pre_joint_pos = self._failure_substep_trace_buffers["joint_pos_rad"][slot]
+        pre_joint_vel = self._failure_substep_trace_buffers["joint_vel_rad_s"][slot]
+        computed_effort = self._asset.data.computed_torque[:, self._joint_ids]
+        applied_effort = self._asset.data.applied_torque[:, self._joint_ids]
+        for field, value in (
+            ("post_joint_pos_rad", post_joint_pos),
+            ("post_joint_vel_rad_s", post_joint_vel),
+            ("delta_joint_pos_rad", post_joint_pos - pre_joint_pos),
+            ("delta_joint_vel_rad_s", post_joint_vel - pre_joint_vel),
+            ("approximate_pd_effort_preclip_nm", computed_effort),
+            ("approximate_pd_effort_postclip_nm", applied_effort),
+        ):
+            self._copy_failure_substep_trace_value(
+                field=field,
+                slot=slot,
+                value=value,
+            )
+
+        self._failure_substep_trace_total_completed += 1
+        self._failure_substep_trace_pending_slot = None
+        self._failure_substep_trace_pending_apply_index = None
+
+    def _stage_failure_substep_trace(
+        self,
+        *,
+        joint_pos: torch.Tensor,
+        joint_vel: torch.Tensor,
+        previous_joint_pos_target: torch.Tensor,
+        raw_dls_joint_pos_target: torch.Tensor,
+        new_joint_pos_target: torch.Tensor,
+        new_joint_vel_target: torch.Tensor,
+        new_joint_effort_target: torch.Tensor,
+        current_eef_position: torch.Tensor,
+        current_eef_quaternion: torch.Tensor,
+        desired_eef_position: torch.Tensor,
+        desired_eef_quaternion: torch.Tensor,
+        pose_error: torch.Tensor,
+    ) -> None:
+        """Stage one accepted command; effort is attached at the next call."""
+
+        if not self._failure_substep_trace_enabled:
+            return
+        if self._failure_substep_trace_pending_slot is not None:
+            raise ValueError(
+                "PolaRiS EEF failure substep trace has an unfinalized command"
+            )
+        slot = (
+            self._failure_substep_trace_total_completed % FAILURE_SUBSTEP_TRACE_CAPACITY
+        )
+        apply_index = self._apply_call_count - 1
+        if apply_index != self._failure_substep_trace_total_completed:
+            raise ValueError(
+                "PolaRiS EEF failure substep trace apply lifecycle drift: "
+                f"expected={self._failure_substep_trace_total_completed!r}, "
+                f"actual={apply_index!r}"
+            )
+        for buffer in self._failure_substep_trace_buffers.values():
+            buffer[slot].fill_(float("nan"))
+        for field, value in (
+            ("joint_pos_rad", joint_pos),
+            ("joint_vel_rad_s", joint_vel),
+            ("previous_joint_pos_target_rad", previous_joint_pos_target),
+            ("raw_dls_joint_pos_target_rad", raw_dls_joint_pos_target),
+            ("new_joint_pos_target_rad", new_joint_pos_target),
+            ("new_joint_vel_target_rad_s", new_joint_vel_target),
+            ("new_joint_effort_target_nm", new_joint_effort_target),
+            ("current_eef_position_m", current_eef_position),
+            ("current_eef_quaternion_wxyz", current_eef_quaternion),
+            ("desired_eef_position_m", desired_eef_position),
+            ("desired_eef_quaternion_wxyz", desired_eef_quaternion),
+            ("pose_error_position_m_axis_angle_rad", pose_error),
+        ):
+            self._copy_failure_substep_trace_value(
+                field=field,
+                slot=slot,
+                value=value,
+            )
+        self._failure_substep_trace_apply_indices[slot] = apply_index
+        self._failure_substep_trace_pending_slot = slot
+        self._failure_substep_trace_pending_apply_index = apply_index
+
+    def failure_substep_trace(self, episode_index: int) -> dict[str, object]:
+        """Export the failure-only ring without changing the safety report schema."""
+
+        if not self._failure_substep_trace_enabled:
+            raise ValueError("PolaRiS EEF failure substep trace is disabled")
+        if (
+            type(episode_index) is not int
+            or self._active_episode_index != episode_index
+        ):
+            raise ValueError(
+                "PolaRiS EEF failure substep trace episode lifecycle mismatch: "
+                f"active={self._active_episode_index!r}, requested={episode_index!r}"
+            )
+        live_drive_tensors = self._validated_failure_substep_trace_drive_tensors()
+        self._validated_failure_substep_trace_zero_effort_target()
+        total_completed = self._failure_substep_trace_total_completed
+        pending_apply_index = self._failure_substep_trace_pending_apply_index
+        pending_entry_count = int(pending_apply_index is not None)
+        # A pending command owns its slot but is intentionally excluded until
+        # the next apply call attaches causal post-physics state. Once full,
+        # staging therefore evicts one completed prefix entry temporarily.
+        completed_capacity = FAILURE_SUBSTEP_TRACE_CAPACITY - pending_entry_count
+        entry_count = min(total_completed, completed_capacity)
+        first_sequence = total_completed - entry_count
+        logical_sequences = list(range(first_sequence, total_completed))
+        slots = [
+            sequence % FAILURE_SUBSTEP_TRACE_CAPACITY for sequence in logical_sequences
+        ]
+
+        if entry_count == 0:
+            apply_indices: list[int] = []
+            vector_values: dict[str, list[list[float]]] = {
+                field: [] for field in FAILURE_SUBSTEP_TRACE_VECTOR_WIDTHS
+            }
+        else:
+            slot_tensor = torch.tensor(
+                slots,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            apply_indices = [
+                int(value)
+                for value in self._failure_substep_trace_apply_indices.index_select(
+                    0, slot_tensor
+                )
+                .detach()
+                .cpu()
+                .tolist()
+            ]
+            vector_values = {
+                field: [
+                    [float(item) for item in vector]
+                    for vector in buffer.index_select(0, slot_tensor)[:, 0, :]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ]
+                for field, buffer in self._failure_substep_trace_buffers.items()
+            }
+
+        if apply_indices != logical_sequences:
+            raise ValueError(
+                "PolaRiS EEF failure substep trace apply-index ordering drift: "
+                f"expected={logical_sequences!r}, actual={apply_indices!r}"
+            )
+        entries: list[dict[str, object]] = []
+        for entry_offset, apply_index in enumerate(apply_indices):
+            entry: dict[str, object] = {
+                "apply_index": apply_index,
+                "policy_step": apply_index // self._decimation,
+                "physics_substep": apply_index % self._decimation,
+            }
+            entry.update(
+                {
+                    field: self._failure_substep_trace_vector(
+                        vector_values[field][entry_offset]
+                    )
+                    for field in FAILURE_SUBSTEP_TRACE_VECTOR_WIDTHS
+                }
+            )
+            entries.append(entry)
+
+        if pending_apply_index is not None and (
+            type(pending_apply_index) is not int
+            or pending_apply_index != total_completed
+            or pending_apply_index >= self._apply_call_count
+        ):
+            raise ValueError(
+                "PolaRiS EEF failure substep trace pending apply-index drift"
+            )
+        return {
+            "schema_version": 1,
+            "profile": FAILURE_SUBSTEP_TRACE_PROFILE,
+            "episode_index": episode_index,
+            "capacity": FAILURE_SUBSTEP_TRACE_CAPACITY,
+            "policy_step_capacity": FAILURE_SUBSTEP_TRACE_CAPACITY
+            // FAILURE_SUBSTEP_TRACE_DECIMATION,
+            "decimation": self._decimation,
+            "joint_names": list(self._joint_names),
+            "joint_drive_stiffness": live_drive_tensors["joint_drive_stiffness"][0]
+            .detach()
+            .cpu()
+            .tolist(),
+            "joint_drive_damping": live_drive_tensors["joint_drive_damping"][0]
+            .detach()
+            .cpu()
+            .tolist(),
+            "joint_effort_limits": live_drive_tensors["joint_effort_limits"][0]
+            .detach()
+            .cpu()
+            .tolist(),
+            "effort_semantics": FAILURE_SUBSTEP_TRACE_EFFORT_SEMANTICS,
+            "phase_contract": dict(FAILURE_SUBSTEP_TRACE_PHASE_CONTRACT),
+            "completed_entry_count": entry_count,
+            "total_completed_entry_count": total_completed,
+            "dropped_prefix_entry_count": first_sequence,
+            "pending_entry_count": pending_entry_count,
+            "pending_apply_index": pending_apply_index,
+            "entries": entries,
         }
 
     def _diagnostic_record(
@@ -837,10 +1362,20 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
     def apply_actions(self):
         """Apply finite, velocity-slewed, soft-limited EEF IK joint targets."""
 
+        if self._failure_substep_trace_enabled:
+            self._finalize_pending_failure_substep_trace(
+                post_joint_pos=self._asset.data.joint_pos[:, self._joint_ids],
+                post_joint_vel=self._asset.data.joint_vel[:, self._joint_ids],
+            )
         self._apply_call_count += 1
         ee_pos_curr, ee_quat_curr = self._compute_frame_pose()
         joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
         joint_vel = self._asset.data.joint_vel[:, self._joint_ids]
+        previous_joint_pos_target = (
+            self._asset.data.joint_pos_target[:, self._joint_ids].clone()
+            if self._failure_substep_trace_enabled
+            else None
+        )
         soft_limits = self._soft_joint_position_limits
         lower = soft_limits[..., 0]
         upper = soft_limits[..., 1]
@@ -1187,6 +1722,27 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             self._joint_ids,
         )
         self._asset.set_joint_position_target(safe_target, self._joint_ids)
+        if self._failure_substep_trace_enabled:
+            if previous_joint_pos_target is None or pose_error is None:
+                raise ValueError(
+                    "PolaRiS EEF failure substep trace command evidence is absent"
+                )
+            self._stage_failure_substep_trace(
+                joint_pos=joint_pos,
+                joint_vel=joint_vel,
+                previous_joint_pos_target=previous_joint_pos_target,
+                raw_dls_joint_pos_target=raw_joint_pos_target,
+                new_joint_pos_target=safe_target,
+                new_joint_vel_target=self._zero_joint_velocity_target,
+                new_joint_effort_target=self._asset.data.joint_effort_target[
+                    :, self._joint_ids
+                ],
+                current_eef_position=ee_pos_curr,
+                current_eef_quaternion=ee_quat_curr,
+                desired_eef_position=self._ik_controller.ee_pos_des,
+                desired_eef_quaternion=self._ik_controller.ee_quat_des,
+                pose_error=pose_error,
+            )
 
     def safety_report(self) -> dict[str, object]:
         """Return JSON-serializable evidence for the active rollout."""
@@ -1451,5 +2007,8 @@ class RobustDifferentialInverseKinematicsActionCfg(
     DifferentialInverseKinematicsActionCfg
 ):
     """Configuration for the robust differential-IK action term."""
+
+    enable_failure_substep_trace: bool = False
+    """Enable the separate failure-only device trace. Defaults to False."""
 
     class_type = RobustDifferentialInverseKinematicsAction

@@ -46,6 +46,136 @@ class _FakeTensor:
         )
 
 
+def _trace_vector(values):
+    values = list(values)
+    return {
+        "values": values,
+        "finite_mask": [True] * len(values),
+        "finite_count": len(values),
+    }
+
+
+def _failure_trace_fixture():
+    q0 = [0.0] * 7
+    q1 = [0.0625] * 7
+    q2 = [0.125] * 7
+    dq0 = [0.0] * 7
+    dq1 = [0.25] * 7
+    dq2 = [3.0] + [0.0] * 6
+    targets = ([0.0] * 7, [0.0625] * 7, [0.125] * 7)
+    entries = []
+    for apply_index, (q_pre, q_post, dq_pre, dq_post) in enumerate(
+        ((q0, q1, dq0, dq1), (q1, q2, dq1, dq2))
+    ):
+        q_target = targets[apply_index + 1]
+        velocity_target = [0.0] * 7
+        effort_target = [0.0] * 7
+        preclip_effort = []
+        postclip_effort = []
+        for joint_index in range(7):
+            position_error = smoke._float32_subtract(  # noqa: SLF001
+                q_target[joint_index], q_pre[joint_index]
+            )
+            velocity_error = smoke._float32_subtract(  # noqa: SLF001
+                velocity_target[joint_index], dq_pre[joint_index]
+            )
+            position_term = smoke._float32_multiply(  # noqa: SLF001
+                smoke.EXPECTED_JOINT_DRIVE_STIFFNESS[joint_index], position_error
+            )
+            velocity_term = smoke._float32_multiply(  # noqa: SLF001
+                smoke.EXPECTED_JOINT_DRIVE_DAMPING[joint_index], velocity_error
+            )
+            preclip = smoke._float32_add(  # noqa: SLF001
+                smoke._float32_add(position_term, velocity_term),  # noqa: SLF001
+                effort_target[joint_index],
+            )
+            effort_limit = smoke.EXPECTED_EFFORT_LIMITS[joint_index]
+            preclip_effort.append(preclip)
+            postclip_effort.append(min(max(preclip, -effort_limit), effort_limit))
+        vectors = {
+            "joint_pos_rad": q_pre,
+            "joint_vel_rad_s": dq_pre,
+            "post_joint_pos_rad": q_post,
+            "post_joint_vel_rad_s": dq_post,
+            "delta_joint_pos_rad": [
+                smoke._float32_subtract(post, pre)  # noqa: SLF001
+                for pre, post in zip(q_pre, q_post, strict=True)
+            ],
+            "delta_joint_vel_rad_s": [
+                smoke._float32_subtract(post, pre)  # noqa: SLF001
+                for pre, post in zip(dq_pre, dq_post, strict=True)
+            ],
+            "previous_joint_pos_target_rad": targets[apply_index],
+            "raw_dls_joint_pos_target_rad": q_target,
+            "new_joint_pos_target_rad": q_target,
+            "new_joint_vel_target_rad_s": velocity_target,
+            "new_joint_effort_target_nm": effort_target,
+            "current_eef_position_m": [0.4, -0.2, 0.3],
+            "current_eef_quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+            "desired_eef_position_m": [0.41, -0.2, 0.3],
+            "desired_eef_quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+            "pose_error_position_m_axis_angle_rad": [0.01, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "approximate_pd_effort_preclip_nm": preclip_effort,
+            "approximate_pd_effort_postclip_nm": postclip_effort,
+        }
+        entries.append(
+            {
+                "apply_index": apply_index,
+                "policy_step": 0,
+                "physics_substep": apply_index,
+                **{name: _trace_vector(value) for name, value in vectors.items()},
+            }
+        )
+    return {
+        "schema_version": 1,
+        "profile": smoke.FAILURE_SUBSTEP_TRACE_PROFILE,
+        "episode_index": 0,
+        "capacity": smoke.FAILURE_SUBSTEP_TRACE_CAPACITY,
+        "policy_step_capacity": smoke.FAILURE_SUBSTEP_TRACE_CAPACITY
+        // smoke.DECIMATION,
+        "decimation": smoke.DECIMATION,
+        "joint_names": [f"panda_joint{index}" for index in range(1, 8)],
+        "joint_drive_stiffness": list(smoke.EXPECTED_JOINT_DRIVE_STIFFNESS),
+        "joint_drive_damping": list(smoke.EXPECTED_JOINT_DRIVE_DAMPING),
+        "joint_effort_limits": list(smoke.EXPECTED_EFFORT_LIMITS),
+        "effort_semantics": smoke.FAILURE_SUBSTEP_TRACE_EFFORT_SEMANTICS,
+        "phase_contract": copy.deepcopy(smoke.FAILURE_SUBSTEP_TRACE_PHASE_CONTRACT),
+        "completed_entry_count": 2,
+        "total_completed_entry_count": 2,
+        "dropped_prefix_entry_count": 0,
+        "pending_entry_count": 0,
+        "pending_apply_index": None,
+        "entries": entries,
+    }
+
+
+def _failure_trace_safety():
+    return {
+        "counters": {
+            "apply_calls": 3,
+            "invariant_aborts": 1,
+            "current_joint_limit_aborts": 0,
+            "nonfinite_aborts": 0,
+        },
+        "guard_diagnostics": [
+            {
+                "kind": "current_joint_velocity_limit_abort",
+                "episode_index": 0,
+                "policy_step": 0,
+                "physics_substep": 2,
+                "joint_pos_rad": _trace_vector([0.125] * 7),
+                "raw_delta_joint_pos_rad": None,
+                "raw_joint_pos_target_rad": None,
+                "safe_joint_pos_target_rad": None,
+                "pose_error_norm": None,
+                "jacobian_finite": None,
+                "jacobian_max_abs": None,
+                "eef_quaternion_norm": None,
+            }
+        ],
+    }
+
+
 def test_failure_vector_evidence_replaces_nonfinite_values_with_null() -> None:
     evidence = smoke._finite_vector_evidence(  # noqa: SLF001
         _FakeTensor([1.0, float("nan"), float("inf"), -2.0])
@@ -60,7 +190,8 @@ def test_failure_vector_evidence_replaces_nonfinite_values_with_null() -> None:
 
 
 def test_failure_runtime_capture_uses_raw_action_term_report() -> None:
-    expected_report = {"failure_diagnostic": True}
+    expected_report = _failure_trace_safety()
+    expected_trace = _failure_trace_fixture()
 
     class _ArmTerm:
         _joint_ids = list(range(7))
@@ -70,18 +201,28 @@ def test_failure_runtime_capture_uses_raw_action_term_report() -> None:
             assert episode_index == 0
             return expected_report
 
+        def failure_substep_trace(self, episode_index):
+            assert episode_index == 0
+            return expected_trace
+
     class _RobotData:
-        joint_pos = _FakeTensor([0.1] * 7)
+        joint_pos = _FakeTensor([0.125] * 7)
         joint_vel = _FakeTensor([3.0] + [0.0] * 6)
-        joint_pos_target = _FakeTensor([0.2] * 7)
-        computed_torque = _FakeTensor([1.0] * 7)
-        applied_torque = _FakeTensor([2.0] * 7)
+        joint_pos_target = _FakeTensor([0.125] * 7)
+        joint_vel_target = _FakeTensor([0.0] * 7)
+        joint_effort_target = _FakeTensor([0.0] * 7)
+        computed_torque = _FakeTensor(
+            expected_trace["entries"][-1]["approximate_pd_effort_preclip_nm"]["values"]
+        )
+        applied_torque = _FakeTensor(
+            expected_trace["entries"][-1]["approximate_pd_effort_postclip_nm"]["values"]
+        )
         _sim_timestamp = 1.25
 
     class _RootView:
         @staticmethod
         def get_dof_positions():
-            return _FakeTensor([0.1] * 7)
+            return _FakeTensor([0.125] * 7)
 
         @staticmethod
         def get_dof_velocities():
@@ -113,16 +254,226 @@ def test_failure_runtime_capture_uses_raw_action_term_report() -> None:
 
     evidence = smoke._capture_failure_runtime_evidence(  # noqa: SLF001
         environment,
-        policy_step=115,
+        policy_step=0,
     )
 
-    assert evidence["policy_step"] == 115
+    assert evidence["policy_step"] == 0
     assert evidence["arm_joint_vel_rad_s"]["values"] == [3.0] + [0.0] * 6
     assert evidence["physx_arm_joint_vel_rad_s"]["values"] == [3.0] + [0.0] * 6
     assert evidence["cached_minus_physx_arm_joint_vel_rad_s"]["values"] == [0.0] * 7
     assert evidence["articulation_data_sim_timestamp"] == 1.25
-    assert evidence["arm_computed_torque"]["values"] == [1.0] * 7
+    assert (
+        evidence["arm_computed_torque"]
+        == expected_trace["entries"][-1]["approximate_pd_effort_preclip_nm"]
+    )
+    assert evidence["arm_joint_velocity_target_rad_s"]["values"] == [0.0] * 7
+    assert evidence["arm_joint_effort_target_nm"]["values"] == [0.0] * 7
     assert evidence["ik_safety"] is expected_report
+    assert evidence["controller_substep_trace"] is expected_trace
+    assert evidence["controller_substep_trace_error"] is None
+
+
+def test_failure_substep_trace_accepts_causal_finite_ring() -> None:
+    trace = _failure_trace_fixture()
+
+    validated = smoke.validate_failure_substep_trace(
+        trace,
+        safety=_failure_trace_safety(),
+        failure_policy_step=0,
+        current_joint_pos=_trace_vector([0.125] * 7),
+        current_joint_vel=_trace_vector([3.0] + [0.0] * 6),
+        current_joint_pos_target=_trace_vector([0.125] * 7),
+        current_joint_vel_target=_trace_vector([0.0] * 7),
+        current_joint_effort_target=_trace_vector([0.0] * 7),
+        current_approximate_pd_effort_preclip=trace["entries"][-1][
+            "approximate_pd_effort_preclip_nm"
+        ],
+        current_approximate_pd_effort_postclip=trace["entries"][-1][
+            "approximate_pd_effort_postclip_nm"
+        ],
+        physx_joint_pos=_trace_vector([0.125] * 7),
+        physx_joint_vel=_trace_vector([3.0] + [0.0] * 6),
+    )
+
+    assert validated is trace
+    assert b"NaN" not in smoke._strict_json_bytes(trace)  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda trace: trace.__setitem__("extra", True), "schema"),
+        (lambda trace: trace.__setitem__("capacity", 32), "capacity"),
+        (
+            lambda trace: trace.__setitem__("phase_contract", {}),
+            "phase contract",
+        ),
+        (lambda trace: trace["entries"].reverse(), "apply index"),
+        (
+            lambda trace: trace["entries"][0].__setitem__("physics_substep", 7),
+            "physics substep",
+        ),
+        (
+            lambda trace: trace["entries"][0]["joint_pos_rad"]["values"].pop(),
+            "width",
+        ),
+        (
+            lambda trace: trace["entries"][0]["approximate_pd_effort_preclip_nm"][
+                "finite_mask"
+            ].__setitem__(0, False),
+            "finite-mask count",
+        ),
+        (
+            lambda trace: (
+                trace["entries"][0]["approximate_pd_effort_preclip_nm"][
+                    "values"
+                ].__setitem__(0, None),
+                trace["entries"][0]["approximate_pd_effort_preclip_nm"][
+                    "finite_mask"
+                ].__setitem__(0, False),
+                trace["entries"][0]["approximate_pd_effort_preclip_nm"].__setitem__(
+                    "finite_count", 6
+                ),
+            ),
+            "must be fully finite",
+        ),
+        (
+            lambda trace: trace["entries"][0]["delta_joint_pos_rad"][
+                "values"
+            ].__setitem__(0, 0.0),
+            "joint_pos delta",
+        ),
+        (
+            lambda trace: (
+                trace["entries"][0]["delta_joint_pos_rad"]["values"].__setitem__(
+                    0, None
+                ),
+                trace["entries"][0]["delta_joint_pos_rad"]["finite_mask"].__setitem__(
+                    0, False
+                ),
+                trace["entries"][0]["delta_joint_pos_rad"].__setitem__(
+                    "finite_count", 6
+                ),
+            ),
+            "must be fully finite",
+        ),
+        (
+            lambda trace: trace["entries"][1]["previous_joint_pos_target_rad"][
+                "values"
+            ].__setitem__(0, 0.0),
+            "target transition continuity",
+        ),
+        (
+            lambda trace: (
+                trace.__setitem__("pending_entry_count", 1),
+                trace.__setitem__("pending_apply_index", 2),
+            ),
+            "must not have a pending command",
+        ),
+    ],
+)
+def test_failure_substep_trace_rejects_schema_phase_and_causality_mutations(
+    mutation, message
+) -> None:
+    trace = _failure_trace_fixture()
+    mutation(trace)
+
+    with pytest.raises(smoke.BoundaryReplayValidationError, match=message):
+        smoke.validate_failure_substep_trace(
+            trace,
+            safety=_failure_trace_safety(),
+            failure_policy_step=0,
+            current_joint_pos=_trace_vector([0.125] * 7),
+            current_joint_vel=_trace_vector([3.0] + [0.0] * 6),
+            current_joint_pos_target=_trace_vector([0.125] * 7),
+            current_joint_vel_target=_trace_vector([0.0] * 7),
+            current_joint_effort_target=_trace_vector([0.0] * 7),
+            current_approximate_pd_effort_preclip=trace["entries"][-1][
+                "approximate_pd_effort_preclip_nm"
+            ],
+            current_approximate_pd_effort_postclip=trace["entries"][-1][
+                "approximate_pd_effort_postclip_nm"
+            ],
+            physx_joint_pos=_trace_vector([0.125] * 7),
+            physx_joint_vel=_trace_vector([3.0] + [0.0] * 6),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("approximate_pd_effort_preclip_nm", "PD preclip effort"),
+        ("approximate_pd_effort_postclip_nm", "PD postclip effort"),
+    ],
+)
+def test_failure_substep_trace_rejects_arbitrary_effort(field, message) -> None:
+    trace = _failure_trace_fixture()
+    trace["entries"][1][field]["values"][0] += 1.0
+
+    with pytest.raises(smoke.BoundaryReplayValidationError, match=message):
+        smoke.validate_failure_substep_trace(
+            trace,
+            safety=_failure_trace_safety(),
+            failure_policy_step=0,
+            current_joint_pos=_trace_vector([0.125] * 7),
+            current_joint_vel=_trace_vector([3.0] + [0.0] * 6),
+            current_joint_pos_target=_trace_vector([0.125] * 7),
+            current_joint_vel_target=_trace_vector([0.0] * 7),
+            current_joint_effort_target=_trace_vector([0.0] * 7),
+            current_approximate_pd_effort_preclip=trace["entries"][-1][
+                "approximate_pd_effort_preclip_nm"
+            ],
+            current_approximate_pd_effort_postclip=trace["entries"][-1][
+                "approximate_pd_effort_postclip_nm"
+            ],
+            physx_joint_pos=_trace_vector([0.125] * 7),
+            physx_joint_vel=_trace_vector([3.0] + [0.0] * 6),
+        )
+
+
+def test_failure_substep_trace_rejects_guard_and_live_target_mismatch() -> None:
+    trace = _failure_trace_fixture()
+    safety = _failure_trace_safety()
+    safety["guard_diagnostics"].append(copy.deepcopy(safety["guard_diagnostics"][0]))
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="exactly one"):
+        smoke.validate_failure_substep_trace(
+            trace,
+            safety=safety,
+            failure_policy_step=0,
+            current_joint_pos=_trace_vector([0.125] * 7),
+            current_joint_vel=_trace_vector([3.0] + [0.0] * 6),
+            current_joint_pos_target=_trace_vector([0.125] * 7),
+            current_joint_vel_target=_trace_vector([0.0] * 7),
+            current_joint_effort_target=_trace_vector([0.0] * 7),
+            current_approximate_pd_effort_preclip=trace["entries"][-1][
+                "approximate_pd_effort_preclip_nm"
+            ],
+            current_approximate_pd_effort_postclip=trace["entries"][-1][
+                "approximate_pd_effort_postclip_nm"
+            ],
+            physx_joint_pos=_trace_vector([0.125] * 7),
+            physx_joint_vel=_trace_vector([3.0] + [0.0] * 6),
+        )
+
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="position-target"):
+        smoke.validate_failure_substep_trace(
+            trace,
+            safety=_failure_trace_safety(),
+            failure_policy_step=0,
+            current_joint_pos=_trace_vector([0.125] * 7),
+            current_joint_vel=_trace_vector([3.0] + [0.0] * 6),
+            current_joint_pos_target=_trace_vector([0.25] * 7),
+            current_joint_vel_target=_trace_vector([0.0] * 7),
+            current_joint_effort_target=_trace_vector([0.0] * 7),
+            current_approximate_pd_effort_preclip=trace["entries"][-1][
+                "approximate_pd_effort_preclip_nm"
+            ],
+            current_approximate_pd_effort_postclip=trace["entries"][-1][
+                "approximate_pd_effort_postclip_nm"
+            ],
+            physx_joint_pos=_trace_vector([0.125] * 7),
+            physx_joint_vel=_trace_vector([3.0] + [0.0] * 6),
+        )
 
 
 def _diagnostic_vector(values):

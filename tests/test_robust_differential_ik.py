@@ -1,4 +1,5 @@
 import inspect
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ import pytest
 from isaaclab.controllers.differential_ik import DifferentialIKController
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 import polaris.robust_differential_ik as robust_ik
+from scripts import smoke_eef_pose_boundary_replay as boundary_smoke
 from polaris.robust_differential_ik import (
     DifferentialIKNumericalError,
     RobustDifferentialIKController,
@@ -692,6 +694,7 @@ def test_eef_pose_config_installs_robust_action_term():
     scene_cfg = SceneCfg()
 
     assert cfg.arm.class_type is RobustDifferentialInverseKinematicsAction
+    assert cfg.arm.enable_failure_substep_trace is False
     assert cfg.arm.body_name == LAP_EEF_FRAME == "panda_link8"
     frame_cfg = scene_cfg.lap_ee_frame
     target_cfg = frame_cfg.target_frames[0]
@@ -758,3 +761,480 @@ def test_eef_pose_config_rejects_missing_articulation_properties():
             cfg,
             physx_cfg=SimpleNamespace(solver_type=0),
         )
+
+
+def _failure_substep_trace_action(
+    *, episode_index=0, data_overrides=None, readback_overrides=None
+):
+    action = object.__new__(RobustDifferentialInverseKinematicsAction)
+    action._failure_substep_trace_enabled = True
+    action.num_envs = 1
+    action._num_joints = 7
+    action._joint_ids = list(range(7))
+    action._joint_names = [f"panda_joint{index + 1}" for index in range(7)]
+    action.device = "cpu"
+    action._decimation = robust_ik.FAILURE_SUBSTEP_TRACE_DECIMATION
+    action._active_episode_index = episode_index
+    action._apply_call_count = 0
+    data = SimpleNamespace(
+        joint_pos=torch.zeros((1, 7), dtype=torch.float32),
+        joint_stiffness=torch.full((1, 7), 400.0, dtype=torch.float32),
+        joint_damping=torch.full((1, 7), 80.0, dtype=torch.float32),
+        joint_effort_limits=torch.tensor(
+            [PANDA_EEF_JOINT_EFFORT_LIMITS], dtype=torch.float32
+        ),
+        joint_effort_target=torch.zeros((1, 7), dtype=torch.float32),
+        computed_torque=torch.zeros((1, 7), dtype=torch.float32),
+        applied_torque=torch.zeros((1, 7), dtype=torch.float32),
+    )
+    for field, value in (data_overrides or {}).items():
+        setattr(data, field, value)
+    readbacks = {
+        "joint_stiffness": data.joint_stiffness.clone(),
+        "joint_damping": data.joint_damping.clone(),
+        "joint_effort_limits": data.joint_effort_limits.clone(),
+    }
+    readbacks.update(readback_overrides or {})
+    root_physx_view = SimpleNamespace(
+        get_dof_stiffnesses=lambda: readbacks["joint_stiffness"],
+        get_dof_dampings=lambda: readbacks["joint_damping"],
+        get_dof_max_forces=lambda: readbacks["joint_effort_limits"],
+    )
+    action._asset = SimpleNamespace(
+        data=data,
+        device="cpu",
+        root_physx_view=root_physx_view,
+    )
+    action._initialize_failure_substep_trace()
+    action._reset_failure_substep_trace_state()
+    return action
+
+
+def _stage_failure_substep_trace(action, apply_index):
+    offset = float(apply_index * 10)
+    joint_pos = torch.arange(7, dtype=torch.float32).unsqueeze(0) + offset
+    joint_vel = joint_pos + 10.0
+    previous_target = joint_pos + 20.0
+    raw_target = joint_pos + 30.0
+    new_target = joint_pos + 40.0
+    new_velocity_target = torch.zeros_like(joint_pos)
+    current_position = torch.tensor(
+        [[offset + 0.1, offset + 0.2, offset + 0.3]], dtype=torch.float32
+    )
+    current_quaternion = torch.tensor(
+        [[1.0, offset + 0.4, offset + 0.5, offset + 0.6]],
+        dtype=torch.float32,
+    )
+    desired_position = current_position + 1.0
+    desired_quaternion = current_quaternion + 2.0
+    pose_error = torch.arange(6, dtype=torch.float32).unsqueeze(0) + offset
+    action._apply_call_count = apply_index + 1
+    action._stage_failure_substep_trace(
+        joint_pos=joint_pos,
+        joint_vel=joint_vel,
+        previous_joint_pos_target=previous_target,
+        raw_dls_joint_pos_target=raw_target,
+        new_joint_pos_target=new_target,
+        new_joint_vel_target=new_velocity_target,
+        new_joint_effort_target=action._asset.data.joint_effort_target,
+        current_eef_position=current_position,
+        current_eef_quaternion=current_quaternion,
+        desired_eef_position=desired_position,
+        desired_eef_quaternion=desired_quaternion,
+        pose_error=pose_error,
+    )
+    return SimpleNamespace(
+        joint_pos=joint_pos,
+        joint_vel=joint_vel,
+        previous_target=previous_target,
+        raw_target=raw_target,
+        new_target=new_target,
+        new_velocity_target=new_velocity_target,
+        new_effort_target=action._asset.data.joint_effort_target.clone(),
+        current_position=current_position,
+        current_quaternion=current_quaternion,
+        desired_position=desired_position,
+        desired_quaternion=desired_quaternion,
+        pose_error=pose_error,
+    )
+
+
+def _finalize_failure_substep_trace(action, staged, apply_index):
+    del apply_index
+    preclip_effort = (
+        action._asset.data.joint_stiffness * (staged.new_target - staged.joint_pos)
+        + action._asset.data.joint_damping
+        * (staged.new_velocity_target - staged.joint_vel)
+        + staged.new_effort_target
+    )
+    postclip_effort = torch.clamp(
+        preclip_effort,
+        min=-action._asset.data.joint_effort_limits,
+        max=action._asset.data.joint_effort_limits,
+    )
+    action._asset.data.computed_torque = preclip_effort
+    action._asset.data.applied_torque = postclip_effort
+    post_joint_pos = staged.joint_pos + 0.25
+    post_joint_vel = staged.joint_vel - 0.5
+    action._finalize_pending_failure_substep_trace(
+        post_joint_pos=post_joint_pos,
+        post_joint_vel=post_joint_vel,
+    )
+    return SimpleNamespace(
+        post_joint_pos=post_joint_pos,
+        post_joint_vel=post_joint_vel,
+        preclip_effort=preclip_effort,
+        postclip_effort=postclip_effort,
+    )
+
+
+def _trace_values(entry, field):
+    return torch.tensor(entry[field]["values"], dtype=torch.float32).unsqueeze(0)
+
+
+def test_failure_substep_trace_is_disabled_by_default_and_separate_from_safety():
+    action = object.__new__(RobustDifferentialInverseKinematicsAction)
+    action._failure_substep_trace_enabled = False
+    with pytest.raises(ValueError, match="trace is disabled"):
+        action.failure_substep_trace(episode_index=0)
+
+    report_source = inspect.getsource(
+        RobustDifferentialInverseKinematicsAction.safety_report
+    )
+    assert "failure_substep_trace" not in report_source
+    apply_source = inspect.getsource(
+        RobustDifferentialInverseKinematicsAction.apply_actions
+    )
+    assert apply_source.index("self._finalize_pending_failure_substep_trace(") < (
+        apply_source.index("self._apply_call_count += 1")
+    )
+    assert (
+        apply_source.index("self._asset.set_joint_velocity_target(")
+        < (apply_source.index("self._asset.set_joint_position_target("))
+        < apply_source.index("self._stage_failure_substep_trace(")
+    )
+    assert "new_joint_vel_target=self._zero_joint_velocity_target" in apply_source
+    assert "new_joint_effort_target=self._asset.data.joint_effort_target[" in (
+        apply_source
+    )
+    for method in (
+        RobustDifferentialInverseKinematicsAction._stage_failure_substep_trace,
+        RobustDifferentialInverseKinematicsAction._finalize_pending_failure_substep_trace,
+    ):
+        hot_path_source = inspect.getsource(method)
+        assert ".cpu(" not in hot_path_source
+        assert ".tolist(" not in hot_path_source
+        assert ".item(" not in hot_path_source
+
+
+def test_failure_substep_trace_runner_contract_matches_controller():
+    assert (
+        boundary_smoke.FAILURE_SUBSTEP_TRACE_PROFILE
+        == robust_ik.FAILURE_SUBSTEP_TRACE_PROFILE
+    )
+    assert (
+        boundary_smoke.FAILURE_SUBSTEP_TRACE_CAPACITY
+        == robust_ik.FAILURE_SUBSTEP_TRACE_CAPACITY
+    )
+    assert (
+        boundary_smoke.FAILURE_SUBSTEP_TRACE_EFFORT_SEMANTICS
+        == robust_ik.FAILURE_SUBSTEP_TRACE_EFFORT_SEMANTICS
+    )
+    assert (
+        boundary_smoke.FAILURE_SUBSTEP_TRACE_PHASE_CONTRACT
+        == robust_ik.FAILURE_SUBSTEP_TRACE_PHASE_CONTRACT
+    )
+    assert (
+        boundary_smoke.FAILURE_SUBSTEP_TRACE_VECTOR_WIDTHS
+        == robust_ik.FAILURE_SUBSTEP_TRACE_VECTOR_WIDTHS
+    )
+
+
+def test_failure_substep_trace_exports_closed_causal_schema():
+    action = _failure_substep_trace_action(episode_index=3)
+    staged = _stage_failure_substep_trace(action, apply_index=0)
+    finalized = _finalize_failure_substep_trace(action, staged, apply_index=0)
+
+    report = action.failure_substep_trace(episode_index=3)
+
+    assert set(report) == {
+        "schema_version",
+        "profile",
+        "episode_index",
+        "capacity",
+        "policy_step_capacity",
+        "decimation",
+        "joint_names",
+        "joint_drive_stiffness",
+        "joint_drive_damping",
+        "joint_effort_limits",
+        "effort_semantics",
+        "phase_contract",
+        "completed_entry_count",
+        "total_completed_entry_count",
+        "dropped_prefix_entry_count",
+        "pending_entry_count",
+        "pending_apply_index",
+        "entries",
+    }
+    assert report["schema_version"] == 1
+    assert report["profile"] == robust_ik.FAILURE_SUBSTEP_TRACE_PROFILE
+    assert report["capacity"] == 64
+    assert report["policy_step_capacity"] == 8
+    assert report["decimation"] == 8
+    assert report["joint_drive_stiffness"] == [400.0] * 7
+    assert report["joint_drive_damping"] == [80.0] * 7
+    assert report["joint_effort_limits"] == list(PANDA_EEF_JOINT_EFFORT_LIMITS)
+    assert report["phase_contract"] == robust_ik.FAILURE_SUBSTEP_TRACE_PHASE_CONTRACT
+    assert report["phase_contract"]["new_effort_target"] == (
+        "zero_feedforward_live_at_write_data_to_sim_v1"
+    )
+    assert report["effort_semantics"] == (
+        robust_ik.FAILURE_SUBSTEP_TRACE_EFFORT_SEMANTICS
+    )
+    assert report["completed_entry_count"] == 1
+    assert report["total_completed_entry_count"] == 1
+    assert report["dropped_prefix_entry_count"] == 0
+    assert report["pending_entry_count"] == 0
+    assert report["pending_apply_index"] is None
+
+    entry = report["entries"][0]
+    assert set(entry) == {
+        "apply_index",
+        "policy_step",
+        "physics_substep",
+        *robust_ik.FAILURE_SUBSTEP_TRACE_VECTOR_WIDTHS,
+    }
+    assert (entry["apply_index"], entry["policy_step"], entry["physics_substep"]) == (
+        0,
+        0,
+        0,
+    )
+    for field, width in robust_ik.FAILURE_SUBSTEP_TRACE_VECTOR_WIDTHS.items():
+        assert set(entry[field]) == {"values", "finite_mask", "finite_count"}
+        assert len(entry[field]["values"]) == width
+        assert entry[field]["finite_mask"] == [True] * width
+        assert entry[field]["finite_count"] == width
+
+    expected_vectors = {
+        "joint_pos_rad": staged.joint_pos,
+        "joint_vel_rad_s": staged.joint_vel,
+        "post_joint_pos_rad": finalized.post_joint_pos,
+        "post_joint_vel_rad_s": finalized.post_joint_vel,
+        "delta_joint_pos_rad": finalized.post_joint_pos - staged.joint_pos,
+        "delta_joint_vel_rad_s": finalized.post_joint_vel - staged.joint_vel,
+        "previous_joint_pos_target_rad": staged.previous_target,
+        "raw_dls_joint_pos_target_rad": staged.raw_target,
+        "new_joint_pos_target_rad": staged.new_target,
+        "new_joint_vel_target_rad_s": staged.new_velocity_target,
+        "new_joint_effort_target_nm": staged.new_effort_target,
+        "current_eef_position_m": staged.current_position,
+        "current_eef_quaternion_wxyz": staged.current_quaternion,
+        "desired_eef_position_m": staged.desired_position,
+        "desired_eef_quaternion_wxyz": staged.desired_quaternion,
+        "pose_error_position_m_axis_angle_rad": staged.pose_error,
+        "approximate_pd_effort_preclip_nm": finalized.preclip_effort,
+        "approximate_pd_effort_postclip_nm": finalized.postclip_effort,
+    }
+    for field, expected in expected_vectors.items():
+        torch.testing.assert_close(
+            _trace_values(entry, field), expected, rtol=0.0, atol=0.0
+        )
+    json.dumps(report, allow_nan=False)
+
+
+def test_failure_substep_trace_producer_passes_boundary_failure_validator():
+    action = _failure_substep_trace_action(episode_index=0)
+    staged = _stage_failure_substep_trace(action, apply_index=0)
+    finalized = _finalize_failure_substep_trace(action, staged, apply_index=0)
+    action._apply_call_count = 2
+    report = action.failure_substep_trace(episode_index=0)
+
+    joint_pos = boundary_smoke._finite_vector_evidence(  # noqa: SLF001
+        finalized.post_joint_pos
+    )
+    joint_vel = boundary_smoke._finite_vector_evidence(  # noqa: SLF001
+        finalized.post_joint_vel
+    )
+    joint_pos_target = boundary_smoke._finite_vector_evidence(  # noqa: SLF001
+        staged.new_target
+    )
+    joint_vel_target = boundary_smoke._finite_vector_evidence(  # noqa: SLF001
+        staged.new_velocity_target
+    )
+    joint_effort_target = boundary_smoke._finite_vector_evidence(  # noqa: SLF001
+        staged.new_effort_target
+    )
+    guard = {
+        "kind": "current_joint_velocity_limit_abort",
+        "episode_index": 0,
+        "policy_step": 0,
+        "physics_substep": 1,
+        "joint_pos_rad": joint_pos,
+        "raw_delta_joint_pos_rad": None,
+        "raw_joint_pos_target_rad": None,
+        "safe_joint_pos_target_rad": None,
+        "pose_error_norm": None,
+        "jacobian_finite": None,
+        "jacobian_max_abs": None,
+        "eef_quaternion_norm": None,
+    }
+    safety = {
+        "counters": {
+            "apply_calls": 2,
+            "invariant_aborts": 1,
+            "current_joint_limit_aborts": 0,
+            "nonfinite_aborts": 0,
+        },
+        "guard_diagnostics": [guard],
+    }
+
+    assert (
+        boundary_smoke.validate_failure_substep_trace(
+            report,
+            safety=safety,
+            failure_policy_step=0,
+            current_joint_pos=joint_pos,
+            current_joint_vel=joint_vel,
+            current_joint_pos_target=joint_pos_target,
+            current_joint_vel_target=joint_vel_target,
+            current_joint_effort_target=joint_effort_target,
+            current_approximate_pd_effort_preclip=report["entries"][-1][
+                "approximate_pd_effort_preclip_nm"
+            ],
+            current_approximate_pd_effort_postclip=report["entries"][-1][
+                "approximate_pd_effort_postclip_nm"
+            ],
+            physx_joint_pos=joint_pos,
+            physx_joint_vel=joint_vel,
+        )
+        is report
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "expected_value"),
+    [
+        ("joint_stiffness", 400.0),
+        ("joint_damping", 80.0),
+        ("joint_effort_limits", None),
+    ],
+)
+@pytest.mark.parametrize("failure_mode", ["shape", "value"])
+def test_failure_substep_trace_rejects_live_drive_contract_drift(
+    field, expected_value, failure_mode
+):
+    if expected_value is None:
+        value = torch.tensor([PANDA_EEF_JOINT_EFFORT_LIMITS], dtype=torch.float32)
+    else:
+        value = torch.full((1, 7), expected_value, dtype=torch.float32)
+    if failure_mode == "shape":
+        value = value[:, :6]
+        message = "shape/device/dtype drift"
+    else:
+        value[0, 0] += 1.0
+        message = "live drive value drift"
+
+    with pytest.raises(ValueError, match=message):
+        _failure_substep_trace_action(data_overrides={field: value})
+
+
+def test_failure_substep_trace_rejects_nonzero_effort_target_and_export_drift():
+    with pytest.raises(ValueError, match="exactly zero live joint effort target"):
+        _failure_substep_trace_action(
+            data_overrides={
+                "joint_effort_target": torch.ones((1, 7), dtype=torch.float32)
+            }
+        )
+
+    action = _failure_substep_trace_action()
+    action._asset.data.joint_stiffness[0, 0] = 399.0
+    with pytest.raises(ValueError, match="mirror/readback mismatch"):
+        action.failure_substep_trace(episode_index=0)
+
+    effort_action = _failure_substep_trace_action()
+    effort_action._asset.data.joint_effort_target[0, 0] = 1.0
+    with pytest.raises(ValueError, match="exactly zero live joint effort target"):
+        effort_action.failure_substep_trace(episode_index=0)
+
+
+def test_failure_substep_trace_rejects_direct_physx_drive_readback_mismatch():
+    with pytest.raises(ValueError, match="mirror/readback mismatch"):
+        _failure_substep_trace_action(
+            readback_overrides={
+                "joint_damping": torch.full(
+                    (1, 7),
+                    79.0,
+                    dtype=torch.float32,
+                )
+            }
+        )
+
+
+def test_failure_substep_trace_wrap_preserves_chronology_and_pending_capacity():
+    action = _failure_substep_trace_action()
+    for apply_index in range(72):
+        staged = _stage_failure_substep_trace(action, apply_index)
+        _finalize_failure_substep_trace(action, staged, apply_index)
+
+    report = action.failure_substep_trace(episode_index=0)
+    assert report["completed_entry_count"] == 64
+    assert report["total_completed_entry_count"] == 72
+    assert report["dropped_prefix_entry_count"] == 8
+    assert [entry["apply_index"] for entry in report["entries"]] == list(range(8, 72))
+    assert (
+        report["entries"][0]["policy_step"],
+        report["entries"][0]["physics_substep"],
+    ) == (
+        1,
+        0,
+    )
+    assert (
+        report["entries"][-1]["policy_step"],
+        report["entries"][-1]["physics_substep"],
+    ) == (
+        8,
+        7,
+    )
+
+    _stage_failure_substep_trace(action, apply_index=72)
+    pending_report = action.failure_substep_trace(episode_index=0)
+    assert pending_report["completed_entry_count"] == 63
+    assert pending_report["total_completed_entry_count"] == 72
+    assert pending_report["dropped_prefix_entry_count"] == 9
+    assert pending_report["pending_entry_count"] == 1
+    assert pending_report["pending_apply_index"] == 72
+    assert [entry["apply_index"] for entry in pending_report["entries"]] == list(
+        range(9, 72)
+    )
+
+
+def test_failure_substep_trace_masks_nonfinite_effort_and_resets_lifecycle():
+    action = _failure_substep_trace_action(episode_index=4)
+    staged = _stage_failure_substep_trace(action, apply_index=0)
+    action._asset.data.computed_torque = torch.tensor(
+        [[float("nan"), float("inf"), -float("inf"), 1.0, 2.0, 3.0, 4.0]],
+        dtype=torch.float32,
+    )
+    action._asset.data.applied_torque = torch.zeros((1, 7), dtype=torch.float32)
+    action._finalize_pending_failure_substep_trace(
+        post_joint_pos=staged.joint_pos,
+        post_joint_vel=staged.joint_vel,
+    )
+
+    report = action.failure_substep_trace(episode_index=4)
+    effort = report["entries"][0]["approximate_pd_effort_preclip_nm"]
+    assert effort["values"][:3] == [None, None, None]
+    assert effort["finite_mask"] == [False, False, False, True, True, True, True]
+    assert effort["finite_count"] == 4
+    json.dumps(report, allow_nan=False)
+
+    action._reset_failure_substep_trace_state()
+    action._apply_call_count = 0
+    reset_report = action.failure_substep_trace(episode_index=4)
+    assert reset_report["completed_entry_count"] == 0
+    assert reset_report["pending_entry_count"] == 0
+    assert reset_report["pending_apply_index"] is None
+    assert reset_report["entries"] == []
+    with pytest.raises(ValueError, match="episode lifecycle mismatch"):
+        action.failure_substep_trace(episode_index=5)

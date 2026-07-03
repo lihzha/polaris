@@ -105,6 +105,8 @@ SOFT_LIMIT_DIGEST = "fbf7535901c042fea5d901812ecd02c5fd81ade06c23c1499c32d66a859
 EXPECTED_MAX_DELTA_RAD = [0.018125001341104507] * 4 + [0.02174999937415123] * 3
 EXPECTED_VELOCITY_LIMITS_RAD_S = [2.174999952316284] * 4 + [2.609999895095825] * 3
 EXPECTED_EFFORT_LIMITS = [87.0] * 4 + [12.0] * 3
+EXPECTED_JOINT_DRIVE_STIFFNESS = [400.0] * 7
+EXPECTED_JOINT_DRIVE_DAMPING = [80.0] * 7
 EXPECTED_OUTER_LIMITS_RAD = [
     [-2.8973000049591064, 2.8973000049591064],
     [-1.7627999782562256, 1.7627999782562256],
@@ -230,6 +232,77 @@ DIAGNOSTIC_FIELDS = {
     "jacobian_finite",
     "jacobian_max_abs",
     "eef_quaternion_norm",
+}
+
+FAILURE_SUBSTEP_TRACE_PROFILE = "eef_applied_substep_ring_last64_v1"
+FAILURE_SUBSTEP_TRACE_CAPACITY = 64
+FAILURE_SUBSTEP_TRACE_EFFORT_SEMANTICS = (
+    "isaaclab_implicit_actuator_approximate_pd_preclip_and_effortlimit_clipped_v1"
+)
+FAILURE_SUBSTEP_TRACE_PHASE_CONTRACT = {
+    "joint_state": "apply_actions_entry_cached_after_previous_scene_update_v1",
+    "post_joint_state": (
+        "next_apply_actions_entry_cached_after_command_physics_and_scene_update_v1"
+    ),
+    "joint_state_delta": "post_joint_state_minus_pre_joint_state_v1",
+    "current_eef_pose": "apply_actions_entry_before_pose_error_and_dls_v1",
+    "desired_eef_pose": "controller_command_live_at_apply_actions_entry_v1",
+    "pose_error": "position_and_axis_angle_after_pose_error_before_dls_v1",
+    "previous_target": "apply_actions_entry_before_current_target_setters_v1",
+    "raw_dls_target": "after_dls_before_safety_bounding_v1",
+    "new_target": "after_safety_bounding_and_both_target_setters_returned_v1",
+    "new_velocity_target": "zero_target_after_velocity_setter_returned_v1",
+    "new_effort_target": "zero_feedforward_live_at_write_data_to_sim_v1",
+    "effort": (
+        "isaaclab_write_data_to_sim_for_new_target_before_physics_"
+        "observed_at_next_apply_actions_entry_v1"
+    ),
+}
+FAILURE_SUBSTEP_TRACE_VECTOR_WIDTHS = {
+    "joint_pos_rad": 7,
+    "joint_vel_rad_s": 7,
+    "post_joint_pos_rad": 7,
+    "post_joint_vel_rad_s": 7,
+    "delta_joint_pos_rad": 7,
+    "delta_joint_vel_rad_s": 7,
+    "previous_joint_pos_target_rad": 7,
+    "raw_dls_joint_pos_target_rad": 7,
+    "new_joint_pos_target_rad": 7,
+    "new_joint_vel_target_rad_s": 7,
+    "new_joint_effort_target_nm": 7,
+    "current_eef_position_m": 3,
+    "current_eef_quaternion_wxyz": 4,
+    "desired_eef_position_m": 3,
+    "desired_eef_quaternion_wxyz": 4,
+    "pose_error_position_m_axis_angle_rad": 6,
+    "approximate_pd_effort_preclip_nm": 7,
+    "approximate_pd_effort_postclip_nm": 7,
+}
+FAILURE_SUBSTEP_TRACE_FIELDS = {
+    "schema_version",
+    "profile",
+    "episode_index",
+    "capacity",
+    "policy_step_capacity",
+    "decimation",
+    "joint_names",
+    "joint_drive_stiffness",
+    "joint_drive_damping",
+    "joint_effort_limits",
+    "effort_semantics",
+    "phase_contract",
+    "completed_entry_count",
+    "total_completed_entry_count",
+    "dropped_prefix_entry_count",
+    "pending_entry_count",
+    "pending_apply_index",
+    "entries",
+}
+FAILURE_SUBSTEP_TRACE_ENTRY_FIELDS = {
+    "apply_index",
+    "policy_step",
+    "physics_substep",
+    *FAILURE_SUBSTEP_TRACE_VECTOR_WIDTHS,
 }
 
 FIXTURE_FIELDS = {
@@ -1328,6 +1401,457 @@ def _finite_vector_evidence(values: Any) -> dict[str, Any]:
     }
 
 
+def _validate_failure_trace_vector(
+    value: Any,
+    *,
+    field: str,
+    width: int,
+) -> dict[str, Any]:
+    """Validate one finite-or-null vector from the failure-only trace."""
+
+    _require(isinstance(value, dict), f"{field} must be an object")
+    _require(
+        set(value) == {"values", "finite_mask", "finite_count"},
+        f"{field} schema",
+    )
+    values = value["values"]
+    finite_mask = value["finite_mask"]
+    finite_count = value["finite_count"]
+    _require(isinstance(values, list) and len(values) == width, f"{field} width")
+    _require(
+        isinstance(finite_mask, list) and len(finite_mask) == width,
+        f"{field} finite-mask width",
+    )
+    _require(
+        type(finite_count) is int and 0 <= finite_count <= width,
+        f"{field} finite count",
+    )
+    _require(
+        all(type(item) is bool for item in finite_mask),
+        f"{field} finite-mask type",
+    )
+    _require(sum(finite_mask) == finite_count, f"{field} finite-mask count")
+    for index, (item, finite) in enumerate(zip(values, finite_mask, strict=True)):
+        if finite:
+            _finite_number(item, f"{field}.values[{index}]")
+        else:
+            _require(item is None, f"{field}.values[{index}] must be null")
+    return value
+
+
+def _float32_subtract(left: float, right: float) -> float:
+    left_f32 = struct.unpack("<f", struct.pack("<f", left))[0]
+    right_f32 = struct.unpack("<f", struct.pack("<f", right))[0]
+    return struct.unpack("<f", struct.pack("<f", left_f32 - right_f32))[0]
+
+
+def _float32_add(left: float, right: float) -> float:
+    left_f32 = struct.unpack("<f", struct.pack("<f", left))[0]
+    right_f32 = struct.unpack("<f", struct.pack("<f", right))[0]
+    return struct.unpack("<f", struct.pack("<f", left_f32 + right_f32))[0]
+
+
+def _float32_multiply(left: float, right: float) -> float:
+    left_f32 = struct.unpack("<f", struct.pack("<f", left))[0]
+    right_f32 = struct.unpack("<f", struct.pack("<f", right))[0]
+    return struct.unpack("<f", struct.pack("<f", left_f32 * right_f32))[0]
+
+
+def validate_failure_substep_trace(
+    trace: Any,
+    *,
+    safety: Any,
+    failure_policy_step: Any,
+    current_joint_pos: dict[str, Any],
+    current_joint_vel: dict[str, Any],
+    current_joint_pos_target: dict[str, Any],
+    current_joint_vel_target: dict[str, Any],
+    current_joint_effort_target: dict[str, Any],
+    current_approximate_pd_effort_preclip: dict[str, Any],
+    current_approximate_pd_effort_postclip: dict[str, Any],
+    physx_joint_pos: dict[str, Any],
+    physx_joint_vel: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate the closed, causal command-to-post-state failure trace."""
+
+    _require(isinstance(trace, dict), "failure substep trace must be an object")
+    _require(set(trace) == FAILURE_SUBSTEP_TRACE_FIELDS, "failure trace schema")
+    _require(
+        type(trace.get("schema_version")) is int and trace["schema_version"] == 1,
+        "failure trace schema version",
+    )
+    _require(
+        trace.get("profile") == FAILURE_SUBSTEP_TRACE_PROFILE, "failure trace profile"
+    )
+    _require(
+        type(trace.get("episode_index")) is int and trace["episode_index"] == 0,
+        "failure trace episode",
+    )
+    _require(
+        type(trace.get("capacity")) is int
+        and trace["capacity"] == FAILURE_SUBSTEP_TRACE_CAPACITY,
+        "failure trace capacity",
+    )
+    _require(
+        type(trace.get("policy_step_capacity")) is int
+        and trace["policy_step_capacity"]
+        == FAILURE_SUBSTEP_TRACE_CAPACITY // DECIMATION,
+        "failure trace policy-step capacity",
+    )
+    _require(
+        type(trace.get("decimation")) is int and trace["decimation"] == DECIMATION,
+        "failure trace decimation",
+    )
+    _require(
+        trace.get("joint_names") == [f"panda_joint{index}" for index in range(1, 8)],
+        "failure trace joint ordering",
+    )
+    for field, expected in (
+        ("joint_drive_stiffness", EXPECTED_JOINT_DRIVE_STIFFNESS),
+        ("joint_drive_damping", EXPECTED_JOINT_DRIVE_DAMPING),
+        ("joint_effort_limits", EXPECTED_EFFORT_LIMITS),
+    ):
+        values = _finite_vector(trace.get(field), f"failure trace {field}", length=7)
+        _require(
+            all(
+                _same_float32(actual, wanted)
+                for actual, wanted in zip(values, expected, strict=True)
+            ),
+            f"failure trace {field} drift",
+        )
+    _require(
+        trace.get("effort_semantics") == FAILURE_SUBSTEP_TRACE_EFFORT_SEMANTICS,
+        "failure trace effort semantics",
+    )
+    _require(
+        trace.get("phase_contract") == FAILURE_SUBSTEP_TRACE_PHASE_CONTRACT,
+        "failure trace phase contract",
+    )
+    for field, value in (
+        ("current joint position", current_joint_pos),
+        ("current joint velocity", current_joint_vel),
+        ("current joint position target", current_joint_pos_target),
+        ("current joint velocity target", current_joint_vel_target),
+        ("current joint effort target", current_joint_effort_target),
+        (
+            "current approximate PD preclip effort",
+            current_approximate_pd_effort_preclip,
+        ),
+        (
+            "current approximate PD postclip effort",
+            current_approximate_pd_effort_postclip,
+        ),
+        ("PhysX joint position", physx_joint_pos),
+        ("PhysX joint velocity", physx_joint_vel),
+    ):
+        validated = _validate_failure_trace_vector(value, field=field, width=7)
+        _require(validated["finite_count"] == 7, f"{field} must be fully finite")
+    _require(
+        current_joint_pos == physx_joint_pos, "failure trace cached/PhysX position"
+    )
+    _require(
+        current_joint_vel == physx_joint_vel, "failure trace cached/PhysX velocity"
+    )
+
+    completed = trace.get("completed_entry_count")
+    total = trace.get("total_completed_entry_count")
+    dropped = trace.get("dropped_prefix_entry_count")
+    pending = trace.get("pending_apply_index")
+    pending_count = trace.get("pending_entry_count")
+    _require(
+        type(completed) is int and 0 <= completed <= FAILURE_SUBSTEP_TRACE_CAPACITY,
+        "failure trace completed count",
+    )
+    _require(type(total) is int and total >= completed, "failure trace total count")
+    _require(
+        type(dropped) is int and dropped == total - completed,
+        "failure trace dropped-prefix count",
+    )
+    _require(
+        type(pending_count) is int and pending_count in (0, 1),
+        "failure trace pending count",
+    )
+    _require(
+        completed == min(total, FAILURE_SUBSTEP_TRACE_CAPACITY - pending_count),
+        "failure trace retained count",
+    )
+    entries = trace.get("entries")
+    _require(
+        isinstance(entries, list) and len(entries) == completed,
+        "failure trace entry count",
+    )
+
+    _require(isinstance(safety, dict), "failure trace safety report")
+    counters = safety.get("counters")
+    _require(isinstance(counters, dict), "failure trace safety counters")
+    apply_calls = counters.get("apply_calls")
+    _require(
+        type(apply_calls) is int and apply_calls >= max(total, 2),
+        "failure trace apply calls",
+    )
+    _require(
+        (pending_count == 0 and pending is None)
+        or (
+            pending_count == 1
+            and type(pending) is int
+            and total <= pending < apply_calls
+        ),
+        "failure trace pending apply index",
+    )
+
+    expected_apply_indices = list(range(total - completed, total))
+    validated_entries: list[dict[str, Any]] = []
+    for offset, (entry, expected_apply_index) in enumerate(
+        zip(entries, expected_apply_indices, strict=True)
+    ):
+        field = f"failure trace entry {offset}"
+        _require(isinstance(entry, dict), f"{field} must be an object")
+        _require(set(entry) == FAILURE_SUBSTEP_TRACE_ENTRY_FIELDS, f"{field} schema")
+        _require(
+            type(entry.get("apply_index")) is int
+            and entry["apply_index"] == expected_apply_index,
+            f"{field} apply index",
+        )
+        _require(
+            type(entry.get("policy_step")) is int
+            and entry["policy_step"] == expected_apply_index // DECIMATION,
+            f"{field} policy step",
+        )
+        _require(
+            type(entry.get("physics_substep")) is int
+            and entry["physics_substep"] == expected_apply_index % DECIMATION,
+            f"{field} physics substep",
+        )
+        for vector_name, width in FAILURE_SUBSTEP_TRACE_VECTOR_WIDTHS.items():
+            vector = _validate_failure_trace_vector(
+                entry.get(vector_name),
+                field=f"{field}.{vector_name}",
+                width=width,
+            )
+            _require(
+                vector["finite_count"] == width,
+                f"{field}.{vector_name} must be fully finite",
+            )
+        _require(
+            entry["new_joint_vel_target_rad_s"]["values"] == [0.0] * 7
+            and entry["new_joint_vel_target_rad_s"]["finite_mask"] == [True] * 7,
+            f"{field} velocity target",
+        )
+        _require(
+            entry["new_joint_effort_target_nm"]["values"] == [0.0] * 7
+            and entry["new_joint_effort_target_nm"]["finite_mask"] == [True] * 7,
+            f"{field} effort target",
+        )
+
+        for prefix in ("joint_pos", "joint_vel"):
+            pre = entry[f"{prefix}_rad" if prefix == "joint_pos" else f"{prefix}_rad_s"]
+            post = entry[
+                f"post_{prefix}_rad"
+                if prefix == "joint_pos"
+                else f"post_{prefix}_rad_s"
+            ]
+            delta = entry[
+                f"delta_{prefix}_rad"
+                if prefix == "joint_pos"
+                else f"delta_{prefix}_rad_s"
+            ]
+            for joint_index, (
+                pre_value,
+                post_value,
+                delta_value,
+                pre_finite,
+                post_finite,
+                delta_finite,
+            ) in enumerate(
+                zip(
+                    pre["values"],
+                    post["values"],
+                    delta["values"],
+                    pre["finite_mask"],
+                    post["finite_mask"],
+                    delta["finite_mask"],
+                    strict=True,
+                )
+            ):
+                expected_delta_finite = pre_finite and post_finite
+                _require(
+                    delta_finite is expected_delta_finite,
+                    f"{field} {prefix} delta mask at joint {joint_index}",
+                )
+                if expected_delta_finite:
+                    expected_delta = _float32_subtract(post_value, pre_value)
+                    _require(
+                        _same_float32(delta_value, expected_delta),
+                        f"{field} {prefix} delta at joint {joint_index}",
+                    )
+
+        q_values = entry["joint_pos_rad"]["values"]
+        dq_values = entry["joint_vel_rad_s"]["values"]
+        q_target_values = entry["new_joint_pos_target_rad"]["values"]
+        dq_target_values = entry["new_joint_vel_target_rad_s"]["values"]
+        effort_target_values = entry["new_joint_effort_target_nm"]["values"]
+        preclip_values = entry["approximate_pd_effort_preclip_nm"]["values"]
+        postclip_values = entry["approximate_pd_effort_postclip_nm"]["values"]
+        for joint_index in range(7):
+            position_error = _float32_subtract(
+                q_target_values[joint_index], q_values[joint_index]
+            )
+            velocity_error = _float32_subtract(
+                dq_target_values[joint_index], dq_values[joint_index]
+            )
+            position_term = _float32_multiply(
+                EXPECTED_JOINT_DRIVE_STIFFNESS[joint_index], position_error
+            )
+            velocity_term = _float32_multiply(
+                EXPECTED_JOINT_DRIVE_DAMPING[joint_index], velocity_error
+            )
+            expected_preclip = _float32_add(
+                _float32_add(position_term, velocity_term),
+                effort_target_values[joint_index],
+            )
+            _require(
+                _same_float32(preclip_values[joint_index], expected_preclip),
+                f"{field} approximate PD preclip effort at joint {joint_index}",
+            )
+            effort_limit = EXPECTED_EFFORT_LIMITS[joint_index]
+            expected_postclip = min(
+                max(expected_preclip, -effort_limit),
+                effort_limit,
+            )
+            _require(
+                _same_float32(postclip_values[joint_index], expected_postclip),
+                f"{field} approximate PD postclip effort at joint {joint_index}",
+            )
+        validated_entries.append(entry)
+
+    for previous, current in zip(
+        validated_entries,
+        validated_entries[1:],
+        strict=False,
+    ):
+        _require(
+            previous["post_joint_pos_rad"] == current["joint_pos_rad"],
+            "failure trace position transition continuity",
+        )
+        _require(
+            previous["post_joint_vel_rad_s"] == current["joint_vel_rad_s"],
+            "failure trace velocity transition continuity",
+        )
+        _require(
+            previous["new_joint_pos_target_rad"]
+            == current["previous_joint_pos_target_rad"],
+            "failure trace target transition continuity",
+        )
+
+    guards = safety.get("guard_diagnostics")
+    _require(
+        isinstance(guards, list) and len(guards) == 1 and isinstance(guards[0], dict),
+        "failure trace requires exactly one velocity-abort guard",
+    )
+    guard = guards[0]
+    _require(set(guard) == DIAGNOSTIC_FIELDS, "failure trace guard schema")
+    _require(
+        guard.get("kind") == "current_joint_velocity_limit_abort",
+        "failure trace guard kind",
+    )
+    _require(
+        type(guard.get("episode_index")) is int and guard["episode_index"] == 0,
+        "failure trace guard episode",
+    )
+    failing_apply_index = apply_calls - 1
+    _require(
+        type(failure_policy_step) is int
+        and failure_policy_step == failing_apply_index // DECIMATION
+        and type(guard.get("policy_step")) is int
+        and guard["policy_step"] == failure_policy_step,
+        "failure trace guard policy step",
+    )
+    _require(
+        type(guard.get("physics_substep")) is int
+        and guard["physics_substep"] == failing_apply_index % DECIMATION,
+        "failure trace guard physics substep",
+    )
+    _require(
+        guard.get("joint_pos_rad") == current_joint_pos,
+        "failure trace guard current position identity",
+    )
+    for field in (
+        "raw_delta_joint_pos_rad",
+        "raw_joint_pos_target_rad",
+        "safe_joint_pos_target_rad",
+        "pose_error_norm",
+        "jacobian_finite",
+        "jacobian_max_abs",
+        "eef_quaternion_norm",
+    ):
+        _require(guard.get(field) is None, f"failure trace guard {field}")
+    _require(
+        type(counters.get("invariant_aborts")) is int
+        and counters["invariant_aborts"] == 1,
+        "failure trace abort count",
+    )
+    _require(
+        type(counters.get("current_joint_limit_aborts")) is int
+        and counters["current_joint_limit_aborts"] == 0
+        and type(counters.get("nonfinite_aborts")) is int
+        and counters["nonfinite_aborts"] == 0,
+        "failure trace unexpected abort counters",
+    )
+    _require(
+        any(
+            abs(value) > limit + 1e-5
+            for value, limit in zip(
+                current_joint_vel["values"],
+                EXPECTED_VELOCITY_LIMITS_RAD_S,
+                strict=True,
+            )
+        ),
+        "failure trace current velocity is not over limit",
+    )
+    _require(
+        pending_count == 0 and pending is None,
+        "velocity-abort trace must not have a pending command",
+    )
+    _require(total == apply_calls - 1, "velocity-abort trace command count")
+    _require(bool(validated_entries), "velocity-abort trace must retain entries")
+    final_entry = validated_entries[-1]
+    _require(
+        final_entry["apply_index"] == apply_calls - 2,
+        "velocity-abort trace causal final apply index",
+    )
+    _require(
+        final_entry["post_joint_pos_rad"] == current_joint_pos,
+        "velocity-abort trace final position identity",
+    )
+    _require(
+        final_entry["post_joint_vel_rad_s"] == current_joint_vel,
+        "velocity-abort trace final velocity identity",
+    )
+    _require(
+        final_entry["new_joint_pos_target_rad"] == current_joint_pos_target,
+        "velocity-abort trace final position-target identity",
+    )
+    _require(
+        final_entry["new_joint_vel_target_rad_s"] == current_joint_vel_target,
+        "velocity-abort trace final velocity-target identity",
+    )
+    _require(
+        final_entry["new_joint_effort_target_nm"] == current_joint_effort_target,
+        "velocity-abort trace final effort-target identity",
+    )
+    _require(
+        final_entry["approximate_pd_effort_preclip_nm"]
+        == current_approximate_pd_effort_preclip,
+        "velocity-abort trace final preclip-effort identity",
+    )
+    _require(
+        final_entry["approximate_pd_effort_postclip_nm"]
+        == current_approximate_pd_effort_postclip,
+        "velocity-abort trace final postclip-effort identity",
+    )
+    return trace
+
+
 def _capture_failure_runtime_evidence(env: Any, *, policy_step: Any) -> dict[str, Any]:
     """Capture the live arm state and controller report before failure teardown."""
 
@@ -1337,6 +1861,7 @@ def _capture_failure_runtime_evidence(env: Any, *, policy_step: Any) -> dict[str
     reporter = getattr(arm_term, "episode_safety_report", None)
     if not callable(reporter):
         raise ValueError("Live EEF action has no failure-safe episode reporter")
+    trace_reporter = getattr(arm_term, "failure_substep_trace", None)
     cached_joint_pos = robot.data.joint_pos[:, joint_ids][0]
     cached_joint_vel = robot.data.joint_vel[:, joint_ids][0]
     physx_joint_pos = robot.root_physx_view.get_dof_positions().to(robot.device)[
@@ -1360,17 +1885,67 @@ def _capture_failure_runtime_evidence(env: Any, *, policy_step: Any) -> dict[str
         sim_timestamp = None
     else:
         sim_timestamp = float(sim_timestamp)
+    ik_safety = reporter(0)
+    arm_joint_pos = _finite_vector_evidence(cached_joint_pos)
+    arm_joint_vel = _finite_vector_evidence(cached_joint_vel)
+    arm_joint_pos_target = _finite_vector_evidence(
+        robot.data.joint_pos_target[:, joint_ids][0]
+    )
+    arm_joint_vel_target = _finite_vector_evidence(
+        robot.data.joint_vel_target[:, joint_ids][0]
+    )
+    arm_joint_effort_target = _finite_vector_evidence(
+        robot.data.joint_effort_target[:, joint_ids][0]
+    )
+    arm_computed_effort = (
+        None
+        if computed_torque is None
+        else _finite_vector_evidence(computed_torque[:, joint_ids][0])
+    )
+    arm_applied_effort = (
+        None
+        if applied_torque is None
+        else _finite_vector_evidence(applied_torque[:, joint_ids][0])
+    )
+    physx_arm_joint_pos = _finite_vector_evidence(physx_joint_pos)
+    physx_arm_joint_vel = _finite_vector_evidence(physx_joint_vel)
+    controller_substep_trace = None
+    controller_substep_trace_error = None
+    try:
+        if not callable(trace_reporter):
+            raise ValueError("Live EEF action has no failure substep trace reporter")
+        candidate_trace = trace_reporter(0)
+        controller_substep_trace = validate_failure_substep_trace(
+            candidate_trace,
+            safety=ik_safety,
+            failure_policy_step=policy_step,
+            current_joint_pos=arm_joint_pos,
+            current_joint_vel=arm_joint_vel,
+            current_joint_pos_target=arm_joint_pos_target,
+            current_joint_vel_target=arm_joint_vel_target,
+            current_joint_effort_target=arm_joint_effort_target,
+            current_approximate_pd_effort_preclip=arm_computed_effort,
+            current_approximate_pd_effort_postclip=arm_applied_effort,
+            physx_joint_pos=physx_arm_joint_pos,
+            physx_joint_vel=physx_arm_joint_vel,
+        )
+    except BaseException as error:
+        controller_substep_trace_error = _exception_evidence(error)
+    _require(
+        (controller_substep_trace is None) != (controller_substep_trace_error is None),
+        "failure substep trace/error exclusivity",
+    )
     return {
         "policy_step": policy_step,
         "arm_joint_names": list(arm_term._joint_names),
         "articulation_data_sim_timestamp": sim_timestamp,
-        "arm_joint_pos_rad": _finite_vector_evidence(cached_joint_pos),
-        "arm_joint_vel_rad_s": _finite_vector_evidence(cached_joint_vel),
-        "arm_joint_target_rad": _finite_vector_evidence(
-            robot.data.joint_pos_target[:, joint_ids][0]
-        ),
-        "physx_arm_joint_pos_rad": _finite_vector_evidence(physx_joint_pos),
-        "physx_arm_joint_vel_rad_s": _finite_vector_evidence(physx_joint_vel),
+        "arm_joint_pos_rad": arm_joint_pos,
+        "arm_joint_vel_rad_s": arm_joint_vel,
+        "arm_joint_target_rad": arm_joint_pos_target,
+        "arm_joint_velocity_target_rad_s": arm_joint_vel_target,
+        "arm_joint_effort_target_nm": arm_joint_effort_target,
+        "physx_arm_joint_pos_rad": physx_arm_joint_pos,
+        "physx_arm_joint_vel_rad_s": physx_arm_joint_vel,
         "cached_minus_physx_arm_joint_pos_rad": _finite_vector_evidence(
             cached_joint_pos - physx_joint_pos
         ),
@@ -1381,20 +1956,14 @@ def _capture_failure_runtime_evidence(env: Any, *, policy_step: Any) -> dict[str
             physx_velocity_limits
         ),
         "physx_arm_effort_limits": _finite_vector_evidence(physx_effort_limits),
-        "arm_computed_torque": (
-            None
-            if computed_torque is None
-            else _finite_vector_evidence(computed_torque[:, joint_ids][0])
-        ),
-        "arm_applied_torque": (
-            None
-            if applied_torque is None
-            else _finite_vector_evidence(applied_torque[:, joint_ids][0])
-        ),
+        "arm_computed_torque": arm_computed_effort,
+        "arm_applied_torque": arm_applied_effort,
         # Deliberately bypass the success-path runtime validator here. A
         # violated invariant is why this failure-only capture runs; the raw
         # action-term report must remain available for diagnosis.
-        "ik_safety": reporter(0),
+        "ik_safety": ik_safety,
+        "controller_substep_trace": controller_substep_trace,
+        "controller_substep_trace_error": controller_substep_trace_error,
     }
 
 
@@ -1429,6 +1998,7 @@ def _run_boundary_replay(
         use_fabric=True,
     )
     env_cfg.actions = EefPoseActionCfg()
+    env_cfg.actions.arm.enable_failure_substep_trace = True
     configure_eef_pose_joint_safety(
         env_cfg.scene.robot,
         physx_cfg=env_cfg.sim.physx,
@@ -1461,6 +2031,10 @@ def _run_boundary_replay(
     begin_eef_safety_episode(env, 0)
 
     arm_term = env.unwrapped.action_manager._terms["arm"]
+    _require(
+        getattr(arm_term, "_failure_substep_trace_enabled", False) is True,
+        "failure-only substep trace is not enabled",
+    )
     _require(
         list(arm_term._joint_names)[TARGET_JOINT_INDEX] == TARGET_JOINT_NAME,
         "live arm joint ordering drift",
