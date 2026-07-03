@@ -207,6 +207,22 @@ SAFETY_FIELDS = {
     "maxima",
     "guard_diagnostics",
     "max_raw_delta_diagnostic",
+    "current_joint_velocity_abort",
+}
+CURRENT_JOINT_VELOCITY_ABORT_PROFILE = (
+    "current_joint_velocity_limit_abort_signed_dq_limit_excess_v1"
+)
+CURRENT_JOINT_VELOCITY_ABORT_FIELDS = {
+    "profile",
+    "episode_index",
+    "policy_step",
+    "physics_substep",
+    "joint_names",
+    "joint_velocity_rad_s",
+    "joint_velocity_limit_rad_s",
+    "joint_velocity_limit_tolerance_rad_s",
+    "joint_velocity_limit_excess_rad_s",
+    "exceeded_joint_mask",
 }
 CANDIDATE_SAFETY_FIELDS = SAFETY_FIELDS | {
     "wrist_energy_brake_profile",
@@ -938,7 +954,10 @@ def _validate_wrist_energy_brake_diagnostics(
 
 
 def validate_safety_static(
-    report: dict[str, Any], *, episode_index: int | None
+    report: dict[str, Any],
+    *,
+    episode_index: int | None,
+    allow_current_joint_velocity_abort: bool = False,
 ) -> None:
     """Validate the closed solver-iteration safety schema and static fields."""
 
@@ -951,6 +970,16 @@ def validate_safety_static(
     )
     expected_fields = CANDIDATE_SAFETY_FIELDS if candidate_enabled else SAFETY_FIELDS
     _require(set(report) == expected_fields, "safety schema")
+    if allow_current_joint_velocity_abort:
+        _require(
+            isinstance(report.get("current_joint_velocity_abort"), dict),
+            "failure safety current-velocity abort evidence must be an object",
+        )
+    else:
+        _require(
+            report.get("current_joint_velocity_abort") is None,
+            "successful safety current-velocity abort evidence must be null",
+        )
     _require(report.get("episode_index") == episode_index, "safety episode index")
     exact = {
         "profile": profile,
@@ -1892,6 +1921,98 @@ def _float32_multiply(left: float, right: float) -> float:
     return struct.unpack("<f", struct.pack("<f", left_f32 * right_f32))[0]
 
 
+def _validate_current_joint_velocity_abort(
+    evidence: Any,
+    *,
+    apply_calls: int,
+    current_joint_velocity: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind the closed abort object to the independently captured live dq."""
+
+    _require(isinstance(evidence, dict), "velocity-abort evidence object")
+    _require(
+        set(evidence) == CURRENT_JOINT_VELOCITY_ABORT_FIELDS,
+        "velocity-abort evidence schema",
+    )
+    _require(
+        evidence.get("profile") == CURRENT_JOINT_VELOCITY_ABORT_PROFILE,
+        "velocity-abort evidence profile",
+    )
+    _require(evidence.get("episode_index") == 0, "velocity-abort evidence episode")
+    failing_apply_index = apply_calls - 1
+    _require(
+        evidence.get("policy_step") == failing_apply_index // DECIMATION
+        and evidence.get("physics_substep") == failing_apply_index % DECIMATION,
+        "velocity-abort evidence cadence",
+    )
+    _require(
+        evidence.get("joint_names") == [f"panda_joint{index}" for index in range(1, 8)],
+        "velocity-abort evidence joint ordering",
+    )
+    measured = _finite_vector(
+        evidence.get("joint_velocity_rad_s"),
+        "velocity-abort measured velocity",
+        length=7,
+    )
+    live = _finite_vector(
+        current_joint_velocity.get("values"),
+        "velocity-abort live velocity",
+        length=7,
+    )
+    limits = _finite_vector(
+        evidence.get("joint_velocity_limit_rad_s"),
+        "velocity-abort limits",
+        length=7,
+    )
+    excess = _finite_vector(
+        evidence.get("joint_velocity_limit_excess_rad_s"),
+        "velocity-abort excess",
+        length=7,
+    )
+    _require(
+        all(
+            _same_float32(actual, captured)
+            for actual, captured in zip(measured, live, strict=True)
+        ),
+        "velocity-abort measured/live identity",
+    )
+    _require(
+        all(
+            _same_float32(actual, expected)
+            for actual, expected in zip(
+                limits, EXPECTED_VELOCITY_LIMITS_RAD_S, strict=True
+            )
+        ),
+        "velocity-abort limit identity",
+    )
+    _require(
+        evidence.get("joint_velocity_limit_tolerance_rad_s") == 1e-5,
+        "velocity-abort tolerance",
+    )
+    mask = evidence.get("exceeded_joint_mask")
+    _require(
+        isinstance(mask, list)
+        and len(mask) == 7
+        and all(type(value) is bool for value in mask),
+        "velocity-abort mask",
+    )
+    expected_mask = []
+    for index, (velocity, limit, recorded_excess) in enumerate(
+        zip(measured, limits, excess, strict=True)
+    ):
+        expected_excess = max(_float32_subtract(abs(velocity), limit), 0.0)
+        _require(
+            _same_float32(recorded_excess, expected_excess),
+            f"velocity-abort excess joint {index}",
+        )
+        threshold = _float32_add(limit, 1e-5)
+        expected_mask.append(abs(velocity) > threshold)
+    _require(
+        mask == expected_mask and any(mask), "velocity-abort direct threshold mask"
+    )
+    return dict(evidence)
+
+
 def validate_failure_substep_trace(
     trace: Any,
     *,
@@ -2231,6 +2352,16 @@ def validate_failure_substep_trace(
         and type(counters.get("nonfinite_aborts")) is int
         and counters["nonfinite_aborts"] == 0,
         "failure trace unexpected abort counters",
+    )
+    velocity_abort = _validate_current_joint_velocity_abort(
+        safety.get("current_joint_velocity_abort"),
+        apply_calls=apply_calls,
+        current_joint_velocity=current_joint_vel,
+    )
+    _require(
+        velocity_abort["policy_step"] == guard["policy_step"]
+        and velocity_abort["physics_substep"] == guard["physics_substep"],
+        "velocity-abort evidence/guard cadence",
     )
     _require(
         any(

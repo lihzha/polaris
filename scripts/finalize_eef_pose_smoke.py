@@ -175,6 +175,7 @@ SAFETY_FIELDS = {
     "maxima",
     "guard_diagnostics",
     "max_raw_delta_diagnostic",
+    "current_joint_velocity_abort",
 }
 COUNTER_FIELDS = {
     "apply_calls",
@@ -437,6 +438,10 @@ def _validate_safety_report(
 ) -> tuple[dict[str, int], dict[str, list[float]]]:
     report = _object(value, field)
     _require(set(report) == SAFETY_FIELDS, f"{field} schema drift")
+    _require(
+        report.get("current_joint_velocity_abort") is None,
+        f"{field}.current_joint_velocity_abort must be null",
+    )
     if episode_index is None:
         _require(report.get("episode_index") is None, f"{field}.episode_index")
     else:

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+import hashlib
+import json
 import math
 from typing import Any
 
@@ -26,6 +29,9 @@ PANDA_EEF_PHYSX_SOLVER_TYPE = 1
 JOINT_SLEW_FLOAT32_TOLERANCE_RAD = 1e-6
 JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S = 1e-5
 EEF_QUATERNION_UNIT_NORM_TOLERANCE = 1e-3
+CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE = (
+    "current_joint_velocity_limit_abort_signed_dq_limit_excess_v1"
+)
 
 # Opt-in diagnostic candidate for the deterministic coupled wrist transient.
 # This is deliberately not part of EEF_IK_SAFETY_PROFILE until the target-
@@ -109,6 +115,66 @@ PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_RAD = (
 PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256 = (
     "dd7865f59efb23e96d7d4cbb5e129906b04a42b5e5c0941459bfc8866dd7ecd0"
 )
+
+
+def current_joint_velocity_abort_evidence_sha256(
+    evidence: Mapping[str, object],
+) -> str:
+    """Hash the closed abort object with one reproducible JSON encoding."""
+
+    try:
+        encoded = json.dumps(
+            dict(evidence),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "Current-joint-velocity abort evidence is not canonical JSON"
+        ) from error
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def format_current_joint_velocity_abort_message(
+    evidence: Mapping[str, object],
+) -> str:
+    """Format the controller exception bound to every signed evidence field."""
+
+    mask = evidence.get("exceeded_joint_mask")
+    names = evidence.get("joint_names")
+    velocities = evidence.get("joint_velocity_rad_s")
+    limits = evidence.get("joint_velocity_limit_rad_s")
+    excess = evidence.get("joint_velocity_limit_excess_rad_s")
+    if not all(
+        isinstance(value, list) for value in (mask, names, velocities, limits, excess)
+    ):
+        raise ValueError("Current-joint-velocity abort vector type drift")
+    if not (
+        len(mask) == len(names) == len(velocities) == len(limits) == len(excess) == 7
+    ):
+        raise ValueError("Current-joint-velocity abort vector width drift")
+    try:
+        first_exceeded = next(
+            index for index, value in enumerate(mask) if value is True
+        )
+    except StopIteration as error:
+        raise ValueError(
+            "Current-joint-velocity abort has no exceeded joint"
+        ) from error
+    digest = current_joint_velocity_abort_evidence_sha256(evidence)
+    return (
+        "PolaRiS EEF IK current joint velocity exceeds the live simulation "
+        "limit; aborting before DLS and PhysX "
+        f"(joint={names[first_exceeded]!r}, "
+        f"velocity_rad_s={velocities[first_exceeded]!r}, "
+        f"limit_rad_s={limits[first_exceeded]!r}, "
+        f"excess_rad_s={excess[first_exceeded]!r}, "
+        f"policy_step={evidence.get('policy_step')!r}, "
+        f"physics_substep={evidence.get('physics_substep')!r}, "
+        f"evidence_sha256={digest})"
+    )
 
 
 def validate_one_step_adversarial_report(report: dict[str, Any]) -> dict[str, Any]:

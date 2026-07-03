@@ -19,10 +19,12 @@ from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
+from polaris.eef_ik_safety import format_current_joint_velocity_abort_message
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
@@ -64,6 +66,8 @@ CANONICAL_IK_METHOD = "dls"
 CANONICAL_DLS_DAMPING = 0.01
 CANONICAL_ARM_SCALE = 1.0
 CANONICAL_ARM_JOINTS = tuple(f"panda_joint{index}" for index in range(1, 8))
+EEF_SAFETY_SIDECAR_SCHEMA_VERSION = 4
+EEF_RUNTIME_CONTRACT_SCHEMA_VERSION = 4
 EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE = "ego_lap_eef_outer450_internal451_no_autoreset_v1"
 EGO_LAP_ENVIRONMENT_STATE_PROFILE = (
     "isaaclab_single_env_episode_sim_common_camera_counters_v1"
@@ -146,6 +150,18 @@ GRIPPER_RUNTIME_EPISODE_FIELDS = {
 GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS = {
     "max_abs_joint_velocity_rad_s",
     "max_abs_joint_acceleration_rad_s2",
+}
+CURRENT_JOINT_VELOCITY_ABORT_FIELDS = {
+    "profile",
+    "episode_index",
+    "policy_step",
+    "physics_substep",
+    "joint_names",
+    "joint_velocity_rad_s",
+    "joint_velocity_limit_rad_s",
+    "joint_velocity_limit_tolerance_rad_s",
+    "joint_velocity_limit_excess_rad_s",
+    "exceeded_joint_mask",
 }
 WRIST_ENERGY_BRAKE_DIAGNOSTIC_FIELDS = {
     "episode_index",
@@ -246,6 +262,7 @@ EPISODE_SAFETY_FIELDS = {
     "maxima",
     "guard_diagnostics",
     "max_raw_delta_diagnostic",
+    "current_joint_velocity_abort",
 }
 WRIST_ENERGY_BRAKE_EPISODE_SAFETY_FIELDS = {
     *EPISODE_SAFETY_FIELDS,
@@ -290,6 +307,7 @@ RUNTIME_EPISODE_FIELDS = {
     "maxima",
     "guard_diagnostics",
     "max_raw_delta_diagnostic",
+    "current_joint_velocity_abort",
     "sidecar_path",
     "sidecar_sha256",
 }
@@ -1291,18 +1309,175 @@ def _validate_guard_diagnostic(
         raise ValueError("EEF IK diagnostic jacobian_finite must be bool or null")
 
 
-def validate_eef_runtime_safety(
-    env: Any, *, require_gripper_runtime: bool = False
+def _validate_current_joint_velocity_abort_binding(
+    *,
+    evidence: Any,
+    episode_index: int | None,
+    apply_calls: int,
+    joint_names: Any,
+    velocity_limits: Any,
+    velocity_tolerance: Any,
+    max_abs_velocity: Any,
+    guard_diagnostics: Any,
+    counters: Mapping[str, Any],
+    field: str,
+) -> dict[str, Any] | None:
+    """Bind one measured-velocity abort to its limit, maxima, and guard."""
+
+    names = list(joint_names) if isinstance(joint_names, (list, tuple)) else None
+    if names != list(CANONICAL_ARM_JOINTS):
+        raise ValueError(f"{field} current-velocity joint-name drift")
+    limits = _finite_numeric_vector(
+        velocity_limits,
+        size=7,
+        field=f"{field} current-velocity limits",
+    ).astype(np.float32)
+    maxima = _finite_numeric_vector(
+        max_abs_velocity,
+        size=7,
+        field=f"{field} current-velocity maxima",
+    ).astype(np.float32)
+    if (
+        isinstance(velocity_tolerance, bool)
+        or not isinstance(velocity_tolerance, (int, float))
+        or not math.isfinite(float(velocity_tolerance))
+        or not math.isclose(
+            float(velocity_tolerance),
+            JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S,
+            rel_tol=0.0,
+            abs_tol=0.0,
+        )
+    ):
+        raise ValueError(f"{field} current-velocity tolerance drift")
+    threshold = limits + np.float32(JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S)
+    maxima_exceeded_mask = maxima > threshold
+    if not isinstance(guard_diagnostics, list):
+        raise ValueError(f"{field} current-velocity guard list drift")
+    velocity_guards = [
+        diagnostic
+        for diagnostic in guard_diagnostics
+        if isinstance(diagnostic, Mapping)
+        and diagnostic.get("kind") == "current_joint_velocity_limit_abort"
+    ]
+
+    if evidence is None:
+        if velocity_guards or np.any(maxima_exceeded_mask):
+            raise ValueError(f"{field} current-velocity abort evidence is missing")
+        return None
+    if not isinstance(evidence, Mapping) or set(evidence) != (
+        CURRENT_JOINT_VELOCITY_ABORT_FIELDS
+    ):
+        raise ValueError(f"{field} current-velocity abort schema drift")
+    exact = {
+        "profile": CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE,
+        "episode_index": episode_index,
+        "joint_names": names,
+    }
+    if any(evidence.get(name) != expected for name, expected in exact.items()):
+        raise ValueError(f"{field} current-velocity abort identity drift")
+    policy_step = evidence.get("policy_step")
+    physics_substep = evidence.get("physics_substep")
+    if (
+        type(policy_step) is not int
+        or policy_step < 0
+        or type(physics_substep) is not int
+        or not 0 <= physics_substep < CANONICAL_DECIMATION
+        or type(apply_calls) is not int
+        or apply_calls < 1
+        or policy_step * CANONICAL_DECIMATION + physics_substep != apply_calls - 1
+    ):
+        raise ValueError(f"{field} current-velocity abort cadence drift")
+    recorded_tolerance = evidence.get("joint_velocity_limit_tolerance_rad_s")
+    if type(recorded_tolerance) is not float or not math.isclose(
+        recorded_tolerance,
+        JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S,
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
+        raise ValueError(f"{field} current-velocity abort tolerance drift")
+    measured = _finite_numeric_vector(
+        evidence.get("joint_velocity_rad_s"),
+        size=7,
+        field=f"{field} current-velocity measured state",
+    ).astype(np.float32)
+    recorded_limits = _finite_numeric_vector(
+        evidence.get("joint_velocity_limit_rad_s"),
+        size=7,
+        field=f"{field} current-velocity recorded limits",
+    ).astype(np.float32)
+    recorded_excess = _finite_numeric_vector(
+        evidence.get("joint_velocity_limit_excess_rad_s"),
+        size=7,
+        field=f"{field} current-velocity excess",
+    ).astype(np.float32)
+    mask = evidence.get("exceeded_joint_mask")
+    if (
+        not isinstance(mask, list)
+        or len(mask) != 7
+        or any(type(value) is not bool for value in mask)
+    ):
+        raise ValueError(f"{field} current-velocity abort mask drift")
+    mask_array = np.asarray(mask, dtype=np.bool_)
+    expected_excess = np.maximum(np.abs(measured) - limits, np.float32(0.0))
+    expected_mask = np.abs(measured) > threshold
+    if (
+        not np.array_equal(recorded_limits, limits)
+        or not np.array_equal(recorded_excess, expected_excess)
+        or not np.array_equal(mask_array, expected_mask)
+        or not np.any(mask_array)
+        or not np.array_equal(maxima_exceeded_mask, mask_array)
+        or np.any(maxima < np.abs(measured))
+        or not np.array_equal(maxima[mask_array], np.abs(measured)[mask_array])
+    ):
+        raise ValueError(f"{field} current-velocity abort numeric binding drift")
+    if len(velocity_guards) != 1:
+        raise ValueError(f"{field} current-velocity guard binding drift")
+    guard = velocity_guards[0]
+    if (
+        guard.get("episode_index") != episode_index
+        or guard.get("policy_step") != policy_step
+        or guard.get("physics_substep") != physics_substep
+        or counters.get("invariant_aborts") != 1
+    ):
+        raise ValueError(f"{field} current-velocity guard/counter binding drift")
+    return dict(evidence)
+
+
+def _validate_current_joint_velocity_abort_result_binding(
+    *,
+    evidence: Mapping[str, Any] | None,
+    episode_result: Mapping[str, Any],
+    field: str,
+) -> None:
+    """Bind every signed evidence field to the independently caught exception."""
+
+    if evidence is None:
+        return
+    result = canonical_episode_result(episode_result)
+    expected_reason = (
+        "DifferentialIKInvariantError: "
+        f"{format_current_joint_velocity_abort_message(evidence)}"
+    )
+    if (
+        not result["numerical_failure"]
+        or result["numerical_failure_reason"] != expected_reason
+    ):
+        raise ValueError(
+            f"{field} current-velocity abort result/reason digest binding drift"
+        )
+
+
+def _validate_eef_runtime_safety_report(
+    env: Any,
+    *,
+    report: Mapping[str, Any],
+    require_gripper_runtime: bool = False,
 ) -> dict[str, Any]:
-    """Validate and return cumulative live EEF IK safety evidence."""
+    """Validate one exact report already obtained from the live action term."""
 
     runtime = _unwrapped(env)
     arm_term = _arm_action_term(runtime)
     candidate_enabled = _wrist_energy_brake_enabled(arm_term)
-    reporter = getattr(arm_term, "safety_report", None)
-    if not callable(reporter):
-        raise ValueError("Live Ego-LAP EEF action has no IK safety reporter")
-    report = reporter()
     if not isinstance(report, dict):
         raise ValueError("Live Ego-LAP EEF IK safety reporter returned no object")
     gripper_runtime_enabled = _gripper_runtime_enabled_from_safety(report)
@@ -1673,10 +1848,6 @@ def validate_eef_runtime_safety(
     velocity_limits = np.asarray(
         report["joint_velocity_limits_rad_s"], dtype=np.float64
     )
-    if np.any(
-        max_abs_velocity > velocity_limits + JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
-    ):
-        raise ValueError("Live EEF IK joint velocity exceeds its configured bound")
     hard_violation = np.asarray(
         maxima["current_physx_hard_limit_violation_rad"], dtype=np.float64
     )
@@ -1728,6 +1899,18 @@ def validate_eef_runtime_safety(
                 f"{counter}: counter={counters[counter]}, "
                 f"diagnostics={diagnostic_count}"
             )
+    _validate_current_joint_velocity_abort_binding(
+        evidence=report.get("current_joint_velocity_abort"),
+        episode_index=episode_index,
+        apply_calls=counters["apply_calls"],
+        joint_names=report["joint_names"],
+        velocity_limits=velocity_limits.tolist(),
+        velocity_tolerance=report["joint_velocity_limit_tolerance_rad_s"],
+        max_abs_velocity=max_abs_velocity.tolist(),
+        guard_diagnostics=guard_diagnostics,
+        counters=counters,
+        field="Live EEF IK",
+    )
     max_raw_diagnostic = report.get("max_raw_delta_diagnostic")
     if max_raw_diagnostic is not None and not isinstance(max_raw_diagnostic, dict):
         raise ValueError("Live EEF IK safety max-raw-delta diagnostic is invalid")
@@ -1746,6 +1929,22 @@ def validate_eef_runtime_safety(
         if dynamic["apply_entry_samples"] != counters["apply_calls"]:
             raise ValueError("All-six gripper/apply sample counts disagree")
     return report
+
+
+def validate_eef_runtime_safety(
+    env: Any, *, require_gripper_runtime: bool = False
+) -> dict[str, Any]:
+    """Fetch, validate, and return cumulative live EEF IK safety evidence."""
+
+    arm_term = _arm_action_term(_unwrapped(env))
+    reporter = getattr(arm_term, "safety_report", None)
+    if not callable(reporter):
+        raise ValueError("Live Ego-LAP EEF action has no IK safety reporter")
+    return _validate_eef_runtime_safety_report(
+        env,
+        report=reporter(),
+        require_gripper_runtime=require_gripper_runtime,
+    )
 
 
 def validate_eef_runtime_frame(
@@ -1917,8 +2116,11 @@ def eef_episode_safety_report(env: Any, episode_index: int) -> dict[str, Any]:
     if not callable(reporter):
         raise ValueError("Live Ego-LAP EEF action has no episode safety reporter")
     report = reporter(episode_index)
-    validate_eef_runtime_safety(env, require_gripper_runtime=True)
-    return report
+    return _validate_eef_runtime_safety_report(
+        env,
+        require_gripper_runtime=True,
+        report=report,
+    )
 
 
 def _reject_json_constant(value: str) -> None:
@@ -2073,7 +2275,7 @@ def atomic_write_episode_safety(
     )
     _validate_terminal_apply_binding(terminal, cadence_evidence)
     payload = {
-        "schema_version": 3,
+        "schema_version": EEF_SAFETY_SIDECAR_SCHEMA_VERSION,
         "transaction_state": "prepared",
         "episode_index": episode_index,
         "episode_result": result,
@@ -2095,7 +2297,7 @@ def atomic_write_episode_safety(
 
 def _validate_episode_safety_evidence_shape(
     safety: Mapping[str, Any], *, episode_index: int
-) -> None:
+) -> dict[str, Any] | None:
     """Validate the exact durable per-episode safety schema and counter mapping."""
 
     candidate_enabled = _candidate_enabled_from_safety(safety)
@@ -2260,6 +2462,18 @@ def _validate_episode_safety_evidence_shape(
                 "Episode safety counter/diagnostic mapping drift for "
                 f"{name}: counter={counters[name]}, diagnostics={count}"
             )
+    velocity_abort = _validate_current_joint_velocity_abort_binding(
+        evidence=safety.get("current_joint_velocity_abort"),
+        episode_index=episode_index,
+        apply_calls=apply_calls,
+        joint_names=safety["joint_names"],
+        velocity_limits=safety["joint_velocity_limits_rad_s"],
+        velocity_tolerance=safety["joint_velocity_limit_tolerance_rad_s"],
+        max_abs_velocity=maxima["abs_joint_vel_rad_s"],
+        guard_diagnostics=diagnostics,
+        counters=counters,
+        field="Episode EEF IK",
+    )
     max_raw = safety.get("max_raw_delta_diagnostic")
     if max_raw is not None:
         _validate_guard_diagnostic(
@@ -2268,6 +2482,7 @@ def _validate_episode_safety_evidence_shape(
             field="max-raw-delta",
             allowed_kinds={"max_raw_delta"},
         )
+    return velocity_abort
 
 
 def validate_episode_safety_cadence(
@@ -2283,7 +2498,14 @@ def validate_episode_safety_cadence(
             "Episode safety/result identity mismatch: "
             f"safety={safety.get('episode_index')!r}, result={result['episode']!r}"
         )
-    _validate_episode_safety_evidence_shape(safety, episode_index=result["episode"])
+    velocity_abort = _validate_episode_safety_evidence_shape(
+        safety, episode_index=result["episode"]
+    )
+    _validate_current_joint_velocity_abort_result_binding(
+        evidence=velocity_abort,
+        episode_result=result,
+        field="Episode EEF IK",
+    )
     counters = safety.get("counters")
     if not isinstance(counters, Mapping):
         raise ValueError("Episode safety cadence requires a counters object")
@@ -2508,7 +2730,7 @@ def load_episode_safety_sidecars(
         if set(payload) != SAFETY_SIDECAR_FIELDS:
             raise ValueError(f"Episode safety sidecar schema drift: {path}")
         if (
-            payload.get("schema_version") != 3
+            payload.get("schema_version") != EEF_SAFETY_SIDECAR_SCHEMA_VERSION
             or payload.get("transaction_state") != "prepared"
             or payload.get("episode_index") != episode_index
         ):
@@ -2617,7 +2839,7 @@ def reconcile_episode_safety_transactions(
         if set(payload) != SAFETY_SIDECAR_FIELDS:
             raise ValueError(f"Prepared safety sidecar schema drift: {path}")
         if (
-            payload.get("schema_version") != 3
+            payload.get("schema_version") != EEF_SAFETY_SIDECAR_SCHEMA_VERSION
             or payload.get("transaction_state") != "prepared"
             or payload.get("episode_index") != episode_index
         ):
@@ -2751,6 +2973,7 @@ def aggregate_episode_safety(
             "maxima": safety["maxima"],
             "guard_diagnostics": safety["guard_diagnostics"],
             "max_raw_delta_diagnostic": safety["max_raw_delta_diagnostic"],
+            "current_joint_velocity_abort": safety["current_joint_velocity_abort"],
             "sidecar_path": sidecar["path"],
             "sidecar_sha256": sidecar["sha256"],
         }
@@ -2858,6 +3081,28 @@ def _validate_runtime_aggregate_consistency(
                 )
             ]
 
+        velocity_abort = _validate_current_joint_velocity_abort_binding(
+            evidence=episode.get("current_joint_velocity_abort"),
+            episode_index=episode["episode_index"],
+            apply_calls=counters["apply_calls"],
+            joint_names=ik_safety["joint_names"],
+            velocity_limits=ik_safety["joint_velocity_limits_rad_s"],
+            velocity_tolerance=ik_safety["joint_velocity_limit_tolerance_rad_s"],
+            max_abs_velocity=maxima["abs_joint_vel_rad_s"],
+            guard_diagnostics=episode["guard_diagnostics"],
+            counters=counters,
+            field="Runtime aggregate episode EEF IK",
+        )
+        if velocity_abort is not None and not result["numerical_failure"]:
+            raise ValueError(
+                "Runtime aggregate completed episode has current-velocity abort"
+            )
+        _validate_current_joint_velocity_abort_result_binding(
+            evidence=velocity_abort,
+            episode_result=result,
+            field="Runtime aggregate episode EEF IK",
+        )
+
         if gripper_runtime_enabled:
             dynamic = validate_eef_gripper_dynamic_evidence(
                 episode["gripper_runtime_dynamic"]
@@ -2908,7 +3153,7 @@ def atomic_write_runtime_contract(
     if frame.get("ik_safety_profile") != ik_safety.get("profile"):
         raise ValueError("Runtime frame and aggregate EEF IK safety profiles disagree")
     payload = {
-        "schema_version": 3,
+        "schema_version": EEF_RUNTIME_CONTRACT_SCHEMA_VERSION,
         "protocol": validated_protocol,
         "frame": dict(frame),
         "ik_safety": dict(ik_safety),

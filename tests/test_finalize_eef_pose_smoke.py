@@ -115,6 +115,7 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
         "maxima": maxima,
         "guard_diagnostics": [],
         "max_raw_delta_diagnostic": max_raw,
+        "current_joint_velocity_abort": None,
     }
 
 
@@ -327,6 +328,11 @@ def test_raw_smoke_gate_requires_pending_full_evidence():
     raw = _valid_raw_result()
     raw["raw_ik_safety_capture"]["physx_solver_type"] = 0
     with pytest.raises(finalizer.VerificationError, match="physx_solver_type"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["raw_ik_safety_capture"]["current_joint_velocity_abort"] = {}
+    with pytest.raises(finalizer.VerificationError, match="must be null"):
         finalizer._verify_raw(raw)
 
     raw = _valid_raw_result()

@@ -38,9 +38,9 @@ from typing import Any, Callable, Mapping, Sequence
 BOUNDARY_HELPER_PATH = (
     Path(__file__).resolve().parent / "smoke_eef_pose_boundary_replay.py"
 )
-_BOOTSTRAP_BOUNDARY_SIZE_BYTES = 108504
+_BOOTSTRAP_BOUNDARY_SIZE_BYTES = 112869
 _BOOTSTRAP_BOUNDARY_SHA256 = (
-    "a63f2a8ab9c42ea872da9d6e1913d43e0a89b0382c01d88071af19bdf2731d97"
+    "edc62b33f6e5edb7737e121fb60cf801cb9964cbd62a92ccf26d292cc3937209"
 )
 _boundary_lstat = os.lstat(BOUNDARY_HELPER_PATH)
 if (
@@ -3538,7 +3538,11 @@ def validate_capture_payload(
                 strict=True,
             )
         ]
-        boundary.validate_safety_static(safety_static_probe, episode_index=0)
+        boundary.validate_safety_static(
+            safety_static_probe,
+            episode_index=0,
+            allow_current_joint_velocity_abort=True,
+        )
     else:
         counters = arm_safety.get("counters", {})
         _require(

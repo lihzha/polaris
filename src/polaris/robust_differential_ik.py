@@ -32,6 +32,7 @@ from pxr import PhysxSchema
 from pxr import UsdPhysics
 
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE
 from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
@@ -39,6 +40,7 @@ from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
+from polaris.eef_ik_safety import format_current_joint_velocity_abort_message
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
 from polaris.eef_ik_safety import PHYSX_DERIVED_SOFT_LIMIT_PROFILE
@@ -1109,6 +1111,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             self._max_raw_delta_joint_pos
         )
         self._max_abs_joint_vel = torch.zeros_like(self._max_raw_delta_joint_pos)
+        self._current_joint_velocity_abort: dict[str, object] | None = None
         self._minimum_outer_joint_clearance = torch.full_like(
             self._max_raw_delta_joint_pos,
             float("inf"),
@@ -1735,6 +1738,55 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             self._guard_diagnostics_dropped += 1
         return record
 
+    def _record_current_joint_velocity_abort(
+        self,
+        *,
+        joint_vel: torch.Tensor,
+        exceeded_joint_mask: torch.Tensor,
+    ) -> dict[str, object]:
+        """Capture the exact finite arm velocity state that triggered an abort."""
+
+        if self._current_joint_velocity_abort is not None:
+            raise ValueError("PolaRiS EEF current-velocity abort was recorded twice")
+        if not (
+            torch.isfinite(joint_vel).all()
+            and torch.isfinite(self._joint_velocity_limits).all()
+        ):
+            raise DifferentialIKNumericalError(
+                "PolaRiS EEF current-velocity abort evidence is non-finite"
+            )
+        excess = torch.clamp(
+            joint_vel.abs() - self._joint_velocity_limits,
+            min=0.0,
+        )
+        expected_mask = joint_vel.abs() > (
+            self._joint_velocity_limits + JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
+        )
+        if not torch.equal(exceeded_joint_mask, expected_mask):
+            raise ValueError("PolaRiS EEF current-velocity abort mask drift")
+        apply_index = self._apply_call_count - 1
+        evidence: dict[str, object] = {
+            "profile": CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE,
+            "episode_index": self._active_episode_index,
+            "policy_step": apply_index // self._decimation,
+            "physics_substep": apply_index % self._decimation,
+            "joint_names": list(self._joint_names),
+            "joint_velocity_rad_s": joint_vel[0].detach().cpu().tolist(),
+            "joint_velocity_limit_rad_s": self._joint_velocity_limits[0]
+            .detach()
+            .cpu()
+            .tolist(),
+            "joint_velocity_limit_tolerance_rad_s": (
+                JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
+            ),
+            "joint_velocity_limit_excess_rad_s": excess[0].detach().cpu().tolist(),
+            "exceeded_joint_mask": [
+                bool(value) for value in exceeded_joint_mask[0].detach().cpu().tolist()
+            ],
+        }
+        self._current_joint_velocity_abort = evidence
+        return evidence
+
     def _append_wrist_energy_brake_diagnostics(
         self,
         *,
@@ -1928,10 +1980,11 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             torch.clamp(joint_pos - hard_upper, min=0.0),
         )
         current_outer_clearance = torch.minimum(joint_pos - lower, upper - joint_pos)
-        current_joint_velocity_invalid = (
+        current_joint_velocity_exceeded = (
             joint_vel.abs()
             > self._joint_velocity_limits + JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
-        ).any(dim=-1)
+        )
+        current_joint_velocity_invalid = current_joint_velocity_exceeded.any(dim=-1)
         jacobian = None
         pose_error = None
         raw_joint_pos_target = None
@@ -2017,6 +2070,24 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                     self._minimum_outer_joint_clearance.dtype
                 ),
             )
+            if not current_joint_velocity_valid:
+                self._invariant_abort_count += current_joint_velocity_invalid.sum()
+                velocity_abort = self._record_current_joint_velocity_abort(
+                    joint_vel=joint_vel,
+                    exceeded_joint_mask=current_joint_velocity_exceeded,
+                )
+                self._append_guard_diagnostic(
+                    kind="current_joint_velocity_limit_abort",
+                    joint_pos=joint_pos,
+                    raw_delta=None,
+                    raw_target=None,
+                    safe_target=None,
+                    pose_error=None,
+                    jacobian=None,
+                )
+                raise DifferentialIKInvariantError(
+                    format_current_joint_velocity_abort_message(velocity_abort)
+                )
             if not desired_finite:
                 _require_finite(desired_state, field="desired EEF pose")
             if not current_quaternion_valid:
@@ -2069,21 +2140,6 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 raise DifferentialIKInvariantError(
                     "PolaRiS EEF IK current joint position is outside live soft "
                     "limits; aborting before DLS and PhysX"
-                )
-            if not current_joint_velocity_valid:
-                self._invariant_abort_count += current_joint_velocity_invalid.sum()
-                self._append_guard_diagnostic(
-                    kind="current_joint_velocity_limit_abort",
-                    joint_pos=joint_pos,
-                    raw_delta=None,
-                    raw_target=None,
-                    safe_target=None,
-                    pose_error=None,
-                    jacobian=None,
-                )
-                raise DifferentialIKInvariantError(
-                    "PolaRiS EEF IK current joint velocity exceeds the live "
-                    "simulation limit; aborting before DLS and PhysX"
                 )
             if not wrist_target_state_valid:
                 if wrist_target_state_invalid is None:
@@ -2634,6 +2690,11 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             },
             "guard_diagnostics": list(self._guard_diagnostics),
             "max_raw_delta_diagnostic": max_raw_delta_diagnostic,
+            "current_joint_velocity_abort": (
+                None
+                if self._current_joint_velocity_abort is None
+                else dict(self._current_joint_velocity_abort)
+            ),
         }
         if self._wrist_energy_brake_enabled:
             counters = report["counters"]

@@ -18,6 +18,9 @@ from polaris.eef_runtime_contract import atomic_write_episode_safety
 from polaris.eef_runtime_contract import _validate_wrist_energy_brake_history
 from polaris.eef_runtime_contract import aggregate_episode_safety
 from polaris.eef_runtime_contract import build_terminal_rollout_evidence
+from polaris.eef_runtime_contract import EEF_RUNTIME_CONTRACT_SCHEMA_VERSION
+from polaris.eef_runtime_contract import EEF_SAFETY_SIDECAR_SCHEMA_VERSION
+from polaris.eef_runtime_contract import eef_episode_safety_report
 from polaris.eef_runtime_contract import load_episode_safety_sidecars
 from polaris.eef_runtime_contract import reconcile_episode_safety_transactions
 from polaris.eef_runtime_contract import validate_episode_safety_cadence
@@ -31,6 +34,9 @@ from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE
+from polaris.eef_ik_safety import current_joint_velocity_abort_evidence_sha256
+from polaris.eef_ik_safety import format_current_joint_velocity_abort_message
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
@@ -184,6 +190,7 @@ def _runtime_fixture(*, wrist_energy_brake=False):
         },
         "guard_diagnostics": [],
         "max_raw_delta_diagnostic": None,
+        "current_joint_velocity_abort": None,
     }
     if wrist_energy_brake:
         base_reporter = arm_term.safety_report
@@ -261,12 +268,19 @@ def _episode_result(*, episode=0, length=2, numerical_failure=False):
 
 
 def _episode_safety(
-    *, episode=0, length=2, numerical_failure=False, wrist_energy_brake=False
+    *,
+    episode=0,
+    length=2,
+    numerical_failure=False,
+    wrist_energy_brake=False,
+    failure_substeps=3,
 ):
     env, _ = _runtime_fixture(wrist_energy_brake=wrist_energy_brake)
     report = env.unwrapped.action_manager._terms["arm"].safety_report()
     report["episode_index"] = episode
-    apply_calls = length * 8 if not numerical_failure else (length - 1) * 8 + 3
+    apply_calls = (
+        length * 8 if not numerical_failure else (length - 1) * 8 + failure_substeps
+    )
     report["counters"]["apply_calls"] = apply_calls
     report["counters"]["environment_substeps"] = apply_calls
     zero_vector = {
@@ -303,7 +317,7 @@ def _episode_safety(
                 "kind": "nonfinite_abort",
                 "episode_index": episode,
                 "policy_step": length - 1,
-                "physics_substep": 2,
+                "physics_substep": failure_substeps - 1,
                 "joint_pos_rad": None,
                 "raw_delta_joint_pos_rad": None,
                 "raw_joint_pos_target_rad": None,
@@ -407,12 +421,12 @@ def _environment_state(step: int) -> dict:
     }
 
 
-def _terminal_rollout(result: dict) -> dict:
+def _terminal_rollout(result: dict, *, failure_substeps: int = 3) -> dict:
     completed = result["episode_length"] - int(result["numerical_failure"])
     environment_after = _environment_state(completed)
     if result["numerical_failure"]:
         # The fixture's failed action aborts on its third attempted substep.
-        environment_after["sim_step_counter"] += 3
+        environment_after["sim_step_counter"] += failure_substeps
     return build_terminal_rollout_evidence(
         episode_result=result,
         environment_before=_environment_state(0),
@@ -420,6 +434,71 @@ def _terminal_rollout(result: dict) -> dict:
         terminated_false_count=completed,
         truncated_false_count=completed,
     )
+
+
+def _current_velocity_abort_safety(
+    *, episode: int = 0, length: int = 118
+) -> tuple[dict, dict]:
+    safety = _episode_safety(
+        episode=episode,
+        length=length,
+        numerical_failure=True,
+        failure_substeps=4,
+    )
+    safety["counters"]["nonfinite_aborts"] = 0
+    safety["counters"]["invariant_aborts"] = 1
+    safety["guard_diagnostics"][0]["kind"] = "current_joint_velocity_limit_abort"
+    limits = np.asarray(safety["joint_velocity_limits_rad_s"], dtype=np.float32)
+    velocity = np.asarray([0.1, -0.2, 0.3, -0.4, 2.75, 0.5, -3.0], dtype=np.float32)
+    excess = np.maximum(np.abs(velocity) - limits, np.float32(0.0))
+    mask = np.abs(velocity) > (
+        limits + np.float32(JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S)
+    )
+    safety["maxima"]["abs_joint_vel_rad_s"] = np.abs(velocity).tolist()
+    safety["current_joint_velocity_abort"] = {
+        "profile": CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE,
+        "episode_index": episode,
+        "policy_step": length - 1,
+        "physics_substep": 3,
+        "joint_names": [f"panda_joint{index}" for index in range(1, 8)],
+        "joint_velocity_rad_s": velocity.tolist(),
+        "joint_velocity_limit_rad_s": limits.tolist(),
+        "joint_velocity_limit_tolerance_rad_s": (JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S),
+        "joint_velocity_limit_excess_rad_s": excess.tolist(),
+        "exceeded_joint_mask": mask.tolist(),
+    }
+    result = _episode_result(
+        episode=episode,
+        length=length,
+        numerical_failure=True,
+    )
+    result["numerical_failure_reason"] = (
+        "DifferentialIKInvariantError: "
+        f"{format_current_joint_velocity_abort_message(safety['current_joint_velocity_abort'])}"
+    )
+    return safety, result
+
+
+def _artifact_identity_for_terminal(result: dict, terminal: dict) -> dict:
+    return {
+        "video": {
+            "filename": f"episode_{result['episode']}.mp4",
+            "size_bytes": 1,
+            "sha256": "0" * 64,
+            "frame_count": result["episode_length"],
+            "height": 224,
+            "width": 448,
+        },
+        "terminal_trace": {
+            "filename": f"episode_{result['episode']:06d}.jsonl",
+            "size_bytes": 1,
+            "sha256": "1" * 64,
+            "schema_version": 2,
+            "trace_profile": EGO_LAP_TRACE_PROFILE,
+            "episode_result": result,
+            "terminal_rollout": terminal,
+        },
+    }
 
 
 def _trace_common(event: str, episode: int) -> dict:
@@ -926,7 +1005,7 @@ def test_runtime_contract_is_atomic_and_has_exact_evidence_schema():
         payload = json.loads(path.read_text(encoding="utf-8"))
 
         assert payload == {
-            "schema_version": 3,
+            "schema_version": EEF_RUNTIME_CONTRACT_SCHEMA_VERSION,
             "protocol": {
                 "profile": "ego_lap_eef_outer450_internal451_no_autoreset_v1",
                 "episode_steps": 450,
@@ -1010,6 +1089,26 @@ def test_transaction_recovery_is_idempotent_after_csv_commit(tmp_path: Path):
             safety=drifted_safety,
             artifact_identity=payload["artifact_identity"],
             terminal_rollout=payload["terminal_rollout"],
+        )
+
+
+def test_sidecar_loader_and_reconciler_reject_obsolete_v3_schema(tmp_path: Path):
+    _result, sidecar_path, payload = _prepare_episode_transaction(tmp_path, episode=0)
+    assert payload["schema_version"] == EEF_SAFETY_SIDECAR_SCHEMA_VERSION == 4
+    payload["schema_version"] = 3
+    sidecar_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid episode safety sidecar identity"):
+        load_episode_safety_sidecars(sidecar_path.parent, [0])
+    with pytest.raises(ValueError, match="Invalid prepared episode safety transaction"):
+        reconcile_episode_safety_transactions(
+            empty_eval_results(),
+            directory=sidecar_path.parent,
+            run_folder=tmp_path,
+            trace_dir=tmp_path / "policy_traces",
+            expected_rollouts=50,
+            expected_horizon=450,
+            video_probe_fn=_video_probe,
         )
 
 
@@ -1185,6 +1284,270 @@ def test_prepared_sidecar_recovery_rejects_csv_and_trace_drift(tmp_path: Path):
             expected_horizon=450,
             video_probe_fn=_video_probe,
         )
+
+
+def test_current_velocity_abort_preserves_sidecar_and_runtime_evidence(
+    tmp_path: Path, monkeypatch
+):
+    safety, result = _current_velocity_abort_safety()
+    terminal = _terminal_rollout(result, failure_substeps=4)
+    env, observation = _runtime_fixture()
+    arm_term = env.unwrapped.action_manager._terms["arm"]
+    arm_term.episode_safety_report = lambda episode_index: (
+        safety
+        if episode_index == 0
+        else (_ for _ in ()).throw(AssertionError("unexpected episode index"))
+    )
+    arm_term.safety_report = lambda: safety
+    assert validate_eef_runtime_safety(env) is safety
+    with pytest.raises(TypeError, match="unexpected keyword argument 'report'"):
+        validate_eef_runtime_safety(env, report=safety)
+    arm_term.safety_report = lambda: (_ for _ in ()).throw(
+        AssertionError("provided report must not be fetched again")
+    )
+
+    def validate_exact_returned_report(
+        passed_env, *, require_gripper_runtime=False, report=None
+    ):
+        assert passed_env is env
+        assert require_gripper_runtime is True
+        assert report is safety
+        return report
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            "polaris.eef_runtime_contract._validate_eef_runtime_safety_report",
+            validate_exact_returned_report,
+        )
+        assert eef_episode_safety_report(env, 0) is safety
+    cadence = validate_episode_safety_cadence(safety=safety, episode_result=result)
+    assert cadence == {
+        "apply_calls": 940,
+        "expected_decimation": 8,
+        "failed_policy_step": 117,
+        "failed_physics_substep": 3,
+        "abort_count": 1,
+    }
+    evidence = safety["current_joint_velocity_abort"]
+    assert evidence["exceeded_joint_mask"] == [
+        False,
+        False,
+        False,
+        False,
+        True,
+        False,
+        True,
+    ]
+    digest = current_joint_velocity_abort_evidence_sha256(evidence)
+    assert len(digest) == 64
+    assert result["numerical_failure_reason"].endswith(f"evidence_sha256={digest})")
+
+    sidecar_path = tmp_path / "ik_safety" / "episode_000000.json"
+    payload = atomic_write_episode_safety(
+        sidecar_path,
+        episode_index=0,
+        episode_result=result,
+        safety=safety,
+        artifact_identity=_artifact_identity_for_terminal(result, terminal),
+        terminal_rollout=terminal,
+    )
+    assert payload["schema_version"] == EEF_SAFETY_SIDECAR_SCHEMA_VERSION == 4
+    assert payload["safety"]["current_joint_velocity_abort"] == evidence
+    aggregate = aggregate_episode_safety(
+        safety,
+        [
+            {
+                **payload,
+                "path": str(sidecar_path),
+                "sha256": "2" * 64,
+            }
+        ],
+    )
+    assert aggregate["episodes"][0]["current_joint_velocity_abort"] == evidence
+    runtime_path = tmp_path / "polaris_runtime_contract.json"
+    atomic_write_runtime_contract(
+        runtime_path,
+        protocol=validate_ego_lap_runtime_protocol(env),
+        frame=validate_eef_runtime_frame(env, observation),
+        ik_safety=aggregate,
+    )
+    runtime_payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+    assert runtime_payload["schema_version"] == EEF_RUNTIME_CONTRACT_SCHEMA_VERSION == 4
+
+    runtime_sign_drift = copy.deepcopy(aggregate)
+    runtime_abort = runtime_sign_drift["episodes"][0]["current_joint_velocity_abort"]
+    runtime_abort["joint_velocity_rad_s"][0] *= -1.0
+    with pytest.raises(ValueError, match="result/reason digest binding drift"):
+        atomic_write_runtime_contract(
+            tmp_path / "runtime-sign-drift.json",
+            protocol=validate_ego_lap_runtime_protocol(env),
+            frame=validate_eef_runtime_frame(env, observation),
+            ik_safety=runtime_sign_drift,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda safety: safety["current_joint_velocity_abort"].__setitem__(
+            "unexpected", True
+        ),
+        lambda safety: safety["current_joint_velocity_abort"].__setitem__(
+            "profile", "wrong"
+        ),
+        lambda safety: safety["current_joint_velocity_abort"].__setitem__(
+            "episode_index", 1
+        ),
+        lambda safety: safety["current_joint_velocity_abort"].__setitem__(
+            "policy_step", 116
+        ),
+        lambda safety: safety["current_joint_velocity_abort"].__setitem__(
+            "physics_substep", 2
+        ),
+        lambda safety: safety["current_joint_velocity_abort"].__setitem__(
+            "joint_names", ["wrong"] * 7
+        ),
+        lambda safety: safety["current_joint_velocity_abort"].__setitem__(
+            "joint_velocity_rad_s", [0.0] * 6
+        ),
+        lambda safety: safety["current_joint_velocity_abort"][
+            "joint_velocity_rad_s"
+        ].__setitem__(4, float("nan")),
+        lambda safety: safety["current_joint_velocity_abort"][
+            "joint_velocity_limit_rad_s"
+        ].__setitem__(4, 9.0),
+        lambda safety: safety["current_joint_velocity_abort"].__setitem__(
+            "joint_velocity_limit_tolerance_rad_s", 1e-4
+        ),
+        lambda safety: safety["current_joint_velocity_abort"][
+            "joint_velocity_limit_excess_rad_s"
+        ].__setitem__(4, 0.0),
+        lambda safety: safety["current_joint_velocity_abort"].__setitem__(
+            "exceeded_joint_mask", [False] * 7
+        ),
+        lambda safety: safety["maxima"]["abs_joint_vel_rad_s"].__setitem__(4, 2.7),
+        lambda safety: safety.__setitem__("guard_diagnostics", []),
+        lambda safety: safety["guard_diagnostics"][0].__setitem__("physics_substep", 2),
+        lambda safety: safety["counters"].__setitem__("invariant_aborts", 0),
+    ],
+)
+def test_current_velocity_abort_rejects_every_schema_and_binding_mutation(mutation):
+    safety, result = _current_velocity_abort_safety()
+    mutation(safety)
+    with pytest.raises(ValueError, match="current-velocity|counter/diagnostic"):
+        validate_episode_safety_cadence(safety=safety, episode_result=result)
+
+
+@pytest.mark.parametrize("joint_index", range(7))
+def test_current_velocity_abort_rejects_each_individual_signed_velocity_flip(
+    joint_index,
+):
+    safety, result = _current_velocity_abort_safety()
+    safety["current_joint_velocity_abort"]["joint_velocity_rad_s"][joint_index] *= -1.0
+
+    with pytest.raises(ValueError, match="result/reason digest binding drift"):
+        validate_episode_safety_cadence(safety=safety, episode_result=result)
+
+
+@pytest.mark.parametrize(
+    "reason_mutation",
+    [
+        lambda _reason: "DifferentialIKNumericalError: unrelated failure",
+        lambda reason: f"{reason} drift",
+        lambda reason: reason[:-65] + "0" * 64 + ")",
+    ],
+)
+def test_current_velocity_abort_rejects_unrelated_or_drifted_failure_reason(
+    reason_mutation,
+):
+    safety, result = _current_velocity_abort_safety()
+    result["numerical_failure_reason"] = reason_mutation(
+        result["numerical_failure_reason"]
+    )
+
+    with pytest.raises(ValueError, match="result/reason digest binding drift"):
+        validate_episode_safety_cadence(safety=safety, episode_result=result)
+
+
+def test_current_velocity_abort_digest_has_reproducible_consumer_canonicalization():
+    safety, _result = _current_velocity_abort_safety()
+    evidence = safety["current_joint_velocity_abort"]
+    producer_digest = current_joint_velocity_abort_evidence_sha256(evidence)
+    reordered = dict(reversed(list(evidence.items())))
+    consumer_encoding = json.dumps(
+        reordered,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    consumer_digest = hashlib.sha256(consumer_encoding).hexdigest()
+
+    assert current_joint_velocity_abort_evidence_sha256(reordered) == producer_digest
+    assert consumer_digest == producer_digest
+    assert producer_digest == (
+        "f7c69e1fa8ae3a36cdd17ad511de65ba1795f2ee3391d3ddb181d2369602d86d"
+    )
+    with pytest.raises(ValueError, match="not canonical JSON"):
+        current_joint_velocity_abort_evidence_sha256(
+            {**evidence, "joint_velocity_rad_s": [float("nan")] * 7}
+        )
+
+
+@pytest.mark.parametrize("threshold_joint_index", [0, 4])
+def test_current_velocity_abort_validator_uses_direct_float32_threshold(
+    threshold_joint_index,
+):
+    safety, result = _current_velocity_abort_safety()
+    evidence = safety["current_joint_velocity_abort"]
+    limits = np.asarray(evidence["joint_velocity_limit_rad_s"], dtype=np.float32)
+    threshold = limits + np.float32(JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S)
+    velocity = np.zeros(7, dtype=np.float32)
+    velocity[threshold_joint_index] = threshold[threshold_joint_index]
+    trigger_index = 1 if threshold_joint_index == 0 else 6
+    velocity[trigger_index] = np.nextafter(threshold[trigger_index], np.float32(np.inf))
+    excess = np.maximum(np.abs(velocity) - limits, np.float32(0.0))
+    mask = np.abs(velocity) > threshold
+    evidence["joint_velocity_rad_s"] = velocity.tolist()
+    evidence["joint_velocity_limit_excess_rad_s"] = excess.tolist()
+    evidence["exceeded_joint_mask"] = mask.tolist()
+    safety["maxima"]["abs_joint_vel_rad_s"] = np.abs(velocity).tolist()
+    result["numerical_failure_reason"] = (
+        "DifferentialIKInvariantError: "
+        f"{format_current_joint_velocity_abort_message(evidence)}"
+    )
+
+    cadence = validate_episode_safety_cadence(
+        safety=safety,
+        episode_result=result,
+    )
+
+    assert evidence["exceeded_joint_mask"][threshold_joint_index] is False
+    assert evidence["exceeded_joint_mask"][trigger_index] is True
+    assert (
+        evidence["joint_velocity_limit_excess_rad_s"][threshold_joint_index]
+        > JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
+    )
+    assert cadence["failed_physics_substep"] == 3
+
+
+def test_current_velocity_abort_requires_bidirectional_guard_maxima_and_failure():
+    safety, result = _current_velocity_abort_safety()
+    safety["current_joint_velocity_abort"] = None
+    with pytest.raises(ValueError, match="current-velocity abort evidence is missing"):
+        validate_episode_safety_cadence(safety=safety, episode_result=result)
+
+    safety, result = _current_velocity_abort_safety()
+    completed = {**result, "numerical_failure": False, "numerical_failure_reason": ""}
+    with pytest.raises(ValueError, match="result/reason digest binding drift"):
+        validate_episode_safety_cadence(safety=safety, episode_result=completed)
+
+    safety, result = _current_velocity_abort_safety()
+    safety["guard_diagnostics"][0]["kind"] = "nonfinite_abort"
+    safety["counters"]["invariant_aborts"] = 0
+    safety["counters"]["nonfinite_aborts"] = 1
+    with pytest.raises(ValueError, match="current-velocity guard binding"):
+        validate_episode_safety_cadence(safety=safety, episode_result=result)
 
 
 def test_episode_safety_cadence_binds_success_and_failure_substep():

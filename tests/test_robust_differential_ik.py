@@ -23,7 +23,11 @@ from polaris.robust_differential_ik import (
     _require_finite,
 )
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE
+from polaris.eef_ik_safety import current_joint_velocity_abort_evidence_sha256
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
+from polaris.eef_ik_safety import format_current_joint_velocity_abort_message
+from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_RAD
@@ -1107,6 +1111,145 @@ def test_huge_finite_diagnostic_scalars_remain_strict_json_finite():
     )
 
 
+def _current_joint_velocity_abort_action():
+    action = _bare_robust_action()
+    action._current_joint_velocity_abort = None
+    action._active_episode_index = 0
+    action._decimation = 8
+    action._apply_call_count = 940
+    action._joint_names = [f"panda_joint{index}" for index in range(1, 8)]
+    action._joint_velocity_limits = torch.tensor(
+        [PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S], dtype=torch.float32
+    )
+    return action
+
+
+def test_current_joint_velocity_abort_records_exact_signed_terminal_evidence():
+    action = _current_joint_velocity_abort_action()
+    joint_vel = torch.tensor(
+        [[0.25, -0.5, 1.0, -1.5, -2.75, 0.0, 2.9]], dtype=torch.float32
+    )
+    expected_excess = torch.clamp(
+        joint_vel.abs() - action._joint_velocity_limits, min=0.0
+    )
+    exceeded = joint_vel.abs() > (
+        action._joint_velocity_limits + JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
+    )
+
+    evidence = action._record_current_joint_velocity_abort(
+        joint_vel=joint_vel,
+        exceeded_joint_mask=exceeded,
+    )
+
+    assert set(evidence) == {
+        "profile",
+        "episode_index",
+        "policy_step",
+        "physics_substep",
+        "joint_names",
+        "joint_velocity_rad_s",
+        "joint_velocity_limit_rad_s",
+        "joint_velocity_limit_tolerance_rad_s",
+        "joint_velocity_limit_excess_rad_s",
+        "exceeded_joint_mask",
+    }
+    assert evidence["profile"] == CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE
+    assert evidence["episode_index"] == 0
+    assert evidence["policy_step"] == 117
+    assert evidence["physics_substep"] == 3
+    assert evidence["joint_names"] == action._joint_names
+    torch.testing.assert_close(
+        torch.tensor(evidence["joint_velocity_rad_s"]),
+        joint_vel[0],
+        rtol=0.0,
+        atol=0.0,
+    )
+    torch.testing.assert_close(
+        torch.tensor(evidence["joint_velocity_limit_rad_s"]),
+        action._joint_velocity_limits[0],
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert evidence["joint_velocity_limit_tolerance_rad_s"] == (
+        JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
+    )
+    torch.testing.assert_close(
+        torch.tensor(evidence["joint_velocity_limit_excess_rad_s"]),
+        expected_excess[0],
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert evidence["exceeded_joint_mask"] == exceeded[0].tolist()
+    assert evidence["joint_velocity_rad_s"][4] < 0.0
+    assert evidence["exceeded_joint_mask"] == [
+        False,
+        False,
+        False,
+        False,
+        True,
+        False,
+        True,
+    ]
+    digest = current_joint_velocity_abort_evidence_sha256(evidence)
+    message = format_current_joint_velocity_abort_message(evidence)
+    assert len(digest) == 64
+    assert message.endswith(f"evidence_sha256={digest})")
+    json.dumps(evidence, allow_nan=False)
+
+    with pytest.raises(ValueError, match="recorded twice"):
+        action._record_current_joint_velocity_abort(
+            joint_vel=joint_vel,
+            exceeded_joint_mask=exceeded,
+        )
+
+
+def test_current_joint_velocity_abort_rejects_mask_drift_and_nonfinite_state():
+    action = _current_joint_velocity_abort_action()
+    joint_vel = action._joint_velocity_limits.clone()
+    joint_vel[0, 0] += 0.1
+    exceeded = torch.zeros_like(joint_vel, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match="mask drift"):
+        action._record_current_joint_velocity_abort(
+            joint_vel=joint_vel,
+            exceeded_joint_mask=exceeded,
+        )
+    assert action._current_joint_velocity_abort is None
+
+    joint_vel[0, 0] = torch.nan
+    with pytest.raises(DifferentialIKNumericalError, match="evidence is non-finite"):
+        action._record_current_joint_velocity_abort(
+            joint_vel=joint_vel,
+            exceeded_joint_mask=exceeded,
+        )
+    assert action._current_joint_velocity_abort is None
+
+
+@pytest.mark.parametrize("joint_index", [0, 4])
+def test_current_joint_velocity_abort_uses_direct_float32_threshold(joint_index):
+    action = _current_joint_velocity_abort_action()
+    threshold = action._joint_velocity_limits + (JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S)
+    joint_vel = torch.zeros_like(action._joint_velocity_limits)
+    joint_vel[0, joint_index] = threshold[0, joint_index]
+    trigger_index = 1 if joint_index == 0 else 6
+    joint_vel[0, trigger_index] = torch.nextafter(
+        threshold[0, trigger_index],
+        torch.tensor(float("inf"), dtype=torch.float32),
+    )
+    exceeded = joint_vel.abs() > threshold
+
+    evidence = action._record_current_joint_velocity_abort(
+        joint_vel=joint_vel,
+        exceeded_joint_mask=exceeded,
+    )
+
+    assert evidence["exceeded_joint_mask"][joint_index] is False
+    assert evidence["exceeded_joint_mask"][trigger_index] is True
+    assert evidence["joint_velocity_limit_excess_rad_s"][joint_index] > (
+        JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
+    )
+
+
 def test_current_limit_and_slew_invariants_abort_before_physx_target_setter():
     source = inspect.getsource(RobustDifferentialInverseKinematicsAction.apply_actions)
     setter = source.index("self._asset.set_joint_position_target")
@@ -1126,6 +1269,35 @@ def test_current_limit_and_slew_invariants_abort_before_physx_target_setter():
     assert (
         current_guard < current_counter < current_diagnostic < jacobian_compute < setter
     )
+    velocity_guard = source.index("if not current_joint_velocity_valid:")
+    velocity_counter = source.index(
+        "self._invariant_abort_count += current_joint_velocity_invalid.sum()"
+    )
+    velocity_record = source.index("self._record_current_joint_velocity_abort(")
+    velocity_diagnostic = source.index('kind="current_joint_velocity_limit_abort"')
+    velocity_raise = source.index(
+        "format_current_joint_velocity_abort_message(velocity_abort)"
+    )
+    velocity_maximum = source.index("self._max_abs_joint_vel = torch.maximum(")
+    current_finite_guard = source.index("if not current_finite:")
+    desired_finite_guard = source.index("if not desired_finite:")
+    current_quaternion_guard = source.index("if not current_quaternion_valid:")
+    desired_quaternion_guard = source.index("if not desired_quaternion_valid:")
+    assert (
+        current_finite_guard
+        < velocity_maximum
+        < velocity_guard
+        < velocity_counter
+        < velocity_record
+        < velocity_diagnostic
+        < velocity_raise
+        < desired_finite_guard
+        < current_quaternion_guard
+        < desired_quaternion_guard
+        < current_guard
+        < jacobian_compute
+        < setter
+    )
     assert source.index("if target_invalid:") < setter
     assert source.index("if slew_invalid:") < setter
     assert velocity_setter < setter
@@ -1141,6 +1313,48 @@ def test_current_limit_and_slew_invariants_abort_before_physx_target_setter():
     assert "self._asset.data.joint_vel_target" in report_source
     assert "torch.equal(live_velocity_target" in report_source
     assert '"arm_velocity_target_rad_s": live_velocity_target[0]' in report_source
+    assert '"current_joint_velocity_abort": (' in report_source
+
+    reset_source = inspect.getsource(
+        RobustDifferentialInverseKinematicsAction._reset_episode_safety_state
+    )
+    assert "self._current_joint_velocity_abort: dict[str, object] | None = None" in (
+        reset_source
+    )
+
+
+@pytest.mark.parametrize(
+    "simultaneous_later_guard",
+    [
+        "if not desired_finite:",
+        "if not current_quaternion_valid:",
+        "if not desired_quaternion_valid:",
+        "if not current_joint_valid:",
+    ],
+)
+def test_overlimit_velocity_has_durable_precedence_over_simultaneous_finite_guard(
+    simultaneous_later_guard,
+):
+    source = inspect.getsource(RobustDifferentialInverseKinematicsAction.apply_actions)
+    current_finite = source.index("if not current_finite:")
+    maxima = source.index("self._max_abs_joint_vel = torch.maximum(")
+    velocity_guard = source.index("if not current_joint_velocity_valid:")
+    evidence_capture = source.index("self._record_current_joint_velocity_abort(")
+    durable_guard = source.index('kind="current_joint_velocity_limit_abort"')
+    digest_bound_raise = source.index(
+        "format_current_joint_velocity_abort_message(velocity_abort)"
+    )
+    later_guard = source.index(simultaneous_later_guard)
+
+    assert (
+        current_finite
+        < maxima
+        < velocity_guard
+        < evidence_capture
+        < durable_guard
+        < digest_bound_raise
+        < later_guard
+    )
 
 
 def test_eef_pose_config_installs_robust_action_term():
@@ -1223,6 +1437,10 @@ def test_wrist_energy_brake_state_resets_and_commits_only_after_target_setters()
 
 
 def test_standard_action_reset_clears_selected_candidate_state():
+    reset_source = inspect.getsource(RobustDifferentialInverseKinematicsAction.reset)
+    assert "_current_joint_velocity_abort" not in reset_source
+    assert "_reset_episode_safety_state" not in reset_source
+
     action = _bare_robust_action()
     action._raw_actions = torch.ones((1, 7), dtype=torch.float32)
     action._wrist_energy_brake_enabled = True
@@ -1666,6 +1884,22 @@ def test_failure_substep_trace_producer_passes_boundary_failure_validator():
         "jacobian_max_abs": None,
         "eef_quaternion_norm": None,
     }
+    joint_velocity_values = joint_vel["values"]
+    velocity_limits = list(PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S)
+    velocity_excess = [
+        max(
+            boundary_smoke._float32_subtract(abs(value), limit),  # noqa: SLF001
+            0.0,
+        )
+        for value, limit in zip(joint_velocity_values, velocity_limits, strict=True)
+    ]
+    velocity_mask = [
+        abs(value)
+        > boundary_smoke._float32_add(  # noqa: SLF001
+            limit, JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
+        )
+        for value, limit in zip(joint_velocity_values, velocity_limits, strict=True)
+    ]
     safety = {
         "counters": {
             "apply_calls": 2,
@@ -1674,6 +1908,20 @@ def test_failure_substep_trace_producer_passes_boundary_failure_validator():
             "nonfinite_aborts": 0,
         },
         "guard_diagnostics": [guard],
+        "current_joint_velocity_abort": {
+            "profile": CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE,
+            "episode_index": 0,
+            "policy_step": 0,
+            "physics_substep": 1,
+            "joint_names": [f"panda_joint{index}" for index in range(1, 8)],
+            "joint_velocity_rad_s": joint_velocity_values,
+            "joint_velocity_limit_rad_s": velocity_limits,
+            "joint_velocity_limit_tolerance_rad_s": (
+                JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
+            ),
+            "joint_velocity_limit_excess_rad_s": velocity_excess,
+            "exceeded_joint_mask": velocity_mask,
+        },
     }
 
     assert (

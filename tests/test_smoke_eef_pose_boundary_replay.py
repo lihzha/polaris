@@ -150,6 +150,16 @@ def _failure_trace_fixture():
 
 
 def _failure_trace_safety():
+    joint_velocity = [3.0] + [0.0] * 6
+    limits = list(smoke.EXPECTED_VELOCITY_LIMITS_RAD_S)
+    excess = [
+        max(smoke._float32_subtract(abs(value), limit), 0.0)  # noqa: SLF001
+        for value, limit in zip(joint_velocity, limits, strict=True)
+    ]
+    mask = [
+        abs(value) > smoke._float32_add(limit, 1e-5)  # noqa: SLF001
+        for value, limit in zip(joint_velocity, limits, strict=True)
+    ]
     return {
         "counters": {
             "apply_calls": 3,
@@ -173,6 +183,18 @@ def _failure_trace_safety():
                 "eef_quaternion_norm": None,
             }
         ],
+        "current_joint_velocity_abort": {
+            "profile": smoke.CURRENT_JOINT_VELOCITY_ABORT_PROFILE,
+            "episode_index": 0,
+            "policy_step": 0,
+            "physics_substep": 2,
+            "joint_names": [f"panda_joint{index}" for index in range(1, 8)],
+            "joint_velocity_rad_s": joint_velocity,
+            "joint_velocity_limit_rad_s": limits,
+            "joint_velocity_limit_tolerance_rad_s": 1e-5,
+            "joint_velocity_limit_excess_rad_s": excess,
+            "exceeded_joint_mask": mask,
+        },
     }
 
 
@@ -297,6 +319,67 @@ def test_failure_substep_trace_accepts_causal_finite_ring() -> None:
 
     assert validated is trace
     assert b"NaN" not in smoke._strict_json_bytes(trace)  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (
+            lambda safety: safety.__setitem__("current_joint_velocity_abort", None),
+            "object",
+        ),
+        (
+            lambda safety: safety["current_joint_velocity_abort"][
+                "joint_velocity_rad_s"
+            ].__setitem__(0, -3.0),
+            "measured/live identity",
+        ),
+        (
+            lambda safety: safety["current_joint_velocity_abort"][
+                "joint_velocity_limit_excess_rad_s"
+            ].__setitem__(0, 0.0),
+            "excess joint",
+        ),
+        (
+            lambda safety: safety["current_joint_velocity_abort"].__setitem__(
+                "exceeded_joint_mask", [False] * 7
+            ),
+            "threshold mask",
+        ),
+        (
+            lambda safety: safety["current_joint_velocity_abort"].__setitem__(
+                "physics_substep", 1
+            ),
+            "cadence",
+        ),
+    ],
+)
+def test_failure_substep_trace_rejects_velocity_abort_evidence_mutation(
+    mutation, message
+) -> None:
+    trace = _failure_trace_fixture()
+    safety = _failure_trace_safety()
+    mutation(safety)
+
+    with pytest.raises(smoke.BoundaryReplayValidationError, match=message):
+        smoke.validate_failure_substep_trace(
+            trace,
+            safety=safety,
+            failure_policy_step=0,
+            current_joint_pos=_trace_vector([0.125] * 7),
+            current_joint_vel=_trace_vector([3.0] + [0.0] * 6),
+            current_joint_pos_target=_trace_vector([0.125] * 7),
+            current_joint_vel_target=_trace_vector([0.0] * 7),
+            current_joint_effort_target=_trace_vector([0.0] * 7),
+            current_approximate_pd_effort_preclip=trace["entries"][-1][
+                "approximate_pd_effort_preclip_nm"
+            ],
+            current_approximate_pd_effort_postclip=trace["entries"][-1][
+                "approximate_pd_effort_postclip_nm"
+            ],
+            physx_joint_pos=_trace_vector([0.125] * 7),
+            physx_joint_vel=_trace_vector([3.0] + [0.0] * 6),
+        )
 
 
 @pytest.mark.parametrize(
@@ -588,6 +671,7 @@ def _safety_report(*, episode_index=0, apply_calls=smoke.EXPECTED_APPLY_CALLS):
         "maxima": maxima,
         "guard_diagnostics": [],
         "max_raw_delta_diagnostic": max_diagnostic,
+        "current_joint_velocity_abort": None,
     }
 
 
@@ -919,6 +1003,14 @@ def test_boundary_evidence_accepts_exact_full_state_dwell():
     assert summary["apply_calls"] == 3152
     assert summary["max_consecutive_dwell_policy_steps"] == 16
     assert summary["joint5_raw_outer_violation_rad"] == 0.04
+
+    velocity_abort = _safety_report()
+    velocity_abort["current_joint_velocity_abort"] = {}
+    with pytest.raises(
+        smoke.BoundaryReplayValidationError,
+        match="current-velocity abort evidence must be null",
+    ):
+        smoke.validate_boundary_result(_boundary_result(), velocity_abort)
 
 
 def test_candidate_boundary_evidence_is_closed_and_requires_brake_activity():
