@@ -30,7 +30,7 @@ import zlib
 
 ENVIRONMENT = "DROID-FoodBussing"
 FIXTURE_PROFILE = "official_lap3b_foodbussing_v3_boundary_actions_v1"
-SMOKE_PROFILE = "panda_joint5_upper_solveriter4_boundary_replay_v3"
+SMOKE_PROFILE = "panda_joint5_upper_solveriter1_slew0p8_boundary_replay_v4"
 FIXTURE_PATH = (
     Path(__file__).resolve().parent
     / "fixtures"
@@ -102,9 +102,12 @@ PHYSX_DERIVED_SOFT_LIMIT_DIGEST = (
     "dd7865f59efb23e96d7d4cbb5e129906b04a42b5e5c0941459bfc8866dd7ecd0"
 )
 SOFT_LIMIT_DIGEST = "fbf7535901c042fea5d901812ecd02c5fd81ade06c23c1499c32d66a859104de"
-EXPECTED_MAX_DELTA_RAD = [0.018125001341104507] * 4 + [0.02174999937415123] * 3
+EXPECTED_PHYSICAL_MARGIN_RAD = [0.018125001341104507] * 4 + [0.02174999937415123] * 3
+EXPECTED_MAX_DELTA_RAD = [0.014500001445412636] * 4 + [0.017400000244379044] * 3
 EXPECTED_VELOCITY_LIMITS_RAD_S = [2.174999952316284] * 4 + [2.609999895095825] * 3
 EXPECTED_EFFORT_LIMITS = [87.0] * 4 + [12.0] * 3
+EXPECTED_DRIVE_STIFFNESS = [400.0] * 7
+EXPECTED_DRIVE_DAMPING = [80.0] * 7
 EXPECTED_OUTER_LIMITS_RAD = [
     [-2.8973000049591064, 2.8973000049591064],
     [-1.7627999782562256, 1.7627999782562256],
@@ -172,10 +175,14 @@ SAFETY_FIELDS = {
     "joint_velocity_limit_tolerance_rad_s",
     "eef_quaternion_unit_norm_tolerance",
     "joint_slew_float32_tolerance_rad",
+    "joint_target_slew_profile",
+    "joint_target_slew_factor",
     "soft_joint_pos_limit_factor",
     "joint_names",
     "joint_velocity_limits_rad_s",
     "joint_effort_limits",
+    "joint_drive_stiffness",
+    "joint_drive_damping",
     "max_delta_joint_pos_rad",
     "target_soft_limit_margin_rad",
     "target_joint_pos_limits_rad",
@@ -199,6 +206,8 @@ SAFETY_COUNTER_FIELDS = {
     "slew_limited_joints",
     "position_limit_events",
     "position_limited_joints",
+    "hard_limit_inward_recovery_events",
+    "hard_limit_inward_recovery_joints",
     "post_clamp_target_violations",
     "current_joint_limit_aborts",
     "invariant_aborts",
@@ -393,6 +402,14 @@ def _same_float32(left: float, right: float) -> bool:
     return struct.pack("<f", left) == struct.pack("<f", right)
 
 
+def _float32(value: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def _float32_add(left: float, right: float) -> float:
+    return _float32(_float32(left) + _float32(right))
+
+
 def decode_replay_fixture(payload: dict[str, Any]) -> list[list[float]]:
     """Validate and decode the committed replay fixture entirely in memory."""
 
@@ -581,9 +598,16 @@ def validate_safety_static(
     """Validate the closed solver-iteration safety schema and static fields."""
 
     _require(isinstance(report, dict) and set(report) == SAFETY_FIELDS, "safety schema")
-    _require(report.get("episode_index") == episode_index, "safety episode index")
+    if episode_index is None:
+        _require(report.get("episode_index") is None, "safety episode index")
+    else:
+        _require(
+            type(report.get("episode_index")) is int
+            and report["episode_index"] == episode_index,
+            "safety episode index",
+        )
     exact = {
-        "profile": "panda_velocity_physxlimit_solveriter4_v5",
+        "profile": "panda_velocity_physxlimit_slew0p8_solveriter1_v6",
         "apply_actions_cadence": "physics_substep",
         "physics_dt": 1.0 / 120.0,
         "control_dt": 1.0 / 15.0,
@@ -598,13 +622,17 @@ def validate_safety_static(
         ),
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": "zero_per_physics_substep_v1",
-        "articulation_solver_profile": "tgs_position64_velocity4_eef_only_v2",
+        "joint_target_slew_profile": (
+            "velocity_dt_factor0p8_with_full_inward_hardlimit_recovery_v1"
+        ),
+        "joint_target_slew_factor": 0.8,
+        "articulation_solver_profile": "tgs_position64_velocity1_eef_only_v1",
         "articulation_solver_readback": (
             "composed_usd_physx_articulation_api_all_env_roots_v1"
         ),
         "physx_solver_type": 1,
         "solver_position_iteration_count": 64,
-        "solver_velocity_iteration_count": 4,
+        "solver_velocity_iteration_count": 1,
         "joint_velocity_limit_tolerance_rad_s": 1e-5,
         "eef_quaternion_unit_norm_tolerance": 1e-3,
         "joint_slew_float32_tolerance_rad": 1e-6,
@@ -623,8 +651,10 @@ def validate_safety_static(
     for field, expected in (
         ("joint_velocity_limits_rad_s", EXPECTED_VELOCITY_LIMITS_RAD_S),
         ("joint_effort_limits", EXPECTED_EFFORT_LIMITS),
+        ("joint_drive_stiffness", EXPECTED_DRIVE_STIFFNESS),
+        ("joint_drive_damping", EXPECTED_DRIVE_DAMPING),
         ("max_delta_joint_pos_rad", EXPECTED_MAX_DELTA_RAD),
-        ("target_soft_limit_margin_rad", EXPECTED_MAX_DELTA_RAD),
+        ("target_soft_limit_margin_rad", EXPECTED_PHYSICAL_MARGIN_RAD),
     ):
         actual = _finite_vector(report.get(field), f"safety {field}", length=7)
         _require(
@@ -689,7 +719,9 @@ def validate_safety_static(
     _require(
         all(
             value <= margin + 1e-5
-            for value, margin in zip(hard_slop, EXPECTED_MAX_DELTA_RAD, strict=True)
+            for value, margin in zip(
+                hard_slop, EXPECTED_PHYSICAL_MARGIN_RAD, strict=True
+            )
         ),
         "PhysX hard-limit slop consumed the outer envelope",
     )
@@ -761,8 +793,16 @@ def _validate_completed_max_diagnostic(report: dict[str, Any]) -> None:
             f"max diagnostic joint {index} raw identity",
         )
         _require(
-            abs(safe_target - q) <= EXPECTED_MAX_DELTA_RAD[index] + 1e-6,
+            abs(safe_target - q)
+            <= _float32_add(EXPECTED_PHYSICAL_MARGIN_RAD[index], 1e-6),
             f"max diagnostic joint {index} safe slew",
+        )
+        _require(
+            abs(safe_target - q)
+            <= _float32_add(
+                report["maxima"]["applied_delta_joint_pos_rad"][index], 1e-6
+            ),
+            f"max diagnostic joint {index} exceeds applied maximum",
         )
         lower, upper = EXPECTED_TARGET_LIMITS_RAD[index]
         _require(lower <= safe_target <= upper, f"max diagnostic joint {index} target")
@@ -953,7 +993,7 @@ def validate_boundary_result(
     validate_safety_static(safety, episode_index=0)
     _require(safety.get("episode_index") == 0, "boundary safety episode")
     _require(
-        safety.get("profile") == "panda_velocity_physxlimit_solveriter4_v5",
+        safety.get("profile") == "panda_velocity_physxlimit_slew0p8_solveriter1_v6",
         "boundary safety profile",
     )
     _require(
@@ -1007,6 +1047,10 @@ def validate_boundary_result(
     for event_field, joint_field in (
         ("slew_limit_events", "slew_limited_joints"),
         ("position_limit_events", "position_limited_joints"),
+        (
+            "hard_limit_inward_recovery_events",
+            "hard_limit_inward_recovery_joints",
+        ),
     ):
         events = counters.get(event_field)
         joints = counters.get(joint_field)
@@ -1027,6 +1071,11 @@ def validate_boundary_result(
     _require(
         type(position_joints) is int and position_joints >= position_events,
         "boundary position-limited joint count",
+    )
+    _require(
+        counters["hard_limit_inward_recovery_events"] <= position_events
+        and counters["hard_limit_inward_recovery_joints"] <= position_joints,
+        "boundary inward-recovery counters exceed position limiting",
     )
     _require(
         sum(record["position_limit_events_delta"] for record in records)
@@ -1060,7 +1109,9 @@ def validate_boundary_result(
     _require(
         all(
             slop <= margin
-            for slop, margin in zip(hard_slop, EXPECTED_MAX_DELTA_RAD, strict=True)
+            for slop, margin in zip(
+                hard_slop, EXPECTED_PHYSICAL_MARGIN_RAD, strict=True
+            )
         ),
         "boundary PhysX hard-limit slop consumed the outer containment margin",
     )
@@ -1080,10 +1131,28 @@ def validate_boundary_result(
     )
     _require(
         all(
-            actual <= bound + 1e-6
+            actual <= _float32_add(bound, 1e-6)
+            for actual, bound in zip(applied, EXPECTED_PHYSICAL_MARGIN_RAD, strict=True)
+        ),
+        "boundary exceeded a physical-substep slew bound",
+    )
+    recovery_active = counters["hard_limit_inward_recovery_events"] > 0
+    recovery_maximum_active = any(
+        actual > _float32_add(bound, 1e-6)
+        for actual, bound in zip(applied, EXPECTED_MAX_DELTA_RAD, strict=True)
+    )
+    if recovery_maximum_active:
+        _require(
+            recovery_active and counters["hard_limit_inward_recovery_joints"] > 0,
+            "boundary nominal slew excess lacks inward recovery",
+        )
+    _require(
+        recovery_active
+        is any(
+            actual > _float32_add(bound, 1e-6)
             for actual, bound in zip(applied, EXPECTED_MAX_DELTA_RAD, strict=True)
         ),
-        "boundary exceeded a physics-substep slew bound",
+        "boundary inward recovery counters/maxima activation mismatch",
     )
     return {
         "apply_calls": EXPECTED_APPLY_CALLS,
@@ -1220,7 +1289,7 @@ def validate_success_payload(payload: dict[str, Any]) -> dict[str, Any]:
         ("action_dim", 7),
         (
             "ik_safety_profile",
-            "panda_velocity_physxlimit_solveriter4_v5",
+            "panda_velocity_physxlimit_slew0p8_solveriter1_v6",
         ),
     ):
         _require(runtime_frame.get(field) == expected, f"payload frame {field}")

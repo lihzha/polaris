@@ -393,3 +393,33 @@
   binds the hard-limit profile/digest/write count/readback and zero-velocity
   profile; per-episode maxima bind hard-limit solver slop, absolute velocity,
   and canonical outer clearance.
+
+## 2026-07-02 — measured-velocity repair iteration
+
+- The v5 standalone matrix passed, but the exact official-action boundary
+  replay failed at policy step 115/substep 2 because joint 7 reached
+  `-2.8927373886` rad/s against the live `2.6099998951` rad/s PhysX limit.
+  Direct PhysX q/dq exactly matched Isaac's cache and the target was already
+  commanding opposite the motion. EEF-only TGS 64/1 reproduced that state
+  bit-for-bit in job `1098049`; TGS 64/4 job `1098051` was worse, reaching
+  joint velocities `[2.9540, -2.5777, -3.3805]` on joints 5–7 while their
+  applied braking efforts saturated at `[-12, 12, 12]` Nm. Both failed closed
+  with immutable evidence and no ready marker/attestation. Increasing solver
+  velocity iterations is rejected and the controller returns to 64/1.
+- The next one-variable hypothesis is an EEF-only nominal slew factor of 0.8.
+  It preserves the exact physical limits, full `velocity/120` PhysX hard-limit
+  inset and digests, zero velocity target, strict measured-qdot abort, and
+  native joint/pi05 path. Ordinary targets use
+  `0.8 * velocity/120`; only an explicitly detected/countable inward recovery
+  from the physical hard-limit band may use the full physical step. The new
+  closed profile binds distinct nominal/physical vectors, the 0.8 factor and
+  profile, recovery counters, and live `400/80` drive stiffness/damping. Two
+  read-only reviews then closed target-margin recomputation, strict JSON scalar
+  typing, event/joint feasibility, recovery attribution, durable-sidecar
+  physical bounds, diagnostic/maxima consistency, and exact float32-add
+  threshold gaps. Local runtime/finalizer/boundary gates now pass 60 tests with
+  exact-threshold, coherent/spurious recovery, stale-profile, vector-swap,
+  gain-drift, boolean, and sidecar-tamper regressions, plus Ruff, formatting,
+  compileall, and diff checks. Torch/Isaac tests and both L40S certification
+  gates remain pending exact-commit deployment; no checkpoint evaluation is
+  authorized yet.

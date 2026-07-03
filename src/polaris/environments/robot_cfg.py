@@ -20,7 +20,7 @@ def configure_eef_pose_joint_safety(
     Isaac Lab 2.3 intentionally ignores the legacy ``velocity_limit`` field on
     implicit actuators unless ``velocity_limit_sim`` is set. Keeping this
     mutation in the EEF setup path preserves native joint-position semantics.
-    Four articulation velocity iterations are also required so PhysX resolves
+    One articulation velocity iteration is also required so PhysX resolves
     drives and velocity limits instead of relying exclusively on the TGS
     position iterations.
     """

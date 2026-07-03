@@ -55,16 +55,25 @@ ABORT_COUNTERS = (
 EXPECTED_JOINT_NAMES = [f"panda_joint{index}" for index in range(1, 8)]
 EXPECTED_VELOCITY_LIMITS = [2.174999952316284] * 4 + [2.609999895095825] * 3
 EXPECTED_EFFORT_LIMITS = [87.0] * 4 + [12.0] * 3
-EXPECTED_MAX_DELTA = [0.018125001341104507] * 4 + [0.02174999937415123] * 3
+EXPECTED_DRIVE_STIFFNESS = [400.0] * 7
+EXPECTED_DRIVE_DAMPING = [80.0] * 7
+EXPECTED_PHYSICAL_MARGIN = [0.018125001341104507] * 4 + [0.02174999937415123] * 3
+EXPECTED_MAX_DELTA = [0.014500001445412636] * 4 + [0.017400000244379044] * 3
 
 
 def _float32(value: float) -> float:
     return struct.unpack("<f", struct.pack("<f", value))[0]
 
 
+def _float32_add(left: float, right: float) -> float:
+    return _float32(_float32(left) + _float32(right))
+
+
 EXPECTED_TARGET_LIMITS = [
     [_float32(lower + margin), _float32(upper - margin)]
-    for (lower, upper), margin in zip(EXPECTED_LIMITS, EXPECTED_MAX_DELTA, strict=True)
+    for (lower, upper), margin in zip(
+        EXPECTED_LIMITS, EXPECTED_PHYSICAL_MARGIN, strict=True
+    )
 ]
 EXPECTED_PHYSX_DERIVED_SOFT_LIMITS = [
     [-2.8791749477386475, 2.8791749477386475],
@@ -156,10 +165,14 @@ SAFETY_FIELDS = {
     "joint_velocity_limit_tolerance_rad_s",
     "eef_quaternion_unit_norm_tolerance",
     "joint_slew_float32_tolerance_rad",
+    "joint_target_slew_profile",
+    "joint_target_slew_factor",
     "soft_joint_pos_limit_factor",
     "joint_names",
     "joint_velocity_limits_rad_s",
     "joint_effort_limits",
+    "joint_drive_stiffness",
+    "joint_drive_damping",
     "max_delta_joint_pos_rad",
     "target_soft_limit_margin_rad",
     "target_joint_pos_limits_rad",
@@ -183,6 +196,8 @@ COUNTER_FIELDS = {
     "slew_limited_joints",
     "position_limit_events",
     "position_limited_joints",
+    "hard_limit_inward_recovery_events",
+    "hard_limit_inward_recovery_joints",
     "post_clamp_target_violations",
     "current_joint_limit_aborts",
     "invariant_aborts",
@@ -442,7 +457,7 @@ def _validate_safety_report(
     else:
         _exact_int(report.get("episode_index"), episode_index, f"{field}.episode_index")
     for name, expected in (
-        ("profile", "panda_velocity_physxlimit_solveriter4_v5"),
+        ("profile", "panda_velocity_physxlimit_slew0p8_solveriter1_v6"),
         ("apply_actions_cadence", "physics_substep"),
         (
             "target_soft_limit_guard_band_profile",
@@ -455,8 +470,12 @@ def _validate_safety_report(
         ),
         ("arm_velocity_target_profile", "zero_per_physics_substep_v1"),
         (
+            "joint_target_slew_profile",
+            "velocity_dt_factor0p8_with_full_inward_hardlimit_recovery_v1",
+        ),
+        (
             "articulation_solver_profile",
-            "tgs_position64_velocity4_eef_only_v2",
+            "tgs_position64_velocity1_eef_only_v1",
         ),
         (
             "articulation_solver_readback",
@@ -486,7 +505,7 @@ def _validate_safety_report(
     )
     _exact_int(
         report.get("solver_velocity_iteration_count"),
-        4,
+        1,
         f"{field}.solver_velocity_iteration_count",
     )
     for name, expected in (
@@ -495,6 +514,7 @@ def _validate_safety_report(
         ("current_joint_soft_limit_tolerance_rad", 1e-5),
         ("eef_quaternion_unit_norm_tolerance", 1e-3),
         ("joint_slew_float32_tolerance_rad", 1e-6),
+        ("joint_target_slew_factor", 0.8),
         ("joint_velocity_limit_tolerance_rad_s", 1e-5),
         ("soft_joint_pos_limit_factor", 1.0),
     ):
@@ -521,13 +541,23 @@ def _validate_safety_report(
         f"{field}.joint_effort_limits",
     )
     _exact_float_vector(
+        report.get("joint_drive_stiffness"),
+        EXPECTED_DRIVE_STIFFNESS,
+        f"{field}.joint_drive_stiffness",
+    )
+    _exact_float_vector(
+        report.get("joint_drive_damping"),
+        EXPECTED_DRIVE_DAMPING,
+        f"{field}.joint_drive_damping",
+    )
+    _exact_float_vector(
         report.get("max_delta_joint_pos_rad"),
         EXPECTED_MAX_DELTA,
         f"{field}.max_delta_joint_pos_rad",
     )
     _exact_float_vector(
         report.get("target_soft_limit_margin_rad"),
-        EXPECTED_MAX_DELTA,
+        EXPECTED_PHYSICAL_MARGIN,
         f"{field}.target_soft_limit_margin_rad",
     )
     target_limits = _list(
@@ -596,6 +626,10 @@ def _validate_safety_report(
     for event_name, joint_name in (
         ("slew_limit_events", "slew_limited_joints"),
         ("position_limit_events", "position_limited_joints"),
+        (
+            "hard_limit_inward_recovery_events",
+            "hard_limit_inward_recovery_joints",
+        ),
     ):
         events = counters[event_name]
         joints = counters[joint_name]
@@ -603,6 +637,13 @@ def _validate_safety_report(
             events <= apply_calls and events <= joints <= 7 * events,
             f"{field}.{event_name}/{joint_name} impossible",
         )
+    _require(
+        counters["hard_limit_inward_recovery_events"]
+        <= counters["position_limit_events"]
+        and counters["hard_limit_inward_recovery_joints"]
+        <= counters["position_limited_joints"],
+        f"{field}.inward recovery exceeds position limiting",
+    )
     for name in (
         *ABORT_COUNTERS,
         "post_clamp_target_violations",
@@ -670,7 +711,7 @@ def _validate_safety_report(
             slop <= margin + 1e-5
             for slop, margin in zip(
                 maxima["current_physx_hard_limit_violation_rad"],
-                EXPECTED_MAX_DELTA,
+                EXPECTED_PHYSICAL_MARGIN,
                 strict=True,
             )
         ),
@@ -678,12 +719,38 @@ def _validate_safety_report(
     )
     _require(
         all(
-            actual <= bound + 1e-6
+            actual <= _float32_add(bound, 1e-6)
             for actual, bound in zip(
-                maxima["applied_delta_joint_pos_rad"], EXPECTED_MAX_DELTA, strict=True
+                maxima["applied_delta_joint_pos_rad"],
+                EXPECTED_PHYSICAL_MARGIN,
+                strict=True,
             )
         ),
-        f"{field}.applied slew maxima",
+        f"{field}.applied physical slew maxima",
+    )
+    recovery_active = counters["hard_limit_inward_recovery_events"] > 0
+    recovery_maximum_active = any(
+        actual > _float32_add(bound, 1e-6)
+        for actual, bound in zip(
+            maxima["applied_delta_joint_pos_rad"], EXPECTED_MAX_DELTA, strict=True
+        )
+    )
+    if recovery_maximum_active:
+        _require(
+            recovery_active and counters["hard_limit_inward_recovery_joints"] > 0,
+            f"{field}.nominal slew excess lacks inward recovery",
+        )
+    _require(
+        recovery_active
+        is any(
+            actual > _float32_add(bound, 1e-6)
+            for actual, bound in zip(
+                maxima["applied_delta_joint_pos_rad"],
+                EXPECTED_MAX_DELTA,
+                strict=True,
+            )
+        ),
+        f"{field}.inward recovery counters/maxima activation mismatch",
     )
     raw_slew_activated = any(
         raw_delta > bound
@@ -806,8 +873,13 @@ def _validate_safety_report(
                 f"{field}.max-raw joint {index} raw target identity",
             )
             _require(
-                abs(safe - q) <= bound + 1e-6,
+                abs(safe - q) <= _float32_add(EXPECTED_PHYSICAL_MARGIN[index], 1e-6),
                 f"{field}.max-raw joint {index} safe slew",
+            )
+            _require(
+                abs(safe - q)
+                <= _float32_add(maxima["applied_delta_joint_pos_rad"][index], 1e-6),
+                f"{field}.max-raw joint {index} exceeds applied maximum",
             )
             _require(
                 limits[0] - 1e-5 <= safe <= limits[1] + 1e-5,
@@ -1199,7 +1271,10 @@ def _verify_raw(raw: dict[str, Any]) -> dict[str, Any]:
     ):
         actual = _finite_number(actual_value, f"applied[{index}]")
         bound = _finite_number(bound_value, f"bound[{index}]")
-        _require(actual <= bound + 1e-6, f"joint {index} exceeded slew bound")
+        _require(
+            actual <= _float32_add(bound, 1e-6),
+            f"joint {index} exceeded slew bound",
+        )
     limited_indices = [
         index
         for index, (raw_delta, bound) in enumerate(

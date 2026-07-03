@@ -38,12 +38,16 @@ from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
+from polaris.eef_ik_safety import JOINT_TARGET_SLEW_FACTOR
+from polaris.eef_ik_safety import JOINT_TARGET_SLEW_PROFILE
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
 from polaris.eef_ik_safety import PHYSX_DERIVED_SOFT_LIMIT_PROFILE
 from polaris.eef_ik_safety import PHYSX_HARD_LIMIT_PROFILE
 from polaris.eef_ik_safety import PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT
 from polaris.eef_ik_safety import PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT
 from polaris.eef_ik_safety import PANDA_EEF_PHYSX_SOLVER_TYPE
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_DRIVE_DAMPING
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_DRIVE_STIFFNESS
 from polaris.eef_ik_safety import TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
 
 
@@ -174,6 +178,7 @@ def _bound_joint_position_target(
     joint_pos: torch.Tensor,
     raw_joint_pos_target: torch.Tensor,
     max_delta_joint_pos: torch.Tensor,
+    target_soft_limit_margin: torch.Tensor,
     soft_joint_pos_limits: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Slew-limit and soft-limit one finite joint-position target.
@@ -204,8 +209,8 @@ def _bound_joint_position_target(
     # output is finite. The velocity-derived guard band makes the actuator
     # brake before that boundary while preserving inherited healthy targets
     # bit-for-bit whenever this guard is inactive.
-    target_lower = lower + max_delta_joint_pos
-    target_upper = upper - max_delta_joint_pos
+    target_lower = lower + target_soft_limit_margin
+    target_upper = upper - target_soft_limit_margin
     # If PhysX reports a current position only microscopically outside the
     # outer limit but still within the named current-state tolerance, retain
     # the slew bound while commanding inward. This recovery allowance is at
@@ -230,6 +235,27 @@ def _bound_joint_position_target(
     )
     safe_target = torch.where(position_limited, clipped_target, slew_limited_target)
     return safe_target, raw_delta_joint_pos, slew_limited, position_limited
+
+
+def _classify_hard_limit_inward_recovery(
+    *,
+    joint_pos: torch.Tensor,
+    applied_delta: torch.Tensor,
+    position_limited: torch.Tensor,
+    target_lower: torch.Tensor,
+    target_upper: torch.Tensor,
+    nominal_max_delta: torch.Tensor,
+) -> torch.Tensor:
+    """Identify only above-nominal commands that recover toward the hard band."""
+
+    return (
+        position_limited
+        & (applied_delta.abs() > nominal_max_delta + JOINT_SLEW_FLOAT32_TOLERANCE_RAD)
+        & (
+            ((joint_pos < target_lower) & (applied_delta > 0.0))
+            | ((joint_pos > target_upper) & (applied_delta < 0.0))
+        )
+    )
 
 
 def _require_current_joint_position_in_soft_limits(
@@ -516,11 +542,27 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             .to(self._asset.device)[:, self._joint_ids]
             .clone()
         )
+        physx_joint_drive_stiffness = (
+            self._asset.root_physx_view.get_dof_stiffnesses()
+            .to(self._asset.device)[:, self._joint_ids]
+            .clone()
+        )
+        physx_joint_drive_damping = (
+            self._asset.root_physx_view.get_dof_dampings()
+            .to(self._asset.device)[:, self._joint_ids]
+            .clone()
+        )
         _require_finite(
             self._joint_velocity_limits, field="configured joint velocity limits"
         )
         _require_finite(
             self._joint_effort_limits, field="configured joint effort limits"
+        )
+        _require_finite(
+            physx_joint_drive_stiffness, field="configured joint drive stiffness"
+        )
+        _require_finite(
+            physx_joint_drive_damping, field="configured joint drive damping"
         )
         if (self._joint_velocity_limits <= 0.0).any() or (
             self._joint_effort_limits <= 0.0
@@ -536,7 +578,30 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             raise ValueError(
                 "PolaRiS EEF IK cached joint limits do not match PhysX readback"
             )
-        self._max_delta_joint_pos = self._joint_velocity_limits * self._physics_dt
+        expected_stiffness = torch.tensor(
+            PANDA_EEF_JOINT_DRIVE_STIFFNESS,
+            dtype=physx_joint_drive_stiffness.dtype,
+            device=physx_joint_drive_stiffness.device,
+        ).expand_as(physx_joint_drive_stiffness)
+        expected_damping = torch.tensor(
+            PANDA_EEF_JOINT_DRIVE_DAMPING,
+            dtype=physx_joint_drive_damping.dtype,
+            device=physx_joint_drive_damping.device,
+        ).expand_as(physx_joint_drive_damping)
+        if not (
+            torch.equal(physx_joint_drive_stiffness, expected_stiffness)
+            and torch.equal(physx_joint_drive_damping, expected_damping)
+        ):
+            raise ValueError(
+                "PolaRiS EEF IK live joint drive gains do not match the "
+                "canonical Panda controller"
+            )
+        self._joint_drive_stiffness = physx_joint_drive_stiffness
+        self._joint_drive_damping = physx_joint_drive_damping
+        self._target_soft_limit_margin = self._joint_velocity_limits * self._physics_dt
+        self._max_delta_joint_pos = (
+            self._target_soft_limit_margin * JOINT_TARGET_SLEW_FACTOR
+        )
 
         articulation_props = getattr(
             getattr(self._asset.cfg, "spawn", None),
@@ -604,7 +669,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             self._asset,
             joint_ids=self._joint_ids,
             outer_limits=self._soft_joint_position_limits,
-            max_delta_joint_pos=self._max_delta_joint_pos,
+            max_delta_joint_pos=self._target_soft_limit_margin,
             soft_limit_factor=self._soft_joint_pos_limit_factor,
         )
         self._physx_hard_limit_write_count = 1
@@ -626,6 +691,12 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             (), dtype=counter_dtype, device=self.device
         )
         self._position_limit_joint_count = torch.zeros(
+            (), dtype=counter_dtype, device=self.device
+        )
+        self._hard_limit_inward_recovery_event_count = torch.zeros(
+            (), dtype=counter_dtype, device=self.device
+        )
+        self._hard_limit_inward_recovery_joint_count = torch.zeros(
             (), dtype=counter_dtype, device=self.device
         )
         self._post_clamp_target_violation_count = torch.zeros(
@@ -1033,6 +1104,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 joint_pos,
                 raw_joint_pos_target,
                 self._max_delta_joint_pos,
+                self._target_soft_limit_margin,
                 soft_limits,
             )
         )
@@ -1045,8 +1117,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             torch.clamp(lower - safe_target, min=0.0),
             torch.clamp(safe_target - upper, min=0.0),
         )
-        target_lower = lower + self._max_delta_joint_pos
-        target_upper = upper - self._max_delta_joint_pos
+        target_lower = lower + self._target_soft_limit_margin
+        target_upper = upper - self._target_soft_limit_margin
         post_clamp_guard_band_violation = torch.maximum(
             torch.clamp(target_lower - safe_target, min=0.0),
             torch.clamp(safe_target - target_upper, min=0.0),
@@ -1055,11 +1127,28 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             post_clamp_guard_band_violation
             > current_joint_violation + JOINT_SLEW_FLOAT32_TOLERANCE_RAD
         )
+        hard_limit_inward_recovery = _classify_hard_limit_inward_recovery(
+            joint_pos=joint_pos,
+            applied_delta=applied_delta,
+            position_limited=position_limited,
+            target_lower=target_lower,
+            target_upper=target_upper,
+            nominal_max_delta=self._max_delta_joint_pos,
+        )
+        allowed_applied_delta = torch.where(
+            hard_limit_inward_recovery,
+            self._target_soft_limit_margin,
+            self._max_delta_joint_pos,
+        )
 
         self._slew_limit_event_count += slew_limited.any(dim=-1).sum()
         self._slew_limit_joint_count += slew_limited.sum()
         self._position_limit_event_count += position_limited.any(dim=-1).sum()
         self._position_limit_joint_count += position_limited.sum()
+        self._hard_limit_inward_recovery_event_count += hard_limit_inward_recovery.any(
+            dim=-1
+        ).sum()
+        self._hard_limit_inward_recovery_joint_count += hard_limit_inward_recovery.sum()
         raw_target_nonfinite = ~torch.isfinite(raw_joint_pos_target).all(dim=-1)
         post_clamp_target_invalid = (
             (post_clamp_violation > 0.0)
@@ -1068,7 +1157,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         ).any(dim=-1)
         post_clamp_slew_invalid = (
             applied_delta.abs()
-            > self._max_delta_joint_pos + JOINT_SLEW_FLOAT32_TOLERANCE_RAD
+            > allowed_applied_delta + JOINT_SLEW_FLOAT32_TOLERANCE_RAD
         ).any(dim=-1)
         self._post_clamp_target_violation_count += post_clamp_target_invalid.sum()
         self._max_raw_delta_joint_pos = torch.maximum(
@@ -1214,6 +1303,16 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             .to(self._asset.device)[:, self._joint_ids]
             .clone()
         )
+        live_joint_drive_stiffness = (
+            self._asset.root_physx_view.get_dof_stiffnesses()
+            .to(self._asset.device)[:, self._joint_ids]
+            .clone()
+        )
+        live_joint_drive_damping = (
+            self._asset.root_physx_view.get_dof_dampings()
+            .to(self._asset.device)[:, self._joint_ids]
+            .clone()
+        )
         (
             live_solver_position_iterations,
             live_solver_velocity_iterations,
@@ -1238,8 +1337,12 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         if not (
             torch.equal(live_joint_velocity_limits, self._joint_velocity_limits)
             and torch.equal(live_joint_effort_limits, self._joint_effort_limits)
+            and torch.equal(live_joint_drive_stiffness, self._joint_drive_stiffness)
+            and torch.equal(live_joint_drive_damping, self._joint_drive_damping)
         ):
-            raise ValueError("PolaRiS EEF live PhysX joint-limit readback drifted")
+            raise ValueError(
+                "PolaRiS EEF live PhysX joint-limit or drive-gain readback drifted"
+            )
         if not (
             live_solver_position_iterations == self._solver_position_iteration_counts
             and live_solver_velocity_iterations
@@ -1325,6 +1428,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             "joint_velocity_limit_tolerance_rad_s": JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S,
             "eef_quaternion_unit_norm_tolerance": EEF_QUATERNION_UNIT_NORM_TOLERANCE,
             "joint_slew_float32_tolerance_rad": JOINT_SLEW_FLOAT32_TOLERANCE_RAD,
+            "joint_target_slew_profile": JOINT_TARGET_SLEW_PROFILE,
+            "joint_target_slew_factor": JOINT_TARGET_SLEW_FACTOR,
             "soft_joint_pos_limit_factor": self._soft_joint_pos_limit_factor,
             "joint_names": list(self._joint_names),
             "joint_velocity_limits_rad_s": live_joint_velocity_limits[0]
@@ -1332,11 +1437,16 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             .cpu()
             .tolist(),
             "joint_effort_limits": live_joint_effort_limits[0].detach().cpu().tolist(),
+            "joint_drive_stiffness": live_joint_drive_stiffness[0]
+            .detach()
+            .cpu()
+            .tolist(),
+            "joint_drive_damping": live_joint_drive_damping[0].detach().cpu().tolist(),
             "max_delta_joint_pos_rad": self._max_delta_joint_pos[0]
             .detach()
             .cpu()
             .tolist(),
-            "target_soft_limit_margin_rad": self._max_delta_joint_pos[0]
+            "target_soft_limit_margin_rad": self._target_soft_limit_margin[0]
             .detach()
             .cpu()
             .tolist(),
@@ -1380,6 +1490,12 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 ),
                 "position_limited_joints": int(
                     self._position_limit_joint_count.detach().cpu().item()
+                ),
+                "hard_limit_inward_recovery_events": int(
+                    self._hard_limit_inward_recovery_event_count.detach().cpu().item()
+                ),
+                "hard_limit_inward_recovery_joints": int(
+                    self._hard_limit_inward_recovery_joint_count.detach().cpu().item()
                 ),
                 "post_clamp_target_violations": int(
                     self._post_clamp_target_violation_count.detach().cpu().item()

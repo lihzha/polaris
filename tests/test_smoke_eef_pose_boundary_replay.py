@@ -142,6 +142,8 @@ def _safety_report(*, episode_index=0, apply_calls=smoke.EXPECTED_APPLY_CALLS):
         "slew_limited_joints": 512 if active else 0,
         "position_limit_events": 128 if active else 0,
         "position_limited_joints": 128 if active else 0,
+        "hard_limit_inward_recovery_events": 0,
+        "hard_limit_inward_recovery_joints": 0,
         "post_clamp_target_violations": 0,
         "current_joint_limit_aborts": 0,
         "invariant_aborts": 0,
@@ -187,7 +189,7 @@ def _safety_report(*, episode_index=0, apply_calls=smoke.EXPECTED_APPLY_CALLS):
     )
     return {
         "episode_index": episode_index,
-        "profile": "panda_velocity_physxlimit_solveriter4_v5",
+        "profile": "panda_velocity_physxlimit_slew0p8_solveriter1_v6",
         "apply_actions_cadence": "physics_substep",
         "physics_dt": 1.0 / 120.0,
         "control_dt": 1.0 / 15.0,
@@ -202,13 +204,17 @@ def _safety_report(*, episode_index=0, apply_calls=smoke.EXPECTED_APPLY_CALLS):
         ),
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": "zero_per_physics_substep_v1",
-        "articulation_solver_profile": "tgs_position64_velocity4_eef_only_v2",
+        "joint_target_slew_profile": (
+            "velocity_dt_factor0p8_with_full_inward_hardlimit_recovery_v1"
+        ),
+        "joint_target_slew_factor": 0.8,
+        "articulation_solver_profile": "tgs_position64_velocity1_eef_only_v1",
         "articulation_solver_readback": (
             "composed_usd_physx_articulation_api_all_env_roots_v1"
         ),
         "physx_solver_type": 1,
         "solver_position_iteration_count": 64,
-        "solver_velocity_iteration_count": 4,
+        "solver_velocity_iteration_count": 1,
         "joint_velocity_limit_tolerance_rad_s": 1e-5,
         "eef_quaternion_unit_norm_tolerance": 1e-3,
         "joint_slew_float32_tolerance_rad": 1e-6,
@@ -216,8 +222,10 @@ def _safety_report(*, episode_index=0, apply_calls=smoke.EXPECTED_APPLY_CALLS):
         "joint_names": [f"panda_joint{index}" for index in range(1, 8)],
         "joint_velocity_limits_rad_s": list(smoke.EXPECTED_VELOCITY_LIMITS_RAD_S),
         "joint_effort_limits": list(smoke.EXPECTED_EFFORT_LIMITS),
+        "joint_drive_stiffness": list(smoke.EXPECTED_DRIVE_STIFFNESS),
+        "joint_drive_damping": list(smoke.EXPECTED_DRIVE_DAMPING),
         "max_delta_joint_pos_rad": list(smoke.EXPECTED_MAX_DELTA_RAD),
-        "target_soft_limit_margin_rad": list(smoke.EXPECTED_MAX_DELTA_RAD),
+        "target_soft_limit_margin_rad": list(smoke.EXPECTED_PHYSICAL_MARGIN_RAD),
         "target_joint_pos_limits_rad": copy.deepcopy(smoke.EXPECTED_TARGET_LIMITS_RAD),
         "target_joint_pos_limits_float32_sha256": smoke.TARGET_LIMIT_DIGEST,
         "physx_hard_joint_pos_limits_rad": copy.deepcopy(
@@ -370,7 +378,7 @@ def _success_payload():
             "gripper_threshold_profile": (
                 "closed_positive_ge_0p5_inverse_open_gt_0p5_v1"
             ),
-            "ik_safety_profile": "panda_velocity_physxlimit_solveriter4_v5",
+            "ik_safety_profile": ("panda_velocity_physxlimit_slew0p8_solveriter1_v6"),
             "action_dim": 7,
         },
         "initial_ik_safety_capture": _safety_report(episode_index=None, apply_calls=0),
@@ -522,6 +530,31 @@ def test_boundary_evidence_accepts_exact_full_state_dwell():
             "solver_velocity_iteration_count",
         ),
         (
+            lambda boundary, safety: safety.__setitem__(
+                "profile", "panda_velocity_physxlimit_solveriter4_v5"
+            ),
+            "profile drift",
+        ),
+        (
+            lambda boundary, safety: safety["joint_drive_stiffness"].__setitem__(
+                0, 399.0
+            ),
+            "joint_drive_stiffness",
+        ),
+        (
+            lambda boundary, safety: (
+                safety.__setitem__(
+                    "max_delta_joint_pos_rad",
+                    list(smoke.EXPECTED_PHYSICAL_MARGIN_RAD),
+                ),
+                safety.__setitem__(
+                    "target_soft_limit_margin_rad",
+                    list(smoke.EXPECTED_MAX_DELTA_RAD),
+                ),
+            ),
+            "max_delta_joint_pos_rad",
+        ),
+        (
             lambda boundary, safety: safety.__setitem__("physx_solver_type", 0),
             "physx_solver_type",
         ),
@@ -533,6 +566,50 @@ def test_boundary_evidence_rejects_mutations(mutation, message):
     mutation(boundary, safety)
 
     with pytest.raises(smoke.BoundaryReplayValidationError, match=message):
+        smoke.validate_boundary_result(boundary, safety)
+
+
+def test_boundary_accepts_coherent_full_inward_hardlimit_recovery():
+    boundary = _boundary_result()
+    exact_threshold = _safety_report()
+    exact_threshold["maxima"]["applied_delta_joint_pos_rad"][0] = smoke._float32_add(
+        smoke.EXPECTED_MAX_DELTA_RAD[0], 1e-6
+    )
+    smoke.validate_boundary_result(boundary, exact_threshold)
+
+    safety = _safety_report()
+    safety["counters"]["hard_limit_inward_recovery_events"] = 1
+    safety["counters"]["hard_limit_inward_recovery_joints"] = 1
+    safety["maxima"]["applied_delta_joint_pos_rad"][0] = (
+        smoke.EXPECTED_MAX_DELTA_RAD[0] + smoke.EXPECTED_PHYSICAL_MARGIN_RAD[0]
+    ) / 2.0
+    smoke.validate_boundary_result(boundary, safety)
+
+    spurious = _safety_report()
+    spurious["counters"]["hard_limit_inward_recovery_events"] = 1
+    spurious["counters"]["hard_limit_inward_recovery_joints"] = 1
+    with pytest.raises(
+        smoke.BoundaryReplayValidationError, match="activation mismatch"
+    ):
+        smoke.validate_boundary_result(boundary, spurious)
+
+
+def test_boundary_rejects_boolean_episode_index_and_diagnostic_above_maximum():
+    boundary = _boundary_result()
+    safety = _safety_report()
+    safety["episode_index"] = False
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="episode index"):
+        smoke.validate_boundary_result(boundary, safety)
+
+    safety = _safety_report()
+    diagnostic = safety["max_raw_delta_diagnostic"]
+    q = diagnostic["joint_pos_rad"]["values"][0]
+    diagnostic["safe_joint_pos_target_rad"]["values"][0] = (
+        q
+        + (smoke.EXPECTED_MAX_DELTA_RAD[0] + smoke.EXPECTED_PHYSICAL_MARGIN_RAD[0])
+        / 2.0
+    )
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="applied maximum"):
         smoke.validate_boundary_result(boundary, safety)
 
 

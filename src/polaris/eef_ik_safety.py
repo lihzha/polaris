@@ -3,19 +3,24 @@
 from __future__ import annotations
 
 import math
+import struct
 from typing import Any
 
-EEF_IK_SAFETY_PROFILE = "panda_velocity_physxlimit_solveriter4_v5"
+EEF_IK_SAFETY_PROFILE = "panda_velocity_physxlimit_slew0p8_solveriter1_v6"
 EEF_IK_APPLY_CADENCE = "physics_substep"
 CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD = 1e-5
 TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE = "eef_physx_inner_hardlimit_one_substep_v2"
 PHYSX_HARD_LIMIT_PROFILE = "outer_minus_one_velocity_substep_v1"
 PHYSX_DERIVED_SOFT_LIMIT_PROFILE = "isaaclab_midpoint_range_factor1_float32_v1"
 ARM_VELOCITY_TARGET_PROFILE = "zero_per_physics_substep_v1"
-ARTICULATION_SOLVER_PROFILE = "tgs_position64_velocity4_eef_only_v2"
+JOINT_TARGET_SLEW_PROFILE = (
+    "velocity_dt_factor0p8_with_full_inward_hardlimit_recovery_v1"
+)
+JOINT_TARGET_SLEW_FACTOR = 0.8
+ARTICULATION_SOLVER_PROFILE = "tgs_position64_velocity1_eef_only_v1"
 ARTICULATION_SOLVER_READBACK = "composed_usd_physx_articulation_api_all_env_roots_v1"
 PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT = 64
-PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT = 4
+PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT = 1
 PANDA_EEF_PHYSX_SOLVER_TYPE = 1
 # One named allowance for float32 subtraction around the configured per-substep
 # slew bound.  Keep this identical in the controller, runtime validation, and
@@ -42,6 +47,8 @@ PANDA_EEF_JOINT_EFFORT_LIMITS = (
     12.0,
     12.0,
 )
+PANDA_EEF_JOINT_DRIVE_STIFFNESS = (400.0,) * 7
+PANDA_EEF_JOINT_DRIVE_DAMPING = (80.0,) * 7
 
 # Canonical float32 limits expected from the pinned NVIDIA DROID articulation
 # with soft_joint_pos_limit_factor=1.  Every safety-profile revision must
@@ -80,6 +87,12 @@ PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_RAD = (
 PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_FLOAT32_SHA256 = (
     "dd7865f59efb23e96d7d4cbb5e129906b04a42b5e5c0941459bfc8866dd7ecd0"
 )
+
+
+def _float32_add(left: float, right: float) -> float:
+    left_f32 = struct.unpack("<f", struct.pack("<f", left))[0]
+    right_f32 = struct.unpack("<f", struct.pack("<f", right))[0]
+    return struct.unpack("<f", struct.pack("<f", left_f32 + right_f32))[0]
 
 
 def validate_one_step_adversarial_report(report: dict[str, Any]) -> dict[str, Any]:
@@ -125,7 +138,7 @@ def validate_one_step_adversarial_report(report: dict[str, Any]) -> dict[str, An
             or not isinstance(bound, (int, float))
             or not math.isfinite(float(actual))
             or not math.isfinite(float(bound))
-            or actual > bound + JOINT_SLEW_FLOAT32_TOLERANCE_RAD
+            or actual > _float32_add(bound, JOINT_SLEW_FLOAT32_TOLERANCE_RAD)
         ):
             raise ValueError("Adversarial EEF smoke exceeded its float32 slew bound")
     return {

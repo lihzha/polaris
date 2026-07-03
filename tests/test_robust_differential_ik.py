@@ -13,6 +13,7 @@ from polaris.robust_differential_ik import (
     RobustDifferentialIKController,
     RobustDifferentialInverseKinematicsAction,
     _bound_joint_position_target,
+    _classify_hard_limit_inward_recovery,
     _derive_isaac_soft_joint_position_limits,
     _eef_quaternion_norm_is_valid,
     _install_eef_physx_position_limits,
@@ -23,6 +24,8 @@ from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_DRIVE_DAMPING
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_DRIVE_STIFFNESS
 from polaris.eef_ik_safety import PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_RAD
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_RAD
 
@@ -87,7 +90,7 @@ def test_joint_target_safety_preserves_healthy_target_and_bounds_outlier():
 
     healthy = torch.tensor([[0.01, -0.01, 0.0, 0.005, 0.0, 0.01, -0.01]])
     safe, raw_delta, slew_limited, position_limited = _bound_joint_position_target(
-        joint_pos, healthy, max_delta, soft_limits
+        joint_pos, healthy, max_delta, max_delta, soft_limits
     )
     torch.testing.assert_close(safe, healthy, rtol=0.0, atol=0.0)
     torch.testing.assert_close(raw_delta, healthy, rtol=0.0, atol=0.0)
@@ -102,6 +105,7 @@ def test_joint_target_safety_preserves_healthy_target_and_bounds_outlier():
         ulp_joint_pos,
         ulp_target,
         torch.ones((1, 7), dtype=torch.float32),
+        torch.ones((1, 7), dtype=torch.float32),
         torch.tensor([[[-3.0, 3.0]] * 7], dtype=torch.float32),
     )
     assert not ulp_slew.any()
@@ -110,7 +114,7 @@ def test_joint_target_safety_preserves_healthy_target_and_bounds_outlier():
 
     outlier = torch.tensor([[0.5, -0.5, 0.03, -0.03, 0.0, 0.02, -0.02]])
     safe, _, slew_limited, position_limited = _bound_joint_position_target(
-        joint_pos, outlier, max_delta, soft_limits
+        joint_pos, outlier, max_delta, max_delta, soft_limits
     )
     assert torch.all(safe.abs() <= max_delta)
     assert slew_limited[0, :4].tolist() == [True, True, True, True]
@@ -124,7 +128,7 @@ def test_joint_target_safety_intersects_slew_and_soft_position_limits():
     soft_limits = torch.tensor([[[-1.0, 1.0]] * 7])
 
     safe, _, slew_limited, position_limited = _bound_joint_position_target(
-        joint_pos, raw_target, max_delta, soft_limits
+        joint_pos, raw_target, max_delta, max_delta, soft_limits
     )
 
     # The command remains one maximum physics-substep motion inside the live
@@ -138,18 +142,19 @@ def test_joint_target_safety_intersects_slew_and_soft_position_limits():
 @pytest.mark.parametrize("direction", [-1.0, 1.0])
 def test_joint_target_guard_band_prevents_exact_bound_actuator_command(direction):
     soft_limits = torch.tensor([PANDA_SOFT_JOINT_POS_LIMITS_RAD], dtype=torch.float32)
-    max_delta = torch.tensor(
+    physical_margin = torch.tensor(
         [PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S], dtype=torch.float32
     ) * (1.0 / 120.0)
+    max_delta = physical_margin * 0.8
     boundary = soft_limits[..., 1] if direction > 0 else soft_limits[..., 0]
-    joint_pos = boundary - direction * max_delta / 4.0
-    raw_target = boundary + direction * max_delta
+    joint_pos = boundary - direction * physical_margin / 4.0
+    raw_target = boundary + direction * physical_margin
 
     safe, _, slew_limited, position_limited = _bound_joint_position_target(
-        joint_pos, raw_target, max_delta, soft_limits
+        joint_pos, raw_target, max_delta, physical_margin, soft_limits
     )
 
-    expected = boundary - direction * max_delta
+    expected = boundary - direction * physical_margin
     torch.testing.assert_close(safe, expected, rtol=0.0, atol=0.0)
     assert slew_limited.all()
     assert position_limited.all()
@@ -157,7 +162,7 @@ def test_joint_target_guard_band_prevents_exact_bound_actuator_command(direction
         assert torch.all(safe < soft_limits[..., 1])
     else:
         assert torch.all(safe > soft_limits[..., 0])
-    assert torch.all((safe - joint_pos).abs() <= max_delta)
+    assert torch.all((safe - joint_pos).abs() <= physical_margin)
 
 
 @pytest.mark.parametrize("direction", [-1.0, 1.0])
@@ -165,23 +170,24 @@ def test_joint_target_guard_band_recovers_outer_tolerance_without_slew_violation
     direction,
 ):
     soft_limits = torch.tensor([PANDA_SOFT_JOINT_POS_LIMITS_RAD], dtype=torch.float32)
-    max_delta = torch.tensor(
+    physical_margin = torch.tensor(
         [PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S], dtype=torch.float32
     ) * (1.0 / 120.0)
+    max_delta = physical_margin * 0.8
     boundary = soft_limits[..., 1] if direction > 0 else soft_limits[..., 0]
     outer_tolerance_offset = torch.full_like(boundary, 5e-6)
     joint_pos = boundary + direction * outer_tolerance_offset
     raw_target = boundary + direction
 
     safe, _, slew_limited, position_limited = _bound_joint_position_target(
-        joint_pos, raw_target, max_delta, soft_limits
+        joint_pos, raw_target, max_delta, physical_margin, soft_limits
     )
 
-    strict_inner = boundary - direction * max_delta
+    strict_inner = boundary - direction * physical_margin
     guard_band_violation = (safe - strict_inner) * direction
     assert slew_limited.all()
     assert position_limited.all()
-    assert torch.all((safe - joint_pos).abs() <= max_delta + 1e-6)
+    assert torch.all((safe - joint_pos).abs() <= physical_margin + 1e-6)
     assert torch.all(guard_band_violation >= 0.0)
     assert torch.all(guard_band_violation <= CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD)
     assert torch.all(safe <= soft_limits[..., 1])
@@ -193,20 +199,59 @@ def test_joint_target_guard_band_does_not_consume_recovery_for_in_range_state(
     direction,
 ):
     soft_limits = torch.tensor([PANDA_SOFT_JOINT_POS_LIMITS_RAD], dtype=torch.float32)
-    max_delta = torch.tensor(
+    physical_margin = torch.tensor(
         [PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S], dtype=torch.float32
     ) * (1.0 / 120.0)
+    max_delta = physical_margin * 0.8
     boundary = soft_limits[..., 1] if direction > 0 else soft_limits[..., 0]
     joint_pos = boundary - direction * torch.full_like(boundary, 5e-6)
     raw_target = boundary + direction
 
     safe, _, _, position_limited = _bound_joint_position_target(
-        joint_pos, raw_target, max_delta, soft_limits
+        joint_pos, raw_target, max_delta, physical_margin, soft_limits
     )
 
-    strict_inner = boundary - direction * max_delta
+    strict_inner = boundary - direction * physical_margin
     assert position_limited.all()
     torch.testing.assert_close(safe, strict_inner, rtol=0.0, atol=0.0)
+
+
+def test_hard_limit_recovery_classifier_is_above_nominal_and_inward_only():
+    joint_pos = torch.tensor([[-0.99, 0.99, -0.99, 0.99]])
+    target_lower = torch.full((1, 4), -0.98)
+    target_upper = torch.full((1, 4), 0.98)
+    nominal = torch.full((1, 4), 0.008)
+    position_limited = torch.ones((1, 4), dtype=torch.bool)
+
+    recovery = _classify_hard_limit_inward_recovery(
+        joint_pos=joint_pos,
+        applied_delta=torch.tensor([[0.01, -0.01, -0.01, 0.01]]),
+        position_limited=position_limited,
+        target_lower=target_lower,
+        target_upper=target_upper,
+        nominal_max_delta=nominal,
+    )
+    assert recovery.tolist() == [[True, True, False, False]]
+
+    not_limited = _classify_hard_limit_inward_recovery(
+        joint_pos=joint_pos,
+        applied_delta=torch.tensor([[0.01, -0.01, 0.01, -0.01]]),
+        position_limited=torch.zeros_like(position_limited),
+        target_lower=target_lower,
+        target_upper=target_upper,
+        nominal_max_delta=nominal,
+    )
+    assert not not_limited.any()
+
+    float32_roundoff_only = _classify_hard_limit_inward_recovery(
+        joint_pos=joint_pos,
+        applied_delta=nominal + 2e-8,
+        position_limited=position_limited,
+        target_lower=target_lower,
+        target_upper=target_upper,
+        nominal_max_delta=nominal,
+    )
+    assert not float32_roundoff_only.any()
 
 
 class _LimitData:
@@ -222,6 +267,12 @@ class _LimitRootView:
         self.max_forces = torch.tensor(
             [PANDA_EEF_JOINT_EFFORT_LIMITS], dtype=torch.float32
         )
+        self.stiffnesses = torch.tensor(
+            [PANDA_EEF_JOINT_DRIVE_STIFFNESS], dtype=torch.float32
+        )
+        self.dampings = torch.tensor(
+            [PANDA_EEF_JOINT_DRIVE_DAMPING], dtype=torch.float32
+        )
 
     def get_dof_limits(self):
         return self.limits
@@ -231,6 +282,12 @@ class _LimitRootView:
 
     def get_dof_max_forces(self):
         return self.max_forces
+
+    def get_dof_stiffnesses(self):
+        return self.stiffnesses
+
+    def get_dof_dampings(self):
+        return self.dampings
 
 
 class _LimitCfg:
@@ -365,20 +422,20 @@ def _install_solver_schema_fakes(monkeypatch, apis):
 def test_solver_schema_readback_covers_every_authored_articulation_root(monkeypatch):
     asset = _install_solver_schema_fakes(
         monkeypatch,
-        [_SolverApi(64, 4), _SolverApi(64, 4)],
+        [_SolverApi(64, 1), _SolverApi(64, 1)],
     )
 
     position, velocity = robust_ik._read_articulation_solver_iteration_counts(asset)
 
     assert position == (64, 64)
-    assert velocity == (4, 4)
+    assert velocity == (1, 1)
 
 
 @pytest.mark.parametrize(
     "api",
     [
-        _SolverApi(64, 4, position_authored=False),
-        _SolverApi(64, 4, velocity_authored=False),
+        _SolverApi(64, 1, position_authored=False),
+        _SolverApi(64, 1, velocity_authored=False),
     ],
 )
 def test_solver_schema_readback_rejects_fallback_but_unauthored_values(
@@ -518,11 +575,13 @@ def test_safety_report_rejects_live_velocity_target_mutation(monkeypatch):
     action._joint_velocity_limits = asset.root_physx_view.max_velocities.clone()
     action._joint_effort_limits = asset.root_physx_view.max_forces.clone()
     action._solver_position_iteration_counts = (64,)
-    action._solver_velocity_iteration_counts = (4,)
+    action._joint_drive_stiffness = asset.root_physx_view.stiffnesses.clone()
+    action._joint_drive_damping = asset.root_physx_view.dampings.clone()
+    action._solver_velocity_iteration_counts = (1,)
     monkeypatch.setattr(
         robust_ik,
         "_read_articulation_solver_iteration_counts",
-        lambda _asset: ((64,), (4,)),
+        lambda _asset: ((64,), (1,)),
     )
 
     with pytest.raises(
@@ -540,8 +599,12 @@ def test_safety_report_rejects_physx_solver_type_drift():
         action.safety_report()
 
 
-@pytest.mark.parametrize("limit_field", ["max_velocities", "max_forces"])
-def test_safety_report_rejects_live_physx_joint_limit_drift(monkeypatch, limit_field):
+@pytest.mark.parametrize(
+    "limit_field", ["max_velocities", "max_forces", "stiffnesses", "dampings"]
+)
+def test_safety_report_rejects_live_physx_joint_limit_or_gain_drift(
+    monkeypatch, limit_field
+):
     prewrite_hard, outer, max_delta = _canonical_limit_inputs()
     asset = _LimitAsset(prewrite_hard)
     hard, derived_soft = _install_eef_physx_position_limits(
@@ -565,15 +628,17 @@ def test_safety_report_rejects_live_physx_joint_limit_drift(monkeypatch, limit_f
     action._joint_velocity_limits = asset.root_physx_view.max_velocities.clone()
     action._joint_effort_limits = asset.root_physx_view.max_forces.clone()
     action._solver_position_iteration_counts = (64,)
-    action._solver_velocity_iteration_counts = (4,)
+    action._joint_drive_stiffness = asset.root_physx_view.stiffnesses.clone()
+    action._joint_drive_damping = asset.root_physx_view.dampings.clone()
+    action._solver_velocity_iteration_counts = (1,)
     monkeypatch.setattr(
         robust_ik,
         "_read_articulation_solver_iteration_counts",
-        lambda _asset: ((64,), (4,)),
+        lambda _asset: ((64,), (1,)),
     )
     getattr(asset.root_physx_view, limit_field)[0, 0] += 1e-3
 
-    with pytest.raises(ValueError, match="live PhysX joint-limit readback drifted"):
+    with pytest.raises(ValueError, match="joint-limit or drive-gain readback drifted"):
         action.safety_report()
 
 
@@ -738,7 +803,7 @@ def test_eef_velocity_and_effort_limits_are_scoped_to_eef_setup():
     assert eef_cfg.actuators["panda_forearm"].velocity_limit_sim == 2.61
     assert eef_cfg.actuators["panda_forearm"].effort_limit_sim == 12.0
     assert eef_cfg.spawn.articulation_props.solver_position_iteration_count == 64
-    assert eef_cfg.spawn.articulation_props.solver_velocity_iteration_count == 4
+    assert eef_cfg.spawn.articulation_props.solver_velocity_iteration_count == 1
     assert eef_physx_cfg.solver_type == 1
     assert native_cfg.actuators["panda_shoulder"].velocity_limit_sim is None
     assert native_cfg.actuators["panda_forearm"].velocity_limit_sim is None

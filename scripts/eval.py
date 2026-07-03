@@ -272,6 +272,8 @@ def main(eval_args: EvalArgs):
             f"profile={runtime_safety['profile']};"
             f"cadence={runtime_safety['apply_actions_cadence']};"
             f"physics_dt={runtime_safety['physics_dt']};"
+            f"slew_profile={runtime_safety['joint_target_slew_profile']};"
+            f"slew_factor={runtime_safety['joint_target_slew_factor']};"
             "target_guard_band="
             f"{runtime_safety['target_soft_limit_guard_band_profile']};"
             "target_limit_sha256="
@@ -279,6 +281,10 @@ def main(eval_args: EvalArgs):
             "max_delta_joint_pos_rad="
             + ",".join(
                 str(value) for value in runtime_safety["max_delta_joint_pos_rad"]
+            )
+            + ";target_soft_limit_margin_rad="
+            + ",".join(
+                str(value) for value in runtime_safety["target_soft_limit_margin_rad"]
             ),
             flush=True,
         )

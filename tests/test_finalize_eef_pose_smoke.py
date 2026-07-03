@@ -65,7 +65,7 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
         max_raw["safe_joint_pos_target_rad"] = _diagnostic_vector(safe_target)
     return {
         "episode_index": episode_index,
-        "profile": "panda_velocity_physxlimit_solveriter4_v5",
+        "profile": "panda_velocity_physxlimit_slew0p8_solveriter1_v6",
         "apply_actions_cadence": "physics_substep",
         "physics_dt": 1.0 / 120.0,
         "control_dt": 1.0 / 15.0,
@@ -80,13 +80,17 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
         ),
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": "zero_per_physics_substep_v1",
-        "articulation_solver_profile": "tgs_position64_velocity4_eef_only_v2",
+        "joint_target_slew_profile": (
+            "velocity_dt_factor0p8_with_full_inward_hardlimit_recovery_v1"
+        ),
+        "joint_target_slew_factor": 0.8,
+        "articulation_solver_profile": "tgs_position64_velocity1_eef_only_v1",
         "articulation_solver_readback": (
             "composed_usd_physx_articulation_api_all_env_roots_v1"
         ),
         "physx_solver_type": 1,
         "solver_position_iteration_count": 64,
-        "solver_velocity_iteration_count": 4,
+        "solver_velocity_iteration_count": 1,
         "joint_velocity_limit_tolerance_rad_s": 1e-5,
         "eef_quaternion_unit_norm_tolerance": 1e-3,
         "joint_slew_float32_tolerance_rad": 1e-6,
@@ -94,8 +98,10 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
         "joint_names": finalizer.EXPECTED_JOINT_NAMES,
         "joint_velocity_limits_rad_s": finalizer.EXPECTED_VELOCITY_LIMITS,
         "joint_effort_limits": finalizer.EXPECTED_EFFORT_LIMITS,
+        "joint_drive_stiffness": finalizer.EXPECTED_DRIVE_STIFFNESS,
+        "joint_drive_damping": finalizer.EXPECTED_DRIVE_DAMPING,
         "max_delta_joint_pos_rad": finalizer.EXPECTED_MAX_DELTA,
-        "target_soft_limit_margin_rad": finalizer.EXPECTED_MAX_DELTA,
+        "target_soft_limit_margin_rad": finalizer.EXPECTED_PHYSICAL_MARGIN,
         "target_joint_pos_limits_rad": finalizer.EXPECTED_TARGET_LIMITS,
         "target_joint_pos_limits_float32_sha256": (finalizer.EXPECTED_TARGET_DIGEST),
         "physx_hard_joint_pos_limits_rad": finalizer.EXPECTED_TARGET_LIMITS,
@@ -214,6 +220,48 @@ def _valid_raw_result():
     return copy.deepcopy(payload)
 
 
+def test_finalizer_accepts_coherent_full_inward_hardlimit_recovery():
+    exact_threshold = _valid_raw_result()
+    exact_threshold["ik_safety_episodes"][0]["maxima"]["applied_delta_joint_pos_rad"][
+        0
+    ] = finalizer._float32_add(finalizer.EXPECTED_MAX_DELTA[0], 1e-6)
+    finalizer._verify_raw(exact_threshold)
+
+    raw = _valid_raw_result()
+    safety = raw["ik_safety_episodes"][0]
+    safety["counters"]["position_limit_events"] = 1
+    safety["counters"]["position_limited_joints"] = 1
+    safety["counters"]["hard_limit_inward_recovery_events"] = 1
+    safety["counters"]["hard_limit_inward_recovery_joints"] = 1
+    safety["maxima"]["applied_delta_joint_pos_rad"][0] = (
+        finalizer.EXPECTED_MAX_DELTA[0] + finalizer.EXPECTED_PHYSICAL_MARGIN[0]
+    ) / 2.0
+    finalizer._verify_raw(raw)
+
+    spurious = _valid_raw_result()
+    counters = spurious["ik_safety_episodes"][0]["counters"]
+    counters["position_limit_events"] = 1
+    counters["position_limited_joints"] = 1
+    counters["hard_limit_inward_recovery_events"] = 1
+    counters["hard_limit_inward_recovery_joints"] = 1
+    with pytest.raises(finalizer.VerificationError, match="activation mismatch"):
+        finalizer._verify_raw(spurious)
+
+
+def test_finalizer_rejects_max_diagnostic_above_recorded_applied_maximum():
+    raw = _valid_raw_result()
+    safety = raw["ik_safety_episodes"][0]
+    diagnostic = safety["max_raw_delta_diagnostic"]
+    q = diagnostic["joint_pos_rad"]["values"][0]
+    diagnostic["safe_joint_pos_target_rad"]["values"][0] = (
+        q
+        + (finalizer.EXPECTED_MAX_DELTA[0] + finalizer.EXPECTED_PHYSICAL_MARGIN[0])
+        / 2.0
+    )
+    with pytest.raises(finalizer.VerificationError, match="exceeds applied maximum"):
+        finalizer._verify_raw(raw)
+
+
 def _write_immutable_json(path: Path, payload) -> bytes:
     data = (json.dumps(payload, indent=2, allow_nan=False) + "\n").encode()
     path.write_bytes(data)
@@ -322,6 +370,25 @@ def test_raw_smoke_gate_requires_pending_full_evidence():
     raw = _valid_raw_result()
     raw["raw_ik_safety_capture"]["solver_velocity_iteration_count"] = 0
     with pytest.raises(finalizer.VerificationError, match="solver_velocity"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["raw_ik_safety_capture"]["profile"] = "panda_velocity_physxlimit_solveriter4_v5"
+    with pytest.raises(finalizer.VerificationError, match="profile"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["raw_ik_safety_capture"]["joint_drive_damping"][6] = 79.0
+    with pytest.raises(finalizer.VerificationError, match="joint_drive_damping"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    safety = raw["raw_ik_safety_capture"]
+    safety["max_delta_joint_pos_rad"], safety["target_soft_limit_margin_rad"] = (
+        safety["target_soft_limit_margin_rad"],
+        safety["max_delta_joint_pos_rad"],
+    )
+    with pytest.raises(finalizer.VerificationError, match="max_delta_joint_pos_rad"):
         finalizer._verify_raw(raw)
 
     raw = _valid_raw_result()

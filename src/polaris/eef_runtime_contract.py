@@ -23,7 +23,11 @@ from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
+from polaris.eef_ik_safety import JOINT_TARGET_SLEW_FACTOR
+from polaris.eef_ik_safety import JOINT_TARGET_SLEW_PROFILE
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_DRIVE_DAMPING
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_DRIVE_STIFFNESS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT
@@ -63,6 +67,8 @@ SAFETY_COUNTER_FIELDS = {
     "slew_limited_joints",
     "position_limit_events",
     "position_limited_joints",
+    "hard_limit_inward_recovery_events",
+    "hard_limit_inward_recovery_joints",
     "post_clamp_target_violations",
     "current_joint_limit_aborts",
     "invariant_aborts",
@@ -125,10 +131,14 @@ SAFETY_STATIC_FIELDS = (
     "joint_velocity_limit_tolerance_rad_s",
     "eef_quaternion_unit_norm_tolerance",
     "joint_slew_float32_tolerance_rad",
+    "joint_target_slew_profile",
+    "joint_target_slew_factor",
     "soft_joint_pos_limit_factor",
     "joint_names",
     "joint_velocity_limits_rad_s",
     "joint_effort_limits",
+    "joint_drive_stiffness",
+    "joint_drive_damping",
     "max_delta_joint_pos_rad",
     "target_soft_limit_margin_rad",
     "target_joint_pos_limits_rad",
@@ -411,6 +421,8 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         "physx_derived_soft_limit_profile": PHYSX_DERIVED_SOFT_LIMIT_PROFILE,
         "physx_hard_limit_write_count": 1,
         "arm_velocity_target_profile": ARM_VELOCITY_TARGET_PROFILE,
+        "joint_target_slew_profile": JOINT_TARGET_SLEW_PROFILE,
+        "joint_target_slew_factor": JOINT_TARGET_SLEW_FACTOR,
         "articulation_solver_profile": ARTICULATION_SOLVER_PROFILE,
         "articulation_solver_readback": ARTICULATION_SOLVER_READBACK,
         "physx_solver_type": PANDA_EEF_PHYSX_SOLVER_TYPE,
@@ -425,6 +437,15 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
                 f"Live EEF IK safety {field} mismatch: "
                 f"expected={expected!r}, actual={report.get(field)!r}"
             )
+    for field in (
+        "physx_hard_limit_write_count",
+        "physx_solver_type",
+        "solver_position_iteration_count",
+        "solver_velocity_iteration_count",
+        "decimation",
+    ):
+        if type(report.get(field)) is not int:
+            raise ValueError(f"Live EEF IK safety {field} must be an exact integer")
     physics_dt = float(report.get("physics_dt", math.nan))
     control_dt = float(report.get("control_dt", math.nan))
     current_limit_tolerance = float(
@@ -444,8 +465,24 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         raise ValueError(
             f"Live EEF IK safety episode index is invalid: {episode_index!r}"
         )
-    if report.get("soft_joint_pos_limit_factor") != 1.0:
+    if (
+        type(report.get("soft_joint_pos_limit_factor")) is not float
+        or report["soft_joint_pos_limit_factor"] != 1.0
+    ):
         raise ValueError("Live EEF IK safety requires soft_joint_pos_limit_factor=1")
+    for field in (
+        "physics_dt",
+        "control_dt",
+        "current_joint_soft_limit_tolerance_rad",
+        "joint_slew_float32_tolerance_rad",
+        "joint_velocity_limit_tolerance_rad_s",
+        "eef_quaternion_unit_norm_tolerance",
+        "joint_target_slew_factor",
+    ):
+        if isinstance(report.get(field), bool) or not isinstance(
+            report.get(field), (int, float)
+        ):
+            raise ValueError(f"Live EEF IK safety {field} must be a finite number")
     if (
         not math.isclose(physics_dt, CANONICAL_PHYSICS_DT, rel_tol=0.0, abs_tol=1e-12)
         or not math.isclose(
@@ -488,8 +525,10 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
     vector_fields = {
         "joint_velocity_limits_rad_s": PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S,
         "joint_effort_limits": PANDA_EEF_JOINT_EFFORT_LIMITS,
+        "joint_drive_stiffness": PANDA_EEF_JOINT_DRIVE_STIFFNESS,
+        "joint_drive_damping": PANDA_EEF_JOINT_DRIVE_DAMPING,
         "max_delta_joint_pos_rad": tuple(
-            value * CANONICAL_PHYSICS_DT
+            value * CANONICAL_PHYSICS_DT * JOINT_TARGET_SLEW_FACTOR
             for value in PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
         ),
         "target_soft_limit_margin_rad": tuple(
@@ -515,16 +554,22 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
             )
     max_delta_report = report.get("max_delta_joint_pos_rad")
     target_margin_report = report.get("target_soft_limit_margin_rad")
-    canonical_max_delta = np.asarray(
+    canonical_physical_margin = np.asarray(
         PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S, dtype=np.float32
     ) * np.float32(CANONICAL_PHYSICS_DT)
-    if target_margin_report != max_delta_report or not np.array_equal(
+    canonical_max_delta = canonical_physical_margin * np.float32(
+        JOINT_TARGET_SLEW_FACTOR
+    )
+    if not np.array_equal(
         np.asarray(max_delta_report, dtype=np.float32),
         canonical_max_delta,
+    ) or not np.array_equal(
+        np.asarray(target_margin_report, dtype=np.float32),
+        canonical_physical_margin,
     ):
         raise ValueError(
-            "Live EEF IK target margin must exactly equal the canonical "
-            "float32 physics-substep slew vector"
+            "Live EEF IK nominal slew and physical target margin must exactly "
+            "match their distinct canonical float32 vectors"
         )
     soft_limits = _numpy(report.get("soft_joint_pos_limits_rad")).astype(np.float64)
     if (
@@ -558,11 +603,11 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         )
 
     target_limits = _numpy(report.get("target_joint_pos_limits_rad")).astype(np.float64)
-    max_delta_float32 = np.asarray(max_delta_report, dtype=np.float32)
+    physical_margin_float32 = np.asarray(target_margin_report, dtype=np.float32)
     expected_target_limits = np.stack(
         (
-            soft_limits.astype(np.float32)[:, 0] + max_delta_float32,
-            soft_limits.astype(np.float32)[:, 1] - max_delta_float32,
+            soft_limits.astype(np.float32)[:, 0] + physical_margin_float32,
+            soft_limits.astype(np.float32)[:, 1] - physical_margin_float32,
         ),
         axis=-1,
     )
@@ -573,8 +618,8 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         or not np.all(target_limits[:, 0] < target_limits[:, 1])
     ):
         raise ValueError(
-            "Live EEF IK target guard-band limits do not match one physics "
-            "substep of the velocity bounds: "
+            "Live EEF IK target guard-band limits do not match the physical "
+            "one-substep velocity margin: "
             f"expected={expected_target_limits.tolist()!r}, "
             f"actual={target_limits.tolist()!r}"
         )
@@ -667,6 +712,27 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         raise ValueError(
             "Single-environment EEF safety substep count must equal apply calls"
         )
+    for event_name, joint_name in (
+        ("slew_limit_events", "slew_limited_joints"),
+        ("position_limit_events", "position_limited_joints"),
+        (
+            "hard_limit_inward_recovery_events",
+            "hard_limit_inward_recovery_joints",
+        ),
+    ):
+        events = counters[event_name]
+        joints = counters[joint_name]
+        if events > counters["apply_calls"] or not events <= joints <= 7 * events:
+            raise ValueError(
+                f"Live EEF IK safety {event_name}/{joint_name} history is impossible"
+            )
+    if (
+        counters["hard_limit_inward_recovery_events"]
+        > counters["position_limit_events"]
+        or counters["hard_limit_inward_recovery_joints"]
+        > counters["position_limited_joints"]
+    ):
+        raise ValueError("Live EEF IK hard-limit recovery exceeds position limiting")
     expected_maxima = SAFETY_MAXIMA_FIELDS
     if set(maxima) != expected_maxima:
         raise ValueError(f"Live EEF IK safety maxima are invalid: {maxima!r}")
@@ -681,11 +747,34 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
                 f"Live EEF IK safety maximum {field} is invalid: {values.tolist()!r}"
             )
     applied = np.asarray(maxima["applied_delta_joint_pos_rad"], dtype=np.float64)
-    max_delta = np.asarray(report["max_delta_joint_pos_rad"], dtype=np.float64)
-    if np.any(applied > max_delta + JOINT_SLEW_FLOAT32_TOLERANCE_RAD):
+    physical_margin = np.asarray(
+        report["target_soft_limit_margin_rad"], dtype=np.float64
+    )
+    nominal_with_tolerance = (
+        np.asarray(report["max_delta_joint_pos_rad"], dtype=np.float32)
+        + np.float32(JOINT_SLEW_FLOAT32_TOLERANCE_RAD)
+    ).astype(np.float64)
+    physical_with_tolerance = (
+        np.asarray(report["target_soft_limit_margin_rad"], dtype=np.float32)
+        + np.float32(JOINT_SLEW_FLOAT32_TOLERANCE_RAD)
+    ).astype(np.float64)
+    recovery_events = counters["hard_limit_inward_recovery_events"]
+    recovery_joints = counters["hard_limit_inward_recovery_joints"]
+    if np.any(applied > physical_with_tolerance):
         raise ValueError(
-            "Live EEF IK applied joint delta exceeds its physics-substep bound: "
-            f"applied={applied.tolist()!r}, bound={max_delta.tolist()!r}"
+            "Live EEF IK applied joint delta exceeds its physical-substep bound: "
+            f"applied={applied.tolist()!r}, bound={physical_margin.tolist()!r}"
+        )
+    if np.any(applied > nominal_with_tolerance) and (
+        recovery_events < 1 or recovery_joints < 1
+    ):
+        raise ValueError(
+            "Live EEF IK exceeded nominal slew without a hard-limit inward "
+            "recovery event"
+        )
+    if (recovery_events > 0) is not bool(np.any(applied > nominal_with_tolerance)):
+        raise ValueError(
+            "Live EEF IK hard-limit recovery counters/maxima activation mismatch"
         )
     max_abs_velocity = np.asarray(maxima["abs_joint_vel_rad_s"], dtype=np.float64)
     velocity_limits = np.asarray(
@@ -698,7 +787,9 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
     hard_violation = np.asarray(
         maxima["current_physx_hard_limit_violation_rad"], dtype=np.float64
     )
-    if np.any(hard_violation > max_delta + CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD):
+    if np.any(
+        hard_violation > physical_margin + CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
+    ):
         raise ValueError(
             "Live EEF IK PhysX hard-limit slop consumed the canonical outer envelope"
         )
@@ -1099,13 +1190,24 @@ def _validate_episode_safety_evidence_shape(
     for event_name, joint_name in (
         ("slew_limit_events", "slew_limited_joints"),
         ("position_limit_events", "position_limited_joints"),
+        (
+            "hard_limit_inward_recovery_events",
+            "hard_limit_inward_recovery_joints",
+        ),
     ):
         events = counters[event_name]
         joints = counters[joint_name]
-        if events > apply_calls or not events <= joints <= 7 * apply_calls:
+        if events > apply_calls or not events <= joints <= 7 * events:
             raise ValueError(
                 f"Episode safety {event_name}/{joint_name} history is impossible"
             )
+    if (
+        counters["hard_limit_inward_recovery_events"]
+        > counters["position_limit_events"]
+        or counters["hard_limit_inward_recovery_joints"]
+        > counters["position_limited_joints"]
+    ):
+        raise ValueError("Hard-limit recovery cannot exceed position limiting")
     if (
         counters["post_clamp_target_violations"] > apply_calls
         or counters["dls_fallbacks"] > apply_calls
@@ -1136,6 +1238,20 @@ def _validate_episode_safety_evidence_shape(
             )
         ):
             raise ValueError(f"Episode safety maximum {name} is invalid")
+    applied = np.asarray(maxima["applied_delta_joint_pos_rad"], dtype=np.float64)
+    nominal_with_tolerance = (
+        np.asarray(safety["max_delta_joint_pos_rad"], dtype=np.float32)
+        + np.float32(JOINT_SLEW_FLOAT32_TOLERANCE_RAD)
+    ).astype(np.float64)
+    physical_with_tolerance = (
+        np.asarray(safety["target_soft_limit_margin_rad"], dtype=np.float32)
+        + np.float32(JOINT_SLEW_FLOAT32_TOLERANCE_RAD)
+    ).astype(np.float64)
+    if np.any(applied > physical_with_tolerance):
+        raise ValueError("Episode safety applied delta exceeds physical margin")
+    recovery_active = counters["hard_limit_inward_recovery_events"] > 0
+    if recovery_active is not bool(np.any(applied > nominal_with_tolerance)):
+        raise ValueError("Episode safety recovery counters/maxima activation mismatch")
     diagnostics = safety.get("guard_diagnostics")
     if not isinstance(diagnostics, list) or len(diagnostics) > 32:
         raise ValueError("Episode safety guard diagnostics are invalid")

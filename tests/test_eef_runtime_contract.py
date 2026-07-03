@@ -28,7 +28,11 @@ from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
+from polaris.eef_ik_safety import JOINT_TARGET_SLEW_FACTOR
+from polaris.eef_ik_safety import JOINT_TARGET_SLEW_PROFILE
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_DRIVE_DAMPING
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_DRIVE_STIFFNESS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT
@@ -86,13 +90,17 @@ def _runtime_fixture():
         _body_idx=1,
         _joint_names=[f"panda_joint{index}" for index in range(1, 8)],
     )
-    max_delta = [
+    physical_margin = [
         np.float32(np.float32(value) * np.float32(1.0 / 120.0)).item()
         for value in PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
     ]
+    max_delta = [
+        np.float32(np.float32(value) * np.float32(JOINT_TARGET_SLEW_FACTOR)).item()
+        for value in physical_margin
+    ]
     soft_limits = [list(values) for values in PANDA_SOFT_JOINT_POS_LIMITS_RAD]
     soft_limits_f32 = np.asarray(soft_limits, dtype=np.float32)
-    margin_f32 = np.asarray(max_delta, dtype=np.float32)
+    margin_f32 = np.asarray(physical_margin, dtype=np.float32)
     target_limits = np.stack(
         (
             soft_limits_f32[:, 0] + margin_f32,
@@ -125,12 +133,16 @@ def _runtime_fixture():
         "joint_velocity_limit_tolerance_rad_s": JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S,
         "eef_quaternion_unit_norm_tolerance": EEF_QUATERNION_UNIT_NORM_TOLERANCE,
         "joint_slew_float32_tolerance_rad": JOINT_SLEW_FLOAT32_TOLERANCE_RAD,
+        "joint_target_slew_profile": JOINT_TARGET_SLEW_PROFILE,
+        "joint_target_slew_factor": JOINT_TARGET_SLEW_FACTOR,
         "soft_joint_pos_limit_factor": 1.0,
         "joint_names": [f"panda_joint{index}" for index in range(1, 8)],
         "joint_velocity_limits_rad_s": list(PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S),
         "joint_effort_limits": list(PANDA_EEF_JOINT_EFFORT_LIMITS),
+        "joint_drive_stiffness": list(PANDA_EEF_JOINT_DRIVE_STIFFNESS),
+        "joint_drive_damping": list(PANDA_EEF_JOINT_DRIVE_DAMPING),
         "max_delta_joint_pos_rad": list(max_delta),
-        "target_soft_limit_margin_rad": list(max_delta),
+        "target_soft_limit_margin_rad": list(physical_margin),
         "target_joint_pos_limits_rad": target_limits,
         "target_joint_pos_limits_float32_sha256": target_limit_sha256,
         "physx_hard_joint_pos_limits_rad": json.loads(json.dumps(target_limits)),
@@ -151,6 +163,8 @@ def _runtime_fixture():
             "slew_limited_joints": 0,
             "position_limit_events": 0,
             "position_limited_joints": 0,
+            "hard_limit_inward_recovery_events": 0,
+            "hard_limit_inward_recovery_joints": 0,
             "post_clamp_target_violations": 0,
             "current_joint_limit_aborts": 0,
             "invariant_aborts": 0,
@@ -351,10 +365,16 @@ def test_runtime_frame_matches_direct_link8_and_absolute_action_term():
     safety = validate_eef_runtime_safety(env)
     assert safety["profile"] == EEF_IK_SAFETY_PROFILE
     assert safety["max_delta_joint_pos_rad"] == [
+        np.float32(
+            np.float32(np.float32(value) * np.float32(1.0 / 120.0))
+            * np.float32(JOINT_TARGET_SLEW_FACTOR)
+        ).item()
+        for value in PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+    ]
+    assert safety["target_soft_limit_margin_rad"] == [
         np.float32(np.float32(value) * np.float32(1.0 / 120.0)).item()
         for value in PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
     ]
-    assert safety["target_soft_limit_margin_rad"] == safety["max_delta_joint_pos_rad"]
     assert safety["target_soft_limit_guard_band_profile"] == (
         TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
     )
@@ -667,6 +687,19 @@ def test_episode_safety_rejects_schema_counter_and_unknown_abort_tamper():
             safety=dropped, episode_result=_episode_result()
         )
 
+    unbounded_recovery = _episode_safety()
+    counters = unbounded_recovery["counters"]
+    counters["position_limit_events"] = 1
+    counters["position_limited_joints"] = 1
+    counters["hard_limit_inward_recovery_events"] = 1
+    counters["hard_limit_inward_recovery_joints"] = 1
+    unbounded_recovery["maxima"]["applied_delta_joint_pos_rad"][0] = 100.0
+    with pytest.raises(ValueError, match="exceeds physical margin"):
+        validate_episode_safety_cadence(
+            safety=unbounded_recovery,
+            episode_result=_episode_result(),
+        )
+
 
 def test_completed_episode_requires_consistent_max_raw_diagnostic():
     missing = _episode_safety()
@@ -816,6 +849,8 @@ def test_runtime_safety_rejects_drift_and_unbounded_applied_delta():
     for field, value in (
         ("articulation_solver_profile", "wrong"),
         ("articulation_solver_readback", "wrong"),
+        ("joint_target_slew_profile", "wrong"),
+        ("joint_target_slew_factor", 1.0),
         ("physx_solver_type", 0),
         ("solver_position_iteration_count", 32),
         ("solver_velocity_iteration_count", 0),
@@ -827,11 +862,33 @@ def test_runtime_safety_rejects_drift_and_unbounded_applied_delta():
         with pytest.raises(ValueError, match=field):
             validate_eef_runtime_safety(env)
 
+    for field in (
+        "physx_hard_limit_write_count",
+        "physx_solver_type",
+        "solver_position_iteration_count",
+        "solver_velocity_iteration_count",
+        "decimation",
+        "soft_joint_pos_limit_factor",
+    ):
+        env, _ = _runtime_fixture()
+        drifted = env.unwrapped.action_manager._terms["arm"].safety_report()
+        drifted[field] = True
+        env.unwrapped.action_manager._terms["arm"].safety_report = lambda: drifted
+        with pytest.raises(ValueError, match=field):
+            validate_eef_runtime_safety(env)
+
+    env, _ = _runtime_fixture()
+    drifted = env.unwrapped.action_manager._terms["arm"].safety_report()
+    drifted["joint_drive_damping"][6] = 79.0
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: drifted
+    with pytest.raises(ValueError, match="joint_drive_damping"):
+        validate_eef_runtime_safety(env)
+
     env, _ = _runtime_fixture()
     unsafe = env.unwrapped.action_manager._terms["arm"].safety_report()
     unsafe["maxima"]["applied_delta_joint_pos_rad"][0] = 1.0
     env.unwrapped.action_manager._terms["arm"].safety_report = lambda: unsafe
-    with pytest.raises(ValueError, match="exceeds its physics-substep bound"):
+    with pytest.raises(ValueError, match="exceeds its physical-substep bound"):
         validate_eef_runtime_safety(env)
 
     env, _ = _runtime_fixture()
@@ -888,7 +945,9 @@ def test_runtime_safety_rejects_drift_and_unbounded_applied_delta():
         np.float32(np.inf),
     ).item()
     env.unwrapped.action_manager._terms["arm"].safety_report = lambda: tampered
-    with pytest.raises(ValueError, match="must exactly equal"):
+    with pytest.raises(
+        ValueError, match="max_delta_joint_pos_rad mismatch|distinct canonical"
+    ):
         validate_eef_runtime_safety(env)
 
 
@@ -902,10 +961,69 @@ def test_runtime_safety_uses_one_exact_float32_slew_tolerance():
     env.unwrapped.action_manager._terms["arm"].safety_report = lambda: report
     validate_eef_runtime_safety(env)
 
+    report["maxima"]["applied_delta_joint_pos_rad"][0] = np.float32(
+        np.float32(bound) + np.float32(JOINT_SLEW_FLOAT32_TOLERANCE_RAD)
+    ).item()
+    validate_eef_runtime_safety(env)
+
     report["maxima"]["applied_delta_joint_pos_rad"][0] = (
         bound + 2 * JOINT_SLEW_FLOAT32_TOLERANCE_RAD
     )
-    with pytest.raises(ValueError, match="exceeds its physics-substep bound"):
+    with pytest.raises(ValueError, match="without a hard-limit inward recovery"):
+        validate_eef_runtime_safety(env)
+
+
+def test_runtime_safety_allows_only_coherent_inward_recovery_to_physical_margin():
+    env, _ = _runtime_fixture()
+    report = env.unwrapped.action_manager._terms["arm"].safety_report()
+    report["counters"].update(
+        {
+            "apply_calls": 1,
+            "environment_substeps": 1,
+            "position_limit_events": 1,
+            "position_limited_joints": 1,
+            "hard_limit_inward_recovery_events": 1,
+            "hard_limit_inward_recovery_joints": 1,
+        }
+    )
+    nominal = report["max_delta_joint_pos_rad"][0]
+    physical = report["target_soft_limit_margin_rad"][0]
+    report["maxima"]["applied_delta_joint_pos_rad"][0] = (nominal + physical) / 2.0
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: report
+    validate_eef_runtime_safety(env)
+
+    unsupported = json.loads(json.dumps(report))
+    unsupported["counters"]["position_limit_events"] = 0
+    unsupported["counters"]["position_limited_joints"] = 0
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: unsupported
+    with pytest.raises(ValueError, match="recovery exceeds position limiting"):
+        validate_eef_runtime_safety(env)
+
+    spurious = json.loads(json.dumps(report))
+    spurious["maxima"]["applied_delta_joint_pos_rad"][0] = nominal
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: spurious
+    with pytest.raises(ValueError, match="counters/maxima activation mismatch"):
+        validate_eef_runtime_safety(env)
+
+
+def test_runtime_safety_rejects_stale_profile_and_nominal_physical_swap():
+    env, _ = _runtime_fixture()
+    stale = env.unwrapped.action_manager._terms["arm"].safety_report()
+    stale["profile"] = "panda_velocity_physxlimit_solveriter4_v5"
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: stale
+    with pytest.raises(ValueError, match="profile"):
+        validate_eef_runtime_safety(env)
+
+    env, _ = _runtime_fixture()
+    swapped = env.unwrapped.action_manager._terms["arm"].safety_report()
+    swapped["max_delta_joint_pos_rad"], swapped["target_soft_limit_margin_rad"] = (
+        swapped["target_soft_limit_margin_rad"],
+        swapped["max_delta_joint_pos_rad"],
+    )
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: swapped
+    with pytest.raises(
+        ValueError, match="max_delta_joint_pos_rad mismatch|distinct canonical"
+    ):
         validate_eef_runtime_safety(env)
 
 
@@ -974,6 +1092,13 @@ def test_one_step_adversarial_smoke_requires_bounded_active_slew_guard():
     assert evidence["apply_calls"] == 8
     assert evidence["slew_limit_events"] == 1
     assert evidence["applied_within_bounds"] is True
+
+    exact_threshold = json.loads(json.dumps(report))
+    exact_threshold["maxima"]["applied_delta_joint_pos_rad"][0] = np.float32(
+        np.float32(report["max_delta_joint_pos_rad"][0])
+        + np.float32(JOINT_SLEW_FLOAT32_TOLERANCE_RAD)
+    ).item()
+    validate_one_step_adversarial_report(exact_threshold)
 
     no_guard = json.loads(json.dumps(report))
     no_guard["counters"]["slew_limit_events"] = 0
