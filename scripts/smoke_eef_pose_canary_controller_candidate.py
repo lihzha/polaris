@@ -801,17 +801,16 @@ def validate_container_argument(
     }
 
 
-def _capture_controller_abort(
+def _build_controller_abort_capture(
     *,
     error: BaseException,
-    variant: str,
     policy_step: int,
     env: Any,
     boundary: Any,
     finger_term: Any,
     candidate_reporter: Any,
 ) -> dict[str, Any]:
-    """Capture and validate all controller/gripper state before teardown."""
+    """Build all controller/gripper evidence before teardown or validation."""
 
     failure_exception = gate0._exception_evidence(error)  # noqa: SLF001
     parsed_failure = gate0.parse_failure_exception(failure_exception["message"])
@@ -839,6 +838,18 @@ def _capture_controller_abort(
         "active_candidate": active_candidate,
         "active_target_slew": target_reporter(),
     }
+    return payload
+
+
+def _retain_then_validate_controller_abort_capture(
+    state: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    variant: str,
+) -> dict[str, Any]:
+    """Retain built evidence even if its secondary validation fails."""
+
+    state["controller_abort_capture"] = payload
     return validate_controller_abort_capture(payload, variant=variant)
 
 
@@ -1008,14 +1019,18 @@ def _run_live(args: argparse.Namespace, state: dict[str, Any]) -> dict[str, Any]
             )  # noqa: SLF001
             state["stage"] = "capture_controller_abort"
             try:
-                state["controller_abort_capture"] = _capture_controller_abort(
+                capture = _build_controller_abort_capture(
                     error=error,
-                    variant=args.variant,
                     policy_step=step,
                     env=env,
                     boundary=boundary,
                     finger_term=finger_term,
                     candidate_reporter=reporter,
+                )
+                _retain_then_validate_controller_abort_capture(
+                    state,
+                    capture,
+                    variant=args.variant,
                 )
             except BaseException as capture_error:
                 state["controller_abort_capture_failure"] = gate0._exception_evidence(

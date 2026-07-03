@@ -536,21 +536,47 @@ def validate_gripper_tail(
         isinstance(value, dict) and set(value) == GRIPPER_TAIL_FIELDS,
         "gripper tail schema",
     )
-    _require(value["schema_version"] == 1, "gripper tail schema version")
+    _require(
+        type(value["schema_version"]) is int and value["schema_version"] == 1,
+        "gripper tail schema version",
+    )
     _require(value["profile"] == GRIPPER_TAIL_PROFILE, "gripper tail profile")
-    _require(value["capacity"] == GRIPPER_TAIL_CAPACITY, "gripper tail capacity")
-    _require(value["decimation"] == DECIMATION, "gripper tail decimation")
+    _require(
+        type(value["capacity"]) is int and value["capacity"] == GRIPPER_TAIL_CAPACITY,
+        "gripper tail capacity",
+    )
+    _require(
+        type(value["decimation"]) is int and value["decimation"] == DECIMATION,
+        "gripper tail decimation",
+    )
     _require(value["joint_names"] == GRIPPER_JOINT_NAMES, "gripper joint names")
-    _require(value["joint_indices"] == GRIPPER_JOINT_INDICES, "gripper joint indices")
-    failure_step = expected_failure["policy_step"]
-    failure_substep = expected_failure["physics_substep"]
+    _require(
+        isinstance(value["joint_indices"], list)
+        and all(type(index) is int for index in value["joint_indices"])
+        and value["joint_indices"] == GRIPPER_JOINT_INDICES,
+        "gripper joint indices",
+    )
+    _require(isinstance(expected_failure, dict), "gripper expected failure")
+    failure_step = expected_failure.get("policy_step")
+    failure_substep = expected_failure.get("physics_substep")
+    _require(
+        type(failure_step) is int and failure_step >= 0,
+        "gripper failure policy step",
+    )
+    _require(
+        type(failure_substep) is int and 0 <= failure_substep < DECIMATION,
+        "gripper failure physics substep",
+    )
     expected_apply_entries = failure_step * DECIMATION + failure_substep
     _require(
-        value["process_action_calls"] == failure_step + 1,
+        type(value["process_action_calls"]) is int
+        and value["process_action_calls"] == failure_step + 1,
         "gripper process/failure cadence",
     )
     _require(
-        value["total_apply_entries"] == expected_apply_entries, "gripper apply cadence"
+        type(value["total_apply_entries"]) is int
+        and value["total_apply_entries"] == expected_apply_entries,
+        "gripper apply cadence",
     )
     entries = value["entries"]
     _require(
@@ -559,14 +585,19 @@ def validate_gripper_tail(
         "gripper tail length",
     )
     _require(
-        value["dropped_entries"] == expected_apply_entries - len(entries),
+        type(value["dropped_entries"]) is int
+        and value["dropped_entries"] == expected_apply_entries - len(entries),
         "gripper tail dropped count",
     )
     expected_first = expected_apply_entries - len(entries)
     for offset, entry in enumerate(entries):
         field = f"gripper tail entry {offset}"
         _require(
-            isinstance(entry, dict) and set(entry) == GRIPPER_ENTRY_FIELDS,
+            isinstance(entry, dict)
+            and set(entry) == GRIPPER_ENTRY_FIELDS
+            and type(entry.get("apply_index")) is int
+            and type(entry.get("policy_step")) is int
+            and type(entry.get("physics_substep")) is int,
             f"{field} schema",
         )
         apply_index = expected_first + offset
@@ -595,9 +626,11 @@ def validate_gripper_tail(
         _validate_snapshot(entry["post"], field=f"{field}.post")
     _require(entries, "gripper tail is empty")
     final_entry = entries[-1]
+    expected_final_apply_index = expected_apply_entries - 1
     _require(
-        final_entry["policy_step"] == failure_step
-        and final_entry["physics_substep"] == failure_substep - 1,
+        final_entry["apply_index"] == expected_final_apply_index
+        and final_entry["policy_step"] == expected_final_apply_index // DECIMATION
+        and final_entry["physics_substep"] == expected_final_apply_index % DECIMATION,
         "gripper tail terminal cadence",
     )
     failure_snapshot = _validate_snapshot(

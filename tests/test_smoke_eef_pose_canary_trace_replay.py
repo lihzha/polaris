@@ -15,8 +15,7 @@ def _snapshot(value: float = 0.0) -> dict[str, list[float]]:
     return {field: [value] * 6 for field in replay.SNAPSHOT_FIELDS}
 
 
-def _gripper_tail(variant: str) -> dict[str, object]:
-    failure = replay.EXPECTED_FIXTURES[variant]["failure"]
+def _gripper_tail_for_failure(failure: dict[str, object]) -> dict[str, object]:
     total = failure["policy_step"] * replay.DECIMATION + failure["physics_substep"]
     first = total - replay.GRIPPER_TAIL_CAPACITY
     entries = []
@@ -48,6 +47,10 @@ def _gripper_tail(variant: str) -> dict[str, object]:
     }
 
 
+def _gripper_tail(variant: str) -> dict[str, object]:
+    return _gripper_tail_for_failure(replay.EXPECTED_FIXTURES[variant]["failure"])
+
+
 @pytest.mark.parametrize("variant", sorted(replay.EXPECTED_FIXTURES))
 def test_committed_fixture_identity_and_actions(variant: str) -> None:
     identity, payload, actions = replay.load_replay_fixture(variant)
@@ -73,6 +76,48 @@ def test_all_six_gripper_tail_exact_failure_cadence(variant: str) -> None:
     assert replay.validate_gripper_tail(tail, expected_failure=failure) == tail
     assert len(tail["entries"]) == 64
     assert len(tail["entries"][-1]["post"]["joint_vel_rad_s"]) == 6
+
+
+def test_gripper_tail_rolls_substep_zero_back_to_previous_policy() -> None:
+    failure = {"policy_step": 121, "physics_substep": 0}
+    tail = _gripper_tail_for_failure(failure)
+    assert tail["process_action_calls"] == 122
+    assert tail["total_apply_entries"] == 968
+    assert tail["dropped_entries"] == 904
+    assert tail["entries"][-1]["apply_index"] == 967
+    assert tail["entries"][-1]["policy_step"] == 120
+    assert tail["entries"][-1]["physics_substep"] == 7
+    assert replay.validate_gripper_tail(tail, expected_failure=failure) == tail
+
+    current_policy_tamper = copy.deepcopy(tail)
+    current_policy_tamper["entries"][-1]["policy_step"] = 121
+    with pytest.raises(replay.Gate0ReplayValidationError, match="policy step"):
+        replay.validate_gripper_tail(
+            current_policy_tamper,
+            expected_failure=failure,
+        )
+
+
+def test_gripper_tail_rejects_boolean_index_aliases() -> None:
+    failure = {"policy_step": 121, "physics_substep": 0}
+    tail = _gripper_tail_for_failure(failure)
+    zero_substep_entry = next(
+        entry for entry in tail["entries"] if entry["physics_substep"] == 0
+    )
+    zero_substep_entry["physics_substep"] = False
+    with pytest.raises(replay.Gate0ReplayValidationError, match="schema"):
+        replay.validate_gripper_tail(tail, expected_failure=failure)
+
+    tail = _gripper_tail_for_failure(failure)
+    boolean_failure_substep = {"policy_step": 121, "physics_substep": False}
+    with pytest.raises(
+        replay.Gate0ReplayValidationError,
+        match="failure physics substep",
+    ):
+        replay.validate_gripper_tail(
+            tail,
+            expected_failure=boolean_failure_substep,
+        )
 
 
 def test_all_six_gripper_names_match_preserved_runtime_contract() -> None:

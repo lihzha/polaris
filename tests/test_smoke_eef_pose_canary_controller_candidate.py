@@ -459,7 +459,34 @@ def test_transactional_abort_capture_requires_arm_ring_all_six_and_target_state(
             )
 
 
-def test_incomplete_generic_abort_preserves_primary_without_promotion(monkeypatch):
+def test_built_abort_capture_is_retained_before_forced_validation_failure(
+    monkeypatch,
+):
+    state = {"controller_abort_capture": None}
+    payload = {"built": "all diagnostics"}
+
+    def reject(value, *, variant):
+        assert value is payload
+        assert variant == "official_lap3b"
+        assert state["controller_abort_capture"] is payload
+        raise candidate.CandidateReplayValidationError("forced secondary failure")
+
+    monkeypatch.setattr(candidate, "validate_controller_abort_capture", reject)
+    with pytest.raises(
+        candidate.CandidateReplayValidationError,
+        match="forced secondary failure",
+    ):
+        candidate._retain_then_validate_controller_abort_capture(
+            state,
+            payload,
+            variant="official_lap3b",
+        )
+    assert state["controller_abort_capture"] is payload
+
+
+def test_incomplete_abort_preserves_primary_and_built_capture_without_promotion(
+    monkeypatch,
+):
     context = {"initial_candidate": _candidate_report(official=True, final=False)}
     monkeypatch.setattr(
         candidate,
@@ -476,6 +503,7 @@ def test_incomplete_generic_abort_preserves_primary_without_promotion(monkeypatc
         "message": "failure message contract",
         "traceback": "secondary traceback",
     }
+    built_capture = {"built": "diagnostics retained before validation"}
     payload = {
         "schema_version": 1,
         "profile": candidate.PROFILE,
@@ -488,18 +516,17 @@ def test_incomplete_generic_abort_preserves_primary_without_promotion(monkeypatc
         "policy_step": 7,
         "failure_context": context,
         "failure": primary,
-        "controller_abort_capture": None,
+        "controller_abort_capture": built_capture,
         "controller_abort_capture_failure": secondary,
         "close_failures": [],
     }
-    assert (
-        candidate.validate_failure_payload(
-            payload,
-            variant="official_lap3b",
-            require_complete_capture=False,
-        )["failure"]
-        == primary
+    validated = candidate.validate_failure_payload(
+        payload,
+        variant="official_lap3b",
+        require_complete_capture=False,
     )
+    assert validated["failure"] == primary
+    assert validated["controller_abort_capture"] is built_capture
 
 
 def test_failure_path_has_separate_postjob_verifier_and_no_ready_publication():
@@ -510,6 +537,8 @@ def test_failure_path_has_separate_postjob_verifier_and_no_ready_publication():
     assert "validate_failure_payload(" in except_source
     assert "failure_context" in except_source
     assert ".ready.json" not in except_source
+    assert "_build_controller_abort_capture(" in source
+    assert "_retain_then_validate_controller_abort_capture(" in source
     verifier = SCRIPTS / "verify_eef_pose_canary_controller_candidate_failure.py"
     verifier_source = verifier.read_text()
     assert "validator.validate_failure(args)" in verifier_source
