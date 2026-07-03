@@ -1251,6 +1251,7 @@ def test_eef_velocity_and_effort_limits_are_scoped_to_eef_setup():
     eef_cfg = NVIDIA_DROID.copy()
     assert native_cfg.actuators["panda_shoulder"].velocity_limit_sim is None
     assert native_cfg.actuators["panda_forearm"].velocity_limit_sim is None
+    assert native_cfg.actuators["gripper"].velocity_limit_sim is None
     assert native_cfg.spawn.articulation_props.solver_position_iteration_count == 64
     assert native_cfg.spawn.articulation_props.solver_velocity_iteration_count == 0
 
@@ -1263,6 +1264,7 @@ def test_eef_velocity_and_effort_limits_are_scoped_to_eef_setup():
         'elif eval_args.control_mode != "joint-position":'
     )
     assert eef_branch < configure_call < native_branch
+    assert "enable_gripper_velocity_limit" not in eval_source
 
     native_physx_cfg = SimpleNamespace(solver_type=0)
     eef_physx_cfg = SimpleNamespace(solver_type=0)
@@ -1272,14 +1274,64 @@ def test_eef_velocity_and_effort_limits_are_scoped_to_eef_setup():
     assert eef_cfg.actuators["panda_shoulder"].effort_limit_sim == 87.0
     assert eef_cfg.actuators["panda_forearm"].velocity_limit_sim == 2.61
     assert eef_cfg.actuators["panda_forearm"].effort_limit_sim == 12.0
+    assert eef_cfg.actuators["gripper"].velocity_limit_sim is None
     assert eef_cfg.spawn.articulation_props.solver_position_iteration_count == 64
     assert eef_cfg.spawn.articulation_props.solver_velocity_iteration_count == 1
     assert eef_physx_cfg.solver_type == 1
     assert native_cfg.actuators["panda_shoulder"].velocity_limit_sim is None
     assert native_cfg.actuators["panda_forearm"].velocity_limit_sim is None
+    assert native_cfg.actuators["gripper"].velocity_limit_sim is None
     assert native_cfg.spawn.articulation_props.solver_position_iteration_count == 64
     assert native_cfg.spawn.articulation_props.solver_velocity_iteration_count == 0
     assert native_physx_cfg.solver_type == 0
+
+
+def test_eef_gripper_velocity_limit_candidate_is_explicit_and_opt_in():
+    from polaris.environments.robot_cfg import NVIDIA_DROID
+    from polaris.environments.robot_cfg import configure_eef_pose_joint_safety
+
+    native_cfg = NVIDIA_DROID.copy()
+    candidate_cfg = NVIDIA_DROID.copy()
+    candidate_physx = SimpleNamespace(solver_type=0)
+
+    configure_eef_pose_joint_safety(
+        candidate_cfg,
+        physx_cfg=candidate_physx,
+        enable_gripper_velocity_limit=True,
+    )
+
+    assert candidate_cfg.actuators["gripper"].velocity_limit == 5.0
+    assert candidate_cfg.actuators["gripper"].velocity_limit_sim == 5.0
+    assert candidate_cfg.actuators["gripper"].effort_limit == 200.0
+    assert candidate_cfg.actuators["gripper"].effort_limit_sim == 200.0
+    assert candidate_cfg.actuators["gripper"].stiffness is None
+    assert candidate_cfg.actuators["gripper"].damping is None
+    assert candidate_cfg.spawn.articulation_props.solver_position_iteration_count == 64
+    assert candidate_cfg.spawn.articulation_props.solver_velocity_iteration_count == 1
+    assert candidate_physx.solver_type == 1
+    assert native_cfg.actuators["gripper"].velocity_limit_sim is None
+    assert native_cfg.spawn.articulation_props.solver_velocity_iteration_count == 0
+
+
+def test_eef_gripper_velocity_limit_candidate_rejects_config_drift():
+    from polaris.environments.robot_cfg import NVIDIA_DROID
+    from polaris.environments.robot_cfg import configure_eef_pose_joint_safety
+
+    with pytest.raises(ValueError, match="enable flag must be bool"):
+        configure_eef_pose_joint_safety(
+            NVIDIA_DROID.copy(),
+            physx_cfg=SimpleNamespace(solver_type=0),
+            enable_gripper_velocity_limit="true",
+        )
+
+    cfg = NVIDIA_DROID.copy()
+    cfg.actuators["gripper"].joint_names_expr = ["wrong_joint"]
+    with pytest.raises(ValueError, match="pinned EEF"):
+        configure_eef_pose_joint_safety(
+            cfg,
+            physx_cfg=SimpleNamespace(solver_type=0),
+            enable_gripper_velocity_limit=True,
+        )
 
 
 def test_eef_pose_config_rejects_missing_articulation_properties():

@@ -78,6 +78,13 @@ FINGER_TRACE_PROFILE = "gripper_apply_causal_tail_all_links_device_partition_v3"
 ACTION_PLAN_PROFILE = "foodbussing_first_close_exact_or_delay1_v1"
 VIDEO_PROFILE = "lap_model_view_external_then_rot180_wrist_224x448_rational_cadence_v2"
 GRIPPER_DRIVE_PROFILE = "implicit_gripper_effort200_cuda_actuator_cpu_static_physx_v3"
+GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE = (
+    "implicit_gripper_physx_velocity_limit5_cuda_actuator_cpu_static_physx_v1"
+)
+GRIPPER_DRIVE_PROFILES = (
+    GRIPPER_DRIVE_PROFILE,
+    GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE,
+)
 SOLVER_CHANGE_PROFILE = "eef_pose_solver_velocity_iterations_0_to_1_v1"
 MODES = ("exact", "delay_first_close_one_step")
 SOURCE_CLOSE_POLICY_STEP = 115
@@ -168,6 +175,10 @@ PROBED_GRIPPER_DRIVE_FLOAT32_VALUES = {
     "effort_limit_nm": 200.0,
     "stiffness_nm_per_rad": 5729.578125,
     "damping_nm_s_per_rad": 0.011459155939519405,
+}
+GRIPPER_VELOCITY_LIMIT_CANDIDATE_FLOAT32_VALUES = {
+    **PROBED_GRIPPER_DRIVE_FLOAT32_VALUES,
+    "velocity_limit_rad_s": 5.0,
 }
 EXPECTED_BOUNDARY_HELPER_SIZE_BYTES = _BOOTSTRAP_BOUNDARY_SIZE_BYTES
 EXPECTED_BOUNDARY_HELPER_SHA256 = _BOOTSTRAP_BOUNDARY_SHA256
@@ -1910,13 +1921,78 @@ def _tensor_evidence_equal_excluding_device(
     )
 
 
-def _validate_gripper_drive_contract(value: Any) -> dict[str, Any]:
+def _selected_gripper_drive_profile(candidate_enabled: Any) -> str:
+    _require(type(candidate_enabled) is bool, "gripper candidate flag type")
+    return (
+        GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+        if candidate_enabled
+        else GRIPPER_DRIVE_PROFILE
+    )
+
+
+def _gripper_drive_expectations(profile: Any) -> dict[str, Any]:
+    if profile == GRIPPER_DRIVE_PROFILE:
+        return {
+            "configured": {
+                "legacy_velocity_limit_rad_s": 5.0,
+                "velocity_limit_sim_rad_s": None,
+                "legacy_effort_limit_nm": 200.0,
+                "effort_limit_sim_nm": None,
+                "stiffness": None,
+                "damping": None,
+            },
+            "live_cfg_velocity_limit_sim": None,
+            "values": PROBED_GRIPPER_DRIVE_FLOAT32_VALUES,
+            "velocity_behavior": (
+                "isaaclab_2p3_implicit_legacy_velocity_limit_5_ignored_"
+                "velocity_limit_sim_unset_v1"
+            ),
+            "effort_behavior": (
+                "implicit_legacy_effort_limit_200_promoted_to_effort_limit_sim_"
+                "and_enforced_v1"
+            ),
+        }
+    if profile == GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE:
+        return {
+            "configured": {
+                "legacy_velocity_limit_rad_s": 5.0,
+                "velocity_limit_sim_rad_s": 5.0,
+                "legacy_effort_limit_nm": 200.0,
+                "effort_limit_sim_nm": 200.0,
+                "stiffness": None,
+                "damping": None,
+            },
+            "live_cfg_velocity_limit_sim": 5.0,
+            "values": GRIPPER_VELOCITY_LIMIT_CANDIDATE_FLOAT32_VALUES,
+            "velocity_behavior": (
+                "isaaclab_2p3_explicit_velocity_limit_sim_5_enforced_"
+                "eef_diagnostic_only_v1"
+            ),
+            "effort_behavior": (
+                "implicit_equal_legacy_and_sim_effort_limit_200_enforced_v1"
+            ),
+        }
+    raise GripperImpulseDiagnosticError(f"unknown gripper drive profile: {profile!r}")
+
+
+def _validate_gripper_drive_contract(
+    value: Any, *, expected_profile: str | None = None
+) -> dict[str, Any]:
     _require(isinstance(value, dict), "gripper drive contract")
     _require(
         set(value) == GRIPPER_DRIVE_CONTRACT_FIELDS,
         "gripper drive contract schema",
     )
-    _require(value.get("profile") == GRIPPER_DRIVE_PROFILE, "gripper profile")
+    expectations = _gripper_drive_expectations(value.get("profile"))
+    if expected_profile is not None:
+        _require(
+            expected_profile in GRIPPER_DRIVE_PROFILES,
+            "expected gripper drive profile",
+        )
+        _require(
+            value.get("profile") == expected_profile,
+            "gripper drive profile does not match independent expectation",
+        )
     _require(
         _typed_equal(value.get("authoritative_device_probe"), DEVICE_PROBE_EVIDENCE),
         "gripper authoritative device probe",
@@ -1944,17 +2020,7 @@ def _validate_gripper_drive_contract(value: Any) -> dict[str, Any]:
         "configured gripper schema",
     )
     _require(
-        _typed_equal(
-            configured,
-            {
-                "legacy_velocity_limit_rad_s": 5.0,
-                "velocity_limit_sim_rad_s": None,
-                "legacy_effort_limit_nm": 200.0,
-                "effort_limit_sim_nm": None,
-                "stiffness": None,
-                "damping": None,
-            },
-        ),
+        _typed_equal(configured, expectations["configured"]),
         "configured gripper drive drift",
     )
     live = value.get("live_actuator")
@@ -1989,7 +2055,10 @@ def _validate_gripper_drive_contract(value: Any) -> dict[str, Any]:
         validated_live[field] = tensor
     _require(
         live.get("cfg_velocity_limit") is None
-        and live.get("cfg_velocity_limit_sim") is None
+        and _typed_equal(
+            live.get("cfg_velocity_limit_sim"),
+            expectations["live_cfg_velocity_limit_sim"],
+        )
         and type(live.get("cfg_effort_limit")) is float
         and live.get("cfg_effort_limit") == 200.0
         and type(live.get("cfg_effort_limit_sim")) is float
@@ -2076,14 +2145,14 @@ def _validate_gripper_drive_contract(value: Any) -> dict[str, Any]:
         _require(
             _same_float32(
                 validated_live[live_field]["values"][0],
-                PROBED_GRIPPER_DRIVE_FLOAT32_VALUES[probed_field],
+                expectations["values"][probed_field],
             ),
-            f"gripper job1098162 resolved actuator value drift: {live_field}",
+            f"gripper job1098162/profile resolved actuator value drift: {live_field}",
         )
-    for physx_field, expected in PROBED_GRIPPER_DRIVE_FLOAT32_VALUES.items():
+    for physx_field, expected in expectations["values"].items():
         _require(
             _same_float32(validated_physx[physx_field]["values"][0], expected),
-            f"gripper job1098162 static PhysX value drift: {physx_field}",
+            f"gripper job1098162/profile static PhysX value drift: {physx_field}",
         )
     effort = physx["effort_limit_nm"]
     _require(
@@ -2091,10 +2160,8 @@ def _validate_gripper_drive_contract(value: Any) -> dict[str, Any]:
         "gripper PhysX effort limit is not enforced at 200 Nm",
     )
     _require(
-        value.get("legacy_velocity_limit_behavior")
-        == "isaaclab_2p3_implicit_legacy_velocity_limit_5_ignored_velocity_limit_sim_unset_v1"
-        and value.get("effort_limit_behavior")
-        == "implicit_legacy_effort_limit_200_promoted_to_effort_limit_sim_and_enforced_v1",
+        value.get("legacy_velocity_limit_behavior") == expectations["velocity_behavior"]
+        and value.get("effort_limit_behavior") == expectations["effort_behavior"],
         "gripper limit semantics",
     )
     _require(
@@ -2876,8 +2943,18 @@ def _validate_failure_runtime_evidence(
     return dict(evidence)
 
 
-def validate_capture_payload(payload: Any, *, expected_mode: str) -> dict[str, Any]:
+def validate_capture_payload(
+    payload: Any,
+    *,
+    expected_mode: str,
+    expected_gripper_drive_profile: str | None = None,
+) -> dict[str, Any]:
     _require(expected_mode in MODES, "expected validation mode")
+    if expected_gripper_drive_profile is not None:
+        _require(
+            expected_gripper_drive_profile in GRIPPER_DRIVE_PROFILES,
+            "expected gripper drive profile",
+        )
     _require(isinstance(payload, dict), "capture must be an object")
     _require(set(payload) == PAYLOAD_FIELDS, "capture top-level schema drift")
     _exact_int(payload.get("schema_version"), 1, field="capture schema version")
@@ -2928,7 +3005,8 @@ def validate_capture_payload(payload: Any, *, expected_mode: str) -> dict[str, A
     _require(plan["mode"] == expected_mode, "capture action-plan mode")
     _validate_solver_contract(payload.get("solver_contract"))
     gripper_drive = _validate_gripper_drive_contract(
-        payload.get("gripper_drive_contract")
+        payload.get("gripper_drive_contract"),
+        expected_profile=expected_gripper_drive_profile,
     )
     outcome = _validate_outcome(payload.get("outcome"), mode=expected_mode)
     video_phase = validate_video_phase_contract(
@@ -3050,6 +3128,7 @@ def validate_capture_artifacts(
     video_path: Path,
     *,
     expected_mode: str,
+    expected_gripper_drive_profile: str | None = None,
     probe: Callable[[Path], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Host-only post-Kit validator for the immutable JSON and MP4 pair."""
@@ -3059,7 +3138,11 @@ def validate_capture_artifacts(
     payload = boundary.strict_json_loads(
         capture_path.read_bytes(), field="gripper impulse capture"
     )
-    validated = validate_capture_payload(payload, expected_mode=expected_mode)
+    validated = validate_capture_payload(
+        payload,
+        expected_mode=expected_mode,
+        expected_gripper_drive_profile=expected_gripper_drive_profile,
+    )
     capture_identity = _file_identity(capture_path)
     _require(
         capture_identity["mode"] == "0444" and capture_identity["nlink"] == 1,
@@ -3308,6 +3391,9 @@ def _host_revalidate_runtime_artifacts(args_cli: argparse.Namespace) -> None:
         args_cli.output_json,
         args_cli.output_video,
         expected_mode=args_cli.mode,
+        expected_gripper_drive_profile=_selected_gripper_drive_profile(
+            args_cli.enable_gripper_velocity_limit_candidate
+        ),
         probe=_probe_video_stdlib,
     )
     raw_identity = _file_identity(args_cli.output_json)
@@ -3696,7 +3782,10 @@ def _capture_gripper_drive_contract(
     finger_term: Any,
     *,
     configured_before_build: Mapping[str, Any],
+    candidate_enabled: bool,
 ) -> dict[str, Any]:
+    profile = _selected_gripper_drive_profile(candidate_enabled)
+    expectations = _gripper_drive_expectations(profile)
     actuator = robot.actuators.get("gripper")
     _require(actuator is not None, "live robot has no gripper actuator")
     action_term_joint_names = list(finger_term._joint_names)
@@ -3730,7 +3819,7 @@ def _capture_gripper_drive_contract(
         "resolved_damping_nm_s_per_rad": tensor_evidence(actuator.damping),
     }
     contract = {
-        "profile": GRIPPER_DRIVE_PROFILE,
+        "profile": profile,
         "actuator_name": "gripper",
         "joint_names": action_term_joint_names,
         "joint_indices": action_term_joint_indices,
@@ -3755,14 +3844,8 @@ def _capture_gripper_drive_contract(
                 select(_direct_physx_tensor(robot, "get_dof_dampings"))
             ),
         },
-        "legacy_velocity_limit_behavior": (
-            "isaaclab_2p3_implicit_legacy_velocity_limit_5_ignored_"
-            "velocity_limit_sim_unset_v1"
-        ),
-        "effort_limit_behavior": (
-            "implicit_legacy_effort_limit_200_promoted_to_effort_limit_sim_"
-            "and_enforced_v1"
-        ),
+        "legacy_velocity_limit_behavior": expectations["velocity_behavior"],
+        "effort_limit_behavior": expectations["effort_behavior"],
         "incoming_joint_wrench_semantics": (
             "physx_total_incoming_joint_wrench_not_contact_force_child_joint_frame_v1"
         ),
@@ -3858,6 +3941,16 @@ def _run_live_diagnostic(args_cli: argparse.Namespace, state: dict[str, Any]):
         BinaryJointPositionZeroToOneAction
     )
     env_cfg.actions.finger_joint.class_type = diagnostic_gripper_class
+    articulation_props = env_cfg.scene.robot.spawn.articulation_props
+    _require(articulation_props is not None, "missing articulation properties")
+    solver_velocity_before = articulation_props.solver_velocity_iteration_count
+    configure_eef_pose_joint_safety(
+        env_cfg.scene.robot,
+        physx_cfg=env_cfg.sim.physx,
+        enable_gripper_velocity_limit=(
+            args_cli.enable_gripper_velocity_limit_candidate
+        ),
+    )
     gripper_cfg = env_cfg.scene.robot.actuators["gripper"]
     configured_gripper = {
         "legacy_velocity_limit_rad_s": _scalar_cfg_value(gripper_cfg.velocity_limit),
@@ -3867,13 +3960,6 @@ def _run_live_diagnostic(args_cli: argparse.Namespace, state: dict[str, Any]):
         "stiffness": _scalar_cfg_value(gripper_cfg.stiffness),
         "damping": _scalar_cfg_value(gripper_cfg.damping),
     }
-    articulation_props = env_cfg.scene.robot.spawn.articulation_props
-    _require(articulation_props is not None, "missing articulation properties")
-    solver_velocity_before = articulation_props.solver_velocity_iteration_count
-    configure_eef_pose_joint_safety(
-        env_cfg.scene.robot,
-        physx_cfg=env_cfg.sim.physx,
-    )
     solver_velocity_after = articulation_props.solver_velocity_iteration_count
     env = gym.make(ENVIRONMENT, cfg=env_cfg)
     state["env"] = env
@@ -3928,6 +4014,7 @@ def _run_live_diagnostic(args_cli: argparse.Namespace, state: dict[str, Any]):
         robot,
         finger_term,
         configured_before_build=configured_gripper,
+        candidate_enabled=args_cli.enable_gripper_velocity_limit_candidate,
     )
     solver_contract = {
         "profile": SOLVER_CHANGE_PROFILE,
@@ -4145,6 +4232,11 @@ def build_runtime_parser(
     parser.add_argument("--output-ready-marker", type=Path, required=True)
     parser.add_argument("--runtime-exit", type=Path, required=True)
     parser.add_argument("--mode", choices=MODES, required=True)
+    parser.add_argument(
+        "--enable-gripper-velocity-limit-candidate",
+        action="store_true",
+        help="Enable the isolated EEF-only 5 rad/s PhysX gripper canary.",
+    )
     parser.add_argument("--expected-source-sha256", required=True)
     parser.add_argument("--expected-source-size-bytes", type=int, required=True)
     if add_app_launcher_args is not None:
@@ -4283,7 +4375,13 @@ def _child_runtime_main(argv: Sequence[str]) -> None:
                 "video": video_identity,
                 "close_failures": [],
             }
-            validate_capture_payload(payload, expected_mode=args_cli.mode)
+            validate_capture_payload(
+                payload,
+                expected_mode=args_cli.mode,
+                expected_gripper_drive_profile=_selected_gripper_drive_profile(
+                    args_cli.enable_gripper_velocity_limit_candidate
+                ),
+            )
             json_identity = publish_immutable_json(args_cli.output_json, payload)
             ready_payload = {
                 "schema_version": 1,

@@ -804,3 +804,130 @@
   decoded stream ticks and time base rationally while accepting only the
   canonical ffprobe stream-duration or MP4 millisecond-ceiling container
   representation.
+
+## 2026-07-03 — fully attested gripper-delay pair implicates close timing but remains unsafe
+
+- Independently reviewed mode-0444 wrappers were submitted 79.7 milliseconds
+  apart from one SSH session with their reviewed SHA-256 values bound through
+  `EXPECTED_SAVED_JOB_SCRIPT_SHA256`. Exact job `1098167` ran on
+  `pool0-00013` from 04:16:41 to 04:21:21 PDT and delay-one job `1098168` ran
+  on `pool0-00027` from 04:16:41 to 04:21:23 PDT. Both root jobs and all five
+  steps completed `0:0`; the nodes are idle and neither job remains queued.
+  The final exact and delayed log SHA-256 values are respectively
+  `d5ec6689325df2d646dee5a1b5f84d1608d4194a9444fe46a41b078494c79675`
+  and
+  `c17b80b0e89f005fb60ab5525682c2b055635d326038ef167f8c5cf07d074136`.
+- Each attempt has exactly ten regular, mode-0444, single-link files and no
+  extras. Runtime, outer-srun, and validator sidecars are exact `0\n`.
+  Exact capture/video/ready/attestation SHA-256 values are
+  `5ec6a5cc5fb85e9f28fc42bf322bd3e9341099e9da3b6dac6e0ef9fa22facff9`,
+  `351126b771e11c1fe8b403ab8ff443607f33a01fc782e1cd8a9d309a1f18f508`,
+  `f36d74011f270f4ae3dc7b69c2a20c2fca8c2ed803171cb114e9f7cabc670f3b`,
+  and
+  `0851b171ed6d7a532c7508d3a6af3ddeaaaba6f40b8f258664a6bbd325261599`.
+  Delayed values are
+  `510c3cd8c7493694fd4ffec54fc9fa4851f2db0c1402e3216a1ee944d8508966`,
+  `dd3a5475fdb6acedcc39591652a7f639d0aa4bca9b4ba5c6912eabcd93e5ad3d`,
+  `0e1cff0ab51ec536d3d18156b18b18a03edd833a9a9a19940e6146691e8fe221`,
+  and
+  `b30c9668779d43236d7665835fb83d7b7b0c1e959164837ce10284a3012fcdef`.
+  Runtime and Slurm wrapper snapshots equal the reviewed exact wrapper
+  `32fc35a4ea6ce684eb1b9ad86204e9f1f8f042ad4fbcebe2d344b1ce9f05a78e`
+  or delayed wrapper
+  `fc98de4dbb6bef279798aa6c3eb06aa7836057ec00f2976180a046b38c954e89`.
+- Both attestation-v6 records bind the clean detached standalone commit
+  `04d9ed6e4f7ec3e418a0927f990c6b30bc4ade8f`, its real in-root Git/common-Git
+  directory, exact source and asset identities, assigned node, command, and
+  Slurm snapshot. Per-job cache and staging directories are absent after
+  completion; the source remains clean and byte-exact.
+- Local ffprobe and complete ffmpeg decoding accept both H.264 High/yuv420p
+  videos at 448x224 and exactly 15 fps. Exact is 117 frames/7.8 seconds;
+  delayed is 119 frames/7.933333 seconds. First, middle, and terminal frames
+  are nonblank, show continuous arm/object motion, and have the intended
+  external-plus-rotated-wrist layout.
+- In exact mode, the only gripper transition is close at policy step 115.
+  Finger velocity jumps from approximately zero to `+8.022388` rad/s on its
+  first physics substep, then to `-8.726713` rad/s while applied gripper torque
+  is clipped at `+200` Nm. The arm guard aborts apply 922 at policy step
+  115/substep 2: joint 5 is `+2.223634` rad/s and joint 7 is `-2.892737` rad/s
+  against their `2.61` rad/s limit.
+- The delayed plan changes only action index 7 at policy step 115 and preserves
+  all arm dimensions bitwise. The gripper remains effectively stationary and
+  arm velocity stays below `0.106` rad/s through that step. Closing at step
+  116 then drives the finger to `+8.726656` rad/s, later oscillating through
+  `-8.727228` rad/s under the same `+200` Nm clip. The arm eventually aborts
+  at apply 943, policy step 117/substep 7, with joints 5 and 7 at
+  `+4.827284` and `-4.899215` rad/s.
+- This intervention establishes that the original policy-115/substep-2 guard
+  is contingent on executing the close at policy step 115: suppressing only
+  that close eliminates the reference-timed failure. It falsifies the simpler
+  prediction that delaying close by one policy step merely shifts the guard by
+  one policy step, because the delayed run instead fails 21 physics substeps
+  later at the diagnostic horizon. The controller is still unsafe, so this is
+  not a production repair. The next isolated default-off candidate should set
+  the implicit gripper's simulation velocity limit to 5 rad/s while preserving
+  legacy behavior byte-for-byte when disabled, then repeat the fully attested
+  A/B under the corrected CPU-static/CUDA-actuator evidence contract.
+
+## 2026-07-03 — isolated 5 rad/s gripper PhysX-cap canary is code-complete locally
+
+- Ported the smallest default-off candidate onto the current attested base
+  `04d9ed6`: `configure_eef_pose_joint_safety` now accepts the exact boolean
+  `enable_gripper_velocity_limit=False`. Only the opt-in gripper diagnostic CLI
+  passes it true. The candidate exact-name-checks the one `finger_joint`, its
+  null configured gains, legacy 5 rad/s velocity, and 200 Nm effort before
+  authoring `velocity_limit_sim=5.0` and `effort_limit_sim=200.0`. Normal
+  `scripts/eval.py`, the action config, arm controller, and arm runtime-contract
+  schemas are unchanged. A source gate asserts that `scripts/eval.py` does not
+  name the candidate flag; the full diff audit separately confirms the action
+  config, arm controller, and production runtime-contract files are unchanged.
+- The disabled diagnostic keeps its existing payload schema and drive profile,
+  and still requires the job-1098162 live value of
+  `8.726646423339844` rad/s. The candidate has a separate nested drive profile
+  and requires exact float32 5.0 rad/s readback from both the CUDA actuator
+  tensor and the CPU direct-PhysX tensor. It preserves the authoritative
+  job-1098162 device partition: actuator/cached evidence is `cuda:0`, static
+  direct PhysX evidence is CPU, dtype/shape/finiteness/value equality remains
+  exact, and only the device label is excluded when cross-comparing those two
+  representations. Effort remains exactly 200 Nm; stiffness and damping remain
+  the probed `5729.578125` and `0.011459155939519405` values. Every retained
+  pre/post physics snapshot cross-binds its selected finger drive values to
+  this startup contract.
+- Isaac Lab v2.3.0 upstream source was checked before pinning the live config
+  expectation: when legacy and `_sim` velocity fields are both present and
+  equal, `ImplicitActuator` leaves both at 5; the candidate therefore requires
+  live `cfg.velocity_limit_sim == 5.0` rather than assuming the legacy unset
+  representation.
+- Local gates currently pass: 258 focused gripper diagnostic/finalizer tests;
+  the wider non-Isaac suite at 448 tests plus 30 subtests; three focused robot
+  config/helper tests under lightweight Isaac-module stubs; Ruff format/check,
+  Python byte compilation, and `git diff --check`. Tamper cases reject a legacy
+  profile paired with candidate config, the old 8.7266 value, swapped CPU/CUDA
+  evidence, an unset live simulation cap, and a full-snapshot finger drive that
+  disagrees with the startup contract.
+- The first independent pre-commit audit was an explicit NO-GO despite all
+  value/device checks passing: candidate intent was derived only inside the
+  runtime capture, so accidentally omitting the runtime candidate flag could
+  produce legacy 8.7266 behavior and still satisfy a finalizer that expected
+  only mode `exact`. The repaired contract now derives and checks the expected
+  profile independently in the stdlib parent; requires the finalizer's closed
+  `--expected-gripper-drive-profile`; rejects candidate/legacy swaps; securely
+  checks that diagnostic and finalizer profile sets agree; and records the
+  expected/capture-matched profile in the v7 attestation. Adversarial tests
+  cover candidate-flag omission, both profile-swap directions, open-ended
+  profile input, missing/non-closed finalizer intent, forwarding into artifact
+  validation, and attestation/capture mismatch.
+- Fresh independent re-audit of the repaired source/test diff SHA-256
+  `24c76a321c18eaef96e16c11129ce5cb4915a53ece9a7a662f7b1a5cd9eab36b`
+  is GO for commit, push, deployment, and the mandatory real-Isaac canary, with
+  no P0/P1 findings. It independently reran all reported gates and confirmed
+  the prior profile-intent issue is closed end to end. This is explicitly not
+  a promotion GO: the fully attested real-Isaac canary remains the integration
+  gate. A single monolithic synthetic candidate-capture/finalizer test is a
+  nonblocking P2 gap because each component boundary is adversarially covered
+  and the real canary is authoritative.
+- This is not yet a repair and has not been committed, deployed, or launched.
+  Independent code/contract GO, a real-Isaac gate, immutable provenance, and a
+  fully attested exact-action canary are still required. Promotion remains
+  blocked unless the capture proves the live 5 rad/s cap and completes the
+  diagnostic horizon without an arm velocity-guard failure.

@@ -24,6 +24,14 @@ FIXTURE_PATH = (
     / ("official_lap3b_foodbussing_v3_boundary_actions.json")
 )
 MODES = ("exact", "delay_first_close_one_step")
+GRIPPER_DRIVE_PROFILE = "implicit_gripper_effort200_cuda_actuator_cpu_static_physx_v3"
+GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE = (
+    "implicit_gripper_physx_velocity_limit5_cuda_actuator_cpu_static_physx_v1"
+)
+GRIPPER_DRIVE_PROFILES = (
+    GRIPPER_DRIVE_PROFILE,
+    GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE,
+)
 EXPECTED_BOUNDARY_SHA256 = (
     "a63f2a8ab9c42ea872da9d6e1913d43e0a89b0382c01d88071af19bdf2731d97"
 )
@@ -33,12 +41,13 @@ EXPECTED_FIXTURE_SHA256 = (
 diagnostic: Any | None = None
 
 
-ATTESTATION_PROFILE = "gripper_impulse_post_kit_staged_attestation_v6"
+ATTESTATION_PROFILE = "gripper_impulse_post_kit_staged_attestation_v7"
 ATTESTATION_FIELDS = {
     "schema_version",
     "profile",
     "stage",
     "mode",
+    "gripper_drive_profile",
     "intended_attestation_path",
     "outcome",
     "artifacts",
@@ -509,6 +518,10 @@ def _bootstrap_trusted_sources(args: argparse.Namespace) -> Any:
         and module.BOUNDARY_HELPER_PATH.resolve() == BOUNDARY_PATH
         and module.boundary.FIXTURE_PATH.resolve() == FIXTURE_PATH,
         "securely imported diagnostic path drift",
+    )
+    _require(
+        tuple(module.GRIPPER_DRIVE_PROFILES) == GRIPPER_DRIVE_PROFILES,
+        "diagnostic/finalizer gripper drive profiles drift",
     )
     return module
 
@@ -1088,6 +1101,7 @@ def _validate_capture_with_stdlib_probe(
         args.validate_capture,
         args.video,
         expected_mode=args.expected_mode,
+        expected_gripper_drive_profile=args.expected_gripper_drive_profile,
         probe=probe,
     )
 
@@ -1216,8 +1230,15 @@ def _attestation_payload(
     context: Mapping[str, Any],
     validator_status: Mapping[str, Any],
     mode: str,
+    gripper_drive_profile: str,
     intended_attestation_path: Path,
 ) -> dict[str, Any]:
+    drive_contract = capture.get("gripper_drive_contract")
+    _require(
+        isinstance(drive_contract, Mapping)
+        and drive_contract.get("profile") == gripper_drive_profile,
+        "attestation/capture gripper drive profile mismatch",
+    )
     artifacts = {
         **context["identities"],
         "validator_status": validator_status,
@@ -1228,6 +1249,7 @@ def _attestation_payload(
         "profile": ATTESTATION_PROFILE,
         "stage": "post_kit_host_attested",
         "mode": mode,
+        "gripper_drive_profile": gripper_drive_profile,
         "intended_attestation_path": str(_canonical_target(intended_attestation_path)),
         "outcome": capture["outcome"],
         "artifacts": artifacts,
@@ -1260,6 +1282,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--attestation-staging-output", type=Path)
     parser.add_argument("--attestation-input", type=Path)
     parser.add_argument("--expected-mode", choices=MODES, required=True)
+    parser.add_argument(
+        "--expected-gripper-drive-profile",
+        choices=GRIPPER_DRIVE_PROFILES,
+        required=True,
+    )
     parser.add_argument("--polaris-repo", type=Path, required=True)
     parser.add_argument("--expected-polaris-commit", required=True)
     parser.add_argument("--expected-diagnostic-sha256", required=True)
@@ -1412,7 +1439,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.action == "validate":
         print(
             "POLARIS_GRIPPER_IMPULSE_HOST_VALID="
-            f"mode={args.expected_mode};outcome={capture['outcome']['kind']}",
+            f"mode={args.expected_mode};"
+            f"gripper_drive_profile={args.expected_gripper_drive_profile};"
+            f"outcome={capture['outcome']['kind']}",
             flush=True,
         )
         return 0
@@ -1432,6 +1461,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         context=context,
         validator_status=validator_status,
         mode=args.expected_mode,
+        gripper_drive_profile=args.expected_gripper_drive_profile,
         intended_attestation_path=args.intended_attestation_path,
     )
     expected_bytes = module._strict_json_bytes(expected)  # noqa: SLF001

@@ -643,6 +643,7 @@ def test_bootstrap_hashes_every_source_before_diagnostic_import(monkeypatch):
     )
     imported = finalizer._bootstrap_trusted_sources(args)
     assert Path(imported.__file__).resolve() == finalizer.DIAGNOSTIC_PATH
+    assert tuple(imported.GRIPPER_DRIVE_PROFILES) == finalizer.GRIPPER_DRIVE_PROFILES
 
     args.expected_diagnostic_sha256 = "0" * 64
     monkeypatch.setattr(
@@ -791,6 +792,9 @@ def test_execution_provenance_requires_pinned_container_path_literal(
 def _fake_capture() -> dict:
     return {
         "outcome": {"kind": "diagnostic_horizon_reached"},
+        "gripper_drive_contract": {
+            "profile": finalizer.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+        },
         "runtime_protocol": {
             "reset_seed": 0,
             "initial_condition_index": 0,
@@ -811,21 +815,61 @@ def test_host_validation_forces_exact_stdlib_video_probe(tmp_path):
         _probe_video_stdlib = staticmethod(stdlib_probe)
 
         @staticmethod
-        def validate_capture_artifacts(capture, video, *, expected_mode, probe):
-            calls.append((capture, video, expected_mode, probe))
+        def validate_capture_artifacts(
+            capture,
+            video,
+            *,
+            expected_mode,
+            expected_gripper_drive_profile,
+            probe,
+        ):
+            calls.append(
+                (
+                    capture,
+                    video,
+                    expected_mode,
+                    expected_gripper_drive_profile,
+                    probe,
+                )
+            )
             return {"validated": True}
 
     args = Namespace(
         validate_capture=tmp_path / "capture.json",
         video=tmp_path / "video.mp4",
         expected_mode="exact",
+        expected_gripper_drive_profile=(
+            finalizer.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+        ),
     )
     assert finalizer._validate_capture_with_stdlib_probe(Module, args) == {
         "validated": True
     }
     assert calls == [
-        (args.validate_capture, args.video, "exact", Module._probe_video_stdlib)
+        (
+            args.validate_capture,
+            args.video,
+            "exact",
+            finalizer.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE,
+            Module._probe_video_stdlib,
+        )
     ]
+
+
+def test_finalizer_requires_closed_independent_gripper_drive_profile():
+    parser = finalizer.build_parser()
+    action = next(
+        candidate
+        for candidate in parser._actions  # noqa: SLF001
+        if candidate.dest == "expected_gripper_drive_profile"
+    )
+
+    assert action.required is True
+    assert tuple(action.choices) == finalizer.GRIPPER_DRIVE_PROFILES
+    assert set(finalizer.GRIPPER_DRIVE_PROFILES) == {
+        finalizer.GRIPPER_DRIVE_PROFILE,
+        finalizer.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE,
+    }
 
 
 def _fake_context(tmp_path: Path) -> dict:
@@ -877,12 +921,37 @@ def _action_args(tmp_path: Path, *, action: str) -> Namespace:
             tmp_path / "final.attestation.json" if action == "verify" else None
         ),
         expected_mode="exact",
+        expected_gripper_drive_profile=(
+            finalizer.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+        ),
         container_image=tmp_path / "image",
         submitted_saved_wrapper=tmp_path / "submitted-saved-wrapper",
         runtime_dollar_zero_snapshot=tmp_path / "runtime-dollar-zero-snapshot",
         scontrol_batch_script_snapshot=tmp_path / "scontrol-batch-script-snapshot",
         slurm_job_oneliner_snapshot=tmp_path / "scontrol-show-job-oneliner",
     )
+
+
+def test_attestation_rejects_capture_expected_profile_swap(tmp_path):
+    capture = _fake_capture()
+    capture["gripper_drive_contract"]["profile"] = finalizer.GRIPPER_DRIVE_PROFILE
+    context = _fake_context(tmp_path)
+    validator_status = next(iter(context["identities"].values()))
+
+    with pytest.raises(
+        finalizer.GripperImpulseFinalizationError,
+        match="attestation/capture gripper drive profile mismatch",
+    ):
+        finalizer._attestation_payload(  # noqa: SLF001
+            capture=capture,
+            context=context,
+            validator_status=validator_status,
+            mode="exact",
+            gripper_drive_profile=(
+                finalizer.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+            ),
+            intended_attestation_path=tmp_path / "final.attestation.json",
+        )
 
 
 class _FixedParser:
@@ -935,6 +1004,10 @@ def test_validate_finalize_verify_use_isolated_staging_and_exact_bytes(
     staged = json.loads(staging.read_text())
     assert staged["intended_attestation_path"] == str(
         finalize_args.intended_attestation_path.absolute()
+    )
+    assert (
+        staged["gripper_drive_profile"]
+        == finalizer.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
     )
 
     final_path = finalize_args.intended_attestation_path

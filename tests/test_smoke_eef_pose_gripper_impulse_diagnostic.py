@@ -370,7 +370,28 @@ def test_host_parsers_cover_runtime_and_post_kit_modes(tmp_path: Path):
             "1",
         ]
     )
+    assert runtime.enable_gripper_velocity_limit_candidate is False
     diagnostic._validate_runtime_output_paths(runtime)  # noqa: SLF001
+    candidate_runtime = diagnostic.build_runtime_parser().parse_args(
+        [
+            "--output-json",
+            str(tmp_path / "candidate.json"),
+            "--output-video",
+            str(tmp_path / "candidate.mp4"),
+            "--output-ready-marker",
+            str(tmp_path / "candidate-ready.json"),
+            "--runtime-exit",
+            str(tmp_path / "candidate-runtime.exit"),
+            "--mode",
+            "exact",
+            "--enable-gripper-velocity-limit-candidate",
+            "--expected-source-sha256",
+            "0" * 64,
+            "--expected-source-size-bytes",
+            "1",
+        ]
+    )
+    assert candidate_runtime.enable_gripper_velocity_limit_candidate is True
     validation = diagnostic.build_validation_parser().parse_args(
         [
             "--action",
@@ -389,6 +410,8 @@ def test_host_parsers_cover_runtime_and_post_kit_modes(tmp_path: Path):
             str(tmp_path / "final.attestation.json"),
             "--expected-mode",
             "delay_first_close_one_step",
+            "--expected-gripper-drive-profile",
+            diagnostic.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE,
             "--polaris-repo",
             str(tmp_path / "repo"),
             "--expected-polaris-commit",
@@ -456,6 +479,19 @@ def test_host_parsers_cover_runtime_and_post_kit_modes(tmp_path: Path):
         ]
     )
     assert validation.expected_mode == "delay_first_close_one_step"
+    assert (
+        validation.expected_gripper_drive_profile
+        == diagnostic.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+    )
+
+
+def test_parent_revalidation_independently_derives_drive_profile_from_runtime_flag():
+    source = inspect.getsource(
+        diagnostic._host_revalidate_runtime_artifacts  # noqa: SLF001
+    )
+
+    assert "expected_gripper_drive_profile=_selected_gripper_drive_profile(" in source
+    assert "args_cli.enable_gripper_velocity_limit_candidate" in source
 
 
 def test_diagnostic_source_is_launch_bound_and_live_rehashed():
@@ -1338,10 +1374,19 @@ def _scalar_evidence(value, *, device):
     return tensor
 
 
-def _gripper_contract():
-    probed = diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES
+def _gripper_contract(*, candidate_enabled=False):
+    probed = (
+        diagnostic.GRIPPER_VELOCITY_LIMIT_CANDIDATE_FLOAT32_VALUES
+        if candidate_enabled
+        else diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES
+    )
+    profile = (
+        diagnostic.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+        if candidate_enabled
+        else diagnostic.GRIPPER_DRIVE_PROFILE
+    )
     return {
-        "profile": diagnostic.GRIPPER_DRIVE_PROFILE,
+        "profile": profile,
         "actuator_name": "gripper",
         "joint_names": ["finger_joint"],
         "joint_indices": [7],
@@ -1352,15 +1397,15 @@ def _gripper_contract():
         "authoritative_device_probe": copy.deepcopy(diagnostic.DEVICE_PROBE_EVIDENCE),
         "configured_before_articulation_build": {
             "legacy_velocity_limit_rad_s": 5.0,
-            "velocity_limit_sim_rad_s": None,
+            "velocity_limit_sim_rad_s": 5.0 if candidate_enabled else None,
             "legacy_effort_limit_nm": 200.0,
-            "effort_limit_sim_nm": None,
+            "effort_limit_sim_nm": 200.0 if candidate_enabled else None,
             "stiffness": None,
             "damping": None,
         },
         "live_actuator": {
             "cfg_velocity_limit": None,
-            "cfg_velocity_limit_sim": None,
+            "cfg_velocity_limit_sim": 5.0 if candidate_enabled else None,
             "cfg_effort_limit": 200.0,
             "cfg_effort_limit_sim": 200.0,
             "cfg_stiffness": None,
@@ -1407,12 +1452,23 @@ def _gripper_contract():
             ),
         },
         "legacy_velocity_limit_behavior": (
-            "isaaclab_2p3_implicit_legacy_velocity_limit_5_ignored_"
-            "velocity_limit_sim_unset_v1"
+            (
+                "isaaclab_2p3_explicit_velocity_limit_sim_5_enforced_"
+                "eef_diagnostic_only_v1"
+            )
+            if candidate_enabled
+            else (
+                "isaaclab_2p3_implicit_legacy_velocity_limit_5_ignored_"
+                "velocity_limit_sim_unset_v1"
+            )
         ),
         "effort_limit_behavior": (
-            "implicit_legacy_effort_limit_200_promoted_to_effort_limit_sim_"
-            "and_enforced_v1"
+            "implicit_equal_legacy_and_sim_effort_limit_200_enforced_v1"
+            if candidate_enabled
+            else (
+                "implicit_legacy_effort_limit_200_promoted_to_effort_limit_sim_"
+                "and_enforced_v1"
+            )
         ),
         "incoming_joint_wrench_semantics": (
             "physx_total_incoming_joint_wrench_not_contact_force_child_joint_frame_v1"
@@ -1449,6 +1505,166 @@ def test_gripper_contract_accepts_job1098162_resolved_values_not_legacy_five():
         == 5.0
     )
     assert physx["velocity_limit_rad_s"]["values"] != [5.0]
+
+
+def test_gripper_candidate_contract_requires_exact_split_device_five_rad_s_cap():
+    contract = _gripper_contract(candidate_enabled=True)
+
+    validated = diagnostic._validate_gripper_drive_contract(  # noqa: SLF001
+        contract,
+        expected_profile=diagnostic.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE,
+    )
+
+    assert (
+        validated["profile"]
+        == diagnostic.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+    )
+    assert validated["configured_before_articulation_build"] == {
+        "legacy_velocity_limit_rad_s": 5.0,
+        "velocity_limit_sim_rad_s": 5.0,
+        "legacy_effort_limit_nm": 200.0,
+        "effort_limit_sim_nm": 200.0,
+        "stiffness": None,
+        "damping": None,
+    }
+    actuator = validated["live_actuator"]["resolved_velocity_limit_rad_s"]
+    physx = validated["live_physx_readback"]["velocity_limit_rad_s"]
+    assert actuator["device"] == diagnostic.PINNED_ACTUATOR_DEVICE
+    assert physx["device"] == diagnostic.PINNED_STATIC_PHYSX_DEVICE
+    assert actuator["values"] == physx["values"] == [5.0]
+
+
+@pytest.mark.parametrize("candidate_enabled", [False, True])
+def test_gripper_drive_contract_rejects_independent_profile_swap(candidate_enabled):
+    expected_profile = (
+        diagnostic.GRIPPER_DRIVE_PROFILE
+        if candidate_enabled
+        else diagnostic.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+    )
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="independent expectation",
+    ):
+        diagnostic._validate_gripper_drive_contract(  # noqa: SLF001
+            _gripper_contract(candidate_enabled=candidate_enabled),
+            expected_profile=expected_profile,
+        )
+
+
+def test_gripper_drive_contract_rejects_open_ended_expected_profile():
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="expected gripper drive profile",
+    ):
+        diagnostic._validate_gripper_drive_contract(  # noqa: SLF001
+            _gripper_contract(candidate_enabled=True),
+            expected_profile="candidate",
+        )
+
+
+def test_omitted_runtime_candidate_flag_cannot_satisfy_candidate_finalizer_intent(
+    tmp_path,
+):
+    runtime = diagnostic.build_runtime_parser().parse_args(
+        [
+            "--output-json",
+            str(tmp_path / "capture.json"),
+            "--output-video",
+            str(tmp_path / "capture.mp4"),
+            "--output-ready-marker",
+            str(tmp_path / "ready.json"),
+            "--runtime-exit",
+            str(tmp_path / "runtime.exit"),
+            "--mode",
+            "exact",
+            "--expected-source-sha256",
+            "0" * 64,
+            "--expected-source-size-bytes",
+            "1",
+        ]
+    )
+    runtime_profile = diagnostic._selected_gripper_drive_profile(  # noqa: SLF001
+        runtime.enable_gripper_velocity_limit_candidate
+    )
+
+    assert runtime_profile == diagnostic.GRIPPER_DRIVE_PROFILE
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="independent expectation",
+    ):
+        diagnostic._validate_gripper_drive_contract(  # noqa: SLF001
+            _gripper_contract(candidate_enabled=False),
+            expected_profile=(
+                diagnostic.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+            ),
+        )
+
+
+def test_gripper_candidate_contract_cross_binds_full_static_physx_snapshot():
+    contract = diagnostic._validate_gripper_drive_contract(  # noqa: SLF001
+        _gripper_contract(candidate_enabled=True)
+    )
+    snapshot = {"joint_names": list(diagnostic.EXPECTED_DROID_JOINT_NAMES)}
+    joint_index = diagnostic.EXPECTED_DROID_JOINT_NAMES.index("finger_joint")
+    for snapshot_field, drive_field in (
+        ("physx_joint_velocity_limit_rad_s", "velocity_limit_rad_s"),
+        ("physx_joint_effort_limit_nm", "effort_limit_nm"),
+        ("physx_joint_stiffness_nm_per_rad", "stiffness_nm_per_rad"),
+        ("physx_joint_damping_nm_s_per_rad", "damping_nm_s_per_rad"),
+    ):
+        evidence = _tensor([len(diagnostic.EXPECTED_DROID_JOINT_NAMES)])
+        evidence["device"] = diagnostic.PINNED_STATIC_PHYSX_DEVICE
+        evidence["values"][joint_index] = contract["live_physx_readback"][drive_field][
+            "values"
+        ][0]
+        snapshot[snapshot_field] = evidence
+
+    diagnostic._validate_snapshot_gripper_binding(  # noqa: SLF001
+        snapshot,
+        gripper_drive=contract,
+        field="candidate snapshot",
+    )
+
+    snapshot["physx_joint_velocity_limit_rad_s"]["values"][joint_index] = (
+        diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES["velocity_limit_rad_s"]
+    )
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="live-drive identity",
+    ):
+        diagnostic._validate_snapshot_gripper_binding(  # noqa: SLF001
+            snapshot,
+            gripper_drive=contract,
+            field="candidate snapshot",
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["legacy_profile", "legacy_value", "swapped_devices", "unset_cfg"],
+)
+def test_gripper_candidate_contract_rejects_profile_value_device_or_cfg_drift(
+    mutation,
+):
+    contract = _gripper_contract(candidate_enabled=True)
+    if mutation == "legacy_profile":
+        contract["profile"] = diagnostic.GRIPPER_DRIVE_PROFILE
+    elif mutation == "legacy_value":
+        for field in (
+            "resolved_velocity_limit_rad_s",
+            "resolved_velocity_limit_sim_rad_s",
+        ):
+            contract["live_actuator"][field]["values"] = [8.726646423339844]
+        contract["live_physx_readback"]["velocity_limit_rad_s"]["values"] = [
+            8.726646423339844
+        ]
+    elif mutation == "swapped_devices":
+        contract["live_actuator"]["resolved_velocity_limit_rad_s"]["device"] = "cpu"
+        contract["live_physx_readback"]["velocity_limit_rad_s"]["device"] = "cuda:0"
+    else:
+        contract["live_actuator"]["cfg_velocity_limit_sim"] = None
+    with pytest.raises(diagnostic.GripperImpulseDiagnosticError):
+        diagnostic._validate_gripper_drive_contract(contract)  # noqa: SLF001
 
 
 @pytest.mark.parametrize(

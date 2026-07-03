@@ -9,21 +9,30 @@ from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_PHYSX_SOLVER_TYPE
 from polaris.eef_ik_safety import PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT
 from polaris.eef_ik_safety import PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT
+from polaris.eef_ik_safety import GRIPPER_EFFORT_LIMIT
+from polaris.eef_ik_safety import GRIPPER_VELOCITY_LIMIT_RAD_S
 from polaris.utils import DATA_PATH
 
 
 def configure_eef_pose_joint_safety(
-    robot_cfg: ArticulationCfg, *, physx_cfg
+    robot_cfg: ArticulationCfg,
+    *,
+    physx_cfg,
+    enable_gripper_velocity_limit: bool = False,
 ) -> ArticulationCfg:
-    """Enable explicit PhysX arm limits only for EEF-pose evaluation.
+    """Enable EEF PhysX arm limits and an optional diagnostic gripper cap.
 
     Isaac Lab 2.3 intentionally ignores the legacy ``velocity_limit`` field on
     implicit actuators unless ``velocity_limit_sim`` is set. Keeping this
     mutation in the EEF setup path preserves native joint-position semantics.
     One articulation velocity iteration is also required so PhysX resolves
     drives and velocity limits instead of relying exclusively on the TGS
-    position iterations.
+    position iterations. The gripper cap remains default-off and is used only
+    by the isolated close-impulse diagnostic.
     """
+
+    if type(enable_gripper_velocity_limit) is not bool:
+        raise ValueError("PolaRiS EEF gripper velocity-limit enable flag must be bool")
 
     limits = {
         "panda_shoulder": {
@@ -44,6 +53,27 @@ def configure_eef_pose_joint_safety(
             ) from error
         actuator.velocity_limit_sim = values["velocity"]
         actuator.effort_limit_sim = values["effort"]
+
+    if enable_gripper_velocity_limit:
+        try:
+            gripper = robot_cfg.actuators["gripper"]
+        except KeyError as error:
+            raise ValueError(
+                "DROID robot config is missing EEF safety actuator 'gripper'"
+            ) from error
+        if (
+            tuple(getattr(gripper, "joint_names_expr", ())) != ("finger_joint",)
+            or getattr(gripper, "stiffness", None) is not None
+            or getattr(gripper, "damping", None) is not None
+            or getattr(gripper, "velocity_limit", None) != GRIPPER_VELOCITY_LIMIT_RAD_S
+            or getattr(gripper, "effort_limit", None) != GRIPPER_EFFORT_LIMIT
+        ):
+            raise ValueError(
+                "DROID gripper configuration does not match the pinned EEF "
+                "velocity-limit candidate"
+            )
+        gripper.velocity_limit_sim = GRIPPER_VELOCITY_LIMIT_RAD_S
+        gripper.effort_limit_sim = GRIPPER_EFFORT_LIMIT
 
     articulation_props = robot_cfg.spawn.articulation_props
     if articulation_props is None:
