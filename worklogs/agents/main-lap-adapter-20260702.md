@@ -723,3 +723,47 @@
   `d8379925b103963dbf3e7c85bcc4ae101b81b7c1d7dabe7d2e964f41d069ec44`.
   These live ordered lists replace the provisional USD traversal order and
   are mandatory cross-bindings for the gripper impulse diagnostic.
+
+## 2026-07-03 — first gripper impulse pair failed closed on static readback device
+
+- Independently reviewed wrappers launched immutable parallel L40S jobs
+  `1098160` (exact, `pool0-00013`) and `1098161` (delay-one-step,
+  `pool0-00027`) from PolaRiS `6e9b7be`. Both scheduler records exactly
+  matched the pinned command, source checkout, node, account, partition,
+  16-CPU/96-GiB/one-GPU allocation, stdout, and generic GPU TRES contract.
+- Both jobs rejected before replay because PhysX
+  `get_dof_max_velocities()` returned a CPU tensor while the diagnostic had
+  incorrectly required every direct PhysX getter to share the articulation's
+  `cuda:0` device. Exact raw invalid-capture SHA-256 is
+  `52afe48a2e10cdd38d430097188dda0f3fd969005919bfe4240194b59a31290c`;
+  delayed raw invalid-capture SHA-256 is
+  `fcfbf9847134d37e5d81e39fcf229f54f2469cf407d6f56a99265194759d762c`.
+  Each attempt contains only immutable mode-0444, single-link
+  `capture.json`, `runtime.exit`, and `outer-srun.exit`; both status files are
+  exact `1\n` with SHA-256
+  `4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865`.
+  Parent and batch jobs are `FAILED 1:0`, no ready marker, video, validator,
+  or attestation exists, caches/staging are empty, the deployed source remains
+  clean, and both nodes returned idle. This is valid negative infrastructure
+  evidence only and says nothing about close-command causality.
+- The repair must not generically weaken device validation. A pinned live
+  device/dtype/shape probe is required to classify dynamic GPU readbacks,
+  static CPU drive-property readbacks, cached articulation tensors, and
+  actuator tensors field by field before the pair is relaunched.
+- Model-free L40S job `1098162` supplied that closed classification and
+  completed `0:0` on `pool0-00013` in 255 seconds. Its immutable JSON is mode
+  0444/single-link, 11,403 bytes, SHA-256
+  `d3c8ccfcb16cd523f084f5c7c82f41a03c1c2ab0f58487f45ff4c2a59066283c`;
+  the saved wrapper SHA-256 is
+  `7bf346c05b676d16db0f102990efba9c481be01e2fb57ea96115313c200d48d1`.
+  The log has no traceback or crash, the cache was removed, source stayed
+  clean, and the node returned idle.
+- Direct PhysX positions, velocities, projected joint forces, link
+  velocities, link accelerations, and link incoming-joint wrenches are
+  `cuda:0` float32. Direct PhysX maximum velocities, maximum forces,
+  stiffnesses, and dampings are instead `cpu` float32. Every captured cached
+  articulation tensor and every resolved gripper actuator tensor is
+  `cuda:0` float32. All observed shapes, element counts, and finiteness checks
+  match the 13-DOF/18-body articulation. The diagnostic must now enforce this
+  exact field partition and compare actuator/static-PhysX values while
+  excluding only their intentionally different device labels.

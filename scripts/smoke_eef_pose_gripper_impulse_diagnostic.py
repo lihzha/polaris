@@ -72,13 +72,11 @@ exec(  # noqa: S102 - execute only the bootstrap-verified exact source bytes.
 
 ENVIRONMENT = boundary.ENVIRONMENT
 FIXTURE_PROFILE = boundary.FIXTURE_PROFILE
-DIAGNOSTIC_PROFILE = "foodbussing_gripper_close_impulse_exact_delay1_v1"
-FINGER_TRACE_PROFILE = "gripper_apply_causal_tail_all_links_v1"
+DIAGNOSTIC_PROFILE = "foodbussing_gripper_close_impulse_exact_delay1_v3"
+FINGER_TRACE_PROFILE = "gripper_apply_causal_tail_all_links_device_partition_v3"
 ACTION_PLAN_PROFILE = "foodbussing_first_close_exact_or_delay1_v1"
 VIDEO_PROFILE = "lap_model_view_external_then_rot180_wrist_224x448_v1"
-GRIPPER_DRIVE_PROFILE = (
-    "implicit_gripper_effort200_legacy_velocity5_ignored_without_sim_limit_v1"
-)
+GRIPPER_DRIVE_PROFILE = "implicit_gripper_effort200_cuda_actuator_cpu_static_physx_v3"
 SOLVER_CHANGE_PROFILE = "eef_pose_solver_velocity_iterations_0_to_1_v1"
 MODES = ("exact", "delay_first_close_one_step")
 SOURCE_CLOSE_POLICY_STEP = 115
@@ -138,6 +136,35 @@ TIMESTAMP_CONTRACT = {
     "post_minus_pre_seconds": TIMESTAMP_DT_SECONDS,
     "relative_tolerance": 0.0,
     "absolute_tolerance_seconds": TIMESTAMP_ABS_TOLERANCE_SECONDS,
+}
+PINNED_CACHED_DEVICE = "cuda:0"
+PINNED_DYNAMIC_PHYSX_DEVICE = "cuda:0"
+PINNED_STATIC_PHYSX_DEVICE = "cpu"
+PINNED_ACTUATOR_DEVICE = "cuda:0"
+PINNED_TENSOR_DTYPE = "torch.float32"
+DEVICE_PROBE_EVIDENCE = {
+    "profile": "nvidia_droid_l40s_root_getter_device_partition_v1",
+    "slurm_job_id": 1098162,
+    "result_size_bytes": 11403,
+    "result_sha256": (
+        "d3c8ccfcb16cd523f084f5c7c82f41a03c1c2ab0f58487f45ff4c2a59066283c"
+    ),
+    "saved_wrapper_sha256": (
+        "7bf346c05b676d16db0f102990efba9c481be01e2fb57ea96115313c200d48d1"
+    ),
+}
+DEVICE_PROBE_EVIDENCE_FIELDS = {
+    "profile",
+    "slurm_job_id",
+    "result_size_bytes",
+    "result_sha256",
+    "saved_wrapper_sha256",
+}
+PROBED_GRIPPER_DRIVE_FLOAT32_VALUES = {
+    "velocity_limit_rad_s": 8.726646423339844,
+    "effort_limit_nm": 200.0,
+    "stiffness_nm_per_rad": 5729.578125,
+    "damping_nm_s_per_rad": 0.011459155939519405,
 }
 EXPECTED_BOUNDARY_HELPER_SIZE_BYTES = _BOOTSTRAP_BOUNDARY_SIZE_BYTES
 EXPECTED_BOUNDARY_HELPER_SHA256 = _BOOTSTRAP_BOUNDARY_SHA256
@@ -208,6 +235,100 @@ SNAPSHOT_FIELDS = {
     "physx_link_incoming_joint_wrench_child_joint_frame",
     "incoming_joint_wrench_semantics",
 }
+CACHED_ARTICULATION_TENSOR_FIELDS = (
+    "joint_position_rad",
+    "joint_velocity_rad_s",
+    "joint_acceleration_rad_s2",
+    "joint_position_target_rad",
+    "joint_velocity_target_rad_s",
+    "joint_effort_target_nm",
+    "approximate_pd_computed_torque_nm",
+    "approximate_pd_applied_torque_nm",
+)
+DYNAMIC_PHYSX_TENSOR_FIELDS = (
+    "physx_joint_position_rad",
+    "physx_joint_velocity_rad_s",
+    "physx_projected_joint_force_nm",
+    "body_com_velocity_world",
+    "body_com_acceleration_world",
+    "physx_link_incoming_joint_wrench_child_joint_frame",
+)
+STATIC_PHYSX_TENSOR_FIELDS = (
+    "physx_joint_velocity_limit_rad_s",
+    "physx_joint_effort_limit_nm",
+    "physx_joint_stiffness_nm_per_rad",
+    "physx_joint_damping_nm_s_per_rad",
+)
+JOINT_SNAPSHOT_TENSOR_FIELDS = (
+    *CACHED_ARTICULATION_TENSOR_FIELDS,
+    *DYNAMIC_PHYSX_TENSOR_FIELDS[:3],
+    *STATIC_PHYSX_TENSOR_FIELDS,
+)
+BODY_SNAPSHOT_TENSOR_FIELDS = DYNAMIC_PHYSX_TENSOR_FIELDS[3:]
+EXPECTED_DIRECT_PHYSX_GETTER_NAMES = {
+    "get_dof_positions",
+    "get_dof_velocities",
+    "get_dof_projected_joint_forces",
+    "get_dof_max_velocities",
+    "get_dof_max_forces",
+    "get_dof_stiffnesses",
+    "get_dof_dampings",
+    "get_link_velocities",
+    "get_link_accelerations",
+    "get_link_incoming_joint_force",
+}
+DIRECT_PHYSX_GETTER_CONTRACT = {
+    "get_dof_positions": {
+        "snapshot_field": "physx_joint_position_rad",
+        "device": PINNED_DYNAMIC_PHYSX_DEVICE,
+        "shape": [1, len(EXPECTED_DROID_JOINT_NAMES)],
+    },
+    "get_dof_velocities": {
+        "snapshot_field": "physx_joint_velocity_rad_s",
+        "device": PINNED_DYNAMIC_PHYSX_DEVICE,
+        "shape": [1, len(EXPECTED_DROID_JOINT_NAMES)],
+    },
+    "get_dof_projected_joint_forces": {
+        "snapshot_field": "physx_projected_joint_force_nm",
+        "device": PINNED_DYNAMIC_PHYSX_DEVICE,
+        "shape": [1, len(EXPECTED_DROID_JOINT_NAMES)],
+    },
+    "get_dof_max_velocities": {
+        "snapshot_field": "physx_joint_velocity_limit_rad_s",
+        "device": PINNED_STATIC_PHYSX_DEVICE,
+        "shape": [1, len(EXPECTED_DROID_JOINT_NAMES)],
+    },
+    "get_dof_max_forces": {
+        "snapshot_field": "physx_joint_effort_limit_nm",
+        "device": PINNED_STATIC_PHYSX_DEVICE,
+        "shape": [1, len(EXPECTED_DROID_JOINT_NAMES)],
+    },
+    "get_dof_stiffnesses": {
+        "snapshot_field": "physx_joint_stiffness_nm_per_rad",
+        "device": PINNED_STATIC_PHYSX_DEVICE,
+        "shape": [1, len(EXPECTED_DROID_JOINT_NAMES)],
+    },
+    "get_dof_dampings": {
+        "snapshot_field": "physx_joint_damping_nm_s_per_rad",
+        "device": PINNED_STATIC_PHYSX_DEVICE,
+        "shape": [1, len(EXPECTED_DROID_JOINT_NAMES)],
+    },
+    "get_link_velocities": {
+        "snapshot_field": "body_com_velocity_world",
+        "device": PINNED_DYNAMIC_PHYSX_DEVICE,
+        "shape": [1, len(EXPECTED_DROID_BODY_NAMES), 6],
+    },
+    "get_link_accelerations": {
+        "snapshot_field": "body_com_acceleration_world",
+        "device": PINNED_DYNAMIC_PHYSX_DEVICE,
+        "shape": [1, len(EXPECTED_DROID_BODY_NAMES), 6],
+    },
+    "get_link_incoming_joint_force": {
+        "snapshot_field": "physx_link_incoming_joint_wrench_child_joint_frame",
+        "device": PINNED_DYNAMIC_PHYSX_DEVICE,
+        "shape": [1, len(EXPECTED_DROID_BODY_NAMES), 6],
+    },
+}
 TRACE_ENTRY_FIELDS = {
     "apply_index",
     "policy_step",
@@ -237,8 +358,14 @@ FINGER_TRACE_FIELDS = {
 }
 TENSOR_CAPTURE_CONTRACT_FIELDS = {
     "profile",
-    "source_device",
+    "cached_articulation_fields",
+    "dynamic_physx_fields",
+    "static_physx_fields",
+    "cached_articulation_device",
+    "dynamic_physx_device",
+    "static_physx_device",
     "tensor_dtype",
+    "authoritative_device_probe",
 }
 VIDEO_IDENTITY_FIELDS = {
     "path",
@@ -265,6 +392,10 @@ GRIPPER_DRIVE_CONTRACT_FIELDS = {
     "actuator_name",
     "joint_names",
     "joint_indices",
+    "action_term_joint_names",
+    "action_term_joint_indices",
+    "actuator_joint_names",
+    "actuator_joint_indices",
     "configured_before_articulation_build",
     "live_actuator",
     "live_physx_readback",
@@ -272,6 +403,7 @@ GRIPPER_DRIVE_CONTRACT_FIELDS = {
     "effort_limit_behavior",
     "incoming_joint_wrench_semantics",
     "computed_applied_torque_semantics",
+    "authoritative_device_probe",
 }
 CONFIGURED_GRIPPER_FIELDS = {
     "legacy_velocity_limit_rad_s",
@@ -286,6 +418,8 @@ LIVE_ACTUATOR_FIELDS = {
     "cfg_velocity_limit_sim",
     "cfg_effort_limit",
     "cfg_effort_limit_sim",
+    "cfg_stiffness",
+    "cfg_damping",
     "resolved_velocity_limit_rad_s",
     "resolved_velocity_limit_sim_rad_s",
     "resolved_effort_limit_nm",
@@ -1197,6 +1331,83 @@ def validate_ready_marker(
     return dict(marker)
 
 
+def _expected_tensor_capture_contract() -> dict[str, Any]:
+    return {
+        "profile": "field_partitioned_device_clone_per_substep_v3",
+        "cached_articulation_fields": list(CACHED_ARTICULATION_TENSOR_FIELDS),
+        "dynamic_physx_fields": list(DYNAMIC_PHYSX_TENSOR_FIELDS),
+        "static_physx_fields": list(STATIC_PHYSX_TENSOR_FIELDS),
+        "cached_articulation_device": PINNED_CACHED_DEVICE,
+        "dynamic_physx_device": PINNED_DYNAMIC_PHYSX_DEVICE,
+        "static_physx_device": PINNED_STATIC_PHYSX_DEVICE,
+        "tensor_dtype": PINNED_TENSOR_DTYPE,
+        "authoritative_device_probe": dict(DEVICE_PROBE_EVIDENCE),
+    }
+
+
+def _validate_tensor_capture_contract(value: Any) -> dict[str, Any]:
+    _require(isinstance(value, dict), "finger tensor capture contract")
+    _require(
+        set(value) == TENSOR_CAPTURE_CONTRACT_FIELDS,
+        "finger tensor capture contract schema",
+    )
+    _require(
+        _typed_equal(value, _expected_tensor_capture_contract()),
+        "finger tensor capture field/device partition",
+    )
+    partitions = (
+        set(CACHED_ARTICULATION_TENSOR_FIELDS),
+        set(DYNAMIC_PHYSX_TENSOR_FIELDS),
+        set(STATIC_PHYSX_TENSOR_FIELDS),
+    )
+    expected_snapshot_tensors = SNAPSHOT_FIELDS - {
+        "articulation_data_sim_timestamp",
+        "joint_names",
+        "body_names",
+        "incoming_joint_wrench_semantics",
+    }
+    _require(
+        set.union(*partitions) == expected_snapshot_tensors
+        and all(
+            left.isdisjoint(right)
+            for index, left in enumerate(partitions)
+            for right in partitions[index + 1 :]
+        )
+        and {
+            contract["snapshot_field"]
+            for contract in DIRECT_PHYSX_GETTER_CONTRACT.values()
+        }
+        == partitions[1] | partitions[2],
+        "finger tensor capture closed field partition",
+    )
+    _require(
+        set(DIRECT_PHYSX_GETTER_CONTRACT) == EXPECTED_DIRECT_PHYSX_GETTER_NAMES,
+        "finger tensor capture exact direct PhysX getter set",
+    )
+    probe = value["authoritative_device_probe"]
+    _require(
+        set(probe) == DEVICE_PROBE_EVIDENCE_FIELDS
+        and type(probe["slurm_job_id"]) is int
+        and type(probe["result_size_bytes"]) is int,
+        "finger tensor capture authoritative probe",
+    )
+    return dict(value)
+
+
+def _snapshot_tensor_expected_device(
+    tensor_field: str, tensor_contract: Mapping[str, Any]
+) -> str:
+    if tensor_field in CACHED_ARTICULATION_TENSOR_FIELDS:
+        return tensor_contract["cached_articulation_device"]
+    if tensor_field in DYNAMIC_PHYSX_TENSOR_FIELDS:
+        return tensor_contract["dynamic_physx_device"]
+    if tensor_field in STATIC_PHYSX_TENSOR_FIELDS:
+        return tensor_contract["static_physx_device"]
+    raise GripperImpulseDiagnosticError(
+        f"snapshot tensor field has no device classification: {tensor_field}"
+    )
+
+
 def _validate_snapshot(
     value: Any,
     *,
@@ -1220,24 +1431,13 @@ def _validate_snapshot(
         isinstance(body_names, list) and body_names == EXPECTED_DROID_BODY_NAMES,
         f"{field} body names",
     )
+    contract = _validate_tensor_capture_contract(
+        _expected_tensor_capture_contract()
+        if tensor_contract is None
+        else dict(tensor_contract)
+    )
     tensors: dict[str, dict[str, Any]] = {}
-    for tensor_field in (
-        "joint_position_rad",
-        "joint_velocity_rad_s",
-        "joint_acceleration_rad_s2",
-        "joint_position_target_rad",
-        "joint_velocity_target_rad_s",
-        "joint_effort_target_nm",
-        "approximate_pd_computed_torque_nm",
-        "approximate_pd_applied_torque_nm",
-        "physx_joint_position_rad",
-        "physx_joint_velocity_rad_s",
-        "physx_projected_joint_force_nm",
-        "physx_joint_velocity_limit_rad_s",
-        "physx_joint_effort_limit_nm",
-        "physx_joint_stiffness_nm_per_rad",
-        "physx_joint_damping_nm_s_per_rad",
-    ):
+    for tensor_field in JOINT_SNAPSHOT_TENSOR_FIELDS:
         tensor = validate_tensor_evidence(
             value.get(tensor_field), field=f"{field}.{tensor_field}"
         )
@@ -1249,17 +1449,12 @@ def _validate_snapshot(
             and tensor["nonfinite"] == [],
             f"{field}.{tensor_field} shape",
         )
-        if tensor_contract is not None:
-            _require(
-                tensor["device"] == tensor_contract["source_device"]
-                and tensor["dtype"] == tensor_contract["tensor_dtype"],
-                f"{field}.{tensor_field} dtype/device contract",
-            )
-    for tensor_field in (
-        "body_com_velocity_world",
-        "body_com_acceleration_world",
-        "physx_link_incoming_joint_wrench_child_joint_frame",
-    ):
+        _require(
+            tensor["device"] == _snapshot_tensor_expected_device(tensor_field, contract)
+            and tensor["dtype"] == contract["tensor_dtype"],
+            f"{field}.{tensor_field} dtype/device contract",
+        )
+    for tensor_field in BODY_SNAPSHOT_TENSOR_FIELDS:
         tensor = validate_tensor_evidence(
             value.get(tensor_field), field=f"{field}.{tensor_field}"
         )
@@ -1271,12 +1466,11 @@ def _validate_snapshot(
             and tensor["nonfinite"] == [],
             f"{field}.{tensor_field} shape",
         )
-        if tensor_contract is not None:
-            _require(
-                tensor["device"] == tensor_contract["source_device"]
-                and tensor["dtype"] == tensor_contract["tensor_dtype"],
-                f"{field}.{tensor_field} dtype/device contract",
-            )
+        _require(
+            tensor["device"] == _snapshot_tensor_expected_device(tensor_field, contract)
+            and tensor["dtype"] == contract["tensor_dtype"],
+            f"{field}.{tensor_field} dtype/device contract",
+        )
     _require(
         value.get("incoming_joint_wrench_semantics")
         == "physx_link_incoming_joint_total_6d_wrench_child_joint_frame_v1",
@@ -1314,7 +1508,7 @@ def _validate_snapshot_gripper_binding(
     ):
         source = snapshot[snapshot_field]
         selected = {
-            "shape": [1],
+            "shape": [1, 1],
             "dtype": source["dtype"],
             "device": source["device"],
             "values": [source["values"][joint_index]],
@@ -1366,17 +1560,8 @@ def validate_finger_trace(
         _typed_equal(trace.get("timestamp_contract"), TIMESTAMP_CONTRACT),
         "finger trace timestamp contract",
     )
-    tensor_contract = trace.get("tensor_capture_contract")
-    _require(
-        isinstance(tensor_contract, dict)
-        and set(tensor_contract) == TENSOR_CAPTURE_CONTRACT_FIELDS
-        and tensor_contract.get("profile")
-        == "device_clone_per_substep_host_serialize_terminal_v1"
-        and isinstance(tensor_contract.get("source_device"), str)
-        and tensor_contract["source_device"]
-        and isinstance(tensor_contract.get("tensor_dtype"), str)
-        and tensor_contract["tensor_dtype"],
-        "finger tensor capture contract",
+    tensor_contract = _validate_tensor_capture_contract(
+        trace.get("tensor_capture_contract")
     )
     mode = action_plan["mode"]
     kind = outcome["kind"]
@@ -1459,7 +1644,7 @@ def validate_finger_trace(
             _same_float32(entry.get("processed_target_at_stage_rad"), target)
             and target_after["shape"] == [1]
             and target_after["finite_mask"] == [True]
-            and target_after["device"] == tensor_contract["source_device"]
+            and target_after["device"] == tensor_contract["cached_articulation_device"]
             and target_after["dtype"] == tensor_contract["tensor_dtype"]
             and _same_float32(target_after["values"][0], target),
             f"{field} staged target copy",
@@ -1713,6 +1898,15 @@ def _capture_assets(*, scene_path: Path, robot_usd_path: Path) -> dict[str, Any]
     return _validate_assets(assets)
 
 
+def _tensor_evidence_equal_excluding_device(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> bool:
+    return _typed_equal(
+        {field: left[field] for field in TENSOR_EVIDENCE_FIELDS if field != "device"},
+        {field: right[field] for field in TENSOR_EVIDENCE_FIELDS if field != "device"},
+    )
+
+
 def _validate_gripper_drive_contract(value: Any) -> dict[str, Any]:
     _require(isinstance(value, dict), "gripper drive contract")
     _require(
@@ -1720,16 +1914,27 @@ def _validate_gripper_drive_contract(value: Any) -> dict[str, Any]:
         "gripper drive contract schema",
     )
     _require(value.get("profile") == GRIPPER_DRIVE_PROFILE, "gripper profile")
-    _require(value.get("actuator_name") == "gripper", "gripper actuator name")
-    _require(value.get("joint_names") == ["finger_joint"], "gripper joint name")
-    indices = value.get("joint_indices")
     _require(
-        isinstance(indices, list)
-        and len(indices) == 1
-        and type(indices[0]) is int
-        and indices[0] == EXPECTED_DROID_JOINT_NAMES.index("finger_joint"),
-        "gripper joint index",
+        _typed_equal(value.get("authoritative_device_probe"), DEVICE_PROBE_EVIDENCE),
+        "gripper authoritative device probe",
     )
+    _require(value.get("actuator_name") == "gripper", "gripper actuator name")
+    expected_joint_names = ["finger_joint"]
+    expected_joint_indices = [EXPECTED_DROID_JOINT_NAMES.index("finger_joint")]
+    for field in ("joint_names", "action_term_joint_names", "actuator_joint_names"):
+        _require(
+            _typed_equal(value.get(field), expected_joint_names),
+            f"gripper {field} cross-binding",
+        )
+    for field in (
+        "joint_indices",
+        "action_term_joint_indices",
+        "actuator_joint_indices",
+    ):
+        _require(
+            _typed_equal(value.get(field), expected_joint_indices),
+            f"gripper {field} cross-binding",
+        )
     configured = value.get("configured_before_articulation_build")
     _require(
         isinstance(configured, dict) and set(configured) == CONFIGURED_GRIPPER_FIELDS,
@@ -1760,16 +1965,23 @@ def _validate_gripper_drive_contract(value: Any) -> dict[str, Any]:
         "cfg_velocity_limit_sim",
         "cfg_effort_limit",
         "cfg_effort_limit_sim",
+        "cfg_stiffness",
+        "cfg_damping",
     }:
         tensor = validate_tensor_evidence(
             live.get(field), field=f"live gripper {field}"
         )
         _require(
-            tensor["shape"] == [1]
+            tensor["shape"] == [1, 1]
             and tensor["finite_mask"] == [True]
             and tensor["finite_count"] == 1
             and tensor["nonfinite"] == [],
             f"live gripper {field} finite scalar",
+        )
+        _require(
+            tensor["dtype"] == PINNED_TENSOR_DTYPE
+            and tensor["device"] == PINNED_ACTUATOR_DEVICE,
+            f"live gripper {field} CUDA device/dtype contract",
         )
         validated_live[field] = tensor
     _require(
@@ -1778,7 +1990,9 @@ def _validate_gripper_drive_contract(value: Any) -> dict[str, Any]:
         and type(live.get("cfg_effort_limit")) is float
         and live.get("cfg_effort_limit") == 200.0
         and type(live.get("cfg_effort_limit_sim")) is float
-        and live.get("cfg_effort_limit_sim") == 200.0,
+        and live.get("cfg_effort_limit_sim") == 200.0
+        and live.get("cfg_stiffness") is None
+        and live.get("cfg_damping") is None,
         "live gripper implicit-actuator cfg behavior",
     )
     physx = value.get("live_physx_readback")
@@ -1790,20 +2004,18 @@ def _validate_gripper_drive_contract(value: Any) -> dict[str, Any]:
     for field, tensor in physx.items():
         validated = validate_tensor_evidence(tensor, field=f"gripper PhysX {field}")
         _require(
-            validated["shape"] == [1]
+            validated["shape"] == [1, 1]
             and validated["finite_mask"] == [True]
             and validated["finite_count"] == 1
             and validated["nonfinite"] == [],
             f"gripper PhysX {field} finite scalar",
         )
-        validated_physx[field] = validated
-    reference_dtype = validated_physx["velocity_limit_rad_s"]["dtype"]
-    reference_device = validated_physx["velocity_limit_rad_s"]["device"]
-    for field, tensor in {**validated_live, **validated_physx}.items():
         _require(
-            tensor["dtype"] == reference_dtype and tensor["device"] == reference_device,
-            f"gripper drive {field} dtype/device coherence",
+            validated["dtype"] == PINNED_TENSOR_DTYPE
+            and validated["device"] == PINNED_STATIC_PHYSX_DEVICE,
+            f"gripper PhysX {field} CPU device/dtype contract",
         )
+        validated_physx[field] = validated
     for field in (
         "resolved_velocity_limit_rad_s",
         "resolved_velocity_limit_sim_rad_s",
@@ -1845,8 +2057,30 @@ def _validate_gripper_drive_contract(value: Any) -> dict[str, Any]:
         ("resolved_damping_nm_s_per_rad", "damping_nm_s_per_rad"),
     ):
         _require(
-            _typed_equal(validated_live[live_field], validated_physx[physx_field]),
-            f"gripper actuator/PhysX {live_field} mirror drift",
+            _tensor_evidence_equal_excluding_device(
+                validated_live[live_field], validated_physx[physx_field]
+            ),
+            f"gripper actuator/PhysX {live_field} mirror drift excluding device only",
+        )
+    for live_field, probed_field in (
+        ("resolved_velocity_limit_rad_s", "velocity_limit_rad_s"),
+        ("resolved_velocity_limit_sim_rad_s", "velocity_limit_rad_s"),
+        ("resolved_effort_limit_nm", "effort_limit_nm"),
+        ("resolved_effort_limit_sim_nm", "effort_limit_nm"),
+        ("resolved_stiffness_nm_per_rad", "stiffness_nm_per_rad"),
+        ("resolved_damping_nm_s_per_rad", "damping_nm_s_per_rad"),
+    ):
+        _require(
+            _same_float32(
+                validated_live[live_field]["values"][0],
+                PROBED_GRIPPER_DRIVE_FLOAT32_VALUES[probed_field],
+            ),
+            f"gripper job1098162 resolved actuator value drift: {live_field}",
+        )
+    for physx_field, expected in PROBED_GRIPPER_DRIVE_FLOAT32_VALUES.items():
+        _require(
+            _same_float32(validated_physx[physx_field]["values"][0], expected),
+            f"gripper job1098162 static PhysX value drift: {physx_field}",
         )
     effort = physx["effort_limit_nm"]
     _require(
@@ -3100,13 +3334,19 @@ def _joint_indices_list(joint_ids: Any, *, joint_count: int) -> list[int]:
 
 
 def _direct_physx_tensor(robot: Any, getter_name: str) -> Any:
+    contract = DIRECT_PHYSX_GETTER_CONTRACT.get(getter_name)
+    _require(contract is not None, f"unclassified PhysX getter: {getter_name}")
     getter = getattr(robot.root_physx_view, getter_name, None)
     _require(callable(getter), f"PhysX articulation is missing {getter_name}()")
     tensor = getter()
     _require(
-        str(getattr(tensor, "device", "missing")) == str(robot.device),
-        f"{getter_name} source-device drift: "
-        f"live={getattr(tensor, 'device', None)!r}, expected={robot.device!r}",
+        str(getattr(tensor, "device", "missing")) == contract["device"]
+        and str(getattr(tensor, "dtype", "missing")) == PINNED_TENSOR_DTYPE
+        and list(getattr(tensor, "shape", ())) == contract["shape"],
+        f"{getter_name} field-specific tensor contract drift: "
+        f"device={getattr(tensor, 'device', None)!r}, "
+        f"dtype={getattr(tensor, 'dtype', None)!r}, "
+        f"shape={getattr(tensor, 'shape', None)!r}, expected={contract!r}",
     )
     if hasattr(tensor, "clone"):
         tensor = tensor.clone()
@@ -3114,7 +3354,7 @@ def _direct_physx_tensor(robot: Any, getter_name: str) -> Any:
 
 
 def _capture_articulation_snapshot(robot: Any) -> dict[str, Any]:
-    """Clone one snapshot on-device without a per-substep host synchronization."""
+    """Clone one snapshot while preserving the pinned CUDA/CPU field partition."""
 
     sim_timestamp = getattr(robot.data, "_sim_timestamp", None)
     _require(
@@ -3134,34 +3374,8 @@ def _capture_articulation_snapshot(robot: Any) -> dict[str, Any]:
         f"live articulation body order drift: {body_names!r}",
     )
     direct = {
-        "physx_joint_position_rad": _direct_physx_tensor(robot, "get_dof_positions")[0],
-        "physx_joint_velocity_rad_s": _direct_physx_tensor(robot, "get_dof_velocities")[
-            0
-        ],
-        "physx_projected_joint_force_nm": _direct_physx_tensor(
-            robot, "get_dof_projected_joint_forces"
-        )[0],
-        "physx_joint_velocity_limit_rad_s": _direct_physx_tensor(
-            robot, "get_dof_max_velocities"
-        )[0],
-        "physx_joint_effort_limit_nm": _direct_physx_tensor(
-            robot, "get_dof_max_forces"
-        )[0],
-        "physx_joint_stiffness_nm_per_rad": _direct_physx_tensor(
-            robot, "get_dof_stiffnesses"
-        )[0],
-        "physx_joint_damping_nm_s_per_rad": _direct_physx_tensor(
-            robot, "get_dof_dampings"
-        )[0],
-        "body_com_velocity_world": _direct_physx_tensor(robot, "get_link_velocities")[
-            0
-        ],
-        "body_com_acceleration_world": _direct_physx_tensor(
-            robot, "get_link_accelerations"
-        )[0],
-        "physx_link_incoming_joint_wrench_child_joint_frame": (
-            _direct_physx_tensor(robot, "get_link_incoming_joint_force")[0]
-        ),
+        contract["snapshot_field"]: _direct_physx_tensor(robot, getter_name)[0]
+        for getter_name, contract in DIRECT_PHYSX_GETTER_CONTRACT.items()
     }
     cached = {
         "joint_position_rad": robot.data.joint_pos[0],
@@ -3173,6 +3387,13 @@ def _capture_articulation_snapshot(robot: Any) -> dict[str, Any]:
         "approximate_pd_computed_torque_nm": robot.data.computed_torque[0],
         "approximate_pd_applied_torque_nm": robot.data.applied_torque[0],
     }
+    for cached_field, tensor in cached.items():
+        _require(
+            str(getattr(tensor, "device", "missing")) == PINNED_CACHED_DEVICE
+            and str(getattr(tensor, "dtype", "missing")) == PINNED_TENSOR_DTYPE
+            and list(getattr(tensor, "shape", ())) == [len(EXPECTED_DROID_JOINT_NAMES)],
+            f"cached articulation field contract drift: {cached_field}",
+        )
     snapshot: dict[str, Any] = {
         "articulation_data_sim_timestamp": float(sim_timestamp),
         "joint_names": joint_names,
@@ -3228,11 +3449,14 @@ def _make_diagnostic_gripper_class(base_class: type) -> type:
             self._diagnostic_pending: dict[str, Any] | None = None
             self._diagnostic_entries: list[dict[str, Any]] = []
             self._diagnostic_dropped = 0
-            self._diagnostic_tensor_contract = {
-                "profile": "device_clone_per_substep_host_serialize_terminal_v1",
-                "source_device": str(self._asset.data.joint_pos.device),
-                "tensor_dtype": str(self._asset.data.joint_pos.dtype),
-            }
+            self._diagnostic_tensor_contract = _expected_tensor_capture_contract()
+            _require(
+                str(self._asset.data.joint_pos.device) == PINNED_CACHED_DEVICE
+                and str(self._asset.data.joint_pos.dtype) == PINNED_TENSOR_DTYPE
+                and list(self._asset.data.joint_pos.shape)
+                == [1, len(EXPECTED_DROID_JOINT_NAMES)],
+                "diagnostic cached articulation tensor contract",
+            )
 
         def reset(self, env_ids: Any = None) -> None:
             super().reset(env_ids=env_ids)
@@ -3408,34 +3632,46 @@ def _capture_gripper_drive_contract(
 ) -> dict[str, Any]:
     actuator = robot.actuators.get("gripper")
     _require(actuator is not None, "live robot has no gripper actuator")
-    joint_indices = _joint_indices_list(
+    action_term_joint_names = list(finger_term._joint_names)
+    action_term_joint_indices = _joint_indices_list(
         finger_term._joint_ids, joint_count=len(robot.joint_names)
     )
-    _require(len(joint_indices) == 1, "gripper diagnostic joint count")
-    joint_index = joint_indices[0]
+    actuator_joint_names = list(actuator.joint_names)
+    actuator_joint_indices = _joint_indices_list(
+        actuator.joint_indices, joint_count=len(robot.joint_names)
+    )
+    _require(len(action_term_joint_indices) == 1, "gripper diagnostic joint count")
+    joint_index = action_term_joint_indices[0]
 
     def select(tensor: Any) -> Any:
-        return tensor[:, [joint_index]][0]
+        return tensor[:, [joint_index]]
 
     live_actuator = {
         "cfg_velocity_limit": _scalar_cfg_value(actuator.cfg.velocity_limit),
         "cfg_velocity_limit_sim": _scalar_cfg_value(actuator.cfg.velocity_limit_sim),
         "cfg_effort_limit": _scalar_cfg_value(actuator.cfg.effort_limit),
         "cfg_effort_limit_sim": _scalar_cfg_value(actuator.cfg.effort_limit_sim),
-        "resolved_velocity_limit_rad_s": tensor_evidence(actuator.velocity_limit[0]),
+        "cfg_stiffness": _scalar_cfg_value(actuator.cfg.stiffness),
+        "cfg_damping": _scalar_cfg_value(actuator.cfg.damping),
+        "resolved_velocity_limit_rad_s": tensor_evidence(actuator.velocity_limit),
         "resolved_velocity_limit_sim_rad_s": tensor_evidence(
-            actuator.velocity_limit_sim[0]
+            actuator.velocity_limit_sim
         ),
-        "resolved_effort_limit_nm": tensor_evidence(actuator.effort_limit[0]),
-        "resolved_effort_limit_sim_nm": tensor_evidence(actuator.effort_limit_sim[0]),
-        "resolved_stiffness_nm_per_rad": tensor_evidence(actuator.stiffness[0]),
-        "resolved_damping_nm_s_per_rad": tensor_evidence(actuator.damping[0]),
+        "resolved_effort_limit_nm": tensor_evidence(actuator.effort_limit),
+        "resolved_effort_limit_sim_nm": tensor_evidence(actuator.effort_limit_sim),
+        "resolved_stiffness_nm_per_rad": tensor_evidence(actuator.stiffness),
+        "resolved_damping_nm_s_per_rad": tensor_evidence(actuator.damping),
     }
     contract = {
         "profile": GRIPPER_DRIVE_PROFILE,
         "actuator_name": "gripper",
-        "joint_names": list(finger_term._joint_names),
-        "joint_indices": joint_indices,
+        "joint_names": action_term_joint_names,
+        "joint_indices": action_term_joint_indices,
+        "action_term_joint_names": action_term_joint_names,
+        "action_term_joint_indices": action_term_joint_indices,
+        "actuator_joint_names": actuator_joint_names,
+        "actuator_joint_indices": actuator_joint_indices,
+        "authoritative_device_probe": dict(DEVICE_PROBE_EVIDENCE),
         "configured_before_articulation_build": dict(configured_before_build),
         "live_actuator": live_actuator,
         "live_physx_readback": {

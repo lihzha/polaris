@@ -33,7 +33,7 @@ EXPECTED_FIXTURE_SHA256 = (
 diagnostic: Any | None = None
 
 
-ATTESTATION_PROFILE = "gripper_impulse_post_kit_staged_attestation_v3"
+ATTESTATION_PROFILE = "gripper_impulse_post_kit_staged_attestation_v5"
 ATTESTATION_FIELDS = {
     "schema_version",
     "profile",

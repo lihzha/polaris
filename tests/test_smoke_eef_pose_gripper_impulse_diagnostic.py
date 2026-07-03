@@ -767,12 +767,17 @@ def test_parent_exit_transport_is_atomic_exact_and_forces_exit(
     assert observed == [exit_code]
 
 
-def _tensor(shape):
+def _tensor(
+    shape,
+    *,
+    device=diagnostic.PINNED_CACHED_DEVICE,
+    dtype=diagnostic.PINNED_TENSOR_DTYPE,
+):
     size = math.prod(shape)
     return {
         "shape": shape,
-        "dtype": "python_float64",
-        "device": "host",
+        "dtype": dtype,
+        "device": device,
         "values": [0.0] * size,
         "finite_mask": [True] * size,
         "finite_count": size,
@@ -838,19 +843,37 @@ def _snapshot(*, timestamp: float = 1.0, gripper_target: float = 0.0):
     }
     gripper_index = diagnostic.EXPECTED_DROID_JOINT_NAMES.index("finger_joint")
     snapshot["joint_position_target_rad"]["values"][gripper_index] = gripper_target
-    computed_torque = boundary._float32_multiply(1.0, gripper_target)  # noqa: SLF001
+    computed_torque = boundary._float32_multiply(  # noqa: SLF001
+        diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES["stiffness_nm_per_rad"],
+        gripper_target,
+    )
+    effort_limit = diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES["effort_limit_nm"]
+    applied_torque = min(max(computed_torque, -effort_limit), effort_limit)
     snapshot["approximate_pd_computed_torque_nm"]["values"][gripper_index] = (
         computed_torque
     )
     snapshot["approximate_pd_applied_torque_nm"]["values"][gripper_index] = (
-        computed_torque
+        applied_torque
     )
     for field, value in (
-        ("physx_joint_velocity_limit_rad_s", 5.0),
-        ("physx_joint_effort_limit_nm", 200.0),
-        ("physx_joint_stiffness_nm_per_rad", 1.0),
-        ("physx_joint_damping_nm_s_per_rad", 1.0),
+        (
+            "physx_joint_velocity_limit_rad_s",
+            diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES["velocity_limit_rad_s"],
+        ),
+        (
+            "physx_joint_effort_limit_nm",
+            diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES["effort_limit_nm"],
+        ),
+        (
+            "physx_joint_stiffness_nm_per_rad",
+            diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES["stiffness_nm_per_rad"],
+        ),
+        (
+            "physx_joint_damping_nm_s_per_rad",
+            diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES["damping_nm_s_per_rad"],
+        ),
     ):
+        snapshot[field]["device"] = diagnostic.PINNED_STATIC_PHYSX_DEVICE
         snapshot[field]["values"][gripper_index] = value
     return snapshot
 
@@ -897,8 +920,8 @@ def _failure_trace(*, mode: str, failure_step: int, failure_substep: int = 2):
                 "pre_apply": pre,
                 "target_after_setter_rad": {
                     "shape": [1],
-                    "dtype": "python_float64",
-                    "device": "host",
+                    "dtype": diagnostic.PINNED_TENSOR_DTYPE,
+                    "device": diagnostic.PINNED_CACHED_DEVICE,
                     "values": [target],
                     "finite_mask": [True],
                     "finite_count": 1,
@@ -922,11 +945,7 @@ def _failure_trace(*, mode: str, failure_step: int, failure_substep: int = 2):
         "total_finalized_apply_count": failure_apply_index,
         "pending_apply_count": 0,
         "dropped_relevant_entry_count": 0,
-        "tensor_capture_contract": {
-            "profile": "device_clone_per_substep_host_serialize_terminal_v1",
-            "source_device": "host",
-            "tensor_dtype": "python_float64",
-        },
+        "tensor_capture_contract": diagnostic._expected_tensor_capture_contract(),  # noqa: SLF001
         "timestamp_contract": copy.deepcopy(diagnostic.TIMESTAMP_CONTRACT),
         "entries": entries,
     }
@@ -1017,6 +1036,13 @@ def test_unexpected_relevant_window_failure_is_complete_but_inconclusive():
         "body_order",
         "nonfinite",
         "cached_direct",
+        "cached_device",
+        "dynamic_device",
+        "static_device",
+        "wrong_dtype",
+        "swapped_contract_devices",
+        "wrong_field_classification",
+        "probe_identity",
         "timestamp_type",
         "timestamp_cadence",
         "setter_post_target",
@@ -1048,6 +1074,25 @@ def test_finger_trace_rejects_every_root_causal_binding_drift(case: str):
         tensor["nonfinite"] = [{"flat_index": 0, "kind": "nan"}]
     elif case == "cached_direct":
         snapshot["physx_joint_position_rad"]["values"][0] = 1.0
+    elif case == "cached_device":
+        snapshot["joint_acceleration_rad_s2"]["device"] = "cpu"
+    elif case == "dynamic_device":
+        snapshot["physx_projected_joint_force_nm"]["device"] = "cuda:1"
+    elif case == "static_device":
+        snapshot["physx_joint_velocity_limit_rad_s"]["device"] = "cuda:0"
+    elif case == "wrong_dtype":
+        snapshot["physx_joint_stiffness_nm_per_rad"]["dtype"] = "torch.float64"
+    elif case == "swapped_contract_devices":
+        contract = trace["tensor_capture_contract"]
+        contract["cached_articulation_device"] = "cpu"
+        contract["static_physx_device"] = "cuda:0"
+    elif case == "wrong_field_classification":
+        contract = trace["tensor_capture_contract"]
+        contract["cached_articulation_fields"][0] = "physx_joint_velocity_limit_rad_s"
+    elif case == "probe_identity":
+        trace["tensor_capture_contract"]["authoritative_device_probe"][
+            "result_sha256"
+        ] = "0" * 64
     elif case == "timestamp_type":
         snapshot["articulation_data_sim_timestamp"] = True
     elif case == "timestamp_cadence":
@@ -1159,18 +1204,24 @@ def test_solver_contract_rejects_boolean_integer_impersonation(field: str):
         diagnostic._validate_solver_contract(solver)  # noqa: SLF001
 
 
-def _scalar_evidence(value):
-    tensor = _tensor([1])
+def _scalar_evidence(value, *, device):
+    tensor = _tensor([1, 1], device=device)
     tensor["values"] = [value]
     return tensor
 
 
 def _gripper_contract():
+    probed = diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES
     return {
         "profile": diagnostic.GRIPPER_DRIVE_PROFILE,
         "actuator_name": "gripper",
         "joint_names": ["finger_joint"],
         "joint_indices": [7],
+        "action_term_joint_names": ["finger_joint"],
+        "action_term_joint_indices": [7],
+        "actuator_joint_names": ["finger_joint"],
+        "actuator_joint_indices": [7],
+        "authoritative_device_probe": copy.deepcopy(diagnostic.DEVICE_PROBE_EVIDENCE),
         "configured_before_articulation_build": {
             "legacy_velocity_limit_rad_s": 5.0,
             "velocity_limit_sim_rad_s": None,
@@ -1184,18 +1235,48 @@ def _gripper_contract():
             "cfg_velocity_limit_sim": None,
             "cfg_effort_limit": 200.0,
             "cfg_effort_limit_sim": 200.0,
-            "resolved_velocity_limit_rad_s": _scalar_evidence(5.0),
-            "resolved_velocity_limit_sim_rad_s": _scalar_evidence(5.0),
-            "resolved_effort_limit_nm": _scalar_evidence(200.0),
-            "resolved_effort_limit_sim_nm": _scalar_evidence(200.0),
-            "resolved_stiffness_nm_per_rad": _scalar_evidence(1.0),
-            "resolved_damping_nm_s_per_rad": _scalar_evidence(1.0),
+            "cfg_stiffness": None,
+            "cfg_damping": None,
+            "resolved_velocity_limit_rad_s": _scalar_evidence(
+                probed["velocity_limit_rad_s"],
+                device=diagnostic.PINNED_ACTUATOR_DEVICE,
+            ),
+            "resolved_velocity_limit_sim_rad_s": _scalar_evidence(
+                probed["velocity_limit_rad_s"],
+                device=diagnostic.PINNED_ACTUATOR_DEVICE,
+            ),
+            "resolved_effort_limit_nm": _scalar_evidence(
+                probed["effort_limit_nm"], device=diagnostic.PINNED_ACTUATOR_DEVICE
+            ),
+            "resolved_effort_limit_sim_nm": _scalar_evidence(
+                probed["effort_limit_nm"], device=diagnostic.PINNED_ACTUATOR_DEVICE
+            ),
+            "resolved_stiffness_nm_per_rad": _scalar_evidence(
+                probed["stiffness_nm_per_rad"],
+                device=diagnostic.PINNED_ACTUATOR_DEVICE,
+            ),
+            "resolved_damping_nm_s_per_rad": _scalar_evidence(
+                probed["damping_nm_s_per_rad"],
+                device=diagnostic.PINNED_ACTUATOR_DEVICE,
+            ),
         },
         "live_physx_readback": {
-            "velocity_limit_rad_s": _scalar_evidence(5.0),
-            "effort_limit_nm": _scalar_evidence(200.0),
-            "stiffness_nm_per_rad": _scalar_evidence(1.0),
-            "damping_nm_s_per_rad": _scalar_evidence(1.0),
+            "velocity_limit_rad_s": _scalar_evidence(
+                probed["velocity_limit_rad_s"],
+                device=diagnostic.PINNED_STATIC_PHYSX_DEVICE,
+            ),
+            "effort_limit_nm": _scalar_evidence(
+                probed["effort_limit_nm"],
+                device=diagnostic.PINNED_STATIC_PHYSX_DEVICE,
+            ),
+            "stiffness_nm_per_rad": _scalar_evidence(
+                probed["stiffness_nm_per_rad"],
+                device=diagnostic.PINNED_STATIC_PHYSX_DEVICE,
+            ),
+            "damping_nm_s_per_rad": _scalar_evidence(
+                probed["damping_nm_s_per_rad"],
+                device=diagnostic.PINNED_STATIC_PHYSX_DEVICE,
+            ),
         },
         "legacy_velocity_limit_behavior": (
             "isaaclab_2p3_implicit_legacy_velocity_limit_5_ignored_"
@@ -1215,9 +1296,178 @@ def _gripper_contract():
     }
 
 
-def test_gripper_contract_accepts_coincidental_physx_velocity_five():
+def test_gripper_contract_rejects_legacy_five_as_effective_physx_velocity():
     contract = _gripper_contract()
-    diagnostic._validate_gripper_drive_contract(contract)  # noqa: SLF001
+    live = contract["live_actuator"]
+    live["resolved_velocity_limit_rad_s"]["values"] = [5.0]
+    live["resolved_velocity_limit_sim_rad_s"]["values"] = [5.0]
+    contract["live_physx_readback"]["velocity_limit_rad_s"]["values"] = [5.0]
+    with pytest.raises(diagnostic.GripperImpulseDiagnosticError, match="job1098162"):
+        diagnostic._validate_gripper_drive_contract(contract)  # noqa: SLF001
+
+
+def test_gripper_contract_accepts_job1098162_resolved_values_not_legacy_five():
+    assert diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES == {
+        "velocity_limit_rad_s": 8.726646423339844,
+        "effort_limit_nm": 200.0,
+        "stiffness_nm_per_rad": 5729.578125,
+        "damping_nm_s_per_rad": 0.011459155939519405,
+    }
+    contract = _gripper_contract()
+    physx = contract["live_physx_readback"]
+    validated = diagnostic._validate_gripper_drive_contract(contract)  # noqa: SLF001
+    assert (
+        validated["configured_before_articulation_build"]["legacy_velocity_limit_rad_s"]
+        == 5.0
+    )
+    assert physx["velocity_limit_rad_s"]["values"] != [5.0]
+
+
+@pytest.mark.parametrize(
+    ("live_fields", "physx_field"),
+    [
+        (
+            [
+                "resolved_velocity_limit_rad_s",
+                "resolved_velocity_limit_sim_rad_s",
+            ],
+            "velocity_limit_rad_s",
+        ),
+        (
+            ["resolved_effort_limit_nm", "resolved_effort_limit_sim_nm"],
+            "effort_limit_nm",
+        ),
+        (["resolved_stiffness_nm_per_rad"], "stiffness_nm_per_rad"),
+        (["resolved_damping_nm_s_per_rad"], "damping_nm_s_per_rad"),
+    ],
+)
+def test_gripper_contract_rejects_mirrored_but_unprobed_drive_values(
+    live_fields, physx_field
+):
+    contract = _gripper_contract()
+    wrong_value = diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES[physx_field] + 1.0
+    for live_field in live_fields:
+        contract["live_actuator"][live_field]["values"] = [wrong_value]
+    contract["live_physx_readback"][physx_field]["values"] = [wrong_value]
+    with pytest.raises(diagnostic.GripperImpulseDiagnosticError, match="job1098162"):
+        diagnostic._validate_gripper_drive_contract(contract)  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("joint_names", ["panda_joint7"]),
+        ("joint_indices", [6]),
+        ("action_term_joint_names", ["panda_joint7"]),
+        ("action_term_joint_indices", [6]),
+        ("actuator_joint_names", ["panda_joint7"]),
+        ("actuator_joint_indices", [6]),
+    ],
+)
+def test_gripper_contract_rejects_action_term_or_actuator_identity_drift(field, value):
+    contract = _gripper_contract()
+    contract[field] = value
+    with pytest.raises(diagnostic.GripperImpulseDiagnosticError, match="cross-binding"):
+        diagnostic._validate_gripper_drive_contract(contract)  # noqa: SLF001
+
+
+@pytest.mark.parametrize("field", ["cfg_stiffness", "cfg_damping"])
+def test_gripper_contract_requires_probed_null_live_gain_cfg(field):
+    contract = _gripper_contract()
+    contract["live_actuator"][field] = 1.0
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="implicit-actuator cfg behavior",
+    ):
+        diagnostic._validate_gripper_drive_contract(contract)  # noqa: SLF001
+
+
+def test_gripper_mirror_excludes_only_device_and_still_rejects_value_mismatch():
+    contract = _gripper_contract()
+    actuator = contract["live_actuator"]["resolved_velocity_limit_rad_s"]
+    static_physx = contract["live_physx_readback"]["velocity_limit_rad_s"]
+    assert actuator["device"] == diagnostic.PINNED_ACTUATOR_DEVICE
+    assert static_physx["device"] == diagnostic.PINNED_STATIC_PHYSX_DEVICE
+    assert diagnostic._tensor_evidence_equal_excluding_device(  # noqa: SLF001
+        actuator, static_physx
+    )
+    actuator["values"][0] = 4.0
+    assert not diagnostic._tensor_evidence_equal_excluding_device(  # noqa: SLF001
+        actuator, static_physx
+    )
+    with pytest.raises(diagnostic.GripperImpulseDiagnosticError, match="mirror drift"):
+        diagnostic._validate_gripper_drive_contract(contract)  # noqa: SLF001
+
+
+class _FakeDirectTensor:
+    def __init__(self, *, device, shape, dtype=diagnostic.PINNED_TENSOR_DTYPE):
+        self.device = device
+        self.dtype = dtype
+        self.shape = shape
+
+    def clone(self):
+        return self
+
+
+def _fake_direct_robot(getter_name, tensor):
+    view = SimpleNamespace(**{getter_name: lambda: tensor})
+    return SimpleNamespace(root_physx_view=view, device="cuda:0")
+
+
+def test_every_direct_physx_getter_has_closed_device_dtype_shape_contract():
+    assert (
+        set(diagnostic.DIRECT_PHYSX_GETTER_CONTRACT)
+        == diagnostic.EXPECTED_DIRECT_PHYSX_GETTER_NAMES
+    )
+    assert {
+        contract["snapshot_field"]
+        for contract in diagnostic.DIRECT_PHYSX_GETTER_CONTRACT.values()
+    } == set(diagnostic.DYNAMIC_PHYSX_TENSOR_FIELDS) | set(
+        diagnostic.STATIC_PHYSX_TENSOR_FIELDS
+    )
+    for getter_name, contract in diagnostic.DIRECT_PHYSX_GETTER_CONTRACT.items():
+        tensor = _FakeDirectTensor(device=contract["device"], shape=contract["shape"])
+        assert (
+            diagnostic._direct_physx_tensor(  # noqa: SLF001
+                _fake_direct_robot(getter_name, tensor), getter_name
+            )
+            is tensor
+        )
+
+
+@pytest.mark.parametrize(
+    ("getter_name", "mutation"),
+    [
+        ("get_dof_positions", {"device": "cpu"}),
+        ("get_dof_max_velocities", {"device": "cuda:0"}),
+        ("get_dof_stiffnesses", {"device": "cuda:1"}),
+        ("get_dof_dampings", {"dtype": "torch.float64"}),
+        ("get_link_velocities", {"shape": [1, 18, 7]}),
+    ],
+)
+def test_direct_physx_getter_rejects_swapped_arbitrary_device_dtype_shape(
+    getter_name, mutation
+):
+    contract = diagnostic.DIRECT_PHYSX_GETTER_CONTRACT[getter_name]
+    values = {
+        "device": contract["device"],
+        "shape": contract["shape"],
+        "dtype": diagnostic.PINNED_TENSOR_DTYPE,
+        **mutation,
+    }
+    tensor = _FakeDirectTensor(**values)
+    with pytest.raises(diagnostic.GripperImpulseDiagnosticError):
+        diagnostic._direct_physx_tensor(  # noqa: SLF001
+            _fake_direct_robot(getter_name, tensor), getter_name
+        )
+
+
+def test_direct_physx_getter_rejects_unclassified_getter():
+    tensor = _FakeDirectTensor(device="cuda:0", shape=[1, 13])
+    with pytest.raises(diagnostic.GripperImpulseDiagnosticError, match="unclassified"):
+        diagnostic._direct_physx_tensor(  # noqa: SLF001
+            _fake_direct_robot("get_unknown", tensor), "get_unknown"
+        )
 
 
 @pytest.mark.parametrize(
@@ -1228,8 +1478,11 @@ def test_gripper_contract_accepts_coincidental_physx_velocity_five():
         ("negative_gain", "must be nonnegative"),
         ("zero_physx_limit", "invalid sign"),
         ("mirror", "mirror drift"),
-        ("dtype", "dtype/device coherence"),
-        ("device", "dtype/device coherence"),
+        ("dtype", "CUDA device/dtype"),
+        ("device", "CUDA device/dtype"),
+        ("physx_device", "CPU device/dtype"),
+        ("swapped_devices", "CUDA device/dtype"),
+        ("probe", "authoritative device probe"),
         ("shape", "finite scalar"),
     ],
 )
@@ -1256,9 +1509,16 @@ def test_gripper_contract_rejects_invalid_live_drive_evidence(case, message):
     elif case == "mirror":
         live["resolved_velocity_limit_rad_s"]["values"] = [4.0]
     elif case == "dtype":
-        live["resolved_velocity_limit_rad_s"]["dtype"] = "torch.float32"
+        live["resolved_velocity_limit_rad_s"]["dtype"] = "torch.float64"
     elif case == "device":
-        live["resolved_velocity_limit_rad_s"]["device"] = "cuda:0"
+        live["resolved_velocity_limit_rad_s"]["device"] = "cpu"
+    elif case == "physx_device":
+        physx["velocity_limit_rad_s"]["device"] = "cuda:0"
+    elif case == "swapped_devices":
+        live["resolved_velocity_limit_rad_s"]["device"] = "cpu"
+        physx["velocity_limit_rad_s"]["device"] = "cuda:0"
+    elif case == "probe":
+        contract["authoritative_device_probe"]["result_sha256"] = "0" * 64
     elif case == "shape":
         tensor = live["resolved_velocity_limit_rad_s"]
         tensor.update(
@@ -1303,22 +1563,28 @@ def _terminal_crossbind_fixture(*, failure: bool):
         "physx_joint_damping_nm_s_per_rad",
     ):
         post[field] = evidence(values)
+        if field in diagnostic.STATIC_PHYSX_TENSOR_FIELDS:
+            post[field]["device"] = diagnostic.PINNED_STATIC_PHYSX_DEVICE
     for field, arm_values, finger_value in (
         (
             "physx_joint_velocity_limit_rad_s",
             boundary.EXPECTED_VELOCITY_LIMITS_RAD_S,
-            5.0,
+            diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES["velocity_limit_rad_s"],
         ),
-        ("physx_joint_effort_limit_nm", boundary.EXPECTED_EFFORT_LIMITS, 200.0),
+        (
+            "physx_joint_effort_limit_nm",
+            boundary.EXPECTED_EFFORT_LIMITS,
+            diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES["effort_limit_nm"],
+        ),
         (
             "physx_joint_stiffness_nm_per_rad",
             boundary.EXPECTED_JOINT_DRIVE_STIFFNESS,
-            1.0,
+            diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES["stiffness_nm_per_rad"],
         ),
         (
             "physx_joint_damping_nm_s_per_rad",
             boundary.EXPECTED_JOINT_DRIVE_DAMPING,
-            1.0,
+            diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES["damping_nm_s_per_rad"],
         ),
     ):
         post[field]["values"] = [
