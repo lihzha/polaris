@@ -5,6 +5,7 @@ unit-test suite.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -64,18 +65,33 @@ def _strict_json_value(value):
     raise TypeError(f"Unsupported smoke JSON value: {type(value).__name__}")
 
 
-def _atomic_write_strict_json(path: Path, payload: dict[str, object]) -> None:
-    serialized = (
+def _strict_json_bytes(payload: dict[str, object]) -> bytes:
+    return (
         json.dumps(_strict_json_value(payload), indent=2, allow_nan=False) + "\n"
-    )
+    ).encode()
+
+
+def _atomic_write_strict_json(path: Path, payload: dict[str, object]) -> None:
+    serialized = _strict_json_bytes(payload)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        with temporary_path.open("w", encoding="utf-8") as stream:
+        with temporary_path.open("xb") as stream:
             stream.write(serialized)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary_path, path)
+        os.link(temporary_path, path)
+        path.chmod(0o444)
+        published_fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(published_fd)
+        finally:
+            os.close(published_fd)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -416,22 +432,10 @@ if __name__ == "__main__":
         _print_exception(run_error)
         exit_code = 1
 
+    env = state["env"]
     if state["failure"] is None:
         state["stage"] = "close_environment"
         state["case"] = None
-    try:
-        _atomic_write_strict_json(
-            args_cli.output_json,
-            _result_payload(state, finalized=False, exit_code=exit_code),
-        )
-    except BaseException as persistence_error:
-        persistence_evidence = _exception_evidence(persistence_error)
-        persistence_evidence["phase"] = "pre_close"
-        state["persistence_failures"].append(persistence_evidence)
-        _print_exception(persistence_error)
-        exit_code = 1
-
-    env = state["env"]
     if env is not None:
         try:
             env.close()
@@ -442,7 +446,87 @@ if __name__ == "__main__":
             _print_exception(close_error)
             exit_code = 1
 
-    if simulation_app is not None:
+    if exit_code == 0 and state["failure"] is None and not state["close_failures"]:
+        state["stage"] = "simulation_app_close_pending"
+        state["case"] = None
+    raw_published = False
+    try:
+        _atomic_write_strict_json(
+            args_cli.output_json,
+            _result_payload(state, finalized=False, exit_code=exit_code),
+        )
+        raw_published = True
+    except BaseException as persistence_error:
+        persistence_evidence = _exception_evidence(persistence_error)
+        persistence_evidence["phase"] = "publish_immutable_raw"
+        state["persistence_failures"].append(persistence_evidence)
+        _print_exception(persistence_error)
+        exit_code = 1
+
+    raw_is_eligible = (
+        raw_published
+        and exit_code == 0
+        and state["stage"] == "simulation_app_close_pending"
+        and state["case"] is None
+        and state["failure"] is None
+        and not state["close_failures"]
+        and not state["persistence_failures"]
+    )
+    raw_ready = False
+    if raw_is_eligible:
+        try:
+            raw_stat = args_cli.output_json.stat()
+            if raw_stat.st_mode & 0o777 != 0o444:
+                raise RuntimeError("Immutable smoke raw JSON mode is not 0444")
+            raw_bytes = args_cli.output_json.read_bytes()
+            raw_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+            ready_marker = args_cli.output_json.with_name(
+                args_cli.output_json.name + ".ready.json"
+            )
+            marker_payload = {
+                "schema_version": 1,
+                "stage": "simulation_app_close_pending",
+                "raw_result": {
+                    "path": str(args_cli.output_json),
+                    "size_bytes": len(raw_bytes),
+                    "sha256": raw_sha256,
+                    "mode": "0444",
+                },
+            }
+            marker_sha256 = hashlib.sha256(
+                _strict_json_bytes(marker_payload)
+            ).hexdigest()
+            _atomic_write_strict_json(ready_marker, marker_payload)
+        except BaseException as persistence_error:
+            _print_exception(persistence_error)
+            exit_code = 1
+            print(
+                "POLARIS_SMOKE_RAW_FAILURE=ready_marker_or_hash_failed",
+                flush=True,
+            )
+        else:
+            print(f"POLARIS_SMOKE_RAW_READY={args_cli.output_json}", flush=True)
+            print(f"POLARIS_SMOKE_RAW_SHA256={raw_sha256}", flush=True)
+            print(f"POLARIS_SMOKE_RAW_READY_MARKER={ready_marker}", flush=True)
+            print(
+                f"POLARIS_SMOKE_RAW_READY_MARKER_SHA256={marker_sha256}",
+                flush=True,
+            )
+            sys.stdout.flush()
+            sys.stderr.flush()
+            raw_ready = True
+    else:
+        print(
+            "POLARIS_SMOKE_RAW_FAILURE="
+            f"stage={state['stage']},exit_code={exit_code},published={raw_published}",
+            flush=True,
+        )
+
+    # SimulationApp.close() terminates the pinned Isaac process before Python
+    # can reliably execute another statement.  The immutable host wrapper must
+    # therefore attest the pending raw JSON only after this process returns 0;
+    # it must never rewrite the raw result itself.
+    if simulation_app is not None and raw_ready:
         try:
             simulation_app.close()
         except BaseException as close_error:
@@ -451,27 +535,8 @@ if __name__ == "__main__":
             state["close_failures"].append(close_evidence)
             _print_exception(close_error)
             exit_code = 1
-
-    if state["failure"] is None:
-        state["stage"] = "close_failure" if state["close_failures"] else "complete"
-        state["case"] = None
-    try:
-        _atomic_write_strict_json(
-            args_cli.output_json,
-            _result_payload(state, finalized=True, exit_code=exit_code),
-        )
-    except BaseException as persistence_error:
-        persistence_evidence = _exception_evidence(persistence_error)
-        persistence_evidence["phase"] = "post_close"
-        state["persistence_failures"].append(persistence_evidence)
-        _print_exception(persistence_error)
+    elif simulation_app is not None:
+        print("POLARIS_SIMULATION_APP_CLOSE_SKIPPED=raw_not_ready", flush=True)
         exit_code = 1
-        try:
-            _atomic_write_strict_json(
-                args_cli.output_json,
-                _result_payload(state, finalized=True, exit_code=exit_code),
-            )
-        except BaseException as retry_error:
-            _print_exception(retry_error)
 
     sys.exit(exit_code)

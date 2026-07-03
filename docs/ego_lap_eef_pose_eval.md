@@ -213,10 +213,20 @@ python scripts/smoke_eef_pose_controller.py \
   --output-json /tmp/polaris-eef-controller-smoke.json
 ```
 
-`--output-json` is required. The smoke writes it atomically before teardown and
-finalizes it after teardown; failures retain the raw safety capture, completed
-partial cases, current stage/case, and flushed exception traceback as strict
-JSON.
+`--output-json` is required. After environment teardown, the smoke atomically
+leaves one immutable strict failure record or clean
+`simulation_app_close_pending` raw record after the environment closes. The
+host wrapper may create a separate finalized attestation only after the Isaac
+process returns zero and it independently verifies the raw record; it never
+rewrites the raw JSON. Both the raw JSON and its path/size/SHA-bound ready
+marker are non-overwriting, mode `0444`, and file/parent-directory fsynced.
+Failures retain the raw safety capture, completed partial cases, current
+stage/case, and flushed exception traceback; a failure path skips the explicit
+SimulationApp hard-exit call so it cannot mask the intended nonzero status.
+The host uses `scripts/finalize_eef_pose_smoke.py` in `finalize` and then
+`verify` mode; its attestation is a separate immutable object bound to the raw
+bytes, ready marker, Slurm job, `srun` status, commit, source, image, and saved
+job script.
 
 Pure adapter tests can be run without Isaac Sim:
 

@@ -258,3 +258,50 @@
   immutable sbatch must parse the JSON after Python and fail unless it is
   finalized, passed, and free of run/close/persistence errors; file existence
   alone is deliberately insufficient.
+
+## 2026-07-02 — standalone smoke `1097498` (failed publication gate)
+
+- Job `1097498` ran exact PolaRiS commit
+  `dbfc41760cd2d9c5f8f97a5ab7fb8a33d488302d` on one L40S with the pinned
+  image/Vulkan/data contract and no model, checkpoint, server, evaluator, or
+  downstream chain. All 13 ordered hold/±XYZ/±RXYZ cases passed with 360
+  physics-substep apply calls each. The one-step adversarial case also passed:
+  eight apply calls, eight slew events, finite EEF/q/dq, q inside captured
+  limits, and zero abort or post-clamp violations.
+- The attempt remains failed and non-promotable. `SimulationApp.close()`
+  cleanly terminated the Python process before its post-close rewrite, so the
+  saved JSON correctly remained `finalized=false`, `passed=false`, stage
+  `close_environment`. The external verifier rejected it, and the batch ended
+  `FAILED 1:0` after `00:04:18`; its `srun` step was `COMPLETED 0:0`.
+- Preserved raw JSON:
+  `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris_eval/controller_safety_v3_smoke/dbfc417/smoke-1097498.json`
+  (99,784 bytes, SHA-256
+  `b0907b132c0872e26245fae8f2ad99c2ce95247abc46b5d0c22f52efd075f861`).
+  Preserved log:
+  `/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris_eval/pol_ik_v3_smoke-1097498.out`
+  (SHA-256 `b1e8d6bb5650a879fda3af9064f12d1fdd1b3be218dc99725ba64977430a8482`).
+  The immutable job script SHA-256 was
+  `0f137d8471bdb0c47c39cc4e85bf5dcb92948b54540a8aca859a44414088124a`;
+  verifier SHA-256 was
+  `34d4289543a103a26324f9ab9e59597a6ca59cfb495536b7242d20504268ee17`.
+- The next revision uses two-phase teardown. After `env.close()`, a clean run
+  atomically publishes exactly one 0444 raw JSON at stage
+  `simulation_app_close_pending`, fsyncs the file and parent directory, and
+  atomically publishes a 0444 ready marker binding its path, size, and SHA-256.
+  Only that exact durable path calls `SimulationApp.close()`; all earlier
+  failures skip the hard-exit call so their nonzero status cannot be masked.
+  After `srun` returns zero, a saved hashed host finalizer must independently
+  validate the raw bytes, ready marker, full smoke evidence, commit/source/
+  image/job provenance, and then create a separate non-overwriting 0444 final
+  attestation. It never rewrites the raw result. Capture status remains
+  `pending_controller_smoke`, and no rerun may start before renewed review.
+- Reusable source finalizer `scripts/finalize_eef_pose_smoke.py` is stdlib-only
+  for host execution. It enforces closed raw/result/controller/diagnostic/
+  adversarial schemas; exact cadence, controller constants, limits, digest,
+  errors, frame checks, finite evidence, maxima and diagnostic consistency;
+  zero fallback/abort/post-clamp/drop counters for promotion; ready-marker and
+  0444 modes; zero `srun` status; and commit/source/image/job provenance. It
+  atomically publishes a non-overwriting 0444 attestation and rereads/hashes it
+  in both `finalize` and `verify` modes. Unit tests cover lifecycle, schema,
+  limits, counters, errors, diagnostics, raw/marker mutation, modes, `srun`,
+  non-overwrite behavior, and provenance tampering.

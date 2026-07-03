@@ -1,5 +1,8 @@
+import ast
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -822,7 +825,10 @@ def test_one_step_adversarial_smoke_requires_bounded_active_slew_guard():
         )
         < smoke_source.index("for case_index, (label, pose_delta)")
     )
-    assert "os.replace(temporary_path, path)" in smoke_source
+    assert "os.link(temporary_path, path)" in smoke_source
+    assert 'temporary_path.open("xb"' in smoke_source
+    assert "path.chmod(0o444)" in smoke_source
+    assert "os.fsync(directory_fd)" in smoke_source
     assert "allow_nan=False" in smoke_source
     assert 'required=True,\n    help="Required atomic' in smoke_source
     assert '"raw_ik_safety_capture"' in smoke_source
@@ -834,14 +840,67 @@ def test_one_step_adversarial_smoke_requires_bounded_active_slew_guard():
     assert 'close_evidence["component"] = "environment"' in smoke_source
     assert 'close_evidence["component"] = "simulation_app"' in smoke_source
     assert "_result_payload(state, finalized=False" in smoke_source
-    assert "_result_payload(state, finalized=True" in smoke_source
+    assert "_result_payload(state, finalized=True" not in smoke_source
     assert '"failure": state["failure"]' in smoke_source
     assert '"close_failures": state["close_failures"]' in smoke_source
     assert '"persistence_failures": state["persistence_failures"]' in smoke_source
     assert smoke_source.index("_print_exception(run_error)") < smoke_source.index(
         "simulation_app.close()"
     )
+    pending_index = smoke_source.index(
+        'state["stage"] = "simulation_app_close_pending"'
+    )
+    raw_write_index = smoke_source.index("_atomic_write_strict_json(", pending_index)
+    ready_index = smoke_source.index("POLARIS_SMOKE_RAW_READY=", raw_write_index)
+    simulation_close_index = smoke_source.index("simulation_app.close()", ready_index)
+    assert (
+        smoke_source.index("env.close()")
+        < pending_index
+        < raw_write_index
+        < ready_index
+        < simulation_close_index
+    )
+    assert "it must never rewrite the raw result itself" in smoke_source
+    assert "POLARIS_SMOKE_RAW_READY=" in smoke_source
+    assert "POLARIS_SMOKE_RAW_SHA256=" in smoke_source
+    assert "POLARIS_SMOKE_RAW_READY_MARKER=" in smoke_source
+    assert "POLARIS_SMOKE_RAW_READY_MARKER_SHA256=" in smoke_source
+    assert "if simulation_app is not None and raw_ready:" in smoke_source
+    assert "POLARIS_SIMULATION_APP_CLOSE_SKIPPED=raw_not_ready" in smoke_source
     assert "sys.stderr.flush()" in smoke_source
+
+
+def test_smoke_raw_json_publication_is_strict_and_nonoverwriting(tmp_path):
+    smoke_path = Path(__file__).parents[1] / "scripts" / "smoke_eef_pose_controller.py"
+    parsed = ast.parse(smoke_path.read_text())
+    helper_names = {
+        "_strict_json_value",
+        "_strict_json_bytes",
+        "_atomic_write_strict_json",
+    }
+    helper_nodes = [
+        node
+        for node in parsed.body
+        if isinstance(node, ast.FunctionDef) and node.name in helper_names
+    ]
+    assert {node.name for node in helper_nodes} == helper_names
+    namespace = {"Path": Path, "json": json, "math": math, "os": os}
+    exec(
+        compile(ast.Module(helper_nodes, type_ignores=[]), str(smoke_path), "exec"),
+        namespace,
+    )
+    writer = namespace["_atomic_write_strict_json"]
+
+    output = tmp_path / "raw.json"
+    writer(output, {"value": 1.0, "nonfinite": math.inf})
+    original = output.read_bytes()
+    assert output.stat().st_mode & 0o777 == 0o444
+    assert json.loads(original) == {"value": 1.0, "nonfinite": None}
+
+    with pytest.raises(FileExistsError):
+        writer(output, {"value": 2.0})
+    assert output.read_bytes() == original
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 @pytest.mark.parametrize(
