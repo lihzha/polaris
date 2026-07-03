@@ -266,6 +266,30 @@ def _exact_float_vector(value: Any, expected: list[float], field: str) -> list[f
     return values
 
 
+def _normalize_quaternion_wxyz(quaternion: list[float]) -> list[float]:
+    norm = math.sqrt(sum(item * item for item in quaternion))
+    _require(norm > 0.0, "quaternion norm must be positive")
+    return [item / norm for item in quaternion]
+
+
+def _quaternion_angular_distance_wxyz(left: list[float], right: list[float]) -> float:
+    left_unit = _normalize_quaternion_wxyz(left)
+    right_unit = _normalize_quaternion_wxyz(right)
+    dot = abs(sum(a * b for a, b in zip(left_unit, right_unit, strict=True)))
+    return 2.0 * math.acos(min(1.0, max(0.0, dot)))
+
+
+def _quaternion_multiply_wxyz(left: list[float], right: list[float]) -> list[float]:
+    lw, lx, ly, lz = left
+    rw, rx, ry, rz = right
+    return [
+        lw * rw - lx * rx - ly * ry - lz * rz,
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+    ]
+
+
 def _diagnostic_vector(value: Any, field: str) -> list[float | None] | None:
     if value is None:
         return None
@@ -614,24 +638,10 @@ def _validate_ordinary_result(
             f"{field}.{name} norm",
         )
         quaternions[name] = quaternion
-    target_norm = math.sqrt(
-        sum(item * item for item in quaternions["target_quaternion_wxyz"])
+    angular_distance = _quaternion_angular_distance_wxyz(
+        quaternions["target_quaternion_wxyz"],
+        quaternions["actual_quaternion_wxyz"],
     )
-    actual_norm = math.sqrt(
-        sum(item * item for item in quaternions["actual_quaternion_wxyz"])
-    )
-    dot = abs(
-        sum(
-            target * actual
-            for target, actual in zip(
-                quaternions["target_quaternion_wxyz"],
-                quaternions["actual_quaternion_wxyz"],
-                strict=True,
-            )
-        )
-        / (target_norm * actual_norm)
-    )
-    angular_distance = 2.0 * math.acos(min(1.0, max(0.0, dot)))
     _require(
         math.isclose(angular_distance, rotation_error, rel_tol=0.0, abs_tol=1e-7),
         f"{field} rotation error inconsistent",
@@ -644,6 +654,93 @@ def _validate_ordinary_result(
     ):
         error = _finite_number(result.get(name), f"{field}.{name}")
         _require(0.0 <= error <= tolerance, f"{field}.{name} exceeded tolerance")
+
+
+def _validate_case_target_geometry(ordinary: list[Any]) -> None:
+    hold = _object(ordinary[0], "ordinary hold")
+    hold_position = _finite_vector(
+        hold.get("target_position"), "ordinary hold target_position", length=3
+    )
+    hold_quaternion = _finite_vector(
+        hold.get("target_quaternion_wxyz"),
+        "ordinary hold target_quaternion_wxyz",
+        length=4,
+    )
+    translation_specs = (
+        (1, 0, 1.0),
+        (2, 0, -1.0),
+        (3, 1, 1.0),
+        (4, 1, -1.0),
+        (5, 2, 1.0),
+        (6, 2, -1.0),
+    )
+    for case_index, axis, sign in translation_specs:
+        case = _object(ordinary[case_index], f"ordinary[{case_index}]")
+        target_position = _finite_vector(
+            case.get("target_position"),
+            f"ordinary[{case_index}].target_position",
+            length=3,
+        )
+        expected_position = hold_position.copy()
+        expected_position[axis] += sign * 0.04
+        _require(
+            all(
+                math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-6)
+                for actual, expected in zip(
+                    target_position, expected_position, strict=True
+                )
+            ),
+            f"ordinary[{case_index}] translation target geometry",
+        )
+        target_quaternion = _finite_vector(
+            case.get("target_quaternion_wxyz"),
+            f"ordinary[{case_index}].target_quaternion_wxyz",
+            length=4,
+        )
+        _require(
+            _quaternion_angular_distance_wxyz(target_quaternion, hold_quaternion)
+            <= 1e-6,
+            f"ordinary[{case_index}] translation changed target rotation",
+        )
+
+    rotation_specs = (
+        (7, 0, 1.0),
+        (8, 0, -1.0),
+        (9, 1, 1.0),
+        (10, 1, -1.0),
+        (11, 2, 1.0),
+        (12, 2, -1.0),
+    )
+    half_angle = math.radians(15.0) / 2.0
+    for case_index, axis, sign in rotation_specs:
+        case = _object(ordinary[case_index], f"ordinary[{case_index}]")
+        target_position = _finite_vector(
+            case.get("target_position"),
+            f"ordinary[{case_index}].target_position",
+            length=3,
+        )
+        _require(
+            all(
+                math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-6)
+                for actual, expected in zip(target_position, hold_position, strict=True)
+            ),
+            f"ordinary[{case_index}] rotation changed target position",
+        )
+        delta_quaternion = [math.cos(half_angle), 0.0, 0.0, 0.0]
+        delta_quaternion[axis + 1] = sign * math.sin(half_angle)
+        expected_quaternion = _quaternion_multiply_wxyz(
+            hold_quaternion, delta_quaternion
+        )
+        target_quaternion = _finite_vector(
+            case.get("target_quaternion_wxyz"),
+            f"ordinary[{case_index}].target_quaternion_wxyz",
+            length=4,
+        )
+        _require(
+            _quaternion_angular_distance_wxyz(target_quaternion, expected_quaternion)
+            <= 2e-6,
+            f"ordinary[{case_index}] rotation target geometry",
+        )
 
 
 def _reject_constant(token: str) -> None:
@@ -758,6 +855,7 @@ def _verify_raw(raw: dict[str, Any]) -> dict[str, Any]:
             frame_position_tolerance=raw["frame_position_tolerance_m"],
             frame_rotation_tolerance=math.radians(raw["frame_rotation_tolerance_deg"]),
         )
+    _validate_case_target_geometry(ordinary)
 
     reports = _list(raw.get("ik_safety_episodes"), "safety reports", length=13)
     for index, report_value in enumerate(reports):
@@ -812,7 +910,14 @@ def _verify_raw(raw: dict[str, Any]) -> dict[str, Any]:
     )
     _require(tolerance == 1e-5, "joint soft-limit tolerance mismatch")
     q = _finite_vector_evidence(joint_state.get("joint_pos_rad"), "adversarial q")
-    _finite_vector_evidence(joint_state.get("joint_vel_rad_s"), "adversarial dq")
+    dq = _finite_vector_evidence(joint_state.get("joint_vel_rad_s"), "adversarial dq")
+    _require(
+        all(
+            abs(velocity) <= limit + 1e-6
+            for velocity, limit in zip(dq, EXPECTED_VELOCITY_LIMITS, strict=True)
+        ),
+        "adversarial terminal dq exceeds configured velocity limits",
+    )
     soft_violations = _finite_vector_evidence(
         joint_state.get("soft_limit_violation_rad"), "adversarial soft violations"
     )

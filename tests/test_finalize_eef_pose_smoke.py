@@ -87,6 +87,45 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
     }
 
 
+def _case_results():
+    hold_position = [0.3, 0.0, 0.5]
+    hold_quaternion = [1.0, 0.0, 0.0, 0.0]
+    targets = [(hold_position.copy(), hold_quaternion.copy())]
+    for axis, sign in ((0, 1.0), (0, -1.0), (1, 1.0), (1, -1.0), (2, 1.0), (2, -1.0)):
+        position = hold_position.copy()
+        position[axis] += sign * 0.04
+        targets.append((position, hold_quaternion.copy()))
+    half_angle = math.radians(15.0) / 2.0
+    for axis, sign in ((0, 1.0), (0, -1.0), (1, 1.0), (1, -1.0), (2, 1.0), (2, -1.0)):
+        delta = [math.cos(half_angle), 0.0, 0.0, 0.0]
+        delta[axis + 1] = sign * math.sin(half_angle)
+        targets.append(
+            (
+                hold_position.copy(),
+                finalizer._quaternion_multiply_wxyz(hold_quaternion, delta),
+            )
+        )
+    return [
+        {
+            "case": case,
+            "passed": True,
+            "position_error_m": 0.0,
+            "rotation_error_rad": 0.0,
+            "target_position": position,
+            "actual_position": position.copy(),
+            "target_quaternion_wxyz": quaternion,
+            "actual_quaternion_wxyz": quaternion.copy(),
+            "reset_frame_position_error_m": 0.0,
+            "reset_frame_rotation_error_rad": 0.0,
+            "final_frame_position_error_m": 0.0,
+            "final_frame_rotation_error_rad": 0.0,
+        }
+        for case, (position, quaternion) in zip(
+            finalizer.EXPECTED_CASES, targets, strict=True
+        )
+    ]
+
+
 def _valid_raw_result():
     q = [(lower + upper) / 2 for lower, upper in finalizer.EXPECTED_LIMITS]
     reports = [_safety_report(index, 360) for index in range(13)]
@@ -111,23 +150,7 @@ def _valid_raw_result():
         "frame_position_tolerance_m": 1e-5,
         "frame_rotation_tolerance_deg": 0.01,
         "raw_ik_safety_capture": _safety_report(None, 0),
-        "results": [
-            {
-                "case": case,
-                "passed": True,
-                "position_error_m": 0.0,
-                "rotation_error_rad": 0.0,
-                "target_position": [0.0, 0.0, 0.0],
-                "actual_position": [0.0, 0.0, 0.0],
-                "target_quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
-                "actual_quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
-                "reset_frame_position_error_m": 0.0,
-                "reset_frame_rotation_error_rad": 0.0,
-                "final_frame_position_error_m": 0.0,
-                "final_frame_rotation_error_rad": 0.0,
-            }
-            for case in finalizer.EXPECTED_CASES
-        ],
+        "results": _case_results(),
         "ik_safety_episodes": reports,
         "ik_safety_adversarial": {
             "case": "oversized absolute +x target for one policy step",
@@ -327,6 +350,21 @@ def test_raw_smoke_gate_requires_pending_full_evidence():
         finalizer._verify_raw(raw)
 
     raw = _valid_raw_result()
+    raw["results"][1]["target_position"] = raw["results"][0]["target_position"].copy()
+    raw["results"][1]["actual_position"] = raw["results"][1]["target_position"].copy()
+    with pytest.raises(
+        finalizer.VerificationError, match="translation target geometry"
+    ):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    wrong_sign = raw["results"][8]["target_quaternion_wxyz"].copy()
+    raw["results"][7]["target_quaternion_wxyz"] = wrong_sign
+    raw["results"][7]["actual_quaternion_wxyz"] = wrong_sign.copy()
+    with pytest.raises(finalizer.VerificationError, match="rotation target geometry"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
     raw["ik_safety_episodes"][0]["max_raw_delta_diagnostic"][
         "raw_joint_pos_target_rad"
     ]["values"][0] += 0.01
@@ -349,6 +387,13 @@ def test_raw_smoke_gate_requires_pending_full_evidence():
     diagnostic["raw_joint_pos_target_rad"] = copy.deepcopy(diagnostic["joint_pos_rad"])
     diagnostic["safe_joint_pos_target_rad"] = copy.deepcopy(diagnostic["joint_pos_rad"])
     with pytest.raises(finalizer.VerificationError, match="never exceed"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    dq = raw["ik_safety_adversarial"]["joint_state"]["joint_vel_rad_s"]
+    dq["values"][0] = finalizer.EXPECTED_VELOCITY_LIMITS[0] + 0.1
+    dq["max_abs"] = dq["values"][0]
+    with pytest.raises(finalizer.VerificationError, match="terminal dq"):
         finalizer._verify_raw(raw)
 
 

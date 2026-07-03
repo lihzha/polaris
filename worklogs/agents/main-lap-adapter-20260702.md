@@ -315,4 +315,7 @@
   reconstruction, max-raw scalar/vector/target/slew/limit identities, and a
   semantically saturated adversarial slew event. It also binds the actual
   `SLURM_JOB_ID`, expected finalizer SHA, and externally supplied expected
-  saved-sbatch SHA. Probe-specific mutation tests cover every rejected case.
+  saved-sbatch SHA. It also reconstructs the actual ±0.04-m translation and
+  right-multiplied, sign-aware ±15° rotation target matrix from the hold case,
+  and bounds terminal adversarial dq by the configured velocity limits.
+  Probe-specific mutation tests cover every rejected case.
