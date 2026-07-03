@@ -221,8 +221,10 @@ no GPU, simulator, Slurm, registry, deployment, or shared checkout was touched.
   `dc1426d4c711c657e2e213dda9ab752fc6d83364`
 - Independently audited staged review hash:
   `260a24129bc61bbc138211bf013e33665adb91a8c3b1264268f2d42b20c303dc`
-- Corrected 2.5 rad/s implementation commit: recorded by the follow-up handoff
-  entry after this diff is frozen.
+- Corrected 2.5 rad/s implementation commit:
+  `86ce5a9f4b154b13f51e10921c40178a0373a719`.
+- Corrected staged diff SHA-256 before commit:
+  `9ce615a7457e39f753d557a7f9ea4d4c620ab96095a73bc2331b3614423c7077`.
 - No corrected simulator, GPU, Slurm, evaluation, or other persistent job was
   launched from this implementation task. Relaunch is pending; no task-owned
   process or local artifact cleanup remains.
