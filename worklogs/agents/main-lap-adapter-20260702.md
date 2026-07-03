@@ -698,3 +698,28 @@
   gripper drive/contact impulse and record live gripper targets/state/drive and
   link-contact evidence; another threshold-only wrist-brake tune is not
   justified by these results.
+
+## 2026-07-03 — authoritative gripper articulation metadata probe
+
+- Model-free L40S job `1098158` completed `0:0` on `pool0-00013` in 258
+  seconds using the pinned PolaRiS source `426ad821`, pinned container, and
+  pinned FoodBussing assets. The job published only the saved wrapper and an
+  immutable mode-0444, single-link JSON artifact. The wrapper SHA-256 is
+  `2de33f05955aba82d7a9cdd4c7f69eb449dc8c0c5e29342f9e3ef356ef407ab4`;
+  the JSON SHA-256 is
+  `839b04a5226ec2d1a0b3171696a24bc97494fa116e16de866bf758c35cebdb1c`.
+  Strict post-run parsing passed, the deployed checkout remained clean, the
+  per-job cache was removed, and the node returned idle. The two logged error
+  lines are the known non-fatal headless NGX initialization messages; there is
+  no traceback, crash, or killed process.
+- The live articulation has exactly 13 ordered DOFs: Panda joints 1--7,
+  `finger_joint`, `right_outer_knuckle_joint`, `left_inner_finger_joint`,
+  `right_inner_finger_joint`, `left_inner_finger_knuckle_joint`, and
+  `right_inner_finger_knuckle_joint`. It has exactly 18 ordered bodies: Panda
+  links 0--8, `base_link`, then left/right outer knuckles, left/right outer
+  fingers, left/right inner fingers, and left/right inner knuckles. Joint and
+  PhysX DOF shapes are `[1, 13]`; body state is `[1, 18, 13]`; PhysX link
+  velocity is `[1, 18, 6]`. The robot USD is 14,156,155 bytes with SHA-256
+  `d8379925b103963dbf3e7c85bcc4ae101b81b7c1d7dabe7d2e964f41d069ec44`.
+  These live ordered lists replace the provisional USD traversal order and
+  are mandatory cross-bindings for the gripper impulse diagnostic.
