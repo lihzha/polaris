@@ -574,3 +574,31 @@
   `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris_eval/controller_diagnostics_v13/2fca845-factor1-trace64`.
   It remains controller-only with no model, checkpoint, policy server, or
   downstream chain.
+- Job `1098116` completed the clean diagnostic contract in 257 seconds. The
+  intentional no-tests-selected probe returned pytest/child/outer status 5,
+  published immutable exact `5\n` SHA-256
+  `f0b5c2c2211c8d67ed15e75e656c7862d086e9245420892a7de62cd9ec582a06`,
+  and was rejected by the same zero gate. The positive real-Isaac suite passed
+  all 50 tests, returned child/outer status 0, and published immutable exact
+  `0\n` SHA-256
+  `9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa`.
+  The host suite then passed 168 tests plus 22 subtests. The expected-failure
+  boundary replay exited 1 at policy step 115 and produced immutable mode-0444
+  raw trace SHA-256
+  `00486e0012753b71ecd6c79c1c00ec9b9cf84e7d0ae11e1143a9536d3f2776ff`;
+  strict validation accepted 64 consecutive completed entries 858--921 with
+  no pending entry, close failure, temporary, ready, attestation, or hidden
+  result. The wrapper exited 0, all Slurm processes reaped, and the clean
+  source remained exactly `2fca845f0e42c089dd6820cb8e0da21cc8a5c4a2`.
+  The log SHA-256 is
+  `1f96b9281212e170e6944bd76b19df6c2925e38ac17fd6405d470bba628eeb2e`.
+  Apart from its source-path traceback, this trace is byte-for-byte equal as a
+  parsed JSON object to the earlier job `1098094` trace. It independently
+  confirms a one-substep coupled wrist impulse at apply index 921: joints 5--7
+  change velocity by `+2.314222`, `-0.755803`, and `-2.970518` rad/s while the
+  post-clip efforts are only `-0.642102`, `+0.380754`, and `+0.454144` Nm.
+  Only two of 448 traced effort samples saturated, both 25 substeps earlier;
+  all arm velocity targets and feed-forward effort targets are exactly zero.
+  An independent post-run audit also executed the source runner's complete
+  failure-trace validator and accepted all transition, live-state, PD, counter,
+  permission, link-count, and publication-boundary identities.
