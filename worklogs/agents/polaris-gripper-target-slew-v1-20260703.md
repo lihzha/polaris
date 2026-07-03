@@ -130,3 +130,12 @@ finalized before any checkpoint canary. A canary must then show that the
 original `panda_joint7 +2.76075697 rad/s` action-117/substep-3 abort is removed
 without a new arm or all-six-gripper safety violation. Task success is not
 claimed.
+
+## Git handoff
+
+- Implementation commit:
+  `dc1426d4c711c657e2e213dda9ab752fc6d83364`
+- Independently audited staged review hash:
+  `260a24129bc61bbc138211bf013e33665adb91a8c3b1264268f2d42b20c303dc`
+- No simulator, GPU, Slurm, evaluation, or other persistent job was launched
+  from this worktree. No cleanup is pending.
