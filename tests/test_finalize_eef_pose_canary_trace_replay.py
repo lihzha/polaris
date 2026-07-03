@@ -207,3 +207,70 @@ def test_finalizer_identity_rejects_symlink_and_hardlink(tmp_path: Path) -> None
     os.link(source, hardlink)
     with pytest.raises(finalizer.Gate0FinalizationError, match="one hard link"):
         finalizer._identity(source, field="source")
+
+
+def test_identities_preserve_parent_alias_and_accept_same_inode(
+    tmp_path: Path,
+) -> None:
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    alias_parent = tmp_path / "alias"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+    real_file = real_parent / "evidence.json"
+    real_file.write_bytes(b"{}\n")
+    alias_file = alias_parent / real_file.name
+
+    status_identity = status_writer._identity(alias_file, field="status evidence")
+    final_alias_identity = finalizer._identity(alias_file, field="alias evidence")
+    final_real_identity = finalizer._identity(real_file, field="real evidence")
+
+    assert status_identity["path"] == str(alias_file)
+    assert final_alias_identity["path"] == str(alias_file)
+    assert final_real_identity["path"] == str(real_file)
+    finalizer._same_core_identity(
+        final_alias_identity,
+        final_real_identity,
+        field="mount-alias evidence",
+    )
+
+
+def test_status_writer_accepts_publisher_visible_parent_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    variant = "official_lap3b"
+    launch_id = "a" * 64
+    job_id = 321
+    real_root = tmp_path / "real-root"
+    raw_path, ready_path, _ = _build_raw_pair(
+        real_root,
+        variant=variant,
+        launch_id=launch_id,
+        job_id=job_id,
+        commit="b" * 40,
+    )
+    alias_root = tmp_path / "publisher-root"
+    alias_root.symlink_to(real_root, target_is_directory=True)
+    alias_raw_path = alias_root / raw_path.relative_to(real_root)
+    alias_status_path = alias_raw_path.with_name(f"gate0-{variant}.srun-status.json")
+
+    marker = replay.strict_json_loads(ready_path.read_bytes(), field="ready marker")
+    marker["raw_result"]["path"] = str(alias_raw_path)
+    ready_path.unlink()
+    replay._atomic_write_immutable(ready_path, marker)
+
+    monkeypatch.setenv("SLURM_JOB_ID", str(job_id))
+    monkeypatch.setattr(replay, "validate_capture_payload", lambda value: value)
+    now = time.time_ns()
+    status = status_writer.build_status(
+        argparse.Namespace(
+            variant=variant,
+            launch_id=launch_id,
+            job_id=job_id,
+            srun_rc=0,
+            srun_started_at_ns=now - 2,
+            srun_returned_at_ns=now - 1,
+            raw_result=alias_raw_path,
+            status=alias_status_path,
+        )
+    )
+    assert status["raw_result"]["path"] == str(alias_raw_path)

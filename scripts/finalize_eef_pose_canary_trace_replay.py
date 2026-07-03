@@ -58,6 +58,10 @@ def _mode(path: Path) -> str:
 
 
 def _identity(path: Path, *, field: str, include_mtime: bool = False) -> dict[str, Any]:
+    # Keep the publisher-visible absolute path instead of canonicalizing a
+    # cluster mount alias.  Pyxis and the outer host can expose one inode as
+    # /lustre/fsw and /lustre/fs11 respectively.
+    path = Path(os.path.abspath(path))
     _require(path.is_file() and not path.is_symlink(), f"{field} missing/linked")
     metadata = path.stat()
     _require(metadata.st_nlink == 1, f"{field} must have one hard link")
@@ -68,7 +72,7 @@ def _identity(path: Path, *, field: str, include_mtime: bool = False) -> dict[st
             size += len(chunk)
             digest.update(chunk)
     result = {
-        "path": str(path.resolve()),
+        "path": str(path),
         "size_bytes": size,
         "sha256": digest.hexdigest(),
         "mode": _mode(path),
@@ -104,7 +108,18 @@ def _git(repo: Path, *arguments: str) -> str:
 
 def _same_core_identity(recorded: Any, current: dict[str, Any], *, field: str) -> None:
     _require(isinstance(recorded, dict), f"{field} recorded identity")
-    for name in ("path", "size_bytes", "sha256", "mode"):
+    recorded_path = recorded.get("path")
+    current_path = current.get("path")
+    try:
+        same_file = (
+            isinstance(recorded_path, str)
+            and isinstance(current_path, str)
+            and os.path.samefile(recorded_path, current_path)
+        )
+    except OSError:
+        same_file = False
+    _require(same_file, f"{field} path changed")
+    for name in ("size_bytes", "sha256", "mode"):
         _require(recorded.get(name) == current[name], f"{field} {name} changed")
 
 

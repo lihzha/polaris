@@ -45,12 +45,17 @@ def _require(condition: bool, message: str) -> None:
 
 
 def _identity(path: Path, *, field: str) -> dict[str, Any]:
+    # Preserve the absolute path visible to the publisher.  The Pyxis bind
+    # namespace exposes /lustre/fsw as a direct mount, while the outer host may
+    # resolve the same inode through /lustre/fs11; resolving symlinks here
+    # would therefore break the raw marker's path binding after srun returns.
+    path = Path(os.path.abspath(path))
     _require(path.is_file() and not path.is_symlink(), f"{field} missing/linked")
     metadata = path.stat()
     _require(metadata.st_nlink == 1, f"{field} must have one hard link")
     data = path.read_bytes()
     return {
-        "path": str(path.resolve()),
+        "path": str(path),
         "size_bytes": len(data),
         "sha256": replay._sha256(data),
         "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
