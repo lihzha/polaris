@@ -190,6 +190,27 @@ def test_slurm_provenance_binds_immutable_snapshot_and_environment(
     assert not hasattr(finalizer, "_scontrol_job")
 
 
+@pytest.mark.parametrize("snapshot_field", ["Account", "JobName"])
+def test_step_local_account_and_job_name_are_snapshot_authoritative(
+    tmp_path, monkeypatch, snapshot_field
+):
+    args = _slurm_args(tmp_path)
+    _set_slurm_environment(monkeypatch, args)
+    monkeypatch.delenv("SLURM_JOB_ACCOUNT", raising=False)
+    monkeypatch.setenv("SLURM_JOB_NAME", "<bash>")
+    observed = finalizer._capture_slurm_provenance(args)
+    assert observed["account"] == args.expected_slurm_account
+    assert observed["job_name"] == args.expected_slurm_job_name
+
+    args.slurm_job_oneliner_snapshot.unlink()
+    _write_slurm_snapshot(args, overrides={snapshot_field: "tampered"})
+    with pytest.raises(
+        finalizer.GripperImpulseFinalizationError,
+        match=rf"snapshot {snapshot_field} mismatch",
+    ):
+        finalizer._capture_slurm_provenance(args)
+
+
 def test_slurm_tres_comparison_is_order_independent(tmp_path, monkeypatch):
     args = _slurm_args(tmp_path)
     args.slurm_job_oneliner_snapshot.unlink()
@@ -257,9 +278,7 @@ def test_slurm_provenance_rejects_every_snapshot_field(tmp_path, monkeypatch, fi
         "SLURM_JOB_ID",
         "SLURM_JOB_NODELIST",
         "SLURMD_NODENAME",
-        "SLURM_JOB_ACCOUNT",
         "SLURM_JOB_PARTITION",
-        "SLURM_JOB_NAME",
         "SLURM_NTASKS",
         "SLURM_GPUS_ON_NODE",
         "SLURM_CPUS_PER_TASK",
