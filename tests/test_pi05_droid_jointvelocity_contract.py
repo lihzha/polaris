@@ -120,9 +120,17 @@ def test_eval_profile_intent_is_required_only_for_native_jointvelocity():
 
 
 def test_polaris_runtime_source_manifest_matches_the_exact_local_sources():
-    source_root = ROOT / "src/polaris/environments"
+    source_paths = {
+        "droid_cfg.py": ROOT / "src/polaris/environments/droid_cfg.py",
+        "robot_cfg.py": ROOT / "src/polaris/environments/robot_cfg.py",
+        "native_gripper_runtime.py": ROOT / "src/polaris/native_gripper_runtime.py",
+        "manager_based_rl_splat_environment.py": (
+            ROOT / "src/polaris/environments/manager_based_rl_splat_environment.py"
+        ),
+    }
+    assert set(source_paths) == set(PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256)
     actual = {
-        filename: hashlib.sha256((source_root / filename).read_bytes()).hexdigest()
+        filename: hashlib.sha256(source_paths[filename].read_bytes()).hexdigest()
         for filename in PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256
     }
     assert actual == PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256

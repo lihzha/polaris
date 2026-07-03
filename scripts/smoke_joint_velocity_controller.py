@@ -444,6 +444,7 @@ def _kit_child_main(argv: list[str]) -> int:
         import polaris.environments  # noqa: F401
         from polaris.environments.droid_cfg import (
             DroidJointVelocityActionCfg,
+            DroidJointVelocityEventCfg,
             DroidJointVelocityObservationCfg,
         )
         from polaris.environments.robot_cfg import NVIDIA_DROID_JOINT_VELOCITY
@@ -457,8 +458,10 @@ def _kit_child_main(argv: list[str]) -> int:
         )
         env_cfg.scene.robot = NVIDIA_DROID_JOINT_VELOCITY.copy()
         env_cfg.actions = DroidJointVelocityActionCfg()
+        env_cfg.events = DroidJointVelocityEventCfg()
         env_cfg.observations = DroidJointVelocityObservationCfg()
         env = gym.make(args_cli.environment, cfg=env_cfg)
+        env.reset(expensive=False)
         stage = "validate_joint_velocity_runtime"
         runtime_contract = validate_joint_velocity_runtime(
             env,

@@ -19,7 +19,8 @@ PROFILE = "pi05_droid_native_jointvelocity_l40s_controller_smoke_v2"
 SMOKE_PROFILE = "pi05_droid_native_jointvelocity_controller_smoke_v2"
 CONTROLLER_PROFILE = "openpi_pi05_droid_native_jointvelocity_v1"
 GRIPPER_DRIVE_PROFILE = (
-    "implicit_gripper_physx_velocity_limit5_cuda_actuator_cpu_static_physx_v1"
+    "implicit_gripper_physx_velocity_limit5_followers5_every_reset_"
+    "cuda_actuator_cpu_static_physx_v1"
 )
 GRIPPER_VELOCITY_LIMIT = 5.0
 GRIPPER_EFFORT_LIMIT = 200.0
@@ -35,10 +36,20 @@ ISAACLAB_SOURCES = {
     "actuator_cfg.py": "3963167d6678c6f052d87202678822d80a98b0b0f3492b859774768b1bd80520",
     "actuator_pd.py": "1d2a9b80812714f5aade3ed7bbb7c74a403ab718868aa73d187eb77173695beb",
     "articulation.py": "9cc03b85642c36c801ff9683e94b8ccc3fbef1178761338974b433dacc78ef75",
+    "action_manager.py": "a95d7c45048b08d8c7b526ba5ab88d40087b4bcbacb248d6e9b039c5f3b9afb9",
+    "event_manager.py": "21864ba786aa30b842023809adacf1548cc75a4e46443a1fc7266d908ddc9090",
+    "manager_based_env.py": "a7d694e20e190678410330e24c365381a80d4f538debcced696d2c8e05cb940e",
+    "manager_based_rl_env.py": "8ec2759541c8320ed725411d49564f5617b3ab6b9d340c860bededee13d557d4",
 }
 POLARIS_RUNTIME_SOURCES = {
-    "droid_cfg.py": "111c34d8d707f6edf31e9166c9aafd999ff3e7ea72344fc31fe5c9b8d6e175ee",
+    "droid_cfg.py": "19ceaceeb06c06e1f708af2380d47dded2a5f7030c436e266c4efca255509287",
     "robot_cfg.py": "d514b32e07b54f98deb6d9dbc7a5201fff5337cdc4600d9351ee2a95e5c4c4c5",
+    "native_gripper_runtime.py": (
+        "8b5cd2e7c0f912418a878544fce621c00a4126551a21ab72d486686b67d70ff1"
+    ),
+    "manager_based_rl_splat_environment.py": (
+        "9381b2704e86aae6447eb2cc229471612104c5eec2acc9d913252a09159da426"
+    ),
 }
 JOINT_NAMES = [f"panda_joint{index}" for index in range(1, 8)]
 VELOCITY_LIMITS = [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61]
@@ -76,10 +87,12 @@ SOURCE_PATHS = (
     "scripts/polaris/l40s_pi05_droid_jointvelocity_controller_smoke.sbatch",
     "scripts/polaris/submit_pi05_droid_jointvelocity_controller_smoke.sh",
     "src/polaris/environments/droid_cfg.py",
+    "src/polaris/environments/manager_based_rl_splat_environment.py",
     "src/polaris/environments/robot_cfg.py",
     "src/polaris/config.py",
     "src/polaris/joint_velocity_runtime.py",
     "src/polaris/joint_velocity_smoke.py",
+    "src/polaris/native_gripper_runtime.py",
     "src/polaris/pi05_droid_jointvelocity_contract.py",
 )
 
@@ -338,6 +351,13 @@ def _validate_array(
 
 
 def _validate_runtime(report: Any) -> dict[str, Any]:
+    from polaris.joint_velocity_runtime import validate_joint_velocity_runtime_report
+
+    return validate_joint_velocity_runtime_report(report)
+
+    # Kept below as a historical independent description of the retired
+    # driver-only schema.  The active all-six schema is centralized above so
+    # old controller completions cannot accidentally authorize the new path.
     required = {
         "schema_version",
         "profile",

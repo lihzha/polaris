@@ -3,8 +3,10 @@ from pathlib import Path
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 from isaaclab.envs.mdp.actions.actions_cfg import (
     BinaryJointPositionActionCfg,
+    JointVelocityActionCfg,
 )
 from isaaclab.envs.mdp.actions.binary_joint_actions import BinaryJointPositionAction
+from isaaclab.envs.mdp.actions.joint_actions import JointVelocityAction
 import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math
 import isaaclab.envs.mdp as mdp
@@ -13,6 +15,10 @@ from typing import Sequence
 
 from polaris.environments.robot_cfg import NVIDIA_DROID
 from polaris.pi05_droid_jointvelocity_contract import PANDA_ARM_JOINT_NAMES
+from polaris.native_gripper_runtime import (
+    NativeAllJointDynamicRecorder,
+    apply_native_gripper_all_six_velocity_limits,
+)
 from polaris.robust_differential_ik import (
     RobustDifferentialInverseKinematicsActionCfg,
 )
@@ -223,6 +229,13 @@ class BinaryJointPositionZeroToOneAction(BinaryJointPositionAction):
                 max=self._clip[:, :, 1],
             )
 
+    def apply_actions(self):
+        super().apply_actions()
+        arm_term = self._env.action_manager._terms.get("arm")
+        recorder = getattr(arm_term, "_native_all_joint_recorder", None)
+        if recorder is not None:
+            recorder.record_apply_entry(self._asset)
+
 
 @configclass
 class BinaryJointPositionZeroToOneActionCfg(BinaryJointPositionActionCfg):
@@ -232,6 +245,32 @@ class BinaryJointPositionZeroToOneActionCfg(BinaryJointPositionActionCfg):
     """
 
     class_type = BinaryJointPositionZeroToOneAction
+
+
+class AuditedDroidJointVelocityAction(JointVelocityAction):
+    """Upstream velocity action with read-only all-DOF safety evidence."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self._native_all_joint_recorder = NativeAllJointDynamicRecorder()
+
+    def reset(self, env_ids=None):
+        super().reset(env_ids)
+        self._native_all_joint_recorder.reset()
+
+    def record_native_all_joint_post_policy_step(self):
+        return self._native_all_joint_recorder.record_post_policy_step(self._asset)
+
+    def native_all_joint_dynamic_report(self, *, include_samples: bool):
+        return self._native_all_joint_recorder.report(include_samples=include_samples)
+
+    def reset_native_all_joint_dynamic_report(self):
+        self._native_all_joint_recorder.reset()
+
+
+@configclass
+class AuditedDroidJointVelocityActionCfg(JointVelocityActionCfg):
+    class_type = AuditedDroidJointVelocityAction
 
 
 @configclass
@@ -290,7 +329,7 @@ class EefPoseActionCfg:
 class DroidJointVelocityActionCfg:
     """Native DROID velocity actions with no position integration or offset."""
 
-    arm = mdp.JointVelocityActionCfg(
+    arm = AuditedDroidJointVelocityActionCfg(
         asset_name="robot",
         joint_names=list(PANDA_ARM_JOINT_NAMES),
         preserve_order=True,
@@ -434,6 +473,16 @@ class EventCfg:
     """Configuration for events."""
 
     reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
+
+
+@configclass
+class DroidJointVelocityEventCfg(EventCfg):
+    """Native reset events, ordered so the all-six cap runs after scene reset."""
+
+    cap_gripper_followers = EventTerm(
+        func=apply_native_gripper_all_six_velocity_limits,
+        mode="reset",
+    )
 
 
 @configclass

@@ -227,7 +227,7 @@ eval_args=(
   --policy.trace-path "${TRACE_PATH}"
   --runtime-contract-path "${RUNTIME_PATH}"
   --lifecycle-ready-path "${LIFECYCLE_PATH}"
-  --expected-gripper-drive-profile implicit_gripper_physx_velocity_limit5_cuda_actuator_cpu_static_physx_v1
+  --expected-gripper-drive-profile implicit_gripper_physx_velocity_limit5_followers5_every_reset_cuda_actuator_cpu_static_physx_v1
   --run-folder "${TASK_DIR}"
   --rollouts 1
   --headless

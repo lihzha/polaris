@@ -13,7 +13,7 @@ SBATCH_SCRIPT="${SBATCH_SCRIPT:-${SCRIPT_DIR}/l40s_pi05_droid_jointvelocity_cont
 OUTPUT_ROOT="${OUTPUT_ROOT:-${NFS_ROOT}/results/polaris-pi05-jointvelocity/controller-smoke}"
 LOG_ROOT="${LOG_ROOT:-${NFS_ROOT}/slurm_logs/polaris-pi05-jointvelocity}"
 EXPECTED_IMAGE_SHA256=ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d556b324a
-EXPECTED_GRIPPER_DRIVE_PROFILE=implicit_gripper_physx_velocity_limit5_cuda_actuator_cpu_static_physx_v1
+EXPECTED_GRIPPER_DRIVE_PROFILE=implicit_gripper_physx_velocity_limit5_followers5_every_reset_cuda_actuator_cpu_static_physx_v1
 
 die() {
   echo "ERROR: $*" >&2

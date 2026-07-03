@@ -7,11 +7,24 @@ import hashlib
 import importlib.metadata
 import inspect
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from polaris.native_gripper_runtime import (
+    EXPECTED_DROID_JOINT_NAMES,
+    EXPECTED_FULL_LIMITS_CAPPED,
+    GRIPPER_JOINT_INDICES,
+    GRIPPER_JOINT_NAMES,
+    NATIVE_GRIPPER_ALL_SIX_PROFILE,
+    capture_native_gripper_mimic_contract,
+    native_gripper_reset_report,
+    validate_actuator_ownership,
+    validate_native_gripper_mimic_contract,
+    validate_native_gripper_reset_report,
+)
 from polaris.pi05_droid_jointvelocity_contract import (
     NATIVE_GRIPPER_DAMPING,
     NATIVE_GRIPPER_DRIVE_PROFILE,
@@ -32,10 +45,16 @@ from polaris.pi05_droid_jointvelocity_contract import (
 
 JOINT_VELOCITY_RUNTIME_MARKER = "POLARIS_JOINT_VELOCITY_RUNTIME="
 _JOINT_VELOCITY_ACTION_CLASS = (
-    "isaaclab.envs.mdp.actions.joint_actions.JointVelocityAction"
+    "polaris.environments.droid_cfg.AuditedDroidJointVelocityAction"
 )
 _JOINT_VELOCITY_CFG_CLASS = (
-    "isaaclab.envs.mdp.actions.actions_cfg.JointVelocityActionCfg"
+    "polaris.environments.droid_cfg.AuditedDroidJointVelocityActionCfg"
+)
+_JOINT_VELOCITY_BASE_CLASS = (
+    "isaaclab.envs.mdp.actions.joint_actions.JointVelocityAction"
+)
+_MANAGER_BASED_RL_ENV_BASE_CLASS = (
+    "isaaclab.envs.manager_based_rl_env.ManagerBasedRLEnv"
 )
 _IMPLICIT_ACTUATOR_CLASS = "isaaclab.actuators.actuator_pd.ImplicitActuator"
 _BINARY_GRIPPER_ACTION_CLASS = (
@@ -147,6 +166,7 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
         "policy_frequency_hz",
         "physics_frequency_hz",
         "decimation",
+        "reset_event_order",
         "joint_names",
         "action_term_class",
         "action_cfg_class",
@@ -158,6 +178,7 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
         "position_integration",
         "velocity_drive",
         "gripper",
+        "all_six_gripper",
         "runtime_sha256",
     }
     if set(report) != required_keys:
@@ -180,6 +201,7 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
         "policy_frequency_hz": 15,
         "physics_frequency_hz": 120,
         "decimation": 8,
+        "reset_event_order": ["reset_all", "cap_gripper_followers"],
         "joint_names": list(PANDA_ARM_JOINT_NAMES),
         "action_term_class": _JOINT_VELOCITY_ACTION_CLASS,
         "action_cfg_class": _JOINT_VELOCITY_CFG_CLASS,
@@ -348,6 +370,51 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
                 field=f"gripper {surface} {name}",
                 expected_device=expected_device,
             )
+    all_six = report["all_six_gripper"]
+    if not isinstance(all_six, dict) or set(all_six) != {
+        "profile",
+        "joint_names",
+        "joint_indices",
+        "actuator_ownership",
+        "reset_write",
+        "mimic_joint_contract",
+        "buffered_velocity_limit",
+        "direct_physx_velocity_limit",
+    }:
+        raise ValueError("Joint-velocity all-six gripper schema mismatch")
+    if (
+        all_six["profile"] != NATIVE_GRIPPER_ALL_SIX_PROFILE
+        or all_six["joint_names"] != list(GRIPPER_JOINT_NAMES)
+        or all_six["joint_indices"] != list(GRIPPER_JOINT_INDICES)
+    ):
+        raise ValueError("Joint-velocity all-six gripper identity mismatch")
+    expected_ownership = {
+        "panda_shoulder": {
+            "joint_names": [f"panda_joint{index}" for index in range(1, 5)],
+            "joint_indices": [0, 1, 2, 3],
+        },
+        "panda_forearm": {
+            "joint_names": [f"panda_joint{index}" for index in range(5, 8)],
+            "joint_indices": [4, 5, 6],
+        },
+        "gripper": {"joint_names": ["finger_joint"], "joint_indices": [7]},
+    }
+    if all_six["actuator_ownership"] != expected_ownership:
+        raise ValueError("Joint-velocity all-six actuator ownership mismatch")
+    validate_native_gripper_reset_report(all_six["reset_write"])
+    validate_native_gripper_mimic_contract(all_six["mimic_joint_contract"])
+    _validate_array_report(
+        all_six["buffered_velocity_limit"],
+        np.asarray([EXPECTED_FULL_LIMITS_CAPPED], dtype=np.float32),
+        field="all-six buffered velocity limit",
+        expected_device=_CUDA_DEVICE,
+    )
+    _validate_array_report(
+        all_six["direct_physx_velocity_limit"],
+        np.asarray([EXPECTED_FULL_LIMITS_CAPPED], dtype=np.float32),
+        field="all-six direct PhysX velocity limit",
+        expected_device=_CPU_DEVICE,
+    )
     return copy.deepcopy(report)
 
 
@@ -356,8 +423,10 @@ def _installed_isaaclab_version() -> str:
 
 
 def _verify_isaaclab_sources(
-    *, arm_term: Any, finger_term: Any, robot: Any, actuator: Any
+    *, root_env: Any, arm_term: Any, finger_term: Any, robot: Any, actuator: Any
 ) -> dict[str, str]:
+    from isaaclab.envs.manager_based_env import ManagerBasedEnv
+
     binary_base = next(
         (
             cls
@@ -368,13 +437,38 @@ def _verify_isaaclab_sources(
     )
     if binary_base is None:
         raise ValueError("Cannot resolve pinned Isaac Lab binary gripper base class")
+    velocity_base = next(
+        (
+            cls
+            for cls in type(arm_term).__mro__
+            if f"{cls.__module__}.{cls.__qualname__}" == _JOINT_VELOCITY_BASE_CLASS
+        ),
+        None,
+    )
+    if velocity_base is None:
+        raise ValueError("Cannot resolve pinned Isaac Lab velocity-action base class")
+    rl_env_base = next(
+        (
+            cls
+            for cls in type(root_env).__mro__
+            if f"{cls.__module__}.{cls.__qualname__}"
+            == _MANAGER_BASED_RL_ENV_BASE_CLASS
+        ),
+        None,
+    )
+    if rl_env_base is None:
+        raise ValueError("Cannot resolve pinned Isaac Lab manager-based RL base class")
     objects = {
         "actions_cfg.py": arm_term.cfg,
-        "joint_actions.py": arm_term,
+        "joint_actions.py": velocity_base,
         "binary_joint_actions.py": binary_base,
         "actuator_cfg.py": robot.cfg.actuators["panda_shoulder"],
         "actuator_pd.py": actuator,
         "articulation.py": robot,
+        "action_manager.py": root_env.action_manager,
+        "event_manager.py": root_env.event_manager,
+        "manager_based_env.py": ManagerBasedEnv,
+        "manager_based_rl_env.py": rl_env_base,
     }
     actual: dict[str, str] = {}
     for source_name, value in objects.items():
@@ -395,12 +489,17 @@ def _verify_isaaclab_sources(
     return actual
 
 
-def _verify_polaris_sources(*, finger_term: Any) -> dict[str, str]:
+def _verify_polaris_sources(*, root_env: Any, finger_term: Any) -> dict[str, str]:
+    from polaris import native_gripper_runtime
     from polaris.environments import robot_cfg
 
     objects = {
         "droid_cfg.py": type(finger_term),
         "robot_cfg.py": robot_cfg.make_nvidia_droid_joint_velocity_cfg,
+        "native_gripper_runtime.py": (
+            native_gripper_runtime.apply_native_gripper_all_six_velocity_limits
+        ),
+        "manager_based_rl_splat_environment.py": type(root_env),
     }
     actual: dict[str, str] = {}
     for source_name, source_object in objects.items():
@@ -439,6 +538,11 @@ def validate_joint_velocity_runtime(
             "Native DROID velocity control requires decimation=8 and dt=1/120"
         )
 
+    reset_event_order = list(root_env.event_manager.active_terms.get("reset", ()))
+    if reset_event_order != ["reset_all", "cap_gripper_followers"]:
+        raise ValueError("Native reset events must run scene reset then all-six cap")
+    if list(root_env.action_manager._terms) != ["arm", "finger_joint"]:
+        raise ValueError("Native action-term order must be arm then finger_joint")
     arm_term = root_env.action_manager._terms["arm"]
     finger_term = root_env.action_manager._terms["finger_joint"]
     if _class_path(arm_term) != _JOINT_VELOCITY_ACTION_CLASS:
@@ -522,6 +626,8 @@ def validate_joint_velocity_runtime(
     )
 
     robot = root_env.scene["robot"]
+    if tuple(robot.joint_names) != EXPECTED_DROID_JOINT_NAMES:
+        raise ValueError(f"Full DROID articulation order mismatch: {robot.joint_names}")
     joint_ids, joint_names = robot.find_joints(
         list(PANDA_ARM_JOINT_NAMES), preserve_order=True
     )
@@ -562,12 +668,15 @@ def validate_joint_velocity_runtime(
     ):
         raise ValueError("Configured native gripper drive mismatch")
     isaaclab_source_sha256 = _verify_isaaclab_sources(
+        root_env=root_env,
         arm_term=arm_term,
         finger_term=finger_term,
         robot=robot,
         actuator=robot.actuators["panda_shoulder"],
     )
-    polaris_runtime_source_sha256 = _verify_polaris_sources(finger_term=finger_term)
+    polaris_runtime_source_sha256 = _verify_polaris_sources(
+        root_env=root_env, finger_term=finger_term
+    )
 
     expected_stiffness = np.zeros((1, 7), dtype=np.float32)
     expected_damping = np.full(
@@ -705,6 +814,29 @@ def validate_joint_velocity_runtime(
             expected_device=_CPU_DEVICE,
         ),
     }
+    all_six_buffered = _require_float32_array(
+        data.joint_vel_limits,
+        np.asarray([EXPECTED_FULL_LIMITS_CAPPED], dtype=np.float32),
+        field="all-six buffered joint velocity limits",
+        expected_device=_CUDA_DEVICE,
+    )
+    all_six_direct = _require_float32_array(
+        view.get_dof_max_velocities(),
+        np.asarray([EXPECTED_FULL_LIMITS_CAPPED], dtype=np.float32),
+        field="all-six direct PhysX joint velocity limits",
+        expected_device=_CPU_DEVICE,
+    )
+    reset_write = native_gripper_reset_report(root_env)
+    ownership = validate_actuator_ownership(robot)
+    data_path = Path(
+        os.environ.get(
+            "POLARIS_DATA_PATH",
+            str(Path(__file__).resolve().parents[2] / "PolaRiS-Hub"),
+        )
+    ).resolve()
+    mimic_contract = capture_native_gripper_mimic_contract(
+        data_path / "nvidia_droid/noninstanceable.usd"
+    )
 
     report: dict[str, Any] = {
         "schema_version": 1,
@@ -716,6 +848,7 @@ def validate_joint_velocity_runtime(
         "policy_frequency_hz": 15,
         "physics_frequency_hz": 120,
         "decimation": 8,
+        "reset_event_order": reset_event_order,
         "joint_names": list(joint_names),
         "action_term_class": _class_path(arm_term),
         "action_cfg_class": _class_path(arm_term.cfg),
@@ -745,6 +878,16 @@ def validate_joint_velocity_runtime(
                 "actuator": gripper_actuator_drive,
                 "direct_physx": gripper_direct_drive,
             },
+        },
+        "all_six_gripper": {
+            "profile": NATIVE_GRIPPER_ALL_SIX_PROFILE,
+            "joint_names": list(GRIPPER_JOINT_NAMES),
+            "joint_indices": list(GRIPPER_JOINT_INDICES),
+            "actuator_ownership": ownership,
+            "reset_write": reset_write,
+            "mimic_joint_contract": mimic_contract,
+            "buffered_velocity_limit": all_six_buffered,
+            "direct_physx_velocity_limit": all_six_direct,
         },
     }
     report["runtime_sha256"] = _canonical_sha256(report)

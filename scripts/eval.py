@@ -76,6 +76,7 @@ def main(eval_args: EvalArgs):
     )
     from polaris.environments.droid_cfg import (
         DroidJointVelocityActionCfg,
+        DroidJointVelocityEventCfg,
         DroidJointVelocityObservationCfg,
         EefPoseActionCfg,
     )
@@ -118,6 +119,7 @@ def main(eval_args: EvalArgs):
     elif eval_args.control_mode == "joint-velocity":
         env_cfg.scene.robot = NVIDIA_DROID_JOINT_VELOCITY.copy()
         env_cfg.actions = DroidJointVelocityActionCfg()
+        env_cfg.events = DroidJointVelocityEventCfg()
         env_cfg.observations = DroidJointVelocityObservationCfg()
         configured_episode_length_seconds = configure_native_environment_timeout(
             env_cfg
@@ -130,6 +132,10 @@ def main(eval_args: EvalArgs):
     runtime_artifact = None
     environment_runtime_contract = None
     if eval_args.control_mode == "joint-velocity":
+        # Gym construction initializes physics but does not execute reset-mode
+        # events.  Perform one native reset before accepting any live drive
+        # contract; the rollout reset below reapplies and recounts the cap.
+        env.reset(expensive=False)
         environment_runtime_contract = make_environment_runtime_contract(
             configured_episode_length_seconds=configured_episode_length_seconds,
             live_max_episode_length=env.max_episode_length,
@@ -244,6 +250,9 @@ def main(eval_args: EvalArgs):
                 bar.update(1)
                 break
             if eval_args.control_mode == "joint-velocity":
+                getattr(env, "unwrapped", env).action_manager._terms[
+                    "arm"
+                ].record_native_all_joint_post_policy_step()
                 policy_client.record_execution(
                     obs,
                     env,

@@ -5,6 +5,11 @@ import pytest
 import torch
 
 import polaris.joint_velocity_runtime as runtime
+from polaris.native_gripper_runtime import (
+    EXPECTED_DROID_JOINT_NAMES,
+    EXPECTED_FULL_LIMITS_CAPPED,
+    native_gripper_mimic_reference_contract,
+)
 from polaris.pi05_droid_jointvelocity_contract import (
     NATIVE_GRIPPER_DAMPING,
     NATIVE_GRIPPER_DRIVE_PROFILE,
@@ -13,7 +18,6 @@ from polaris.pi05_droid_jointvelocity_contract import (
     NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
     PANDA_ARM_EFFORT_LIMITS,
     PANDA_ARM_JOINT_NAMES,
-    PANDA_ARM_VELOCITY_LIMITS,
     PI05_DROID_JOINTVELOCITY_PROFILE,
     PI05_DROID_ISAACLAB_SOURCE_SHA256,
     PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256,
@@ -25,10 +29,10 @@ def _named_class(module, name):
 
 
 JointVelocityAction = _named_class(
-    "isaaclab.envs.mdp.actions.joint_actions", "JointVelocityAction"
+    "polaris.environments.droid_cfg", "AuditedDroidJointVelocityAction"
 )
 JointVelocityActionCfg = _named_class(
-    "isaaclab.envs.mdp.actions.actions_cfg", "JointVelocityActionCfg"
+    "polaris.environments.droid_cfg", "AuditedDroidJointVelocityActionCfg"
 )
 ImplicitActuator = _named_class("isaaclab.actuators.actuator_pd", "ImplicitActuator")
 BinaryGripperAction = _named_class(
@@ -90,9 +94,7 @@ class _Robot:
         effort = torch.zeros((1, 13), dtype=torch.float32)
         effort[:, :7] = torch.tensor(PANDA_ARM_EFFORT_LIMITS)
         effort[:, 7] = NATIVE_GRIPPER_EFFORT_LIMIT
-        velocity = torch.zeros((1, 13), dtype=torch.float32)
-        velocity[:, :7] = torch.tensor(PANDA_ARM_VELOCITY_LIMITS)
-        velocity[:, 7] = NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S
+        velocity = torch.tensor([EXPECTED_FULL_LIMITS_CAPPED], dtype=torch.float32)
         self.data = SimpleNamespace(
             joint_stiffness=_DeviceTensor(stiffness, device="cuda:0"),
             joint_damping=_DeviceTensor(damping, device="cuda:0"),
@@ -130,11 +132,20 @@ class _Robot:
         gripper.velocity_limit_sim = _DeviceTensor(
             [[NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S]], device="cuda:0"
         )
+        shoulder = ImplicitActuator()
+        shoulder.joint_names = list(PANDA_ARM_JOINT_NAMES[:4])
+        shoulder.joint_indices = [0, 1, 2, 3]
+        forearm = ImplicitActuator()
+        forearm.joint_names = list(PANDA_ARM_JOINT_NAMES[4:])
+        forearm.joint_indices = [4, 5, 6]
+        gripper.joint_names = ["finger_joint"]
+        gripper.joint_indices = [7]
         self.actuators = {
-            "panda_shoulder": ImplicitActuator(),
-            "panda_forearm": ImplicitActuator(),
+            "panda_shoulder": shoulder,
+            "panda_forearm": forearm,
             "gripper": gripper,
         }
+        self.joint_names = list(EXPECTED_DROID_JOINT_NAMES)
         self.cfg = SimpleNamespace(
             actuators={
                 "panda_shoulder": SimpleNamespace(),
@@ -183,6 +194,9 @@ class _Env:
         self.action_manager = SimpleNamespace(
             _terms={"arm": arm, "finger_joint": finger}
         )
+        self.event_manager = SimpleNamespace(
+            active_terms={"reset": ["reset_all", "cap_gripper_followers"]}
+        )
         self.scene = {"robot": _Robot()}
 
     @property
@@ -201,6 +215,18 @@ def _stub_isaaclab(monkeypatch):
         runtime,
         "_verify_polaris_sources",
         lambda **_: dict(PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256),
+    )
+    from conftest import make_native_gripper_reset_report
+
+    monkeypatch.setattr(
+        runtime,
+        "native_gripper_reset_report",
+        lambda _: make_native_gripper_reset_report(),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "capture_native_gripper_mimic_contract",
+        lambda _: native_gripper_mimic_reference_contract(),
     )
 
 
@@ -270,6 +296,14 @@ def test_runtime_rejects_unpinned_isaaclab(monkeypatch):
     monkeypatch.setattr(runtime, "_installed_isaaclab_version", lambda: "2.3.1")
     with pytest.raises(ValueError, match="requires Isaac Lab 2.3.0"):
         _validate(_Env())
+
+
+def test_runtime_rejects_reset_event_order_drift(monkeypatch):
+    _stub_isaaclab(monkeypatch)
+    env = _Env()
+    env.event_manager.active_terms["reset"].reverse()
+    with pytest.raises(ValueError, match="scene reset then all-six cap"):
+        _validate(env)
 
 
 def test_runtime_requires_independent_gripper_candidate_intent(monkeypatch):

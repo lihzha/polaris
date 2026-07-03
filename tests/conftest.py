@@ -22,6 +22,17 @@ from polaris.pi05_droid_jointvelocity_contract import (
     PI05_DROID_JOINTVELOCITY_PROFILE,
     PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256,
 )
+from polaris.native_gripper_runtime import (
+    EXPECTED_FULL_LIMITS_CAPPED,
+    EXPECTED_FULL_LIMITS_UNCAPPED,
+    GRIPPER_JOINT_INDICES,
+    GRIPPER_JOINT_NAMES,
+    NATIVE_GRIPPER_ALL_SIX_PROFILE,
+    NATIVE_GRIPPER_RESET_WRITE_PROFILE,
+    NATIVE_GRIPPER_RESET_WRITE_SETTER,
+    NATIVE_GRIPPER_RESET_WRITE_TIMING,
+    native_gripper_mimic_reference_contract,
+)
 
 
 def _array_report(values, *, device="cuda:0"):
@@ -31,6 +42,30 @@ def _array_report(values, *, device="cuda:0"):
         "dtype": "torch.float32",
         "device": device,
         "values": array.tolist(),
+    }
+
+
+def make_native_gripper_reset_report(reset_count=1):
+    uncapped_cuda = _array_report([EXPECTED_FULL_LIMITS_UNCAPPED])
+    uncapped_cpu = _array_report([EXPECTED_FULL_LIMITS_UNCAPPED], device="cpu")
+    capped_cuda = _array_report([EXPECTED_FULL_LIMITS_CAPPED])
+    capped_cpu = _array_report([EXPECTED_FULL_LIMITS_CAPPED], device="cpu")
+    return {
+        "schema_version": 1,
+        "profile": NATIVE_GRIPPER_ALL_SIX_PROFILE,
+        "write_profile": NATIVE_GRIPPER_RESET_WRITE_PROFILE,
+        "setter": NATIVE_GRIPPER_RESET_WRITE_SETTER,
+        "timing": NATIVE_GRIPPER_RESET_WRITE_TIMING,
+        "reset_count": reset_count,
+        "write_count": reset_count,
+        "initial_before_buffered": uncapped_cuda,
+        "initial_before_direct_physx": uncapped_cpu,
+        "latest_env_ids": [0],
+        "latest_before_buffered": capped_cuda,
+        "latest_before_direct_physx": capped_cpu,
+        "latest_full_input": capped_cuda,
+        "latest_after_buffered": capped_cuda,
+        "latest_after_direct_physx": capped_cpu,
     }
 
 
@@ -65,12 +100,13 @@ def make_joint_velocity_runtime_report():
         "policy_frequency_hz": 15,
         "physics_frequency_hz": 120,
         "decimation": 8,
+        "reset_event_order": ["reset_all", "cap_gripper_followers"],
         "joint_names": list(PANDA_ARM_JOINT_NAMES),
         "action_term_class": (
-            "isaaclab.envs.mdp.actions.joint_actions.JointVelocityAction"
+            "polaris.environments.droid_cfg.AuditedDroidJointVelocityAction"
         ),
         "action_cfg_class": (
-            "isaaclab.envs.mdp.actions.actions_cfg.JointVelocityActionCfg"
+            "polaris.environments.droid_cfg.AuditedDroidJointVelocityActionCfg"
         ),
         "scale": 1.0,
         "offset": 0.0,
@@ -124,6 +160,31 @@ def make_joint_velocity_runtime_report():
                     for name, value in gripper_live.items()
                 },
             },
+        },
+        "all_six_gripper": {
+            "profile": NATIVE_GRIPPER_ALL_SIX_PROFILE,
+            "joint_names": list(GRIPPER_JOINT_NAMES),
+            "joint_indices": list(GRIPPER_JOINT_INDICES),
+            "actuator_ownership": {
+                "panda_shoulder": {
+                    "joint_names": [f"panda_joint{index}" for index in range(1, 5)],
+                    "joint_indices": [0, 1, 2, 3],
+                },
+                "panda_forearm": {
+                    "joint_names": [f"panda_joint{index}" for index in range(5, 8)],
+                    "joint_indices": [4, 5, 6],
+                },
+                "gripper": {
+                    "joint_names": ["finger_joint"],
+                    "joint_indices": [7],
+                },
+            },
+            "reset_write": make_native_gripper_reset_report(),
+            "mimic_joint_contract": native_gripper_mimic_reference_contract(),
+            "buffered_velocity_limit": _array_report([EXPECTED_FULL_LIMITS_CAPPED]),
+            "direct_physx_velocity_limit": _array_report(
+                [EXPECTED_FULL_LIMITS_CAPPED], device="cpu"
+            ),
         },
     }
     report["runtime_sha256"] = runtime._canonical_sha256(report)
