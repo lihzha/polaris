@@ -11,6 +11,7 @@ import stat
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from scripts import smoke_eef_pose_gripper_impulse_diagnostic as diagnostic
 from scripts import smoke_eef_pose_boundary_replay as boundary
@@ -371,6 +372,8 @@ def test_host_parsers_cover_runtime_and_post_kit_modes(tmp_path: Path):
         ]
     )
     assert runtime.enable_gripper_velocity_limit_candidate is False
+    assert runtime.enable_gripper_follower_velocity_limit_candidate is False
+    assert runtime.enable_gripper_velocity_limit_identity_write_candidate is False
     diagnostic._validate_runtime_output_paths(runtime)  # noqa: SLF001
     candidate_runtime = diagnostic.build_runtime_parser().parse_args(
         [
@@ -392,6 +395,68 @@ def test_host_parsers_cover_runtime_and_post_kit_modes(tmp_path: Path):
         ]
     )
     assert candidate_runtime.enable_gripper_velocity_limit_candidate is True
+    assert candidate_runtime.enable_gripper_follower_velocity_limit_candidate is False
+    assert (
+        candidate_runtime.enable_gripper_velocity_limit_identity_write_candidate
+        is False
+    )
+    follower_runtime = diagnostic.build_runtime_parser().parse_args(
+        [
+            "--output-json",
+            str(tmp_path / "follower.json"),
+            "--output-video",
+            str(tmp_path / "follower.mp4"),
+            "--output-ready-marker",
+            str(tmp_path / "follower-ready.json"),
+            "--runtime-exit",
+            str(tmp_path / "follower-runtime.exit"),
+            "--mode",
+            "exact",
+            "--enable-gripper-velocity-limit-candidate",
+            "--enable-gripper-follower-velocity-limit-candidate",
+            "--expected-source-sha256",
+            "0" * 64,
+            "--expected-source-size-bytes",
+            "1",
+        ]
+    )
+    diagnostic._validate_runtime_variant_args(follower_runtime)  # noqa: SLF001
+    assert (
+        diagnostic._selected_gripper_drive_profile(  # noqa: SLF001
+            follower_runtime.enable_gripper_velocity_limit_candidate,
+            follower_runtime.enable_gripper_follower_velocity_limit_candidate,
+        )
+        == diagnostic.GRIPPER_FOLLOWER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+    )
+    identity_runtime = diagnostic.build_runtime_parser().parse_args(
+        [
+            "--output-json",
+            str(tmp_path / "identity.json"),
+            "--output-video",
+            str(tmp_path / "identity.mp4"),
+            "--output-ready-marker",
+            str(tmp_path / "identity-ready.json"),
+            "--runtime-exit",
+            str(tmp_path / "identity-runtime.exit"),
+            "--mode",
+            "exact",
+            "--enable-gripper-velocity-limit-candidate",
+            "--enable-gripper-velocity-limit-identity-write-candidate",
+            "--expected-source-sha256",
+            "0" * 64,
+            "--expected-source-size-bytes",
+            "1",
+        ]
+    )
+    diagnostic._validate_runtime_variant_args(identity_runtime)  # noqa: SLF001
+    assert (
+        diagnostic._selected_gripper_drive_profile(  # noqa: SLF001
+            identity_runtime.enable_gripper_velocity_limit_candidate,
+            identity_runtime.enable_gripper_follower_velocity_limit_candidate,
+            identity_runtime.enable_gripper_velocity_limit_identity_write_candidate,
+        )
+        == diagnostic.GRIPPER_VELOCITY_LIMIT_IDENTITY_WRITE_DRIVE_PROFILE
+    )
     validation = diagnostic.build_validation_parser().parse_args(
         [
             "--action",
@@ -492,6 +557,8 @@ def test_parent_revalidation_independently_derives_drive_profile_from_runtime_fl
 
     assert "expected_gripper_drive_profile=_selected_gripper_drive_profile(" in source
     assert "args_cli.enable_gripper_velocity_limit_candidate" in source
+    assert "args_cli.enable_gripper_follower_velocity_limit_candidate" in source
+    assert "args_cli.enable_gripper_velocity_limit_identity_write_candidate" in source
 
 
 def test_diagnostic_source_is_launch_bound_and_live_rehashed():
@@ -1039,6 +1106,9 @@ def _snapshot(*, timestamp: float = 1.0, gripper_target: float = 0.0):
     ):
         snapshot[field]["device"] = diagnostic.PINNED_STATIC_PHYSX_DEVICE
         snapshot[field]["values"][gripper_index] = value
+    snapshot["physx_joint_velocity_limit_rad_s"]["values"] = list(
+        diagnostic.LEGACY_FULL_VELOCITY_LIMITS_FLOAT32
+    )
     return snapshot
 
 
@@ -1374,17 +1444,53 @@ def _scalar_evidence(value, *, device):
     return tensor
 
 
-def _gripper_contract(*, candidate_enabled=False):
+def _gripper_contract(
+    *,
+    candidate_enabled=False,
+    follower_candidate_enabled=False,
+    identity_write_candidate_enabled=False,
+):
     probed = (
         diagnostic.GRIPPER_VELOCITY_LIMIT_CANDIDATE_FLOAT32_VALUES
         if candidate_enabled
         else diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES
     )
-    profile = (
-        diagnostic.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
-        if candidate_enabled
-        else diagnostic.GRIPPER_DRIVE_PROFILE
+    profile = diagnostic._selected_gripper_drive_profile(  # noqa: SLF001
+        candidate_enabled,
+        follower_candidate_enabled,
+        identity_write_candidate_enabled,
     )
+    expectations = diagnostic._gripper_drive_expectations(profile)  # noqa: SLF001
+
+    def full_limit_evidence(values):
+        result = _tensor(
+            [1, len(diagnostic.EXPECTED_DROID_JOINT_NAMES)],
+            device=diagnostic.PINNED_STATIC_PHYSX_DEVICE,
+        )
+        result["values"] = list(values)
+        return result
+
+    velocity_limit_write_contract = {
+        "profile": expectations["write_profile"],
+        "setter": (
+            diagnostic.VELOCITY_LIMIT_WRITE_SETTER
+            if expectations["write_enabled"]
+            else None
+        ),
+        "timing": (
+            diagnostic.VELOCITY_LIMIT_WRITE_TIMING
+            if expectations["write_enabled"]
+            else None
+        ),
+        "call_count": 1 if expectations["write_enabled"] else 0,
+        "articulation_indices": [0] if expectations["write_enabled"] else [],
+        "full_input": (
+            full_limit_evidence(expectations["full_after"])
+            if expectations["write_enabled"]
+            else None
+        ),
+    }
+
     return {
         "profile": profile,
         "actuator_name": "gripper",
@@ -1451,6 +1557,15 @@ def _gripper_contract(*, candidate_enabled=False):
                 device=diagnostic.PINNED_STATIC_PHYSX_DEVICE,
             ),
         },
+        "mimic_joint_contract": diagnostic._expected_mimic_joint_contract(),  # noqa: SLF001
+        "live_physx_velocity_limits_before_follower_write": full_limit_evidence(
+            expectations["full_before"]
+        ),
+        "live_physx_velocity_limits_after_follower_write": full_limit_evidence(
+            expectations["full_after"]
+        ),
+        "follower_velocity_limit_behavior": expectations["follower_behavior"],
+        "velocity_limit_write_contract": velocity_limit_write_contract,
         "legacy_velocity_limit_behavior": (
             (
                 "isaaclab_2p3_explicit_velocity_limit_sim_5_enforced_"
@@ -1536,6 +1651,539 @@ def test_gripper_candidate_contract_requires_exact_split_device_five_rad_s_cap()
     assert actuator["values"] == physx["values"] == [5.0]
 
 
+def test_identity_write_contract_is_distinct_from_driver5_no_write_with_same_limits():
+    no_write = diagnostic._validate_gripper_drive_contract(  # noqa: SLF001
+        _gripper_contract(candidate_enabled=True)
+    )
+    identity = diagnostic._validate_gripper_drive_contract(  # noqa: SLF001
+        _gripper_contract(
+            candidate_enabled=True,
+            identity_write_candidate_enabled=True,
+        ),
+        expected_profile=(
+            diagnostic.GRIPPER_VELOCITY_LIMIT_IDENTITY_WRITE_DRIVE_PROFILE
+        ),
+    )
+
+    assert no_write["profile"] != identity["profile"]
+    assert (
+        no_write["live_physx_velocity_limits_after_follower_write"]
+        == identity["live_physx_velocity_limits_after_follower_write"]
+    )
+    assert no_write["velocity_limit_write_contract"]["call_count"] == 0
+    assert identity["velocity_limit_write_contract"]["call_count"] == 1
+    assert (
+        identity["velocity_limit_write_contract"]["full_input"]
+        == (identity["live_physx_velocity_limits_after_follower_write"])
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["profile", "setter", "timing", "call_count", "indices", "full_input"],
+)
+def test_identity_write_contract_rejects_setter_attestation_drift(mutation):
+    contract = _gripper_contract(
+        candidate_enabled=True,
+        identity_write_candidate_enabled=True,
+    )
+    write = contract["velocity_limit_write_contract"]
+    if mutation == "profile":
+        write["profile"] = diagnostic.NO_VELOCITY_LIMIT_WRITE_PROFILE
+    elif mutation == "setter":
+        write["setter"] = "wrong"
+    elif mutation == "timing":
+        write["timing"] = "wrong"
+    elif mutation == "call_count":
+        write["call_count"] = 2
+    elif mutation == "indices":
+        write["articulation_indices"] = [1]
+    else:
+        write["full_input"]["values"][0] = 0.0
+
+    with pytest.raises(diagnostic.GripperImpulseDiagnosticError):
+        diagnostic._validate_gripper_drive_contract(contract)  # noqa: SLF001
+
+
+def test_follower_candidate_requires_driver_candidate():
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="requires driver candidate",
+    ):
+        diagnostic._selected_gripper_drive_profile(False, True)  # noqa: SLF001
+
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="requires driver candidate",
+    ):
+        diagnostic._validate_runtime_variant_args(  # noqa: SLF001
+            SimpleNamespace(
+                enable_gripper_velocity_limit_candidate=False,
+                enable_gripper_follower_velocity_limit_candidate=True,
+                enable_gripper_velocity_limit_identity_write_candidate=False,
+            )
+        )
+
+
+def test_identity_write_candidate_requires_driver_and_excludes_follower_write():
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="identity-write candidate requires driver candidate",
+    ):
+        diagnostic._selected_gripper_drive_profile(  # noqa: SLF001
+            False,
+            False,
+            True,
+        )
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="mutually exclusive",
+    ):
+        diagnostic._selected_gripper_drive_profile(  # noqa: SLF001
+            True,
+            True,
+            True,
+        )
+
+
+def test_follower_candidate_contract_binds_mimics_and_full_limit_write():
+    contract = _gripper_contract(
+        candidate_enabled=True,
+        follower_candidate_enabled=True,
+    )
+
+    validated = diagnostic._validate_gripper_drive_contract(  # noqa: SLF001
+        contract,
+        expected_profile=(
+            diagnostic.GRIPPER_FOLLOWER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+        ),
+    )
+
+    assert validated["mimic_joint_contract"] == (
+        diagnostic._expected_mimic_joint_contract()  # noqa: SLF001
+    )
+    assert (
+        validated["live_physx_velocity_limits_before_follower_write"]["values"]
+        == diagnostic.DRIVER5_FULL_VELOCITY_LIMITS_FLOAT32
+    )
+    assert (
+        validated["live_physx_velocity_limits_after_follower_write"]["values"]
+        == diagnostic.DRIVER5_FOLLOWERS5_FULL_VELOCITY_LIMITS_FLOAT32
+    )
+    assert all(
+        validated["live_physx_velocity_limits_after_follower_write"]["values"][index]
+        == 5.0
+        for index in diagnostic.GRIPPER_FOLLOWER_JOINT_INDICES
+    )
+    assert validated["action_term_joint_names"] == ["finger_joint"]
+    assert validated["actuator_joint_names"] == ["finger_joint"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("joint_name", "wrong_joint"),
+        ("joint_index", 7),
+        ("prim_path", "/wrong"),
+        ("physics_joint_type", "PhysicsFixedJoint"),
+        ("exclude_from_articulation", True),
+        ("mimic_axis", "rotY"),
+        ("reference_joint_path", "/wrong"),
+        ("gearing", 0.5),
+        ("natural_frequency_hz", 999.0),
+        ("damping_ratio", 0.1),
+    ],
+)
+def test_follower_candidate_rejects_mimic_source_drift(field, value):
+    contract = _gripper_contract(
+        candidate_enabled=True,
+        follower_candidate_enabled=True,
+    )
+    contract["mimic_joint_contract"]["followers"][0][field] = value
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="mimic joint source USD contract drift",
+    ):
+        diagnostic._validate_gripper_drive_contract(contract)  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("field", "mutation"),
+    [
+        ("live_physx_velocity_limits_before_follower_write", "follower_five"),
+        ("live_physx_velocity_limits_after_follower_write", "follower_default"),
+        ("live_physx_velocity_limits_after_follower_write", "driver_wrong"),
+        ("live_physx_velocity_limits_after_follower_write", "device"),
+        ("live_physx_velocity_limits_after_follower_write", "shape"),
+    ],
+)
+def test_follower_candidate_rejects_full_limit_evidence_drift(field, mutation):
+    contract = _gripper_contract(
+        candidate_enabled=True,
+        follower_candidate_enabled=True,
+    )
+    evidence = contract[field]
+    if mutation == "follower_five":
+        evidence["values"][diagnostic.GRIPPER_FOLLOWER_JOINT_INDICES[0]] = 5.0
+    elif mutation == "follower_default":
+        evidence["values"][diagnostic.GRIPPER_FOLLOWER_JOINT_INDICES[0]] = (
+            diagnostic.GRIPPER_FOLLOWER_DEFAULT_VELOCITY_LIMIT_FLOAT32
+        )
+    elif mutation == "driver_wrong":
+        evidence["values"][diagnostic.DRIVEN_GRIPPER_JOINT_INDEX] = 2.5
+    elif mutation == "device":
+        evidence["device"] = "cuda:0"
+    else:
+        evidence["shape"] = [len(diagnostic.EXPECTED_DROID_JOINT_NAMES)]
+    with pytest.raises(diagnostic.GripperImpulseDiagnosticError):
+        diagnostic._validate_gripper_drive_contract(contract)  # noqa: SLF001
+
+
+class _FakeFollowerLimitView:
+    def __init__(self):
+        self.limits = torch.tensor(
+            [diagnostic.DRIVER5_FULL_VELOCITY_LIMITS_FLOAT32],
+            dtype=torch.float32,
+        )
+        self.calls = []
+
+    def get_dof_max_velocities(self):
+        return self.limits.clone()
+
+    def set_dof_max_velocities(self, values, indices):
+        self.calls.append((values.clone(), indices.clone()))
+        self.limits = values.clone()
+
+
+def _fake_follower_write_identity():
+    robot = SimpleNamespace(
+        joint_names=list(diagnostic.EXPECTED_DROID_JOINT_NAMES),
+        actuators={
+            "panda_shoulder": SimpleNamespace(
+                joint_names=list(diagnostic.EXPECTED_ARM_JOINT_NAMES[:4]),
+                joint_indices=list(diagnostic.EXPECTED_ARM_JOINT_INDICES[:4]),
+            ),
+            "panda_forearm": SimpleNamespace(
+                joint_names=list(diagnostic.EXPECTED_ARM_JOINT_NAMES[4:]),
+                joint_indices=list(diagnostic.EXPECTED_ARM_JOINT_INDICES[4:]),
+            ),
+            "gripper": SimpleNamespace(
+                joint_names=[diagnostic.DRIVEN_GRIPPER_JOINT_NAME],
+                joint_indices=[diagnostic.DRIVEN_GRIPPER_JOINT_INDEX],
+            ),
+        },
+    )
+    arm = SimpleNamespace(
+        _joint_names=list(diagnostic.EXPECTED_ARM_JOINT_NAMES),
+        _joint_ids=list(diagnostic.EXPECTED_ARM_JOINT_INDICES),
+    )
+    finger = SimpleNamespace(
+        _joint_names=[diagnostic.DRIVEN_GRIPPER_JOINT_NAME],
+        _joint_ids=[diagnostic.DRIVEN_GRIPPER_JOINT_INDEX],
+    )
+    return robot, arm, finger
+
+
+def test_follower_write_validates_live_names_and_control_ownership_before_mutation():
+    robot, arm, finger = _fake_follower_write_identity()
+    assert diagnostic.EXPECTED_ACTUATOR_JOINT_OWNERSHIP == {
+        "panda_shoulder": (
+            ["panda_joint1", "panda_joint2", "panda_joint3", "panda_joint4"],
+            [0, 1, 2, 3],
+        ),
+        "panda_forearm": (
+            ["panda_joint5", "panda_joint6", "panda_joint7"],
+            [4, 5, 6],
+        ),
+        "gripper": (["finger_joint"], [7]),
+    }
+    diagnostic._validate_live_follower_write_identity(  # noqa: SLF001
+        robot, arm, finger
+    )
+
+    wrong_order = copy.deepcopy(robot)
+    wrong_order.joint_names[8], wrong_order.joint_names[9] = (
+        wrong_order.joint_names[9],
+        wrong_order.joint_names[8],
+    )
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="joint order before follower write",
+    ):
+        diagnostic._validate_live_follower_write_identity(  # noqa: SLF001
+            wrong_order,
+            arm,
+            finger,
+        )
+
+    follower_owned = copy.deepcopy(robot)
+    follower_owned.actuators["panda_forearm"].joint_names.append(
+        diagnostic.GRIPPER_FOLLOWER_JOINT_NAMES[0]
+    )
+    follower_owned.actuators["panda_forearm"].joint_indices.append(
+        diagnostic.GRIPPER_FOLLOWER_JOINT_INDICES[0]
+    )
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="mimic follower name/index unexpectedly owned",
+    ):
+        diagnostic._validate_live_follower_write_identity(  # noqa: SLF001
+            follower_owned,
+            arm,
+            finger,
+        )
+
+    wrong_action = copy.deepcopy(finger)
+    wrong_action._joint_names = [diagnostic.GRIPPER_FOLLOWER_JOINT_NAMES[0]]
+    wrong_action._joint_ids = [diagnostic.GRIPPER_FOLLOWER_JOINT_INDICES[0]]
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="mimic follower name/index unexpectedly owned",
+    ):
+        diagnostic._validate_live_follower_write_identity(  # noqa: SLF001
+            robot,
+            arm,
+            wrong_action,
+        )
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("wrong_pairing", "live joint name/index pairing"),
+        ("arm_wrong_order", "exact arm action-term joints"),
+        ("arm_follower_name", "mimic follower name/index unexpectedly owned"),
+        ("arm_follower_index", "mimic follower name/index unexpectedly owned"),
+        ("finger_wrong_joint", "exact finger action-term joint"),
+        ("gripper_wrong_joint", "exact live actuator joint mapping"),
+        ("length_mismatch", "joint name/index lengths"),
+        ("non_integer_index", "joint indices exact integer sequence"),
+        ("duplicate_name", "joint name/index uniqueness"),
+        ("duplicate_index", "joint name/index uniqueness"),
+        ("out_of_range", "joint index range"),
+    ],
+)
+def test_follower_write_rejects_adversarial_live_ownership(case, message):
+    robot, arm, finger = _fake_follower_write_identity()
+    if case == "wrong_pairing":
+        robot.actuators["panda_forearm"].joint_indices[-1] = (
+            diagnostic.DRIVEN_GRIPPER_JOINT_INDEX
+        )
+    elif case == "arm_wrong_order":
+        arm._joint_names[0], arm._joint_names[1] = (
+            arm._joint_names[1],
+            arm._joint_names[0],
+        )
+        arm._joint_ids[0], arm._joint_ids[1] = arm._joint_ids[1], arm._joint_ids[0]
+    elif case == "arm_follower_name":
+        arm._joint_names[-1] = diagnostic.GRIPPER_FOLLOWER_JOINT_NAMES[0]
+    elif case == "arm_follower_index":
+        arm._joint_ids[-1] = diagnostic.GRIPPER_FOLLOWER_JOINT_INDICES[0]
+    elif case == "finger_wrong_joint":
+        finger._joint_names = [diagnostic.EXPECTED_ARM_JOINT_NAMES[0]]
+        finger._joint_ids = [diagnostic.EXPECTED_ARM_JOINT_INDICES[0]]
+    elif case == "gripper_wrong_joint":
+        robot.actuators["panda_shoulder"].joint_names.pop(0)
+        robot.actuators["panda_shoulder"].joint_indices.pop(0)
+        robot.actuators["gripper"].joint_names = [
+            diagnostic.EXPECTED_ARM_JOINT_NAMES[0]
+        ]
+        robot.actuators["gripper"].joint_indices = [
+            diagnostic.EXPECTED_ARM_JOINT_INDICES[0]
+        ]
+    elif case == "length_mismatch":
+        robot.actuators["panda_forearm"].joint_indices.pop()
+    elif case == "non_integer_index":
+        robot.actuators["panda_forearm"].joint_indices[-1] = 6.0
+    elif case == "duplicate_name":
+        robot.actuators["panda_forearm"].joint_names[-1] = robot.actuators[
+            "panda_forearm"
+        ].joint_names[0]
+    elif case == "duplicate_index":
+        robot.actuators["panda_forearm"].joint_indices[-1] = robot.actuators[
+            "panda_forearm"
+        ].joint_indices[0]
+    else:
+        robot.actuators["panda_forearm"].joint_indices[-1] = len(
+            diagnostic.EXPECTED_DROID_JOINT_NAMES
+        )
+
+    with pytest.raises(diagnostic.GripperImpulseDiagnosticError, match=message):
+        diagnostic._validate_live_follower_write_identity(  # noqa: SLF001
+            robot,
+            arm,
+            finger,
+        )
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("missing", "exact live actuator key set"),
+        ("extra_split", "exact live actuator key set"),
+        ("renamed", "exact live actuator key set"),
+        ("repartitioned", "exact live actuator joint mapping"),
+    ],
+)
+def test_follower_write_rejects_noncanonical_c69_actuator_partition(case, message):
+    robot, arm, finger = _fake_follower_write_identity()
+    if case == "missing":
+        forearm = robot.actuators.pop("panda_forearm")
+        robot.actuators["panda_shoulder"].joint_names.extend(forearm.joint_names)
+        robot.actuators["panda_shoulder"].joint_indices.extend(forearm.joint_indices)
+    elif case == "extra_split":
+        name = robot.actuators["panda_forearm"].joint_names.pop()
+        index = robot.actuators["panda_forearm"].joint_indices.pop()
+        robot.actuators["panda_wrist"] = SimpleNamespace(
+            joint_names=[name],
+            joint_indices=[index],
+        )
+    elif case == "renamed":
+        robot.actuators["panda_arm_tail"] = robot.actuators.pop("panda_forearm")
+    else:
+        name = robot.actuators["panda_shoulder"].joint_names.pop()
+        index = robot.actuators["panda_shoulder"].joint_indices.pop()
+        robot.actuators["panda_forearm"].joint_names.append(name)
+        robot.actuators["panda_forearm"].joint_indices.append(index)
+
+    with pytest.raises(diagnostic.GripperImpulseDiagnosticError, match=message):
+        diagnostic._validate_live_follower_write_identity(  # noqa: SLF001
+            robot,
+            arm,
+            finger,
+        )
+
+
+def test_follower_candidate_live_write_is_full_tensor_and_five_dofs_only():
+    view = _FakeFollowerLimitView()
+    robot = SimpleNamespace(
+        root_physx_view=view,
+        joint_names=list(diagnostic.EXPECTED_DROID_JOINT_NAMES),
+    )
+
+    before, after, write = diagnostic._apply_follower_velocity_limit_profile(  # noqa: SLF001
+        robot,
+        profile=diagnostic.GRIPPER_FOLLOWER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE,
+    )
+
+    assert before["values"] == diagnostic.DRIVER5_FULL_VELOCITY_LIMITS_FLOAT32
+    assert after["values"] == diagnostic.DRIVER5_FOLLOWERS5_FULL_VELOCITY_LIMITS_FLOAT32
+    assert len(view.calls) == 1
+    written, indices = view.calls[0]
+    assert written.shape == (1, len(diagnostic.EXPECTED_DROID_JOINT_NAMES))
+    assert written.dtype == torch.float32
+    assert written.device.type == "cpu"
+    assert indices.dtype == torch.int32
+    assert indices.tolist() == [0]
+    assert write["profile"] == diagnostic.FOLLOWER_VELOCITY_LIMIT_WRITE_PROFILE
+    assert write["call_count"] == 1
+    assert write["full_input"]["values"] == after["values"]
+    for index, (original, updated) in enumerate(
+        zip(
+            diagnostic.DRIVER5_FULL_VELOCITY_LIMITS_FLOAT32,
+            written[0].tolist(),
+            strict=True,
+        )
+    ):
+        expected = (
+            5.0 if index in diagnostic.GRIPPER_FOLLOWER_JOINT_INDICES else original
+        )
+        assert updated == expected
+
+
+def test_driver5_baseline_performs_no_follower_limit_write():
+    view = _FakeFollowerLimitView()
+    before, after, write = diagnostic._apply_follower_velocity_limit_profile(  # noqa: SLF001
+        SimpleNamespace(
+            root_physx_view=view,
+            joint_names=list(diagnostic.EXPECTED_DROID_JOINT_NAMES),
+        ),
+        profile=diagnostic.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE,
+    )
+
+    assert view.calls == []
+    assert before == after
+    assert write == {
+        "profile": diagnostic.NO_VELOCITY_LIMIT_WRITE_PROFILE,
+        "setter": None,
+        "timing": None,
+        "call_count": 0,
+        "articulation_indices": [],
+        "full_input": None,
+    }
+
+
+def test_identity_and_follower_profiles_share_one_exact_setter_path():
+    identity_view = _FakeFollowerLimitView()
+    follower_view = _FakeFollowerLimitView()
+    identity_before, identity_after, identity_write = (
+        diagnostic._apply_follower_velocity_limit_profile(  # noqa: SLF001
+            SimpleNamespace(
+                root_physx_view=identity_view,
+                joint_names=list(diagnostic.EXPECTED_DROID_JOINT_NAMES),
+            ),
+            profile=diagnostic.GRIPPER_VELOCITY_LIMIT_IDENTITY_WRITE_DRIVE_PROFILE,
+        )
+    )
+    follower_before, follower_after, follower_write = (
+        diagnostic._apply_follower_velocity_limit_profile(  # noqa: SLF001
+            SimpleNamespace(
+                root_physx_view=follower_view,
+                joint_names=list(diagnostic.EXPECTED_DROID_JOINT_NAMES),
+            ),
+            profile=(
+                diagnostic.GRIPPER_FOLLOWER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+            ),
+        )
+    )
+
+    assert len(identity_view.calls) == len(follower_view.calls) == 1
+    identity_input, identity_indices = identity_view.calls[0]
+    follower_input, follower_indices = follower_view.calls[0]
+    assert torch.equal(identity_indices, follower_indices)
+    assert identity_indices.dtype == follower_indices.dtype == torch.int32
+    assert identity_input.shape == follower_input.shape == (1, 13)
+    assert identity_input.dtype == follower_input.dtype == torch.float32
+    assert identity_input.device == follower_input.device
+    differing_indices = set(
+        torch.nonzero(identity_input[0] != follower_input[0]).flatten().tolist()
+    )
+    assert differing_indices == set(diagnostic.GRIPPER_FOLLOWER_JOINT_INDICES)
+    assert identity_before == identity_after == follower_before
+    assert follower_after["values"] == (
+        diagnostic.DRIVER5_FOLLOWERS5_FULL_VELOCITY_LIMITS_FLOAT32
+    )
+    assert identity_write["profile"] == (
+        diagnostic.IDENTITY_VELOCITY_LIMIT_WRITE_PROFILE
+    )
+    assert follower_write["profile"] == diagnostic.FOLLOWER_VELOCITY_LIMIT_WRITE_PROFILE
+    assert identity_write["setter"] == follower_write["setter"]
+    assert identity_write["timing"] == follower_write["timing"]
+    assert identity_write["call_count"] == follower_write["call_count"] == 1
+
+
+def test_follower_candidate_rejects_setter_without_live_readback_change():
+    view = _FakeFollowerLimitView()
+    view.set_dof_max_velocities = lambda values, indices: view.calls.append(
+        (values.clone(), indices.clone())
+    )
+    robot = SimpleNamespace(
+        root_physx_view=view,
+        joint_names=list(diagnostic.EXPECTED_DROID_JOINT_NAMES),
+    )
+
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="after follower write pinned per-joint values",
+    ):
+        diagnostic._apply_follower_velocity_limit_profile(  # noqa: SLF001
+            robot,
+            profile=(
+                diagnostic.GRIPPER_FOLLOWER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+            ),
+        )
+
+
 @pytest.mark.parametrize("candidate_enabled", [False, True])
 def test_gripper_drive_contract_rejects_independent_profile_swap(candidate_enabled):
     expected_profile = (
@@ -1602,9 +2250,52 @@ def test_omitted_runtime_candidate_flag_cannot_satisfy_candidate_finalizer_inten
         )
 
 
-def test_gripper_candidate_contract_cross_binds_full_static_physx_snapshot():
+def test_omitted_follower_flag_cannot_satisfy_follower_finalizer_intent():
+    runtime_profile = diagnostic._selected_gripper_drive_profile(  # noqa: SLF001
+        True,
+        False,
+    )
+    assert runtime_profile == diagnostic.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="independent expectation",
+    ):
+        diagnostic._validate_gripper_drive_contract(  # noqa: SLF001
+            _gripper_contract(candidate_enabled=True),
+            expected_profile=(
+                diagnostic.GRIPPER_FOLLOWER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+            ),
+        )
+
+
+def test_omitted_identity_write_flag_cannot_satisfy_identity_finalizer_intent():
+    runtime_profile = diagnostic._selected_gripper_drive_profile(  # noqa: SLF001
+        True,
+        False,
+        False,
+    )
+    assert runtime_profile == diagnostic.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="independent expectation",
+    ):
+        diagnostic._validate_gripper_drive_contract(  # noqa: SLF001
+            _gripper_contract(candidate_enabled=True),
+            expected_profile=(
+                diagnostic.GRIPPER_VELOCITY_LIMIT_IDENTITY_WRITE_DRIVE_PROFILE
+            ),
+        )
+
+
+@pytest.mark.parametrize("identity_write_candidate_enabled", [False, True])
+def test_gripper_candidate_contract_cross_binds_full_static_physx_snapshot(
+    identity_write_candidate_enabled,
+):
     contract = diagnostic._validate_gripper_drive_contract(  # noqa: SLF001
-        _gripper_contract(candidate_enabled=True)
+        _gripper_contract(
+            candidate_enabled=True,
+            identity_write_candidate_enabled=identity_write_candidate_enabled,
+        )
     )
     snapshot = {"joint_names": list(diagnostic.EXPECTED_DROID_JOINT_NAMES)}
     joint_index = diagnostic.EXPECTED_DROID_JOINT_NAMES.index("finger_joint")
@@ -1616,9 +2307,14 @@ def test_gripper_candidate_contract_cross_binds_full_static_physx_snapshot():
     ):
         evidence = _tensor([len(diagnostic.EXPECTED_DROID_JOINT_NAMES)])
         evidence["device"] = diagnostic.PINNED_STATIC_PHYSX_DEVICE
-        evidence["values"][joint_index] = contract["live_physx_readback"][drive_field][
-            "values"
-        ][0]
+        if snapshot_field == "physx_joint_velocity_limit_rad_s":
+            evidence["values"] = list(
+                contract["live_physx_velocity_limits_after_follower_write"]["values"]
+            )
+        else:
+            evidence["values"][joint_index] = contract["live_physx_readback"][
+                drive_field
+            ]["values"][0]
         snapshot[snapshot_field] = evidence
 
     diagnostic._validate_snapshot_gripper_binding(  # noqa: SLF001
@@ -1626,18 +2322,68 @@ def test_gripper_candidate_contract_cross_binds_full_static_physx_snapshot():
         gripper_drive=contract,
         field="candidate snapshot",
     )
+    assert contract["velocity_limit_write_contract"]["call_count"] == int(
+        identity_write_candidate_enabled
+    )
 
     snapshot["physx_joint_velocity_limit_rad_s"]["values"][joint_index] = (
         diagnostic.PROBED_GRIPPER_DRIVE_FLOAT32_VALUES["velocity_limit_rad_s"]
     )
     with pytest.raises(
         diagnostic.GripperImpulseDiagnosticError,
-        match="live-drive identity",
+        match="velocity-limit identity",
     ):
         diagnostic._validate_snapshot_gripper_binding(  # noqa: SLF001
             snapshot,
             gripper_drive=contract,
             field="candidate snapshot",
+        )
+
+
+def test_follower_candidate_cross_binds_every_snapshot_follower_limit():
+    contract = diagnostic._validate_gripper_drive_contract(  # noqa: SLF001
+        _gripper_contract(
+            candidate_enabled=True,
+            follower_candidate_enabled=True,
+        )
+    )
+    snapshot = {"joint_names": list(diagnostic.EXPECTED_DROID_JOINT_NAMES)}
+    joint_index = diagnostic.DRIVEN_GRIPPER_JOINT_INDEX
+    for snapshot_field, drive_field in (
+        ("physx_joint_velocity_limit_rad_s", "velocity_limit_rad_s"),
+        ("physx_joint_effort_limit_nm", "effort_limit_nm"),
+        ("physx_joint_stiffness_nm_per_rad", "stiffness_nm_per_rad"),
+        ("physx_joint_damping_nm_s_per_rad", "damping_nm_s_per_rad"),
+    ):
+        evidence = _tensor([len(diagnostic.EXPECTED_DROID_JOINT_NAMES)])
+        evidence["device"] = diagnostic.PINNED_STATIC_PHYSX_DEVICE
+        if snapshot_field == "physx_joint_velocity_limit_rad_s":
+            evidence["values"] = list(
+                diagnostic.DRIVER5_FOLLOWERS5_FULL_VELOCITY_LIMITS_FLOAT32
+            )
+        else:
+            evidence["values"][joint_index] = contract["live_physx_readback"][
+                drive_field
+            ]["values"][0]
+        snapshot[snapshot_field] = evidence
+    diagnostic._validate_snapshot_gripper_binding(  # noqa: SLF001
+        snapshot,
+        gripper_drive=contract,
+        field="follower candidate snapshot",
+    )
+
+    follower_index = diagnostic.GRIPPER_FOLLOWER_JOINT_INDICES[0]
+    snapshot["physx_joint_velocity_limit_rad_s"]["values"][follower_index] = (
+        diagnostic.GRIPPER_FOLLOWER_DEFAULT_VELOCITY_LIMIT_FLOAT32
+    )
+    with pytest.raises(
+        diagnostic.GripperImpulseDiagnosticError,
+        match="full driven/follower velocity-limit identity",
+    ):
+        diagnostic._validate_snapshot_gripper_binding(  # noqa: SLF001
+            snapshot,
+            gripper_drive=contract,
+            field="follower candidate snapshot",
         )
 
 

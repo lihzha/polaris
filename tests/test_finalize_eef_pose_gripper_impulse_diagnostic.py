@@ -869,6 +869,8 @@ def test_finalizer_requires_closed_independent_gripper_drive_profile():
     assert set(finalizer.GRIPPER_DRIVE_PROFILES) == {
         finalizer.GRIPPER_DRIVE_PROFILE,
         finalizer.GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE,
+        finalizer.GRIPPER_VELOCITY_LIMIT_IDENTITY_WRITE_DRIVE_PROFILE,
+        finalizer.GRIPPER_FOLLOWER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE,
     }
 
 
@@ -952,6 +954,45 @@ def test_attestation_rejects_capture_expected_profile_swap(tmp_path):
             ),
             intended_attestation_path=tmp_path / "final.attestation.json",
         )
+
+
+def test_attestation_binds_follower_limit_profile(tmp_path):
+    capture = _fake_capture()
+    profile = finalizer.GRIPPER_FOLLOWER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+    capture["gripper_drive_contract"]["profile"] = profile
+    context = _fake_context(tmp_path)
+    validator_status = next(iter(context["identities"].values()))
+
+    attestation = finalizer._attestation_payload(  # noqa: SLF001
+        capture=capture,
+        context=context,
+        validator_status=validator_status,
+        mode="exact",
+        gripper_drive_profile=profile,
+        intended_attestation_path=tmp_path / "final.attestation.json",
+    )
+
+    assert attestation["profile"] == "gripper_impulse_post_kit_staged_attestation_v8"
+    assert attestation["gripper_drive_profile"] == profile
+
+
+def test_attestation_binds_identity_write_profile(tmp_path):
+    capture = _fake_capture()
+    profile = finalizer.GRIPPER_VELOCITY_LIMIT_IDENTITY_WRITE_DRIVE_PROFILE
+    capture["gripper_drive_contract"]["profile"] = profile
+    context = _fake_context(tmp_path)
+    validator_status = next(iter(context["identities"].values()))
+
+    attestation = finalizer._attestation_payload(  # noqa: SLF001
+        capture=capture,
+        context=context,
+        validator_status=validator_status,
+        mode="exact",
+        gripper_drive_profile=profile,
+        intended_attestation_path=tmp_path / "final.attestation.json",
+    )
+
+    assert attestation["gripper_drive_profile"] == profile
 
 
 class _FixedParser:

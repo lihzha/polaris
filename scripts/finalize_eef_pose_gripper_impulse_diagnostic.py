@@ -28,9 +28,19 @@ GRIPPER_DRIVE_PROFILE = "implicit_gripper_effort200_cuda_actuator_cpu_static_phy
 GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE = (
     "implicit_gripper_physx_velocity_limit5_cuda_actuator_cpu_static_physx_v1"
 )
+GRIPPER_VELOCITY_LIMIT_IDENTITY_WRITE_DRIVE_PROFILE = (
+    "implicit_gripper_physx_velocity_limit5_identity_write_"
+    "cuda_actuator_cpu_static_physx_v1"
+)
+GRIPPER_FOLLOWER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE = (
+    "implicit_gripper_physx_velocity_limit5_followers5_"
+    "cuda_actuator_cpu_static_physx_v1"
+)
 GRIPPER_DRIVE_PROFILES = (
     GRIPPER_DRIVE_PROFILE,
     GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE,
+    GRIPPER_VELOCITY_LIMIT_IDENTITY_WRITE_DRIVE_PROFILE,
+    GRIPPER_FOLLOWER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE,
 )
 EXPECTED_BOUNDARY_SHA256 = (
     "a63f2a8ab9c42ea872da9d6e1913d43e0a89b0382c01d88071af19bdf2731d97"
@@ -41,7 +51,7 @@ EXPECTED_FIXTURE_SHA256 = (
 diagnostic: Any | None = None
 
 
-ATTESTATION_PROFILE = "gripper_impulse_post_kit_staged_attestation_v7"
+ATTESTATION_PROFILE = "gripper_impulse_post_kit_staged_attestation_v8"
 ATTESTATION_FIELDS = {
     "schema_version",
     "profile",

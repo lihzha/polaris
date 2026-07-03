@@ -8,6 +8,8 @@ closed-positive 1 to 0; the original close at step 116 is left untouched.
 
 Host-only parsing and validation deliberately import no Isaac modules so a
 cluster wrapper can validate the immutable capture after Kit exits.
+The closed follower variant writes only the five source-USD PhysX mimic-joint
+velocity limits through the live full-articulation tensor API after reset.
 """
 
 from __future__ import annotations
@@ -73,7 +75,7 @@ exec(  # noqa: S102 - execute only the bootstrap-verified exact source bytes.
 
 ENVIRONMENT = boundary.ENVIRONMENT
 FIXTURE_PROFILE = boundary.FIXTURE_PROFILE
-DIAGNOSTIC_PROFILE = "foodbussing_gripper_close_impulse_exact_delay1_v4"
+DIAGNOSTIC_PROFILE = "foodbussing_gripper_close_impulse_exact_delay1_v5"
 FINGER_TRACE_PROFILE = "gripper_apply_causal_tail_all_links_device_partition_v3"
 ACTION_PLAN_PROFILE = "foodbussing_first_close_exact_or_delay1_v1"
 VIDEO_PROFILE = "lap_model_view_external_then_rot180_wrist_224x448_rational_cadence_v2"
@@ -81,9 +83,19 @@ GRIPPER_DRIVE_PROFILE = "implicit_gripper_effort200_cuda_actuator_cpu_static_phy
 GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE = (
     "implicit_gripper_physx_velocity_limit5_cuda_actuator_cpu_static_physx_v1"
 )
+GRIPPER_VELOCITY_LIMIT_IDENTITY_WRITE_DRIVE_PROFILE = (
+    "implicit_gripper_physx_velocity_limit5_identity_write_"
+    "cuda_actuator_cpu_static_physx_v1"
+)
+GRIPPER_FOLLOWER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE = (
+    "implicit_gripper_physx_velocity_limit5_followers5_"
+    "cuda_actuator_cpu_static_physx_v1"
+)
 GRIPPER_DRIVE_PROFILES = (
     GRIPPER_DRIVE_PROFILE,
     GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE,
+    GRIPPER_VELOCITY_LIMIT_IDENTITY_WRITE_DRIVE_PROFILE,
+    GRIPPER_FOLLOWER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE,
 )
 SOLVER_CHANGE_PROFILE = "eef_pose_solver_velocity_iterations_0_to_1_v1"
 MODES = ("exact", "delay_first_close_one_step")
@@ -123,6 +135,110 @@ EXPECTED_DROID_JOINT_NAMES = [
     "right_inner_finger_joint",
     "left_inner_finger_knuckle_joint",
     "right_inner_finger_knuckle_joint",
+]
+EXPECTED_ARM_JOINT_NAMES = EXPECTED_DROID_JOINT_NAMES[:7]
+EXPECTED_ARM_JOINT_INDICES = list(range(7))
+EXPECTED_ACTUATOR_JOINT_OWNERSHIP = {
+    "panda_shoulder": (EXPECTED_ARM_JOINT_NAMES[:4], EXPECTED_ARM_JOINT_INDICES[:4]),
+    "panda_forearm": (EXPECTED_ARM_JOINT_NAMES[4:], EXPECTED_ARM_JOINT_INDICES[4:]),
+    "gripper": (["finger_joint"], [7]),
+}
+DRIVEN_GRIPPER_JOINT_NAME = "finger_joint"
+GRIPPER_FOLLOWER_JOINT_NAMES = [
+    "right_outer_knuckle_joint",
+    "left_inner_finger_joint",
+    "right_inner_finger_joint",
+    "left_inner_finger_knuckle_joint",
+    "right_inner_finger_knuckle_joint",
+]
+DRIVEN_GRIPPER_JOINT_INDEX = EXPECTED_DROID_JOINT_NAMES.index(DRIVEN_GRIPPER_JOINT_NAME)
+GRIPPER_FOLLOWER_JOINT_INDICES = [
+    EXPECTED_DROID_JOINT_NAMES.index(name) for name in GRIPPER_FOLLOWER_JOINT_NAMES
+]
+GRIPPER_FOLLOWER_DEFAULT_VELOCITY_LIMIT_FLOAT32 = 174.53292846679688
+GRIPPER_FOLLOWER_CANDIDATE_VELOCITY_LIMIT_FLOAT32 = 5.0
+NO_VELOCITY_LIMIT_WRITE_PROFILE = "no_live_velocity_limit_write_v1"
+IDENTITY_VELOCITY_LIMIT_WRITE_PROFILE = (
+    "live_root_physx_view_full_tensor_identity_velocity_limit_write_diagnostic_only_v1"
+)
+FOLLOWER_VELOCITY_LIMIT_WRITE_PROFILE = (
+    "live_root_physx_view_full_tensor_five_mimic_dofs_velocity_limit5_"
+    "diagnostic_only_v1"
+)
+VELOCITY_LIMIT_WRITE_SETTER = "root_physx_view.set_dof_max_velocities"
+VELOCITY_LIMIT_WRITE_TIMING = "after_reset_before_first_replay_apply_v1"
+EXPECTED_ARM_VELOCITY_LIMITS_FLOAT32 = [
+    2.174999952316284,
+    2.174999952316284,
+    2.174999952316284,
+    2.174999952316284,
+    2.609999895095825,
+    2.609999895095825,
+    2.609999895095825,
+]
+LEGACY_FULL_VELOCITY_LIMITS_FLOAT32 = [
+    *EXPECTED_ARM_VELOCITY_LIMITS_FLOAT32,
+    8.726646423339844,
+    *(
+        [GRIPPER_FOLLOWER_DEFAULT_VELOCITY_LIMIT_FLOAT32]
+        * len(GRIPPER_FOLLOWER_JOINT_NAMES)
+    ),
+]
+DRIVER5_FULL_VELOCITY_LIMITS_FLOAT32 = [
+    *EXPECTED_ARM_VELOCITY_LIMITS_FLOAT32,
+    5.0,
+    *(
+        [GRIPPER_FOLLOWER_DEFAULT_VELOCITY_LIMIT_FLOAT32]
+        * len(GRIPPER_FOLLOWER_JOINT_NAMES)
+    ),
+]
+DRIVER5_FOLLOWERS5_FULL_VELOCITY_LIMITS_FLOAT32 = [
+    *EXPECTED_ARM_VELOCITY_LIMITS_FLOAT32,
+    5.0,
+    *([5.0] * len(GRIPPER_FOLLOWER_JOINT_NAMES)),
+]
+MIMIC_JOINT_CONTRACT_PROFILE = "robotiq_2f85_source_usd_physx_mimic_joint_v1"
+EXPECTED_MIMIC_JOINT_SPECS = [
+    {
+        "joint_name": "right_outer_knuckle_joint",
+        "joint_index": 8,
+        "mimic_axis": "rotZ",
+        "gearing": -1.0,
+        "natural_frequency_hz": 1000000.0,
+        "damping_ratio": 0.0,
+    },
+    {
+        "joint_name": "left_inner_finger_joint",
+        "joint_index": 9,
+        "mimic_axis": "rotX",
+        "gearing": 1.0,
+        "natural_frequency_hz": 1000.0,
+        "damping_ratio": 0.05000000074505806,
+    },
+    {
+        "joint_name": "right_inner_finger_joint",
+        "joint_index": 10,
+        "mimic_axis": "rotX",
+        "gearing": -1.0,
+        "natural_frequency_hz": 1000.0,
+        "damping_ratio": 0.05000000074505806,
+    },
+    {
+        "joint_name": "left_inner_finger_knuckle_joint",
+        "joint_index": 11,
+        "mimic_axis": "rotX",
+        "gearing": 1.0,
+        "natural_frequency_hz": 1000.0,
+        "damping_ratio": 0.05000000074505806,
+    },
+    {
+        "joint_name": "right_inner_finger_knuckle_joint",
+        "joint_index": 12,
+        "mimic_axis": "rotX",
+        "gearing": 1.0,
+        "natural_frequency_hz": 1000.0,
+        "damping_ratio": 0.05000000074505806,
+    },
 ]
 # Authoritative live Isaac Lab/PhysX order from the pinned nvidia_droid USD,
 # captured by the immutable L40S articulation-name probe (Slurm job 1098158).
@@ -413,11 +529,46 @@ GRIPPER_DRIVE_CONTRACT_FIELDS = {
     "configured_before_articulation_build",
     "live_actuator",
     "live_physx_readback",
+    "mimic_joint_contract",
+    "live_physx_velocity_limits_before_follower_write",
+    "live_physx_velocity_limits_after_follower_write",
+    "follower_velocity_limit_behavior",
+    "velocity_limit_write_contract",
     "legacy_velocity_limit_behavior",
     "effort_limit_behavior",
     "incoming_joint_wrench_semantics",
     "computed_applied_torque_semantics",
     "authoritative_device_probe",
+}
+VELOCITY_LIMIT_WRITE_CONTRACT_FIELDS = {
+    "profile",
+    "setter",
+    "timing",
+    "call_count",
+    "articulation_indices",
+    "full_input",
+}
+MIMIC_JOINT_CONTRACT_FIELDS = {
+    "profile",
+    "robot_usd_sha256",
+    "driver_joint_name",
+    "driver_joint_index",
+    "driver_joint_prim_path",
+    "driver_physics_joint_type",
+    "driver_exclude_from_articulation",
+    "followers",
+}
+MIMIC_JOINT_ENTRY_FIELDS = {
+    "joint_name",
+    "joint_index",
+    "prim_path",
+    "physics_joint_type",
+    "exclude_from_articulation",
+    "mimic_axis",
+    "reference_joint_path",
+    "gearing",
+    "natural_frequency_hz",
+    "damping_ratio",
 }
 CONFIGURED_GRIPPER_FIELDS = {
     "legacy_velocity_limit_rad_s",
@@ -1507,12 +1658,35 @@ def _validate_snapshot_gripper_binding(
     gripper_drive: Mapping[str, Any],
     field: str,
 ) -> None:
+    profile = gripper_drive.get("profile")
+    _require(profile in GRIPPER_DRIVE_PROFILES, f"{field} gripper drive profile")
+    write_contract = _validate_velocity_limit_write_contract(
+        gripper_drive.get("velocity_limit_write_contract"),
+        profile=profile,
+    )
+    _require(
+        write_contract["profile"]
+        == _gripper_drive_expectations(profile)["write_profile"],
+        f"{field} velocity-limit write profile binding",
+    )
     joint_index = gripper_drive["joint_indices"][0]
     _require(
         snapshot["joint_names"] == EXPECTED_DROID_JOINT_NAMES
         and joint_index == EXPECTED_DROID_JOINT_NAMES.index("finger_joint")
         and gripper_drive["joint_names"] == ["finger_joint"],
         f"{field} gripper joint identity",
+    )
+    full_limits = gripper_drive["live_physx_velocity_limits_after_follower_write"]
+    expected_snapshot_limits = {
+        **full_limits,
+        "shape": [len(EXPECTED_DROID_JOINT_NAMES)],
+    }
+    _require(
+        _typed_equal(
+            snapshot["physx_joint_velocity_limit_rad_s"],
+            expected_snapshot_limits,
+        ),
+        f"{field} full driven/follower velocity-limit identity",
     )
     for snapshot_field, drive_field in (
         ("physx_joint_velocity_limit_rad_s", "velocity_limit_rad_s"),
@@ -1921,8 +2095,36 @@ def _tensor_evidence_equal_excluding_device(
     )
 
 
-def _selected_gripper_drive_profile(candidate_enabled: Any) -> str:
+def _selected_gripper_drive_profile(
+    candidate_enabled: Any,
+    follower_candidate_enabled: Any = False,
+    identity_write_candidate_enabled: Any = False,
+) -> str:
     _require(type(candidate_enabled) is bool, "gripper candidate flag type")
+    _require(
+        type(follower_candidate_enabled) is bool,
+        "gripper follower candidate flag type",
+    )
+    _require(
+        type(identity_write_candidate_enabled) is bool,
+        "gripper identity-write candidate flag type",
+    )
+    _require(
+        not follower_candidate_enabled or candidate_enabled,
+        "gripper follower candidate requires driver candidate",
+    )
+    _require(
+        not identity_write_candidate_enabled or candidate_enabled,
+        "gripper identity-write candidate requires driver candidate",
+    )
+    _require(
+        not (follower_candidate_enabled and identity_write_candidate_enabled),
+        "gripper follower and identity-write candidates are mutually exclusive",
+    )
+    if follower_candidate_enabled:
+        return GRIPPER_FOLLOWER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
+    if identity_write_candidate_enabled:
+        return GRIPPER_VELOCITY_LIMIT_IDENTITY_WRITE_DRIVE_PROFILE
     return (
         GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE
         if candidate_enabled
@@ -1952,6 +2154,11 @@ def _gripper_drive_expectations(profile: Any) -> dict[str, Any]:
                 "implicit_legacy_effort_limit_200_promoted_to_effort_limit_sim_"
                 "and_enforced_v1"
             ),
+            "full_before": LEGACY_FULL_VELOCITY_LIMITS_FLOAT32,
+            "full_after": LEGACY_FULL_VELOCITY_LIMITS_FLOAT32,
+            "follower_behavior": "no_follower_velocity_limit_write_v1",
+            "write_profile": NO_VELOCITY_LIMIT_WRITE_PROFILE,
+            "write_enabled": False,
         }
     if profile == GRIPPER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE:
         return {
@@ -1973,8 +2180,186 @@ def _gripper_drive_expectations(profile: Any) -> dict[str, Any]:
             "effort_behavior": (
                 "implicit_equal_legacy_and_sim_effort_limit_200_enforced_v1"
             ),
+            "full_before": DRIVER5_FULL_VELOCITY_LIMITS_FLOAT32,
+            "full_after": DRIVER5_FULL_VELOCITY_LIMITS_FLOAT32,
+            "follower_behavior": "no_follower_velocity_limit_write_v1",
+            "write_profile": NO_VELOCITY_LIMIT_WRITE_PROFILE,
+            "write_enabled": False,
+        }
+    if profile == GRIPPER_VELOCITY_LIMIT_IDENTITY_WRITE_DRIVE_PROFILE:
+        return {
+            "configured": {
+                "legacy_velocity_limit_rad_s": 5.0,
+                "velocity_limit_sim_rad_s": 5.0,
+                "legacy_effort_limit_nm": 200.0,
+                "effort_limit_sim_nm": 200.0,
+                "stiffness": None,
+                "damping": None,
+            },
+            "live_cfg_velocity_limit": 5.0,
+            "live_cfg_velocity_limit_sim": 5.0,
+            "values": GRIPPER_VELOCITY_LIMIT_CANDIDATE_FLOAT32_VALUES,
+            "velocity_behavior": (
+                "isaaclab_2p3_explicit_velocity_limit_sim_5_enforced_"
+                "eef_diagnostic_only_v1"
+            ),
+            "effort_behavior": (
+                "implicit_equal_legacy_and_sim_effort_limit_200_enforced_v1"
+            ),
+            "full_before": DRIVER5_FULL_VELOCITY_LIMITS_FLOAT32,
+            "full_after": DRIVER5_FULL_VELOCITY_LIMITS_FLOAT32,
+            "follower_behavior": (
+                "live_root_physx_view_full_tensor_identity_write_"
+                "no_follower_value_change_diagnostic_only_v1"
+            ),
+            "write_profile": IDENTITY_VELOCITY_LIMIT_WRITE_PROFILE,
+            "write_enabled": True,
+        }
+    if profile == GRIPPER_FOLLOWER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE:
+        return {
+            "configured": {
+                "legacy_velocity_limit_rad_s": 5.0,
+                "velocity_limit_sim_rad_s": 5.0,
+                "legacy_effort_limit_nm": 200.0,
+                "effort_limit_sim_nm": 200.0,
+                "stiffness": None,
+                "damping": None,
+            },
+            "live_cfg_velocity_limit": 5.0,
+            "live_cfg_velocity_limit_sim": 5.0,
+            "values": GRIPPER_VELOCITY_LIMIT_CANDIDATE_FLOAT32_VALUES,
+            "velocity_behavior": (
+                "isaaclab_2p3_explicit_velocity_limit_sim_5_enforced_"
+                "eef_diagnostic_only_v1"
+            ),
+            "effort_behavior": (
+                "implicit_equal_legacy_and_sim_effort_limit_200_enforced_v1"
+            ),
+            "full_before": DRIVER5_FULL_VELOCITY_LIMITS_FLOAT32,
+            "full_after": DRIVER5_FOLLOWERS5_FULL_VELOCITY_LIMITS_FLOAT32,
+            "follower_behavior": (
+                "live_root_physx_view_full_tensor_five_mimic_dofs_"
+                "velocity_limit5_diagnostic_only_v1"
+            ),
+            "write_profile": FOLLOWER_VELOCITY_LIMIT_WRITE_PROFILE,
+            "write_enabled": True,
         }
     raise GripperImpulseDiagnosticError(f"unknown gripper drive profile: {profile!r}")
+
+
+def _expected_mimic_joint_contract() -> dict[str, Any]:
+    joint_root = "/panda/Gripper/Robotiq_2F_85/Joints"
+    driver_path = f"{joint_root}/{DRIVEN_GRIPPER_JOINT_NAME}"
+    return {
+        "profile": MIMIC_JOINT_CONTRACT_PROFILE,
+        "robot_usd_sha256": EXPECTED_ROBOT_USD_SHA256,
+        "driver_joint_name": DRIVEN_GRIPPER_JOINT_NAME,
+        "driver_joint_index": DRIVEN_GRIPPER_JOINT_INDEX,
+        "driver_joint_prim_path": driver_path,
+        "driver_physics_joint_type": "PhysicsRevoluteJoint",
+        "driver_exclude_from_articulation": False,
+        "followers": [
+            {
+                **spec,
+                "prim_path": f"{joint_root}/{spec['joint_name']}",
+                "physics_joint_type": "PhysicsRevoluteJoint",
+                "exclude_from_articulation": False,
+                "reference_joint_path": driver_path,
+            }
+            for spec in EXPECTED_MIMIC_JOINT_SPECS
+        ],
+    }
+
+
+def _validate_mimic_joint_contract(value: Any) -> dict[str, Any]:
+    _require(isinstance(value, dict), "gripper mimic joint contract")
+    _require(
+        set(value) == MIMIC_JOINT_CONTRACT_FIELDS,
+        "gripper mimic joint contract schema",
+    )
+    followers = value.get("followers")
+    _require(
+        isinstance(followers, list)
+        and all(
+            isinstance(entry, dict) and set(entry) == MIMIC_JOINT_ENTRY_FIELDS
+            for entry in followers
+        ),
+        "gripper mimic joint entry schema",
+    )
+    _require(
+        _typed_equal(value, _expected_mimic_joint_contract()),
+        "gripper mimic joint source USD contract drift",
+    )
+    return dict(value)
+
+
+def _validate_full_velocity_limit_evidence(
+    value: Any,
+    *,
+    expected: Sequence[float],
+    field: str,
+) -> dict[str, Any]:
+    tensor = validate_tensor_evidence(value, field=field)
+    _require(
+        tensor["shape"] == [1, len(EXPECTED_DROID_JOINT_NAMES)]
+        and tensor["dtype"] == PINNED_TENSOR_DTYPE
+        and tensor["device"] == PINNED_STATIC_PHYSX_DEVICE
+        and tensor["finite_count"] == len(EXPECTED_DROID_JOINT_NAMES)
+        and tensor["finite_mask"] == [True] * len(EXPECTED_DROID_JOINT_NAMES)
+        and tensor["nonfinite"] == [],
+        f"{field} full CPU float32 tensor contract",
+    )
+    _require(
+        len(expected) == len(EXPECTED_DROID_JOINT_NAMES)
+        and all(
+            _same_float32(actual, wanted)
+            for actual, wanted in zip(tensor["values"], expected, strict=True)
+        ),
+        f"{field} pinned per-joint values",
+    )
+    return tensor
+
+
+def _validate_velocity_limit_write_contract(
+    value: Any,
+    *,
+    profile: str,
+) -> dict[str, Any]:
+    _require(isinstance(value, dict), "velocity-limit write contract")
+    _require(
+        set(value) == VELOCITY_LIMIT_WRITE_CONTRACT_FIELDS,
+        "velocity-limit write contract schema",
+    )
+    expectations = _gripper_drive_expectations(profile)
+    _require(
+        value.get("profile") == expectations["write_profile"],
+        "velocity-limit write profile",
+    )
+    if not expectations["write_enabled"]:
+        _require(
+            value.get("setter") is None
+            and value.get("timing") is None
+            and type(value.get("call_count")) is int
+            and value.get("call_count") == 0
+            and _typed_equal(value.get("articulation_indices"), [])
+            and value.get("full_input") is None,
+            "no-write velocity-limit contract",
+        )
+        return dict(value)
+    _require(
+        value.get("setter") == VELOCITY_LIMIT_WRITE_SETTER
+        and value.get("timing") == VELOCITY_LIMIT_WRITE_TIMING
+        and type(value.get("call_count")) is int
+        and value.get("call_count") == 1
+        and _typed_equal(value.get("articulation_indices"), [0]),
+        "live velocity-limit setter identity/count/timing",
+    )
+    _validate_full_velocity_limit_evidence(
+        value.get("full_input"),
+        expected=expectations["full_after"],
+        field="velocity-limit setter full input",
+    )
+    return dict(value)
 
 
 def _validate_gripper_drive_contract(
@@ -1999,6 +2384,31 @@ def _validate_gripper_drive_contract(
         _typed_equal(value.get("authoritative_device_probe"), DEVICE_PROBE_EVIDENCE),
         "gripper authoritative device probe",
     )
+    _validate_mimic_joint_contract(value.get("mimic_joint_contract"))
+    before_limits = _validate_full_velocity_limit_evidence(
+        value.get("live_physx_velocity_limits_before_follower_write"),
+        expected=expectations["full_before"],
+        field="gripper PhysX limits before follower write",
+    )
+    after_limits = _validate_full_velocity_limit_evidence(
+        value.get("live_physx_velocity_limits_after_follower_write"),
+        expected=expectations["full_after"],
+        field="gripper PhysX limits after follower write",
+    )
+    _require(
+        value.get("follower_velocity_limit_behavior")
+        == expectations["follower_behavior"],
+        "gripper follower velocity-limit behavior",
+    )
+    write_contract = _validate_velocity_limit_write_contract(
+        value.get("velocity_limit_write_contract"),
+        profile=value["profile"],
+    )
+    if expectations["write_enabled"]:
+        _require(
+            _typed_equal(write_contract["full_input"], after_limits),
+            "velocity-limit setter input/live readback cross-binding",
+        )
     _require(value.get("actuator_name") == "gripper", "gripper actuator name")
     expected_joint_names = ["finger_joint"]
     expected_joint_indices = [EXPECTED_DROID_JOINT_NAMES.index("finger_joint")]
@@ -2159,6 +2569,21 @@ def _validate_gripper_drive_contract(
             _same_float32(validated_physx[physx_field]["values"][0], expected),
             f"gripper job1098162/profile static PhysX value drift: {physx_field}",
         )
+    _require(
+        _same_float32(
+            before_limits["values"][DRIVEN_GRIPPER_JOINT_INDEX],
+            expectations["values"]["velocity_limit_rad_s"],
+        )
+        and _same_float32(
+            after_limits["values"][DRIVEN_GRIPPER_JOINT_INDEX],
+            expectations["values"]["velocity_limit_rad_s"],
+        )
+        and _same_float32(
+            validated_physx["velocity_limit_rad_s"]["values"][0],
+            after_limits["values"][DRIVEN_GRIPPER_JOINT_INDEX],
+        ),
+        "gripper driven/full PhysX velocity-limit cross-binding",
+    )
     effort = physx["effort_limit_nm"]
     _require(
         effort["finite_mask"] == [True] and _same_float32(effort["values"][0], 200.0),
@@ -3397,7 +3822,9 @@ def _host_revalidate_runtime_artifacts(args_cli: argparse.Namespace) -> None:
         args_cli.output_video,
         expected_mode=args_cli.mode,
         expected_gripper_drive_profile=_selected_gripper_drive_profile(
-            args_cli.enable_gripper_velocity_limit_candidate
+            args_cli.enable_gripper_velocity_limit_candidate,
+            args_cli.enable_gripper_follower_velocity_limit_candidate,
+            args_cli.enable_gripper_velocity_limit_identity_write_candidate,
         ),
         probe=_probe_video_stdlib,
     )
@@ -3480,7 +3907,16 @@ def _scalar_cfg_value(value: Any) -> float | None:
 
 
 def _joint_indices_list(joint_ids: Any, *, joint_count: int) -> list[int]:
+    _require(type(joint_count) is int and joint_count > 0, "live joint count")
     if isinstance(joint_ids, slice):
+        _require(
+            all(
+                value is None or type(value) is int
+                for value in (joint_ids.start, joint_ids.stop, joint_ids.step)
+            ),
+            "joint-index slice exact integer bounds",
+        )
+        _require(joint_ids.step != 0, "joint-index slice nonzero step")
         return list(range(joint_count))[joint_ids]
     if hasattr(joint_ids, "detach"):
         joint_ids = joint_ids.detach()
@@ -3488,7 +3924,52 @@ def _joint_indices_list(joint_ids: Any, *, joint_count: int) -> list[int]:
         joint_ids = joint_ids.cpu()
     if hasattr(joint_ids, "tolist"):
         joint_ids = joint_ids.tolist()
-    return [int(value) for value in joint_ids]
+    _require(
+        isinstance(joint_ids, (list, tuple))
+        and all(type(value) is int for value in joint_ids),
+        "joint indices exact integer sequence",
+    )
+    return list(joint_ids)
+
+
+def _validated_live_joint_owner(
+    *,
+    owner: str,
+    joint_names: Any,
+    joint_ids: Any,
+    live_joint_names: Sequence[str],
+    reject_followers: bool,
+) -> tuple[list[str], list[int]]:
+    _require(
+        isinstance(joint_names, (list, tuple))
+        and all(type(name) is str for name in joint_names),
+        f"{owner} joint names exact string sequence",
+    )
+    names = list(joint_names)
+    indices = _joint_indices_list(joint_ids, joint_count=len(live_joint_names))
+    _require(
+        len(names) > 0 and len(names) == len(indices),
+        f"{owner} joint name/index lengths",
+    )
+    _require(
+        len(set(names)) == len(names) and len(set(indices)) == len(indices),
+        f"{owner} joint name/index uniqueness",
+    )
+    _require(
+        all(0 <= index < len(live_joint_names) for index in indices),
+        f"{owner} joint index range",
+    )
+    if reject_followers:
+        _require(
+            not set(names).intersection(GRIPPER_FOLLOWER_JOINT_NAMES)
+            and not set(indices).intersection(GRIPPER_FOLLOWER_JOINT_INDICES),
+            f"mimic follower name/index unexpectedly owned by {owner}",
+        )
+    _require(
+        all(live_joint_names[index] == name for name, index in zip(names, indices)),
+        f"{owner} live joint name/index pairing",
+    )
+    return names, indices
 
 
 def _direct_physx_tensor(robot: Any, getter_name: str) -> Any:
@@ -3509,6 +3990,220 @@ def _direct_physx_tensor(robot: Any, getter_name: str) -> Any:
     if hasattr(tensor, "clone"):
         tensor = tensor.clone()
     return tensor
+
+
+def _capture_mimic_joint_contract(robot_usd_path: Path) -> dict[str, Any]:
+    """Capture the exact source-USD mimic topology inside the Kit child."""
+
+    from pxr import Usd  # noqa: PLC0415
+
+    robot_usd_path = robot_usd_path.resolve()
+    identity = _file_identity(robot_usd_path)
+    _require(
+        identity["sha256"] == EXPECTED_ROBOT_USD_SHA256
+        and identity["size_bytes"] == EXPECTED_ROBOT_USD_SIZE_BYTES,
+        "mimic contract robot USD identity",
+    )
+    stage = Usd.Stage.Open(str(robot_usd_path), load=Usd.Stage.LoadNone)
+    _require(stage is not None, "cannot open robot USD for mimic contract")
+    expected = _expected_mimic_joint_contract()
+
+    def joint_static(prim_path: str) -> tuple[Any, bool]:
+        prim = stage.GetPrimAtPath(prim_path)
+        _require(prim and prim.IsValid(), f"missing mimic joint prim: {prim_path}")
+        excluded = prim.GetAttribute("physics:excludeFromArticulation").Get()
+        _require(type(excluded) is bool, f"mimic joint exclusion type: {prim_path}")
+        return prim, excluded
+
+    driver, driver_excluded = joint_static(expected["driver_joint_prim_path"])
+    captured = {
+        "profile": MIMIC_JOINT_CONTRACT_PROFILE,
+        "robot_usd_sha256": identity["sha256"],
+        "driver_joint_name": DRIVEN_GRIPPER_JOINT_NAME,
+        "driver_joint_index": DRIVEN_GRIPPER_JOINT_INDEX,
+        "driver_joint_prim_path": str(driver.GetPath()),
+        "driver_physics_joint_type": driver.GetTypeName(),
+        "driver_exclude_from_articulation": driver_excluded,
+        "followers": [],
+    }
+    for spec in expected["followers"]:
+        prim, excluded = joint_static(spec["prim_path"])
+        namespace = f"physxMimicJoint:{spec['mimic_axis']}"
+        reference = prim.GetRelationship(f"{namespace}:referenceJoint").GetTargets()
+        _require(
+            len(reference) == 1,
+            f"mimic reference target count: {spec['joint_name']}",
+        )
+        captured["followers"].append(
+            {
+                "joint_name": spec["joint_name"],
+                "joint_index": spec["joint_index"],
+                "prim_path": str(prim.GetPath()),
+                "physics_joint_type": prim.GetTypeName(),
+                "exclude_from_articulation": excluded,
+                "mimic_axis": spec["mimic_axis"],
+                "reference_joint_path": str(reference[0]),
+                "gearing": float(prim.GetAttribute(f"{namespace}:gearing").Get()),
+                "natural_frequency_hz": float(
+                    prim.GetAttribute(f"{namespace}:naturalFrequency").Get()
+                ),
+                "damping_ratio": float(
+                    prim.GetAttribute(f"{namespace}:dampingRatio").Get()
+                ),
+            }
+        )
+    return _validate_mimic_joint_contract(captured)
+
+
+def _validate_live_follower_write_identity(
+    robot: Any,
+    arm_term: Any,
+    finger_term: Any,
+) -> None:
+    """Fail before mutation unless live names and control ownership are exact."""
+
+    _require(
+        isinstance(robot.joint_names, (list, tuple))
+        and all(type(name) is str for name in robot.joint_names),
+        "live articulation joint names exact string sequence",
+    )
+    joint_names = list(robot.joint_names)
+    _require(
+        joint_names == EXPECTED_DROID_JOINT_NAMES,
+        f"live articulation joint order before follower write: {joint_names!r}",
+    )
+    arm_action_names, arm_action_indices = _validated_live_joint_owner(
+        owner="arm action term",
+        joint_names=getattr(arm_term, "_joint_names", None),
+        joint_ids=getattr(arm_term, "_joint_ids", None),
+        live_joint_names=joint_names,
+        reject_followers=True,
+    )
+    _require(
+        arm_action_names == EXPECTED_ARM_JOINT_NAMES
+        and arm_action_indices == EXPECTED_ARM_JOINT_INDICES,
+        "exact arm action-term joints before follower write",
+    )
+    finger_action_names, finger_action_indices = _validated_live_joint_owner(
+        owner="finger action term",
+        joint_names=getattr(finger_term, "_joint_names", None),
+        joint_ids=getattr(finger_term, "_joint_ids", None),
+        live_joint_names=joint_names,
+        reject_followers=True,
+    )
+    _require(
+        finger_action_names == [DRIVEN_GRIPPER_JOINT_NAME]
+        and finger_action_indices == [DRIVEN_GRIPPER_JOINT_INDEX],
+        "exact finger action-term joint before follower write",
+    )
+    _require(
+        isinstance(robot.actuators, Mapping) and bool(robot.actuators),
+        "live actuator mapping before follower write",
+    )
+    validated_actuators: dict[str, tuple[list[str], list[int]]] = {}
+    all_actuated_names: set[str] = set()
+    all_actuated_indices: set[int] = set()
+    for actuator_name, actuator in robot.actuators.items():
+        _require(type(actuator_name) is str, "live actuator name type")
+        names, indices = _validated_live_joint_owner(
+            owner=f"actuator {actuator_name!r}",
+            joint_names=getattr(actuator, "joint_names", None),
+            joint_ids=getattr(actuator, "joint_indices", None),
+            live_joint_names=joint_names,
+            reject_followers=True,
+        )
+        _require(
+            not all_actuated_names.intersection(names)
+            and not all_actuated_indices.intersection(indices),
+            "duplicate joint ownership across actuators",
+        )
+        all_actuated_names.update(names)
+        all_actuated_indices.update(indices)
+        validated_actuators[actuator_name] = (names, indices)
+    _require(
+        set(validated_actuators) == set(EXPECTED_ACTUATOR_JOINT_OWNERSHIP),
+        "exact live actuator key set before follower write",
+    )
+    for actuator_name, expected_ownership in EXPECTED_ACTUATOR_JOINT_OWNERSHIP.items():
+        _require(
+            validated_actuators[actuator_name] == expected_ownership,
+            f"exact live actuator joint mapping for {actuator_name!r}",
+        )
+    gripper = validated_actuators.get("gripper")
+    _require(
+        gripper is not None
+        and gripper[0] == finger_action_names == [DRIVEN_GRIPPER_JOINT_NAME]
+        and gripper[1] == finger_action_indices == [DRIVEN_GRIPPER_JOINT_INDEX],
+        "driven gripper action/actuator identity before follower write",
+    )
+
+
+def _apply_follower_velocity_limit_profile(
+    robot: Any,
+    *,
+    profile: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Apply the selected closed full-tensor write variant after reset."""
+
+    import torch  # noqa: PLC0415
+
+    _require(
+        list(robot.joint_names) == EXPECTED_DROID_JOINT_NAMES,
+        "live articulation joint order at follower write",
+    )
+    expectations = _gripper_drive_expectations(profile)
+    before = _direct_physx_tensor(robot, "get_dof_max_velocities")
+    before_evidence = _validate_full_velocity_limit_evidence(
+        tensor_evidence(before),
+        expected=expectations["full_before"],
+        field="runtime PhysX limits before follower write",
+    )
+    replacement = before.clone()
+    if profile == GRIPPER_FOLLOWER_VELOCITY_LIMIT_CANDIDATE_DRIVE_PROFILE:
+        replacement[:, GRIPPER_FOLLOWER_JOINT_INDICES] = (
+            GRIPPER_FOLLOWER_CANDIDATE_VELOCITY_LIMIT_FLOAT32
+        )
+    if expectations["write_enabled"]:
+        setter = getattr(robot.root_physx_view, "set_dof_max_velocities", None)
+        _require(callable(setter), "PhysX articulation has no velocity-limit setter")
+        articulation_indices = torch.arange(
+            replacement.shape[0],
+            dtype=torch.int32,
+            device=replacement.device,
+        )
+        _require(
+            replacement.shape[0] == 1 and articulation_indices.tolist() == [0],
+            "follower limit write single-articulation identity",
+        )
+        setter(replacement, articulation_indices)
+        write_contract = {
+            "profile": expectations["write_profile"],
+            "setter": VELOCITY_LIMIT_WRITE_SETTER,
+            "timing": VELOCITY_LIMIT_WRITE_TIMING,
+            "call_count": 1,
+            "articulation_indices": articulation_indices.tolist(),
+            "full_input": tensor_evidence(replacement),
+        }
+    else:
+        write_contract = {
+            "profile": expectations["write_profile"],
+            "setter": None,
+            "timing": None,
+            "call_count": 0,
+            "articulation_indices": [],
+            "full_input": None,
+        }
+    after = _direct_physx_tensor(robot, "get_dof_max_velocities")
+    after_evidence = _validate_full_velocity_limit_evidence(
+        tensor_evidence(after),
+        expected=expectations["full_after"],
+        field="runtime PhysX limits after follower write",
+    )
+    return (
+        before_evidence,
+        after_evidence,
+        _validate_velocity_limit_write_contract(write_contract, profile=profile),
+    )
 
 
 def _capture_articulation_snapshot(robot: Any) -> dict[str, Any]:
@@ -3788,8 +4483,18 @@ def _capture_gripper_drive_contract(
     *,
     configured_before_build: Mapping[str, Any],
     candidate_enabled: bool,
+    follower_candidate_enabled: bool,
+    identity_write_candidate_enabled: bool,
+    mimic_joint_contract: Mapping[str, Any],
+    velocity_limits_before_follower_write: Mapping[str, Any],
+    velocity_limits_after_follower_write: Mapping[str, Any],
+    velocity_limit_write_contract: Mapping[str, Any],
 ) -> dict[str, Any]:
-    profile = _selected_gripper_drive_profile(candidate_enabled)
+    profile = _selected_gripper_drive_profile(
+        candidate_enabled,
+        follower_candidate_enabled,
+        identity_write_candidate_enabled,
+    )
     expectations = _gripper_drive_expectations(profile)
     actuator = robot.actuators.get("gripper")
     _require(actuator is not None, "live robot has no gripper actuator")
@@ -3835,6 +4540,15 @@ def _capture_gripper_drive_contract(
         "authoritative_device_probe": dict(DEVICE_PROBE_EVIDENCE),
         "configured_before_articulation_build": dict(configured_before_build),
         "live_actuator": live_actuator,
+        "mimic_joint_contract": dict(mimic_joint_contract),
+        "live_physx_velocity_limits_before_follower_write": dict(
+            velocity_limits_before_follower_write
+        ),
+        "live_physx_velocity_limits_after_follower_write": dict(
+            velocity_limits_after_follower_write
+        ),
+        "follower_velocity_limit_behavior": expectations["follower_behavior"],
+        "velocity_limit_write_contract": dict(velocity_limit_write_contract),
         "live_physx_readback": {
             "velocity_limit_rad_s": tensor_evidence(
                 select(_direct_physx_tensor(robot, "get_dof_max_velocities"))
@@ -4015,11 +4729,38 @@ def _run_live_diagnostic(args_cli: argparse.Namespace, state: dict[str, Any]):
         "arm failure substep trace is not enabled",
     )
     robot = env.unwrapped.scene["robot"]
+    selected_drive_profile = _selected_gripper_drive_profile(
+        args_cli.enable_gripper_velocity_limit_candidate,
+        args_cli.enable_gripper_follower_velocity_limit_candidate,
+        args_cli.enable_gripper_velocity_limit_identity_write_candidate,
+    )
+    _validate_live_follower_write_identity(robot, arm_term, finger_term)
+    mimic_joint_contract = _capture_mimic_joint_contract(
+        Path(env_cfg.scene.robot.spawn.usd_path)
+    )
+    (
+        velocity_limits_before_follower_write,
+        velocity_limits_after_follower_write,
+        velocity_limit_write_contract,
+    ) = _apply_follower_velocity_limit_profile(
+        robot,
+        profile=selected_drive_profile,
+    )
     gripper_drive_contract = _capture_gripper_drive_contract(
         robot,
         finger_term,
         configured_before_build=configured_gripper,
         candidate_enabled=args_cli.enable_gripper_velocity_limit_candidate,
+        follower_candidate_enabled=(
+            args_cli.enable_gripper_follower_velocity_limit_candidate
+        ),
+        identity_write_candidate_enabled=(
+            args_cli.enable_gripper_velocity_limit_identity_write_candidate
+        ),
+        mimic_joint_contract=mimic_joint_contract,
+        velocity_limits_before_follower_write=(velocity_limits_before_follower_write),
+        velocity_limits_after_follower_write=(velocity_limits_after_follower_write),
+        velocity_limit_write_contract=velocity_limit_write_contract,
     )
     solver_contract = {
         "profile": SOLVER_CHANGE_PROFILE,
@@ -4242,6 +4983,22 @@ def build_runtime_parser(
         action="store_true",
         help="Enable the isolated EEF-only 5 rad/s PhysX gripper canary.",
     )
+    parser.add_argument(
+        "--enable-gripper-follower-velocity-limit-candidate",
+        action="store_true",
+        help=(
+            "Additionally set the five passive PhysX mimic-joint velocity "
+            "limits to 5 rad/s through the live articulation view."
+        ),
+    )
+    parser.add_argument(
+        "--enable-gripper-velocity-limit-identity-write-candidate",
+        action="store_true",
+        help=(
+            "Write the unchanged full driver-5 PhysX velocity-limit tensor "
+            "through the same post-reset setter path used by the follower canary."
+        ),
+    )
     parser.add_argument("--expected-source-sha256", required=True)
     parser.add_argument("--expected-source-size-bytes", type=int, required=True)
     if add_app_launcher_args is not None:
@@ -4267,6 +5024,14 @@ def _validate_runtime_output_paths(args_cli: argparse.Namespace) -> None:
         _require(not os.path.lexists(path), f"{field} already exists: {path}")
 
 
+def _validate_runtime_variant_args(args_cli: argparse.Namespace) -> None:
+    _selected_gripper_drive_profile(
+        args_cli.enable_gripper_velocity_limit_candidate,
+        args_cli.enable_gripper_follower_velocity_limit_candidate,
+        args_cli.enable_gripper_velocity_limit_identity_write_candidate,
+    )
+
+
 def _parse_runtime_args(argv: Sequence[str]) -> tuple[argparse.Namespace, Any]:
     from isaaclab.app import AppLauncher  # noqa: PLC0415
 
@@ -4275,6 +5040,7 @@ def _parse_runtime_args(argv: Sequence[str]) -> tuple[argparse.Namespace, Any]:
     args_cli.enable_cameras = True
     args_cli.headless = True
     _validate_runtime_output_paths(args_cli)
+    _validate_runtime_variant_args(args_cli)
     args_cli.diagnostic_source = capture_diagnostic_source(
         expected_sha256=args_cli.expected_source_sha256,
         expected_size_bytes=args_cli.expected_source_size_bytes,
@@ -4384,7 +5150,9 @@ def _child_runtime_main(argv: Sequence[str]) -> None:
                 payload,
                 expected_mode=args_cli.mode,
                 expected_gripper_drive_profile=_selected_gripper_drive_profile(
-                    args_cli.enable_gripper_velocity_limit_candidate
+                    args_cli.enable_gripper_velocity_limit_candidate,
+                    args_cli.enable_gripper_follower_velocity_limit_candidate,
+                    args_cli.enable_gripper_velocity_limit_identity_write_candidate,
                 ),
             )
             json_identity = publish_immutable_json(args_cli.output_json, payload)
@@ -4475,6 +5243,7 @@ def _parse_parent_runtime_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = build_runtime_parser()
     args_cli, _ = parser.parse_known_args(list(argv))
     _validate_runtime_output_paths(args_cli)
+    _validate_runtime_variant_args(args_cli)
     args_cli.diagnostic_source = capture_diagnostic_source(
         expected_sha256=args_cli.expected_source_sha256,
         expected_size_bytes=args_cli.expected_source_size_bytes,
