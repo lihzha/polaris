@@ -228,3 +228,32 @@ no GPU, simulator, Slurm, registry, deployment, or shared checkout was touched.
 - No corrected simulator, GPU, Slurm, evaluation, or other persistent job was
   launched from this implementation task. Relaunch is pending; no task-owned
   process or local artifact cleanup remains.
+
+## 2026-07-03 corrected L40S smoke and independent promotion audit
+
+- The clean pushed runtime head
+  `9098cac31713d5f9b3742de28f94402a92d0553f` was deployed detached and clean
+  on l401. The frozen wrapper SHA-256 was
+  `d756a0dabc78ec576c17b9f070c00b8d6814b91fcb767cae1965d30e80c07775`.
+- Slurm job `1098288` completed `0:0` on `pool0-00005` in 304 seconds. All 13
+  ordinary cases, the delayed close replay, and the adversarial case passed
+  (`15/15`). Immediate and delayed close each had exactly 37 slew-limited
+  writes and reached the endpoint on apply 38, with zero arm abort, fallback,
+  nonfinite, dropped-diagnostic, or post-clamp violation counters.
+- Maximum arm velocity/limit ratios were `0.028715338070707645` for immediate
+  close and `0.02872080468466036` for delayed close, far below the `0.95`
+  promotion threshold.
+- Immutable artifact SHA-256 values: raw
+  `553ba7301b91fb96a637a41c6acf7fb35f96de04b556fb91614c142753b04e20`;
+  ready `03dfdf2f11eecfd14414e96d8b3c45d243d9a149d8b6668af728946cda7b3ac1`;
+  attestation
+  `ecf7765db3c02d71d7c8f39193f7f467a7a4a16675d38d47a0916645d158d647`;
+  full log
+  `9590035422bd554c200fb22152bb559221f6396492db27a4f859510e0dc2d7ea`.
+- Independent post-run audit: **GO**, no P0/P1/P2. It reproduced the strict
+  closed-schema validator and durable metadata byte-for-byte, checked the
+  exact four-file mode-0444 result root, independently verified all cadence,
+  target-slew, headroom, and adversarial invariants, and rehashed the full
+  runtime image and relevant sources.
+- This promotes the standalone controller smoke only. Checkpoint/task behavior
+  remains pending an artifact-complete, video-inspected full-horizon canary.
