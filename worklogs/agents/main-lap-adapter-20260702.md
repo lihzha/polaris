@@ -322,3 +322,34 @@
   positive slew-event counters and a raw per-joint delta strictly above its
   configured slew bound. Probe-specific mutation tests cover both mismatch
   directions and every other rejected case.
+
+## 2026-07-02 — controller-safety v3 promotion evidence
+
+- Preflight-only job `1097684` failed before `srun` because it pinned the login
+  node's stale Vulkan ICD. It produced no raw, ready, attestation, controller,
+  or simulator evidence and is non-promotable. Replacement `1097716` pinned
+  the allocated L40S node's driver-580.105.08 ICD and completed job, batch,
+  extern, and `srun` with `0:0` in 4m39s.
+- All 13 ordered hold/±XYZ/±RXYZ cases passed with exactly 360 apply calls each;
+  maximum error was 0.538 mm / 0.218 degrees. The fresh-reset oversized +X
+  case passed with eight apply calls, eight slew events affecting 24 joints,
+  finite q/dq, maximum terminal |dq| 0.10463 rad/s, q inside the captured soft
+  limits, and zero abort, fallback, dropped-diagnostic, current-limit, or
+  post-clamp violations.
+- Immutable mode-0444 evidence is under
+  `results/polaris_eval/controller_safety_v3_smoke/c6939d7`: raw SHA-256
+  `545048264844c2d18d594f574b87073a0ab98071697c402993bd3915ad741890`,
+  ready-marker SHA-256
+  `5f5771d5ce8109392a4ee97c6921603dcd44718188a22a1f1a18de797ecd567a`,
+  final attestation SHA-256
+  `36fb7338c1d438bc9af34ef3bff2e983134b5ee1cae3f8e61b8707da365eb5c9`,
+  and saved/recovered sbatch SHA-256
+  `dd4cb04c5487125e1b8b4a448938b5fdad00d6c330f982ffb775486da80e85e7`.
+  Both finalize and verify passes agree on the attestation hash.
+- Independent strict parsing, typed attestation reconstruction, target-geometry
+  recomputation, counter/maxima audit, and little-endian float32 reconstruction
+  reproduced soft-limit digest
+  `fbf7535901c042fea5d901812ecd02c5fd81ade06c23c1499c32d66a859104de`.
+  This promotes the exact captured limits for EEF IK-safety v3 only; native
+  joint-position/pi05 semantics are unchanged. A full-horizon checkpoint
+  canary remains mandatory before any standard evaluation.
