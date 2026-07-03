@@ -12,6 +12,7 @@ import numpy as np
 from typing import Sequence
 
 from polaris.environments.robot_cfg import NVIDIA_DROID
+from polaris.pi05_droid_jointvelocity_contract import PANDA_ARM_JOINT_NAMES
 from polaris.robust_differential_ik import (
     RobustDifferentialInverseKinematicsActionCfg,
 )
@@ -285,6 +286,28 @@ class EefPoseActionCfg:
     )
 
 
+@configclass
+class DroidJointVelocityActionCfg:
+    """Native DROID velocity actions with no position integration or offset."""
+
+    arm = mdp.JointVelocityActionCfg(
+        asset_name="robot",
+        joint_names=list(PANDA_ARM_JOINT_NAMES),
+        preserve_order=True,
+        scale=1.0,
+        offset=0.0,
+        use_default_offset=False,
+        clip={joint_name: (-1.0, 1.0) for joint_name in PANDA_ARM_JOINT_NAMES},
+    )
+
+    finger_joint = BinaryJointPositionZeroToOneActionCfg(
+        asset_name="robot",
+        joint_names=["finger_joint"],
+        open_command_expr={"finger_joint": 0.0},
+        close_command_expr={"finger_joint": np.pi / 4},
+    )
+
+
 ### ActionCfg ###
 
 
@@ -308,6 +331,24 @@ def arm_joint_pos(
     ]
     joint_pos = robot.data.joint_pos[:, joint_indices]
     return joint_pos
+
+
+def _ordered_arm_joint_value(env: ManagerBasedRLEnv, attribute: str):
+    robot = env.scene["robot"]
+    joint_indices, joint_names = robot.find_joints(
+        list(PANDA_ARM_JOINT_NAMES), preserve_order=True
+    )
+    if tuple(joint_names) != PANDA_ARM_JOINT_NAMES:
+        raise ValueError(f"Live Panda joint order mismatch: {joint_names}")
+    return getattr(robot.data, attribute)[:, joint_indices]
+
+
+def ordered_arm_joint_pos(env: ManagerBasedRLEnv):
+    return _ordered_arm_joint_value(env, "joint_pos")
+
+
+def ordered_arm_joint_vel(env: ManagerBasedRLEnv):
+    return _ordered_arm_joint_value(env, "joint_vel")
 
 
 def gripper_pos(
@@ -360,6 +401,23 @@ class ObservationCfg:
         )
         eef_pos = ObsTerm(func=eef_pos)
         eef_quat = ObsTerm(func=eef_quat)
+
+        def __post_init__(self) -> None:
+            self.enable_corruption = False
+            self.concatenate_terms = False
+
+    policy: PolicyCfg = PolicyCfg()
+
+
+@configclass
+class DroidJointVelocityObservationCfg:
+    """Exact ordered state used by the official ``pi05_droid`` checkpoint."""
+
+    @configclass
+    class PolicyCfg(ObsGroup):
+        arm_joint_pos = ObsTerm(func=ordered_arm_joint_pos)
+        arm_joint_vel = ObsTerm(func=ordered_arm_joint_vel)
+        gripper_pos = ObsTerm(func=gripper_pos)
 
         def __post_init__(self) -> None:
             self.enable_corruption = False

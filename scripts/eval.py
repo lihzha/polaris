@@ -26,6 +26,18 @@ def main(eval_args: EvalArgs):
         and eval_args.control_mode != "joint-position"
     ):
         raise ValueError("DroidJointPos requires --control-mode joint-position")
+    if (
+        eval_args.policy.client == "DroidJointVelocity"
+        and eval_args.control_mode != "joint-velocity"
+    ):
+        raise ValueError("DroidJointVelocity requires --control-mode joint-velocity")
+    if (
+        eval_args.control_mode == "joint-velocity"
+        and eval_args.policy.client != "DroidJointVelocity"
+    ):
+        raise ValueError(
+            "joint-velocity control mode is reserved for DroidJointVelocity"
+        )
 
     # This must be done before importing anything from IsaacLab
     # Inside main function to avoid launching IsaacLab in global scope
@@ -42,11 +54,23 @@ def main(eval_args: EvalArgs):
     from polaris.environments.manager_based_rl_splat_environment import (
         ManagerBasedRLSplatEnv,
     )
-    from polaris.environments.droid_cfg import EefPoseActionCfg
+    from polaris.environments.droid_cfg import (
+        DroidJointVelocityActionCfg,
+        DroidJointVelocityObservationCfg,
+        EefPoseActionCfg,
+    )
+    from polaris.environments.robot_cfg import NVIDIA_DROID_JOINT_VELOCITY
+    from polaris.joint_velocity_runtime import (
+        print_joint_velocity_runtime,
+        validate_joint_velocity_runtime,
+    )
     from polaris.utils import load_eval_initial_conditions
     from polaris.policy import InferenceClient
     from polaris.policy.droid_jointpos_client import (
         JointPositionObservationNumericalError,
+    )
+    from polaris.policy.droid_jointvelocity_client import (
+        JointVelocityObservationNumericalError,
     )
     from polaris.robust_differential_ik import DifferentialIKNumericalError
     # from real2simeval.autoscoring import TASK_TO_SUCCESS_CHECKER
@@ -61,11 +85,17 @@ def main(eval_args: EvalArgs):
         # Action managers are constructed by gym.make, so select the controller
         # on the config before creating the environment.
         env_cfg.actions = EefPoseActionCfg()
+    elif eval_args.control_mode == "joint-velocity":
+        env_cfg.scene.robot = NVIDIA_DROID_JOINT_VELOCITY.copy()
+        env_cfg.actions = DroidJointVelocityActionCfg()
+        env_cfg.observations = DroidJointVelocityObservationCfg()
     elif eval_args.control_mode != "joint-position":
         raise ValueError(f"Unsupported control mode: {eval_args.control_mode}")
     env: ManagerBasedRLSplatEnv = gym.make(  # type: ignore[assignment]
         eval_args.environment, cfg=env_cfg
     )
+    if eval_args.control_mode == "joint-velocity":
+        print_joint_velocity_runtime(validate_joint_velocity_runtime(env))
 
     default_instruction, initial_conditions = load_eval_initial_conditions(
         usd=env.usd_file,
@@ -124,7 +154,10 @@ def main(eval_args: EvalArgs):
                 action, viz = policy_client.infer(
                     obs, language_instruction, return_viz=True
                 )
-            except JointPositionObservationNumericalError as error:
+            except (
+                JointPositionObservationNumericalError,
+                JointVelocityObservationNumericalError,
+            ) as error:
                 numerical_failure_reason = f"{type(error).__name__}: {error}"
                 print(
                     f"Numerical failure in episode {episode} before action "
@@ -150,6 +183,8 @@ def main(eval_args: EvalArgs):
                 # attempted action, so include it in the episode length.
                 bar.update(1)
                 break
+            if eval_args.control_mode == "joint-velocity":
+                policy_client.record_execution(obs, env)
             bar.update(1)
             if term[0] or trunc[0]:
                 break

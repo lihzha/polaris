@@ -5,6 +5,10 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
 
 from polaris.utils import DATA_PATH
+from polaris.pi05_droid_jointvelocity_contract import (
+    PANDA_ARM_VELOCITY_DRIVE_DAMPING,
+    PANDA_ARM_VELOCITY_DRIVE_STIFFNESS,
+)
 
 NVIDIA_DROID = ArticulationCfg(
     prim_path="{ENV_REGEX_NS}/robot",
@@ -63,3 +67,36 @@ NVIDIA_DROID = ArticulationCfg(
         ),
     },
 )
+
+
+def make_nvidia_droid_joint_velocity_cfg() -> ArticulationCfg:
+    """Return the profile-local Panda velocity-drive articulation config.
+
+    The upstream robot uses a position PD drive (stiffness 400).  A velocity
+    target sent into that drive would still be pulled toward the stale
+    position target.  The native DROID profile therefore has a private robot
+    config with explicit zero position stiffness, nonzero velocity damping,
+    and solver-enforced effort/velocity limits.  The shared joint-position and
+    EEF ``NVIDIA_DROID`` object is not mutated.
+    """
+
+    config = NVIDIA_DROID.copy()
+    config.actuators = dict(config.actuators)
+    config.actuators["panda_shoulder"] = ImplicitActuatorCfg(
+        joint_names_expr=["panda_joint[1-4]"],
+        effort_limit_sim=87.0,
+        velocity_limit_sim=2.175,
+        stiffness=PANDA_ARM_VELOCITY_DRIVE_STIFFNESS,
+        damping=PANDA_ARM_VELOCITY_DRIVE_DAMPING,
+    )
+    config.actuators["panda_forearm"] = ImplicitActuatorCfg(
+        joint_names_expr=["panda_joint[5-7]"],
+        effort_limit_sim=12.0,
+        velocity_limit_sim=2.61,
+        stiffness=PANDA_ARM_VELOCITY_DRIVE_STIFFNESS,
+        damping=PANDA_ARM_VELOCITY_DRIVE_DAMPING,
+    )
+    return config
+
+
+NVIDIA_DROID_JOINT_VELOCITY = make_nvidia_droid_joint_velocity_cfg()
