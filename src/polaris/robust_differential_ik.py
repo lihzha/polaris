@@ -206,10 +206,18 @@ def _install_eef_physx_position_limits(
         field="EEF PhysX-derived soft joint position limits",
     )
     prewrite_hard_limits = asset.data.joint_pos_limits[:, joint_ids, :].clone()
-    if not torch.equal(prewrite_hard_limits, outer_limits):
+    _require_finite(
+        prewrite_hard_limits,
+        field="pre-install EEF PhysX hard joint position limits",
+    )
+    prewrite_derived_soft_limits = _derive_isaac_soft_joint_position_limits(
+        prewrite_hard_limits,
+        soft_limit_factor=soft_limit_factor,
+    )
+    if not torch.equal(prewrite_derived_soft_limits, outer_limits):
         raise ValueError(
-            "PolaRiS EEF live hard and soft joint limits disagree before the "
-            "inner PhysX envelope is installed"
+            "PolaRiS EEF pre-install hard limits do not derive to the captured "
+            "outer soft envelope"
         )
     asset.write_joint_position_limit_to_sim(
         inner_limits,

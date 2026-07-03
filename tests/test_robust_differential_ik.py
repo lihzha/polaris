@@ -226,11 +226,14 @@ class _LimitAsset:
     device = "cpu"
     cfg = _LimitCfg()
 
-    def __init__(self, limits, *, corrupt_physx=False, corrupt_soft=False):
+    def __init__(self, hard_limits, *, corrupt_physx=False, corrupt_soft=False):
         self.data = _LimitData()
-        self.data.joint_pos_limits = limits.clone()
-        self.data.soft_joint_pos_limits = limits.clone()
-        self.root_physx_view = _LimitRootView(limits.clone())
+        self.data.joint_pos_limits = hard_limits.clone()
+        self.data.soft_joint_pos_limits = _derive_isaac_soft_joint_position_limits(
+            hard_limits,
+            soft_limit_factor=self.cfg.soft_joint_pos_limit_factor,
+        )
+        self.root_physx_view = _LimitRootView(hard_limits.clone())
         self.write_count = 0
         self.corrupt_physx = corrupt_physx
         self.corrupt_soft = corrupt_soft
@@ -264,16 +267,40 @@ class _LimitAsset:
 
 
 def _canonical_limit_inputs():
+    prewrite_hard = torch.tensor(
+        [
+            [
+                [-2.8973, 2.8973],
+                [-1.7628, 1.7628],
+                [-2.8973, 2.8973],
+                [-3.0718, -0.0698],
+                [-2.8973, 2.8973],
+                [-0.0175, 3.7525],
+                [-2.8973, 2.8973],
+            ]
+        ],
+        dtype=torch.float32,
+    )
     outer = torch.tensor([PANDA_SOFT_JOINT_POS_LIMITS_RAD], dtype=torch.float32)
+    assert not torch.equal(prewrite_hard, outer)
+    assert prewrite_hard[0, 3, 1] != outer[0, 3, 1]
+    assert prewrite_hard[0, 5, 0] != outer[0, 5, 0]
+    assert torch.equal(
+        _derive_isaac_soft_joint_position_limits(
+            prewrite_hard,
+            soft_limit_factor=1.0,
+        ),
+        outer,
+    )
     max_delta = torch.tensor(
         [PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S], dtype=torch.float32
     ) * torch.tensor(1.0 / 120.0, dtype=torch.float32)
-    return outer, max_delta
+    return prewrite_hard, outer, max_delta
 
 
 def test_eef_physx_inner_limits_are_written_once_and_read_back_exactly():
-    outer, max_delta = _canonical_limit_inputs()
-    asset = _LimitAsset(outer)
+    prewrite_hard, outer, max_delta = _canonical_limit_inputs()
+    asset = _LimitAsset(prewrite_hard)
 
     inner, derived_soft = _install_eef_physx_position_limits(
         asset,
@@ -317,10 +344,10 @@ def test_eef_physx_inner_limits_are_written_once_and_read_back_exactly():
     ],
 )
 def test_eef_physx_limit_install_rejects_readback_mutation(asset_kwargs, match):
-    outer, max_delta = _canonical_limit_inputs()
+    prewrite_hard, outer, max_delta = _canonical_limit_inputs()
     with pytest.raises(ValueError, match=match):
         _install_eef_physx_position_limits(
-            _LimitAsset(outer, **asset_kwargs),
+            _LimitAsset(prewrite_hard, **asset_kwargs),
             joint_ids=list(range(7)),
             outer_limits=outer,
             max_delta_joint_pos=max_delta,
@@ -329,10 +356,10 @@ def test_eef_physx_limit_install_rejects_readback_mutation(asset_kwargs, match):
 
 
 def test_eef_physx_limit_install_rejects_prewrite_outer_identity_drift():
-    outer, max_delta = _canonical_limit_inputs()
-    asset = _LimitAsset(outer)
+    prewrite_hard, outer, max_delta = _canonical_limit_inputs()
+    asset = _LimitAsset(prewrite_hard)
     asset.data.joint_pos_limits[0, 0, 0] += 1e-3
-    with pytest.raises(ValueError, match="live hard and soft joint limits disagree"):
+    with pytest.raises(ValueError, match="do not derive to the captured outer"):
         _install_eef_physx_position_limits(
             asset,
             joint_ids=list(range(7)),
@@ -343,8 +370,8 @@ def test_eef_physx_limit_install_rejects_prewrite_outer_identity_drift():
 
 
 def test_safety_report_rejects_live_velocity_target_mutation():
-    outer, max_delta = _canonical_limit_inputs()
-    asset = _LimitAsset(outer)
+    prewrite_hard, outer, max_delta = _canonical_limit_inputs()
+    asset = _LimitAsset(prewrite_hard)
     hard, derived_soft = _install_eef_physx_position_limits(
         asset,
         joint_ids=list(range(7)),
