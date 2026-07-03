@@ -175,3 +175,101 @@
 - No further job has been launched. The alias fix remains an uncommitted
   candidate at base commit
   `46e5eec62e66b45f04943c84d8fa5eb3dd71a4db`, pending main-agent review.
+
+## 2026-07-03 — completed controller-only smoke 1098174
+
+- The reviewed alias fix was committed as
+  `90d56b3b8d0a93ad7c48319a377d325790b89144`, tree
+  `e6f27fb6c6da31f96b296417cd98ebc3be0c8775`, and pushed to
+  `lihzha/codex/pi05-droid-native-jointvelocity-v1-20260703` before launch.
+  Its six reviewed file hashes matched the frozen candidate.
+- Launch source was a new full standalone clone declared at
+  `/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-pi05-jv-90d56b3b8d0a-standalone-v3`
+  and resolved at
+  `/lustre/fs11/portfolios/nvr/projects/nvr_lpr_rvp/users/lzha/src/PolaRiS-pi05-jv-90d56b3b8d0a-standalone-v3`.
+  It had a real in-root `.git` directory, no alternates, detached `HEAD`, a
+  clean tracked/untracked status, and OpenPI initialized over HTTPS at
+  `bd70b8f4011e85b3f3b0f039f12113f78718e7bf`. GLM and OpenPI's unrelated
+  nested submodules remained uninitialized.
+- The committed public submitter launched Slurm job `1098174` with namespace
+  `90d56b3b8d0a-controller-only-v3`. It completed `0:0` in 3m17s on one
+  NVIDIA L40S at `pool0-00005`; the container step completed `0:0` in 2m58s
+  with maximum RSS 31,054,664 KiB. The full 15,992-byte mode-`0644`, one-link
+  log has SHA-256
+  `857fba68ad5cec4c033fc0759086eb5e813ce3d9d2d877e82737ed40b4dc8a5e`
+  at
+  `/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris-pi05-jointvelocity/controller-v3-90d56b3b8d0a/pi05_jv_ctrl_smoke-1098174.out`.
+  No traceback, finalization error, child failure, or nonzero-srun marker was
+  present.
+- The strict finalizer published and live-reverified the 13,947-byte
+  mode-`0444`, one-link controller-only completion with SHA-256
+  `05403d0aabf3ebc8111cecf64d33f56f50a3a5673e7a84653ae096e7f4027ad3`.
+  The remaining immutable one-link artifacts are: parent-published smoke,
+  28,042 bytes, SHA-256
+  `ef046c07e844ec15accf8cacc0178c67d587ee497047b416e575464054f2c611`;
+  child raw capture, 27,276 bytes, SHA-256
+  `c1e119b1ef5e3341d6d392a98f04248f6eb5eeacf26742bdaed04bf96e494f66`;
+  ready marker, 410 bytes, SHA-256
+  `5e8897bc67fef727f399ca8b15f3575de1939409f0a69e5b99b6aa00083ad5b4`;
+  zero-exit srun status, 38 bytes, SHA-256
+  `ece5d9dfa33e3dc4d23de0680407585bb8010e954a194a6c9b376703b41eb765`;
+  GPU inventory, 66 bytes, SHA-256
+  `52a36f3a1122d8813c9b9e279c4c1e681aa9db3fd3f74292937c07a73712e9d0`;
+  saved sbatch, 9,643 bytes, SHA-256
+  `5d257bc2df44446307f9c07da5e1a51084930c554b7d9abdaa2445222fc4c482`;
+  and submission record, 1,629 bytes, SHA-256
+  `7d050bf80b413b0546971dab42d20315bd71f9c863268578bc09b16c7df1fb00`.
+- Every completion path retained its normalized `/lustre/fsw/...` declared
+  spelling and separately recorded its `/lustre/fs11/...` resolved spelling.
+  Smoke, raw, ready, status, GPU, saved-sbatch, and image bindings reported
+  alias equivalence, producer/host spelling agreement, and the exact device
+  and inode. Source, data root, every asset and metadata file, run directory,
+  and submission record also retained declared/resolved paths. Live
+  re-verification reproduced the completion hash.
+- Runtime provenance pinned image SHA-256
+  `ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d556b324a`,
+  PolaRiS-Hub revision `8c7e4103e266ef83d8b1ad2e9a63116edd5f155b`,
+  FoodBussing initial-condition SHA-256
+  `40091faee14f692350220871d30705294f21f17ae3d2974cd3c09a34d560f5de`,
+  scene SHA-256
+  `82cd641e422935b394ce7ea7b6be55214c9952a2544000222921e544c409b489`,
+  and DROID USD SHA-256
+  `d8379925b103963dbf3e7c85bcc4ae101b81b7c1d7dabe7d2e964f41d069ec44`.
+- All 20 controller cases passed: hold remained zero; every signed
+  `panda_joint1..7` command produced the requested position and measured-
+  velocity direction near 0.25 rad/s; positive limit-case velocities ranged
+  from 0.9656 to 1.0133 rad/s and negative limit-case velocities from -1.0065
+  to -0.9896 rad/s; action processing exactly matched articulation velocity
+  targets. Gripper open and boundary `0.5` produced target `0`, closed `1.0`
+  produced float32 pi/4, and reset exactly restored default position, zero
+  velocity, and zero velocity target. Arm/gripper action and buffered drive
+  tensors were float32 on `cuda:0`; direct PhysX arm-drive evidence was
+  float32 on CPU. Runtime SHA-256 was
+  `495ce92226ad0d1840138fc2b315fc2531d0ff50953fb16d70172080a8ee0b71`.
+  Lifecycle evidence records completed `env.close()`, immediate
+  `SimulationApp.close()` invocation, zero child exit, parent publication, and
+  no failure sidecar.
+- The job-specific cache contained 30,703,440 bytes, 74 files, 46 directories,
+  and a zero-byte `ov/_cache.lock`. After terminal artifact inspection it was
+  removed, and absence was verified through both `/lustre/fsw` and
+  `/lustre/fs11` spellings.
+
+## Remaining gripper simulation-limit gate
+
+- The successful gate validates the existing native arm velocity drive and
+  binary gripper command/target contract. It does not establish a physical
+  gripper slew limit: `NVIDIA_DROID_JOINT_VELOCITY` copies `NVIDIA_DROID` and
+  replaces only the two Panda arm actuators, so it inherits the gripper's
+  legacy `ImplicitActuatorCfg(velocity_limit=5.0)`. The job's live Isaac Lab
+  warning states that this legacy field is ignored; the runtime attestation
+  currently contains gripper command/action tensors but no gripper PhysX
+  max-velocity or measured-slew evidence.
+- This is therefore not EEF-only. It affects the same simulated gripper used
+  by native joint-velocity evaluation. Job `1098174` remains valid within its
+  explicitly attested controller-only scope, but authoritative native full
+  checkpoint evaluation should remain blocked until the gripper uses and
+  attests the intended simulation-side limit (and the legacy effort-limit
+  path is audited), gripper slew is covered by the smoke, and the native
+  controller gate is rerun. An EEF-only canary cannot independently qualify
+  the native action mode or its changed source.
+- No model, checkpoint canary, or full checkpoint evaluation was launched.
