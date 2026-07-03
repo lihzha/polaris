@@ -133,6 +133,31 @@ def _require_live_recorded_identity(recorded: Any, *, field: str) -> dict[str, A
     return current
 
 
+def _require_same_production_eval_evidence(
+    recorded: Any, current: dict[str, Any]
+) -> None:
+    """Require exact evidence except for proven aliases of its three files."""
+
+    _require(isinstance(recorded, dict), "production eval evidence")
+    _same_core_identity(recorded, current, field="production eval source")
+    normalized = dict(current)
+    normalized["path"] = recorded.get("path")
+    for name in ("policy_config_source", "lap_client_source"):
+        recorded_source = recorded.get(name)
+        current_source = current.get(name)
+        _require(
+            isinstance(recorded_source, dict) and isinstance(current_source, dict),
+            f"production eval {name}",
+        )
+        _same_core_identity(
+            recorded_source,
+            current_source,
+            field=f"production eval {name}",
+        )
+        normalized[name] = {**current_source, "path": recorded_source.get("path")}
+    _require(recorded == normalized, "production reset/render source evidence changed")
+
+
 def _validate_live_assets(raw: dict[str, Any]) -> dict[str, Any]:
     assets = raw["assets"]
     scene = assets["scene"]
@@ -297,13 +322,7 @@ def build_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "finalizer": _identity(Path(__file__).resolve(), field="Gate 0 finalizer"),
     }
     production_eval = replay.validate_production_reset_source()
-    _same_core_identity(
-        raw["production_eval"], production_eval, field="production eval source"
-    )
-    _require(
-        raw["production_eval"] == production_eval,
-        "production reset/render source evidence changed",
-    )
+    _require_same_production_eval_evidence(raw["production_eval"], production_eval)
     sources["production_eval"] = production_eval
     _require(
         Path(replay.__file__).resolve() == Path(sources["runner"]["path"]),

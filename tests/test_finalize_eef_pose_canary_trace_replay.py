@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 from pathlib import Path
 import subprocess
@@ -274,3 +275,30 @@ def test_status_writer_accepts_publisher_visible_parent_alias(
         )
     )
     assert status["raw_result"]["path"] == str(alias_raw_path)
+
+
+def test_production_eval_evidence_allows_only_same_inode_path_aliases(
+    tmp_path: Path,
+) -> None:
+    current = replay.validate_production_reset_source()
+    repo = Path(__file__).resolve().parents[1]
+    alias_repo = tmp_path / "publisher-repo"
+    alias_repo.symlink_to(repo, target_is_directory=True)
+    recorded = copy.deepcopy(current)
+    for source in (
+        recorded,
+        recorded["policy_config_source"],
+        recorded["lap_client_source"],
+    ):
+        source_path = Path(source["path"])
+        source["path"] = str(alias_repo / source_path.relative_to(repo))
+
+    finalizer._require_same_production_eval_evidence(recorded, current)
+
+    tampered = copy.deepcopy(recorded)
+    tampered["effective_step_expensive"] = False
+    with pytest.raises(
+        finalizer.Gate0FinalizationError,
+        match="production reset/render source evidence changed",
+    ):
+        finalizer._require_same_production_eval_evidence(tampered, current)
