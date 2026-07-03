@@ -21,6 +21,7 @@ CONTROLLER_PROFILE = "openpi_pi05_droid_native_jointvelocity_v1"
 ISAACLAB_SOURCES = {
     "actions_cfg.py": "94722a5c0d6da3639b5507130d1ec2e7f62d7490e4625d4bf30ada8691ef63d4",
     "joint_actions.py": "1b3dcb55d969d886cee500e660f12331e49f8638fec98cde30d2b818a1ca1692",
+    "binary_joint_actions.py": "84bf343dc4a609d2327f1ee8b965439f49f3167f9a45f652e9aa6b652c9c0630",
     "actuator_cfg.py": "3963167d6678c6f052d87202678822d80a98b0b0f3492b859774768b1bd80520",
     "actuator_pd.py": "1d2a9b80812714f5aade3ed7bbb7c74a403ab718868aa73d187eb77173695beb",
     "articulation.py": "9cc03b85642c36c801ff9683e94b8ccc3fbef1178761338974b433dacc78ef75",
@@ -106,8 +107,66 @@ def _regular_file(path: Path, field: str, *, mode: int | None = None) -> os.stat
 
 
 def _read_canonical_json(path: Path, field: str, *, mode: int = 0o444):
-    file_stat = _regular_file(path, field, mode=mode)
-    payload = Path(path).read_bytes()
+    path = Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"{field} must be one readable regular file") from error
+    try:
+        file_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or file_stat.st_nlink != 1
+            or stat.S_IMODE(file_stat.st_mode) != mode
+        ):
+            raise ValueError(f"{field} must be one mode-{mode:04o} regular link")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    current = os.stat(path, follow_symlinks=False)
+    identity = (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_size,
+        file_stat.st_mode,
+        file_stat.st_nlink,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+    if (
+        identity
+        != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mode,
+            after.st_nlink,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        or identity
+        != (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_mode,
+            current.st_nlink,
+            current.st_mtime_ns,
+            current.st_ctime_ns,
+        )
+        or not stat.S_ISREG(current.st_mode)
+        or current.st_nlink != 1
+        or stat.S_IMODE(current.st_mode) != mode
+    ):
+        raise ValueError(f"{field} changed while it was being read")
     try:
         value = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -152,7 +211,12 @@ def _flatten_shape(value: Any, shape: tuple[int, ...], field: str) -> list[float
 
 
 def _validate_array(
-    report: Any, shape: tuple[int, ...], expected: list[float], field: str
+    report: Any,
+    shape: tuple[int, ...],
+    expected: list[float],
+    field: str,
+    *,
+    device: str,
 ) -> None:
     if not isinstance(report, dict) or set(report) != {
         "shape",
@@ -163,8 +227,8 @@ def _validate_array(
         raise ValueError(f"{field} array schema mismatch")
     if report["shape"] != list(shape):
         raise ValueError(f"{field} shape mismatch")
-    if report["dtype"] != "torch.float32" or report["device"] != "cuda:0":
-        raise ValueError(f"{field} must be a cuda:0 torch.float32 tensor")
+    if report["dtype"] != "torch.float32" or report["device"] != device:
+        raise ValueError(f"{field} must be a {device} torch.float32 tensor")
     values = _flatten_shape(report["values"], shape, field)
     if values != expected:
         raise ValueError(f"{field} values mismatch")
@@ -188,6 +252,7 @@ def _validate_runtime(report: Any) -> dict[str, Any]:
         "offset",
         "use_default_offset",
         "clip",
+        "action_buffers",
         "position_integration",
         "velocity_drive",
         "gripper",
@@ -233,7 +298,22 @@ def _validate_runtime(report: Any) -> dict[str, Any]:
         (1, 7, 2),
         [-1.0, 1.0] * 7,
         "action clip",
+        device="cuda:0",
     )
+    action_buffers = report["action_buffers"]
+    if not isinstance(action_buffers, dict) or set(action_buffers) != {
+        "raw_action",
+        "processed_action",
+    }:
+        raise ValueError("Runtime arm action-buffer schema mismatch")
+    for name in ("raw_action", "processed_action"):
+        _validate_array(
+            action_buffers[name],
+            (1, 7),
+            [0.0] * 7,
+            f"arm {name}",
+            device="cuda:0",
+        )
     drive = report["velocity_drive"]
     if not isinstance(drive, dict) or set(drive) != {
         "position_stiffness",
@@ -258,11 +338,17 @@ def _validate_runtime(report: Any) -> dict[str, Any]:
         "effort_limit": ((1, 7), EFFORT_LIMITS),
         "velocity_limit": ((1, 7), FLOAT32_VELOCITY_LIMITS),
     }
-    for surface in ("buffered", "direct_physx"):
+    for surface, device in (("buffered", "cuda:0"), ("direct_physx", "cpu")):
         if not isinstance(drive[surface], dict) or set(drive[surface]) != set(arrays):
             raise ValueError(f"Runtime {surface} schema mismatch")
         for name, (shape, values) in arrays.items():
-            _validate_array(drive[surface][name], shape, values, f"{surface} {name}")
+            _validate_array(
+                drive[surface][name],
+                shape,
+                values,
+                f"{surface} {name}",
+                device=device,
+            )
     gripper = report["gripper"]
     if not isinstance(gripper, dict) or set(gripper) != {
         "action_class",
@@ -270,6 +356,8 @@ def _validate_runtime(report: Any) -> dict[str, Any]:
         "threshold",
         "open_command",
         "closed_command",
+        "raw_action",
+        "processed_action",
     }:
         raise ValueError("Runtime gripper schema mismatch")
     if gripper["action_class"] != (
@@ -280,13 +368,28 @@ def _validate_runtime(report: Any) -> dict[str, Any]:
         raise ValueError("Runtime gripper joint mismatch")
     if gripper["threshold"] != "closed_if_gt_0p5_else_open":
         raise ValueError("Runtime gripper threshold mismatch")
-    _validate_array(gripper["open_command"], (1, 1), [0.0], "gripper open")
+    _validate_array(
+        gripper["open_command"],
+        (1,),
+        [0.0],
+        "gripper open",
+        device="cuda:0",
+    )
     _validate_array(
         gripper["closed_command"],
-        (1, 1),
+        (1,),
         [FLOAT32_PI_OVER_4],
         "gripper closed",
+        device="cuda:0",
     )
+    for name in ("raw_action", "processed_action"):
+        _validate_array(
+            gripper[name],
+            (1, 1),
+            [0.0],
+            f"gripper {name}",
+            device="cuda:0",
+        )
     return report
 
 
@@ -376,7 +479,7 @@ def _validate_smoke(payload: Any) -> dict[str, Any]:
             raise ValueError(f"Smoke result {key} mismatch")
     if payload["lifecycle"] != {
         "env_close": "complete",
-        "simulation_app_close": "complete",
+        "simulation_app_close": "invoked_then_child_exited_zero",
         "capture_stage": "stdlib_parent_after_kit_child_exit",
     }:
         raise ValueError("Smoke lifecycle is not close-complete")
@@ -388,6 +491,10 @@ def _validate_smoke(payload: Any) -> dict[str, Any]:
         "child_capture_size",
         "child_capture_mode",
         "child_capture_path",
+        "child_ready_marker_sha256",
+        "child_ready_marker_size",
+        "child_ready_marker_mode",
+        "child_ready_marker_path",
     }:
         raise ValueError("Smoke parent completion schema mismatch")
     if (
@@ -402,9 +509,20 @@ def _validate_smoke(payload: Any) -> dict[str, Any]:
         )
         or type(completion["child_capture_size"]) is not int
         or completion["child_capture_size"] <= 0
-        or completion["child_capture_mode"] != "0400"
+        or completion["child_capture_mode"] != "0444"
         or not isinstance(completion["child_capture_path"], str)
         or not Path(completion["child_capture_path"]).is_absolute()
+        or not isinstance(completion["child_ready_marker_sha256"], str)
+        or len(completion["child_ready_marker_sha256"]) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in completion["child_ready_marker_sha256"]
+        )
+        or type(completion["child_ready_marker_size"]) is not int
+        or completion["child_ready_marker_size"] <= 0
+        or completion["child_ready_marker_mode"] != "0444"
+        or not isinstance(completion["child_ready_marker_path"], str)
+        or not Path(completion["child_ready_marker_path"]).is_absolute()
     ):
         raise ValueError("Smoke parent completion mismatch")
     _validate_runtime(payload["runtime_contract"])
@@ -497,11 +615,46 @@ def _source_provenance(repository: Path, expected_commit: str) -> dict[str, Any]
     if repository.is_symlink():
         raise ValueError("PolaRiS repository path must not be a symlink")
     repository = repository.resolve()
+    git_metadata = repository / ".git"
+    if git_metadata.is_symlink() or not git_metadata.is_dir():
+        raise ValueError(
+            "PolaRiS repository must be a standalone clone with an in-root .git directory"
+        )
+    expected_git_directory = git_metadata.resolve()
+    if expected_git_directory != git_metadata:
+        raise ValueError(
+            "PolaRiS .git directory must resolve inside the repository root"
+        )
     top_level = Path(
         _git(repository, "rev-parse", "--show-toplevel").decode().strip()
     ).resolve()
     if top_level != repository:
         raise ValueError("PolaRiS repository path is not the exact Git root")
+    git_directory = Path(
+        _git(repository, "rev-parse", "--absolute-git-dir").decode().strip()
+    ).resolve()
+    common_directory = Path(
+        _git(
+            repository,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        )
+        .decode()
+        .strip()
+    ).resolve()
+    if (
+        git_directory != expected_git_directory
+        or common_directory != expected_git_directory
+    ):
+        raise ValueError(
+            "PolaRiS Git directory and common directory must both be the in-root .git directory"
+        )
+    head_reference = (
+        _git(repository, "rev-parse", "--abbrev-ref", "HEAD").decode().strip()
+    )
+    if head_reference != "HEAD":
+        raise ValueError("PolaRiS repository must be checked out at a detached HEAD")
     head = _git(repository, "rev-parse", "HEAD").decode().strip()
     if head != expected_commit:
         raise ValueError("PolaRiS commit mismatch")
@@ -521,6 +674,11 @@ def _source_provenance(repository: Path, expected_commit: str) -> dict[str, Any]
         }
     return {
         "repository": str(repository),
+        "git_directory": str(git_directory),
+        "git_common_directory": str(common_directory),
+        "standalone_git_directory": True,
+        "head_reference": "HEAD",
+        "detached_head": True,
         "commit": head,
         "tracked_and_untracked_clean": True,
         "files": files,
@@ -584,12 +742,38 @@ def _build_attestation(args: argparse.Namespace) -> dict[str, Any]:
     expected_child_path = args.smoke_artifact.with_name(
         args.smoke_artifact.name + ".child-close.json"
     ).resolve()
-    completion_evidence = smoke["completion"]
-    if Path(completion_evidence["child_capture_path"]).resolve() != expected_child_path:
-        raise ValueError("Smoke child-capture path mismatch")
-    child, child_bytes, child_stat = _read_canonical_json(
-        expected_child_path, "child close capture", mode=0o400
+    expected_ready_path = expected_child_path.with_name(
+        expected_child_path.name + ".ready.json"
+    ).resolve()
+    expected_failure_path = expected_child_path.with_name(
+        expected_child_path.name + ".failure.json"
     )
+    if expected_failure_path.exists() or expected_failure_path.is_symlink():
+        raise ValueError("Smoke child failure status exists beside a pass artifact")
+    completion_evidence = smoke["completion"]
+    if completion_evidence["child_capture_path"] != str(expected_child_path):
+        raise ValueError("Smoke child-capture path mismatch")
+    _, child_bytes, child_stat = _read_canonical_json(
+        expected_child_path, "child close capture", mode=0o444
+    )
+    if completion_evidence["child_ready_marker_path"] != str(expected_ready_path):
+        raise ValueError("Smoke child-ready-marker path mismatch")
+    _, ready_bytes, ready_stat = _read_canonical_json(
+        expected_ready_path, "child ready marker", mode=0o444
+    )
+    expected_ready = {
+        "schema_version": 1,
+        "status": "success",
+        "stage": "kit_child_after_env_close_before_simulation_app_close",
+        "raw_result": {
+            "path": str(expected_child_path),
+            "size_bytes": len(child_bytes),
+            "sha256": _sha256_bytes(child_bytes),
+            "mode": "0444",
+        },
+    }
+    if ready_bytes != _canonical_json(expected_ready, newline=True):
+        raise ValueError("Child ready marker does not bind exact child capture")
     expected_child = dict(smoke)
     expected_child.pop("completion")
     expected_child["status"] = "close_validated_pending_parent"
@@ -598,14 +782,20 @@ def _build_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "simulation_app_close": "pending_child_exit",
         "capture_stage": "kit_child_after_env_close_before_simulation_app_close",
     }
-    if child != expected_child:
+    if child_bytes != _canonical_json(expected_child, newline=True):
         raise ValueError("Child close capture differs from promoted smoke evidence")
     if (
         completion_evidence["child_capture_sha256"] != _sha256_bytes(child_bytes)
         or completion_evidence["child_capture_size"] != len(child_bytes)
-        or completion_evidence["child_capture_mode"] != "0400"
+        or completion_evidence["child_capture_mode"] != "0444"
     ):
         raise ValueError("Smoke completion does not bind exact child capture")
+    if (
+        completion_evidence["child_ready_marker_sha256"] != _sha256_bytes(ready_bytes)
+        or completion_evidence["child_ready_marker_size"] != len(ready_bytes)
+        or completion_evidence["child_ready_marker_mode"] != "0444"
+    ):
+        raise ValueError("Smoke completion does not bind exact child ready marker")
 
     status, status_bytes, _ = _read_canonical_json(args.srun_status, "srun status")
     if (
@@ -695,8 +885,15 @@ def _build_attestation(args: argparse.Namespace) -> dict[str, Any]:
                 "path": str(expected_child_path),
                 "size": child_stat.st_size,
                 "sha256": _sha256_bytes(child_bytes),
-                "mode": "0400",
+                "mode": "0444",
                 "status": "close_validated_pending_parent",
+            },
+            "child_ready_marker": {
+                "path": str(expected_ready_path),
+                "size": ready_stat.st_size,
+                "sha256": _sha256_bytes(ready_bytes),
+                "mode": "0444",
+                "status": "success",
             },
         },
         "runtime_contract": smoke["runtime_contract"],

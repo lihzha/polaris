@@ -7,13 +7,16 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
+import traceback
 from pathlib import Path
+from typing import NoReturn
 
 
-def _write_child_capture(path: Path, payload: dict) -> None:
-    rendered = (
+def _canonical_json(payload: dict) -> bytes:
+    return (
         json.dumps(
             payload,
             sort_keys=True,
@@ -23,13 +26,19 @@ def _write_child_capture(path: Path, payload: dict) -> None:
         ).encode("ascii")
         + b"\n"
     )
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+
+
+def _write_immutable_json(path: Path, payload: dict) -> bytes:
+    """Publish one canonical, fsynced, non-overwriting mode-0444 JSON file."""
+
+    rendered = _canonical_json(payload)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
     try:
         with os.fdopen(descriptor, "wb", closefd=False) as output:
             output.write(rendered)
             output.flush()
             os.fsync(output.fileno())
-        os.fchmod(descriptor, 0o400)
+        os.fchmod(descriptor, 0o444)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -38,57 +47,204 @@ def _write_child_capture(path: Path, payload: dict) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
+    return rendered
 
 
-def _close_kit_resources(env, simulation_app) -> None:
-    """Attempt Kit close even when environment close fails."""
+def _read_immutable_json(path: Path, field: str) -> tuple[dict, bytes, os.stat_result]:
+    """Read one exact immutable inode without following or racing a replacement."""
+
+    path = Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"{field} is not one readable regular file") from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o444
+        ):
+            raise ValueError(f"{field} must be one mode-0444 regular link")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        rendered = b"".join(chunks)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    current = os.stat(path, follow_symlinks=False)
+    stable_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mode,
+        before.st_nlink,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    if (
+        stable_identity
+        != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mode,
+            after.st_nlink,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        or stable_identity
+        != (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_mode,
+            current.st_nlink,
+            current.st_mtime_ns,
+            current.st_ctime_ns,
+        )
+        or not stat.S_ISREG(current.st_mode)
+        or stat.S_IMODE(current.st_mode) != 0o444
+        or current.st_nlink != 1
+    ):
+        raise ValueError(f"{field} changed while it was being read")
+    try:
+        value = json.loads(rendered)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{field} is not strict JSON") from error
+    if not isinstance(value, dict) or rendered != _canonical_json(value):
+        raise ValueError(f"{field} is not canonical JSON")
+    return value, rendered, before
+
+
+def _child_ready_payload(raw_path: Path, raw_bytes: bytes) -> dict:
+    return {
+        "schema_version": 1,
+        "status": "success",
+        "stage": "kit_child_after_env_close_before_simulation_app_close",
+        "raw_result": {
+            "path": str(raw_path.resolve()),
+            "size_bytes": len(raw_bytes),
+            "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+            "mode": "0444",
+        },
+    }
+
+
+def _abort_kit_child(
+    failure_path: Path, *, stage: str, error: BaseException
+) -> NoReturn:
+    """Durably report the original failure, then bypass Kit teardown hooks."""
 
     try:
-        if env is not None:
-            env.close()
+        try:
+            try:
+                formatted = "".join(
+                    traceback.format_exception(type(error), error, error.__traceback__)
+                )
+            except BaseException:
+                formatted = "traceback formatting failed"
+            try:
+                message = str(error)
+            except BaseException:
+                message = "exception stringification failed"
+            failure = {
+                "schema_version": 1,
+                "status": "failure",
+                "stage": stage,
+                "exception": {
+                    "type": f"{type(error).__module__}.{type(error).__qualname__}",
+                    "message": message,
+                    "traceback": formatted,
+                },
+            }
+            try:
+                _write_immutable_json(failure_path, failure)
+            except BaseException as persistence_error:
+                try:
+                    print(
+                        "POLARIS_JOINT_VELOCITY_FAILURE_PERSISTENCE="
+                        f"{type(persistence_error).__name__}: {persistence_error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except BaseException:
+                    pass
+            try:
+                traceback.print_exception(
+                    type(error), error, error.__traceback__, file=sys.stderr
+                )
+            except BaseException:
+                pass
+        except BaseException:
+            pass
     finally:
-        simulation_app.close()
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            # Failure paths deliberately do not call SimulationApp.close(): in
+            # the pinned Kit runtime that call can hard-exit zero and mask this
+            # error.
+            os._exit(1)
 
 
 def finalize_child_capture(
-    raw_path: Path, output_path: Path, *, child_exit_code: int
+    raw_path: Path,
+    ready_path: Path,
+    failure_path: Path,
+    output_path: Path,
+    *,
+    child_exit_code: int,
 ) -> dict:
-    """Publish only after the close-aware Kit child has exited zero."""
+    """Publish only after validated raw+ready evidence and child exit zero."""
 
     from polaris.joint_velocity_smoke import (
         publish_immutable_joint_velocity_smoke,
         validate_joint_velocity_smoke,
     )
 
+    raw_path = Path(raw_path)
+    ready_path = Path(ready_path)
+    failure_path = Path(failure_path)
+    if failure_path.exists() or failure_path.is_symlink():
+        failure, _, _ = _read_immutable_json(failure_path, "Kit child failure")
+        exception = failure.get("exception")
+        if (
+            set(failure) != {"schema_version", "status", "stage", "exception"}
+            or failure.get("schema_version") != 1
+            or type(failure.get("schema_version")) is not int
+            or failure.get("status") != "failure"
+            or not isinstance(failure.get("stage"), str)
+            or not failure["stage"]
+            or not isinstance(exception, dict)
+            or set(exception) != {"type", "message", "traceback"}
+            or not all(isinstance(exception.get(key), str) for key in exception)
+        ):
+            raise ValueError("Kit child failure status schema mismatch")
+        raise ValueError(
+            "Kit child reported failure at "
+            f"{failure['stage']}: {exception['type']}: {exception['message']}"
+        )
     if child_exit_code != 0:
         raise ValueError(f"Kit child exited nonzero: {child_exit_code}")
-    raw_path = Path(raw_path)
-    if raw_path.is_symlink() or not raw_path.is_file():
-        raise ValueError("Kit child did not publish a regular close capture")
-    raw_stat = raw_path.stat()
-    if raw_stat.st_nlink != 1 or (raw_stat.st_mode & 0o777) != 0o400:
-        raise ValueError("Kit child close capture must be one mode-0400 link")
-    raw_bytes = raw_path.read_bytes()
-    raw = json.loads(raw_bytes)
-    canonical_raw = (
-        json.dumps(
-            raw,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        ).encode("ascii")
-        + b"\n"
-    )
-    if raw_bytes != canonical_raw:
-        raise ValueError("Kit child close capture is not canonical JSON")
+    raw, raw_bytes, _ = _read_immutable_json(raw_path, "Kit child raw capture")
+    _, ready_bytes, _ = _read_immutable_json(ready_path, "Kit child ready marker")
+    expected_ready = _child_ready_payload(raw_path, raw_bytes)
+    if ready_bytes != _canonical_json(expected_ready):
+        raise ValueError("Kit child ready marker does not bind the raw capture")
     validated_raw = validate_joint_velocity_smoke(raw, require_parent_completion=False)
     final_payload = dict(validated_raw)
     final_payload.pop("status", None)
     final_payload.pop("case_count", None)
     final_payload["lifecycle"] = {
         "env_close": "complete",
-        "simulation_app_close": "complete",
+        "simulation_app_close": "invoked_then_child_exited_zero",
         "capture_stage": "stdlib_parent_after_kit_child_exit",
     }
     final_payload["completion"] = {
@@ -96,8 +252,12 @@ def finalize_child_capture(
         "publication_stage": "stdlib_parent_after_child_exit",
         "child_capture_sha256": hashlib.sha256(raw_bytes).hexdigest(),
         "child_capture_size": len(raw_bytes),
-        "child_capture_mode": "0400",
+        "child_capture_mode": "0444",
         "child_capture_path": str(raw_path.resolve()),
+        "child_ready_marker_sha256": hashlib.sha256(ready_bytes).hexdigest(),
+        "child_ready_marker_size": len(ready_bytes),
+        "child_ready_marker_mode": "0444",
+        "child_ready_marker_path": str(ready_path.resolve()),
     }
     return publish_immutable_joint_velocity_smoke(output_path, final_payload)
 
@@ -211,16 +371,18 @@ def _kit_child_main(argv: list[str]) -> int:
     parser.add_argument("--output-json", type=Path, required=True)
     parser.add_argument("--kit-child", action="store_true")
     parser.add_argument("--raw-json", type=Path, required=True)
+    parser.add_argument("--ready-json", type=Path, required=True)
+    parser.add_argument("--failure-json", type=Path, required=True)
     AppLauncher.add_app_launcher_args(parser)
     args_cli, _ = parser.parse_known_args(argv)
     args_cli.enable_cameras = True
     args_cli.headless = True
-    app_launcher = AppLauncher(args_cli)
-    simulation_app = app_launcher.app
-
     env = None
-    payload = None
+    stage = "launch_simulation_app"
     try:
+        app_launcher = AppLauncher(args_cli)
+        simulation_app = app_launcher.app
+        stage = "initialize_environment"
         import gymnasium as gym
         from isaaclab_tasks.utils import parse_env_cfg
 
@@ -242,41 +404,34 @@ def _kit_child_main(argv: list[str]) -> int:
         env_cfg.actions = DroidJointVelocityActionCfg()
         env_cfg.observations = DroidJointVelocityObservationCfg()
         env = gym.make(args_cli.environment, cfg=env_cfg)
+        stage = "validate_joint_velocity_runtime"
         runtime_contract = validate_joint_velocity_runtime(env)
+        stage = "run_controller_capture"
         payload = _run_capture(args_cli, env, runtime_contract)
-    except BaseException:
-        _close_kit_resources(env, simulation_app)
-        raise
+        if payload is None:
+            raise RuntimeError("Kit child produced no capture")
+        stage = "close_environment"
+        env.close()
+        payload["lifecycle"] = {
+            "env_close": "complete",
+            "simulation_app_close": "pending_child_exit",
+            "capture_stage": "kit_child_after_env_close_before_simulation_app_close",
+        }
+        from polaris.joint_velocity_smoke import validate_joint_velocity_smoke
 
-    if payload is None:
-        _close_kit_resources(env, simulation_app)
-        raise RuntimeError("Kit child produced no capture")
-    try:
-        if env is not None:
-            env.close()
-    except BaseException:
-        simulation_app.close()
-        raise
-
-    # This mode-0400 record is deliberately non-final. SimulationApp.close can
-    # terminate Kit without returning, so only the stdlib parent may promote it,
-    # and only after observing this child exit zero.
-    payload["lifecycle"] = {
-        "env_close": "complete",
-        "simulation_app_close": "pending_child_exit",
-        "capture_stage": "kit_child_after_env_close_before_simulation_app_close",
-    }
-    from polaris.joint_velocity_smoke import validate_joint_velocity_smoke
-
-    try:
+        stage = "validate_child_capture"
         validated = validate_joint_velocity_smoke(
             payload, require_parent_completion=False
         )
-        _write_child_capture(args_cli.raw_json, validated)
-    except BaseException:
+        stage = "publish_child_capture"
+        raw_bytes = _write_immutable_json(args_cli.raw_json, validated)
+        stage = "publish_ready_then_invoke_simulation_app_close"
+        _write_immutable_json(
+            args_cli.ready_json, _child_ready_payload(args_cli.raw_json, raw_bytes)
+        )
         simulation_app.close()
-        raise
-    simulation_app.close()
+    except BaseException as error:
+        _abort_kit_child(args_cli.failure_json, stage=stage, error=error)
     return 0
 
 
@@ -284,12 +439,19 @@ def _parent_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-json", type=Path, required=True)
     known, _ = parser.parse_known_args(argv)
-    if known.output_json.exists():
+    if known.output_json.exists() or known.output_json.is_symlink():
         raise FileExistsError(f"Refusing to overwrite {known.output_json}")
     known.output_json.parent.mkdir(parents=True, exist_ok=True)
     raw_path = known.output_json.with_name(known.output_json.name + ".child-close.json")
-    if raw_path.exists() or raw_path.is_symlink():
-        raise FileExistsError(f"Refusing existing child capture {raw_path}")
+    ready_path = raw_path.with_name(raw_path.name + ".ready.json")
+    failure_path = raw_path.with_name(raw_path.name + ".failure.json")
+    for path, field in (
+        (raw_path, "child capture"),
+        (ready_path, "child ready marker"),
+        (failure_path, "child failure status"),
+    ):
+        if path.exists() or path.is_symlink():
+            raise FileExistsError(f"Refusing existing {field} {path}")
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -297,10 +459,18 @@ def _parent_main(argv: list[str]) -> int:
         "--kit-child",
         "--raw-json",
         str(raw_path),
+        "--ready-json",
+        str(ready_path),
+        "--failure-json",
+        str(failure_path),
     ]
     completed = subprocess.run(command, check=False)
     finalize_child_capture(
-        raw_path, known.output_json, child_exit_code=completed.returncode
+        raw_path,
+        ready_path,
+        failure_path,
+        known.output_json,
+        child_exit_code=completed.returncode,
     )
     print(f"Immutable joint-velocity smoke: {known.output_json}")
     return 0

@@ -38,6 +38,16 @@ die() {
 
 [[ "${EXPECTED_POLARIS_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
   || die "EXPECTED_POLARIS_COMMIT must be a full lowercase commit"
+[[ ! -L "${POLARIS_DIR}" ]] || die "POLARIS_DIR must not be a symlink"
+POLARIS_DIR="$(realpath "${POLARIS_DIR}")"
+[[ -d "${POLARIS_DIR}/.git" && ! -L "${POLARIS_DIR}/.git" ]] \
+  || die "POLARIS_DIR must be a standalone clone with an in-root .git directory"
+git_dir="$(git -C "${POLARIS_DIR}" rev-parse --absolute-git-dir)"
+git_common_dir="$(git -C "${POLARIS_DIR}" rev-parse --path-format=absolute --git-common-dir)"
+[[ "${git_dir}" == "${POLARIS_DIR}/.git" && "${git_common_dir}" == "${POLARIS_DIR}/.git" ]] \
+  || die "POLARIS_DIR Git metadata must be wholly contained in its .git directory"
+[[ "$(git -C "${POLARIS_DIR}" rev-parse --abbrev-ref HEAD)" == HEAD ]] \
+  || die "POLARIS_DIR must be checked out at a detached HEAD"
 [[ "$(git -C "${POLARIS_DIR}" rev-parse --show-toplevel)" == "$(realpath "${POLARIS_DIR}")" ]] \
   || die "POLARIS_DIR must name the exact Git root"
 [[ "$(git -C "${POLARIS_DIR}" rev-parse HEAD)" == "${EXPECTED_POLARIS_COMMIT}" ]] \

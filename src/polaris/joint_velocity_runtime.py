@@ -36,6 +36,11 @@ _IMPLICIT_ACTUATOR_CLASS = "isaaclab.actuators.actuator_pd.ImplicitActuator"
 _BINARY_GRIPPER_ACTION_CLASS = (
     "polaris.environments.droid_cfg.BinaryJointPositionZeroToOneAction"
 )
+_BINARY_GRIPPER_BASE_CLASS = (
+    "isaaclab.envs.mdp.actions.binary_joint_actions.BinaryJointPositionAction"
+)
+_CUDA_DEVICE = "cuda:0"
+_CPU_DEVICE = "cpu"
 
 
 def _class_path(value: Any) -> str:
@@ -57,13 +62,17 @@ def _to_numpy(value: Any, *, field: str) -> tuple[np.ndarray, str, str]:
 
 
 def _require_float32_array(
-    value: Any, expected: np.ndarray, *, field: str
+    value: Any, expected: np.ndarray, *, field: str, expected_device: str
 ) -> dict[str, Any]:
     actual, source_dtype, source_device = _to_numpy(value, field=field)
     if source_dtype != "torch.float32" or actual.dtype != np.float32:
         raise ValueError(
             f"{field} must be a live torch.float32 tensor, "
             f"got source={source_dtype}, numpy={actual.dtype}"
+        )
+    if source_device != expected_device:
+        raise ValueError(
+            f"{field} must be on {expected_device}, got {source_device or '<missing>'}"
         )
     expected = np.asarray(expected, dtype=np.float32)
     if actual.shape != expected.shape or not np.array_equal(actual, expected):
@@ -89,7 +98,9 @@ def _canonical_sha256(value: dict[str, Any]) -> str:
     ).hexdigest()
 
 
-def _validate_array_report(report: Any, expected: np.ndarray, *, field: str) -> None:
+def _validate_array_report(
+    report: Any, expected: np.ndarray, *, field: str, expected_device: str
+) -> None:
     if not isinstance(report, dict) or set(report) != {
         "shape",
         "dtype",
@@ -102,8 +113,8 @@ def _validate_array_report(report: Any, expected: np.ndarray, *, field: str) -> 
         raise ValueError(f"{field} report shape mismatch")
     if report["dtype"] != "torch.float32":
         raise ValueError(f"{field} report must attest torch.float32")
-    if not isinstance(report["device"], str) or not report["device"]:
-        raise ValueError(f"{field} report device is missing")
+    if report["device"] != expected_device:
+        raise ValueError(f"{field} report must attest device {expected_device}")
     actual = np.asarray(report["values"])
     if (
         actual.shape != expected.shape
@@ -138,6 +149,7 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
         "offset",
         "use_default_offset",
         "clip",
+        "action_buffers",
         "position_integration",
         "velocity_drive",
         "gripper",
@@ -185,7 +197,21 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
         report["clip"],
         np.broadcast_to(np.asarray([-1.0, 1.0], dtype=np.float32), (1, 7, 2)),
         field="action clip",
+        expected_device=_CUDA_DEVICE,
     )
+    action_buffers = report["action_buffers"]
+    if not isinstance(action_buffers, dict) or set(action_buffers) != {
+        "raw_action",
+        "processed_action",
+    }:
+        raise ValueError("Joint-velocity arm action-buffer schema mismatch")
+    for name in ("raw_action", "processed_action"):
+        _validate_array_report(
+            action_buffers[name],
+            np.zeros((1, 7), dtype=np.float32),
+            field=f"arm {name}",
+            expected_device=_CUDA_DEVICE,
+        )
     velocity_drive = report["velocity_drive"]
     if not isinstance(velocity_drive, dict) or set(velocity_drive) != {
         "position_stiffness",
@@ -210,7 +236,10 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
         "effort_limit": np.asarray([PANDA_ARM_EFFORT_LIMITS], dtype=np.float32),
         "velocity_limit": np.asarray([PANDA_ARM_VELOCITY_LIMITS], dtype=np.float32),
     }
-    for surface in ("buffered", "direct_physx"):
+    for surface, expected_device in (
+        ("buffered", _CUDA_DEVICE),
+        ("direct_physx", _CPU_DEVICE),
+    ):
         surface_report = velocity_drive[surface]
         if not isinstance(surface_report, dict) or set(surface_report) != set(
             expected_arrays
@@ -218,7 +247,10 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
             raise ValueError(f"Joint-velocity {surface} report schema mismatch")
         for name, expected in expected_arrays.items():
             _validate_array_report(
-                surface_report[name], expected, field=f"{surface} {name}"
+                surface_report[name],
+                expected,
+                field=f"{surface} {name}",
+                expected_device=expected_device,
             )
     gripper = report["gripper"]
     if not isinstance(gripper, dict) or set(gripper) != {
@@ -227,6 +259,8 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
         "threshold",
         "open_command",
         "closed_command",
+        "raw_action",
+        "processed_action",
     }:
         raise ValueError("Joint-velocity gripper report schema mismatch")
     if gripper["action_class"] != _BINARY_GRIPPER_ACTION_CLASS:
@@ -237,14 +271,23 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
         raise ValueError("Joint-velocity gripper threshold mismatch")
     _validate_array_report(
         gripper["open_command"],
-        np.zeros((1, 1), dtype=np.float32),
+        np.zeros((1,), dtype=np.float32),
         field="gripper open command",
+        expected_device=_CUDA_DEVICE,
     )
     _validate_array_report(
         gripper["closed_command"],
-        np.full((1, 1), np.pi / 4.0, dtype=np.float32),
+        np.full((1,), np.pi / 4.0, dtype=np.float32),
         field="gripper closed command",
+        expected_device=_CUDA_DEVICE,
     )
+    for name in ("raw_action", "processed_action"):
+        _validate_array_report(
+            gripper[name],
+            np.zeros((1, 1), dtype=np.float32),
+            field=f"gripper {name}",
+            expected_device=_CUDA_DEVICE,
+        )
     return copy.deepcopy(report)
 
 
@@ -253,18 +296,30 @@ def _installed_isaaclab_version() -> str:
 
 
 def _verify_isaaclab_sources(
-    *, arm_term: Any, robot: Any, actuator: Any
+    *, arm_term: Any, finger_term: Any, robot: Any, actuator: Any
 ) -> dict[str, str]:
+    binary_base = next(
+        (
+            cls
+            for cls in type(finger_term).__mro__
+            if f"{cls.__module__}.{cls.__qualname__}" == _BINARY_GRIPPER_BASE_CLASS
+        ),
+        None,
+    )
+    if binary_base is None:
+        raise ValueError("Cannot resolve pinned Isaac Lab binary gripper base class")
     objects = {
         "actions_cfg.py": arm_term.cfg,
         "joint_actions.py": arm_term,
+        "binary_joint_actions.py": binary_base,
         "actuator_cfg.py": robot.cfg.actuators["panda_shoulder"],
         "actuator_pd.py": actuator,
         "articulation.py": robot,
     }
     actual: dict[str, str] = {}
     for source_name, value in objects.items():
-        source_path_string = inspect.getsourcefile(type(value))
+        source_object = value if inspect.isclass(value) else type(value)
+        source_path_string = inspect.getsourcefile(source_object)
         if source_path_string is None:
             raise ValueError(f"Cannot resolve Isaac Lab source for {source_name}")
         source_path = Path(source_path_string)
@@ -327,7 +382,12 @@ def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
         raise ValueError("JointVelocityActionCfg.preserve_order must be true")
     if arm_term.cfg.use_default_offset is not False:
         raise ValueError("JointVelocityActionCfg.use_default_offset must be false")
-    if arm_term._scale != 1.0 or arm_term._offset != 0.0:
+    if (
+        type(arm_term._scale) is not float
+        or arm_term._scale != 1.0
+        or type(arm_term._offset) is not float
+        or arm_term._offset != 0.0
+    ):
         raise ValueError(
             f"Velocity action affine mismatch: scale={arm_term._scale}, offset={arm_term._offset}"
         )
@@ -335,8 +395,25 @@ def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
         np.asarray([-1.0, 1.0], dtype=np.float32), (1, 7, 2)
     )
     clip_report = _require_float32_array(
-        arm_term._clip, expected_clip, field="action term clip"
+        arm_term._clip,
+        expected_clip,
+        field="action term clip",
+        expected_device=_CUDA_DEVICE,
     )
+    action_buffers = {
+        "raw_action": _require_float32_array(
+            arm_term.raw_actions,
+            np.zeros((1, 7), dtype=np.float32),
+            field="arm raw action",
+            expected_device=_CUDA_DEVICE,
+        ),
+        "processed_action": _require_float32_array(
+            arm_term.processed_actions,
+            np.zeros((1, 7), dtype=np.float32),
+            field="arm processed action",
+            expected_device=_CUDA_DEVICE,
+        ),
+    }
     if _class_path(finger_term) != _BINARY_GRIPPER_ACTION_CLASS:
         raise ValueError(
             "Gripper action term must preserve closed-positive binary semantics; "
@@ -346,13 +423,27 @@ def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
         raise ValueError(f"Gripper joint mismatch: {finger_term._joint_names}")
     gripper_open = _require_float32_array(
         finger_term._open_command,
-        np.zeros((1, 1), dtype=np.float32),
+        np.zeros((1,), dtype=np.float32),
         field="gripper open command",
+        expected_device=_CUDA_DEVICE,
     )
     gripper_closed = _require_float32_array(
         finger_term._close_command,
-        np.full((1, 1), np.pi / 4.0, dtype=np.float32),
+        np.full((1,), np.pi / 4.0, dtype=np.float32),
         field="gripper closed command",
+        expected_device=_CUDA_DEVICE,
+    )
+    gripper_raw = _require_float32_array(
+        finger_term.raw_actions,
+        np.zeros((1, 1), dtype=np.float32),
+        field="gripper raw action",
+        expected_device=_CUDA_DEVICE,
+    )
+    gripper_processed = _require_float32_array(
+        finger_term.processed_actions,
+        np.zeros((1, 1), dtype=np.float32),
+        field="gripper processed action",
+        expected_device=_CUDA_DEVICE,
     )
 
     robot = root_env.scene["robot"]
@@ -370,6 +461,7 @@ def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
             )
     isaaclab_source_sha256 = _verify_isaaclab_sources(
         arm_term=arm_term,
+        finger_term=finger_term,
         robot=robot,
         actuator=robot.actuators["panda_shoulder"],
     )
@@ -387,21 +479,25 @@ def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
             data.joint_stiffness[:, joint_ids],
             expected_stiffness,
             field="buffered joint stiffness",
+            expected_device=_CUDA_DEVICE,
         ),
         "damping": _require_float32_array(
             data.joint_damping[:, joint_ids],
             expected_damping,
             field="buffered joint damping",
+            expected_device=_CUDA_DEVICE,
         ),
         "effort_limit": _require_float32_array(
             data.joint_effort_limits[:, joint_ids],
             expected_effort,
             field="buffered joint effort limits",
+            expected_device=_CUDA_DEVICE,
         ),
         "velocity_limit": _require_float32_array(
             data.joint_vel_limits[:, joint_ids],
             expected_velocity,
             field="buffered joint velocity limits",
+            expected_device=_CUDA_DEVICE,
         ),
     }
 
@@ -411,21 +507,25 @@ def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
             view.get_dof_stiffnesses()[:, joint_ids],
             expected_stiffness,
             field="direct PhysX joint stiffness",
+            expected_device=_CPU_DEVICE,
         ),
         "damping": _require_float32_array(
             view.get_dof_dampings()[:, joint_ids],
             expected_damping,
             field="direct PhysX joint damping",
+            expected_device=_CPU_DEVICE,
         ),
         "effort_limit": _require_float32_array(
             view.get_dof_max_forces()[:, joint_ids],
             expected_effort,
             field="direct PhysX joint effort limits",
+            expected_device=_CPU_DEVICE,
         ),
         "velocity_limit": _require_float32_array(
             view.get_dof_max_velocities()[:, joint_ids],
             expected_velocity,
             field="direct PhysX joint velocity limits",
+            expected_device=_CPU_DEVICE,
         ),
     }
 
@@ -446,6 +546,7 @@ def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
         "offset": 0.0,
         "use_default_offset": False,
         "clip": clip_report,
+        "action_buffers": action_buffers,
         "position_integration": "absent_by_exact_action_class",
         "velocity_drive": {
             "position_stiffness": PANDA_ARM_VELOCITY_DRIVE_STIFFNESS,
@@ -459,6 +560,8 @@ def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
             "threshold": "closed_if_gt_0p5_else_open",
             "open_command": gripper_open,
             "closed_command": gripper_closed,
+            "raw_action": gripper_raw,
+            "processed_action": gripper_processed,
         },
     }
     report["runtime_sha256"] = _canonical_sha256(report)

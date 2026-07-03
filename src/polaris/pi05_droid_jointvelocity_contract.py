@@ -42,6 +42,7 @@ PI05_DROID_ISAACLAB_REVISION = "3c6e67bb5c7ada942a6d1884ab69338f57596f77"
 PI05_DROID_ISAACLAB_SOURCE_SHA256 = {
     "actions_cfg.py": "94722a5c0d6da3639b5507130d1ec2e7f62d7490e4625d4bf30ada8691ef63d4",
     "joint_actions.py": "1b3dcb55d969d886cee500e660f12331e49f8638fec98cde30d2b818a1ca1692",
+    "binary_joint_actions.py": "84bf343dc4a609d2327f1ee8b965439f49f3167f9a45f652e9aa6b652c9c0630",
     "actuator_cfg.py": "3963167d6678c6f052d87202678822d80a98b0b0f3492b859774768b1bd80520",
     "actuator_pd.py": "1d2a9b80812714f5aade3ed7bbb7c74a403ab718868aa73d187eb77173695beb",
     "articulation.py": "9cc03b85642c36c801ff9683e94b8ccc3fbef1178761338974b433dacc78ef75",

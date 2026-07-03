@@ -18,12 +18,12 @@ from polaris.pi05_droid_jointvelocity_contract import (
 )
 
 
-def _array_report(values):
+def _array_report(values, *, device="cuda:0"):
     array = np.asarray(values, dtype=np.float32)
     return {
         "shape": list(array.shape),
         "dtype": "torch.float32",
-        "device": "cuda:0",
+        "device": device,
         "values": array.tolist(),
     }
 
@@ -33,11 +33,15 @@ def make_joint_velocity_runtime_report():
     damping = np.full((1, 7), 80.0, dtype=np.float32)
     effort = np.asarray([PANDA_ARM_EFFORT_LIMITS], dtype=np.float32)
     velocity = np.asarray([PANDA_ARM_VELOCITY_LIMITS], dtype=np.float32)
-    drive = {
+    buffered_drive = {
         "stiffness": _array_report(stiffness),
         "damping": _array_report(damping),
         "effort_limit": _array_report(effort),
         "velocity_limit": _array_report(velocity),
+    }
+    direct_drive = {
+        name: {**copy.deepcopy(value), "device": "cpu"}
+        for name, value in buffered_drive.items()
     }
     report = {
         "schema_version": 1,
@@ -62,12 +66,16 @@ def make_joint_velocity_runtime_report():
         "clip": _array_report(
             np.broadcast_to(np.asarray([-1.0, 1.0], dtype=np.float32), (1, 7, 2))
         ),
+        "action_buffers": {
+            "raw_action": _array_report(np.zeros((1, 7), dtype=np.float32)),
+            "processed_action": _array_report(np.zeros((1, 7), dtype=np.float32)),
+        },
         "position_integration": "absent_by_exact_action_class",
         "velocity_drive": {
             "position_stiffness": 0.0,
             "velocity_damping": 80.0,
-            "buffered": copy.deepcopy(drive),
-            "direct_physx": copy.deepcopy(drive),
+            "buffered": buffered_drive,
+            "direct_physx": direct_drive,
         },
         "gripper": {
             "action_class": (
@@ -75,10 +83,12 @@ def make_joint_velocity_runtime_report():
             ),
             "joint_name": "finger_joint",
             "threshold": "closed_if_gt_0p5_else_open",
-            "open_command": _array_report(np.zeros((1, 1), dtype=np.float32)),
+            "open_command": _array_report(np.zeros((1,), dtype=np.float32)),
             "closed_command": _array_report(
-                np.full((1, 1), np.pi / 4.0, dtype=np.float32)
+                np.full((1,), np.pi / 4.0, dtype=np.float32)
             ),
+            "raw_action": _array_report(np.zeros((1, 1), dtype=np.float32)),
+            "processed_action": _array_report(np.zeros((1, 1), dtype=np.float32)),
         },
     }
     report["runtime_sha256"] = runtime._canonical_sha256(report)
@@ -124,7 +134,7 @@ def make_joint_velocity_smoke_payload():
         },
         "lifecycle": {
             "env_close": "complete",
-            "simulation_app_close": "complete",
+            "simulation_app_close": "invoked_then_child_exited_zero",
             "capture_stage": "stdlib_parent_after_kit_child_exit",
         },
         "completion": {
@@ -132,8 +142,12 @@ def make_joint_velocity_smoke_payload():
             "publication_stage": "stdlib_parent_after_child_exit",
             "child_capture_sha256": "a" * 64,
             "child_capture_size": 1,
-            "child_capture_mode": "0400",
+            "child_capture_mode": "0444",
             "child_capture_path": "/tmp/test-child-close.json",
+            "child_ready_marker_sha256": "b" * 64,
+            "child_ready_marker_size": 1,
+            "child_ready_marker_mode": "0444",
+            "child_ready_marker_path": "/tmp/test-child-close.json.ready.json",
         },
     }
 

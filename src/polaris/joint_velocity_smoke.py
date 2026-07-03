@@ -138,7 +138,7 @@ def validate_joint_velocity_smoke(
     if require_parent_completion:
         if lifecycle != {
             "env_close": "complete",
-            "simulation_app_close": "complete",
+            "simulation_app_close": "invoked_then_child_exited_zero",
             "capture_stage": "stdlib_parent_after_kit_child_exit",
         }:
             raise ValueError("Velocity smoke lifecycle is not close-complete")
@@ -150,6 +150,10 @@ def validate_joint_velocity_smoke(
             "child_capture_size",
             "child_capture_mode",
             "child_capture_path",
+            "child_ready_marker_sha256",
+            "child_ready_marker_size",
+            "child_ready_marker_mode",
+            "child_ready_marker_path",
         }:
             raise ValueError("Velocity smoke lacks parent completion evidence")
         if (
@@ -164,10 +168,22 @@ def validate_joint_velocity_smoke(
             )
             or type(completion["child_capture_size"]) is not int
             or completion["child_capture_size"] <= 0
-            or completion["child_capture_mode"] != "0400"
+            or completion["child_capture_mode"] != "0444"
             or not isinstance(completion["child_capture_path"], str)
             or not completion["child_capture_path"]
             or not Path(completion["child_capture_path"]).is_absolute()
+            or not isinstance(completion["child_ready_marker_sha256"], str)
+            or len(completion["child_ready_marker_sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in completion["child_ready_marker_sha256"]
+            )
+            or type(completion["child_ready_marker_size"]) is not int
+            or completion["child_ready_marker_size"] <= 0
+            or completion["child_ready_marker_mode"] != "0444"
+            or not isinstance(completion["child_ready_marker_path"], str)
+            or not completion["child_ready_marker_path"]
+            or not Path(completion["child_ready_marker_path"]).is_absolute()
         ):
             raise ValueError("Velocity smoke lacks parent completion evidence")
     else:
