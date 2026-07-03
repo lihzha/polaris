@@ -1404,7 +1404,7 @@ def _gripper_contract(*, candidate_enabled=False):
             "damping": None,
         },
         "live_actuator": {
-            "cfg_velocity_limit": None,
+            "cfg_velocity_limit": 5.0 if candidate_enabled else None,
             "cfg_velocity_limit_sim": 5.0 if candidate_enabled else None,
             "cfg_effort_limit": 200.0,
             "cfg_effort_limit_sim": 200.0,
@@ -1529,6 +1529,8 @@ def test_gripper_candidate_contract_requires_exact_split_device_five_rad_s_cap()
     }
     actuator = validated["live_actuator"]["resolved_velocity_limit_rad_s"]
     physx = validated["live_physx_readback"]["velocity_limit_rad_s"]
+    assert validated["live_actuator"]["cfg_velocity_limit"] == 5.0
+    assert validated["live_actuator"]["cfg_velocity_limit_sim"] == 5.0
     assert actuator["device"] == diagnostic.PINNED_ACTUATOR_DEVICE
     assert physx["device"] == diagnostic.PINNED_STATIC_PHYSX_DEVICE
     assert actuator["values"] == physx["values"] == [5.0]
@@ -1641,7 +1643,13 @@ def test_gripper_candidate_contract_cross_binds_full_static_physx_snapshot():
 
 @pytest.mark.parametrize(
     "mutation",
-    ["legacy_profile", "legacy_value", "swapped_devices", "unset_cfg"],
+    [
+        "legacy_profile",
+        "legacy_value",
+        "swapped_devices",
+        "unset_legacy_cfg",
+        "unset_sim_cfg",
+    ],
 )
 def test_gripper_candidate_contract_rejects_profile_value_device_or_cfg_drift(
     mutation,
@@ -1661,6 +1669,8 @@ def test_gripper_candidate_contract_rejects_profile_value_device_or_cfg_drift(
     elif mutation == "swapped_devices":
         contract["live_actuator"]["resolved_velocity_limit_rad_s"]["device"] = "cpu"
         contract["live_physx_readback"]["velocity_limit_rad_s"]["device"] = "cuda:0"
+    elif mutation == "unset_legacy_cfg":
+        contract["live_actuator"]["cfg_velocity_limit"] = None
     else:
         contract["live_actuator"]["cfg_velocity_limit_sim"] = None
     with pytest.raises(diagnostic.GripperImpulseDiagnosticError):

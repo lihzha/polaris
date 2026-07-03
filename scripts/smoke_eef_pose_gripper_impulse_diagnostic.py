@@ -1941,6 +1941,7 @@ def _gripper_drive_expectations(profile: Any) -> dict[str, Any]:
                 "stiffness": None,
                 "damping": None,
             },
+            "live_cfg_velocity_limit": None,
             "live_cfg_velocity_limit_sim": None,
             "values": PROBED_GRIPPER_DRIVE_FLOAT32_VALUES,
             "velocity_behavior": (
@@ -1962,6 +1963,7 @@ def _gripper_drive_expectations(profile: Any) -> dict[str, Any]:
                 "stiffness": None,
                 "damping": None,
             },
+            "live_cfg_velocity_limit": 5.0,
             "live_cfg_velocity_limit_sim": 5.0,
             "values": GRIPPER_VELOCITY_LIMIT_CANDIDATE_FLOAT32_VALUES,
             "velocity_behavior": (
@@ -2054,7 +2056,10 @@ def _validate_gripper_drive_contract(
         )
         validated_live[field] = tensor
     _require(
-        live.get("cfg_velocity_limit") is None
+        _typed_equal(
+            live.get("cfg_velocity_limit"),
+            expectations["live_cfg_velocity_limit"],
+        )
         and _typed_equal(
             live.get("cfg_velocity_limit_sim"),
             expectations["live_cfg_velocity_limit_sim"],

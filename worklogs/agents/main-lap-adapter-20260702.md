@@ -931,3 +931,58 @@
   fully attested exact-action canary are still required. Promotion remains
   blocked unless the capture proves the live 5 rad/s cap and completes the
   diagnostic horizon without an arm velocity-guard failure.
+
+## 2026-07-03 — first gripper-cap pair failed closed on live config representation
+
+- Commit `e13f50df4c1b0614744a5614516717578ff9ec54` passed real-Isaac gate
+  `1098177` on `pool0-00013`. The deliberate no-tests probe produced exact
+  immutable `5\n` and was rejected by the zero gate; the positive run passed
+  all 76 real-Isaac robust-controller/config tests. The wider container suite
+  passed 446 tests with two environment-specific skips and 22 subtests. Root,
+  batch, positive, and wider steps completed `0:0`; only the deliberate probe
+  step is `FAILED 5:0`. The saved wrapper is mode 0444/single-link with reviewed
+  SHA-256 `079844d139e1bf5fafcf1ee740418edd29805b6f9490b304bee68757709d6d6e`;
+  negative/positive sidecars have the exact `5\n`/`0\n` digests; the log
+  SHA-256 is
+  `1cfa3dea83dce127f84c1d4094c4eca40390727dc34742325e4a2dd633d40014`.
+  Cache is absent, source stayed clean, and the node returned idle.
+- Exact baseline `1098178` and candidate `1098179` were submitted 122.0 ms
+  apart to `pool0-00013` and `pool0-00027`. Baseline completed `0:0` in 4:38
+  with the exact ten-file immutable v7-attested set. Capture/video/ready/
+  attestation SHA-256 values are
+  `2227dcdbf41973f332f9958a1e056cb1332a2c2ae00a0abb245f07bb79732ded`,
+  `337383a6e65d9ea7643e7748912918056c05f64748a97ae8933c195a61b1041c`,
+  `012b0b4fbb89942c2d26cabdf14864acccf7fe41ef826c58b730afc01f1d598e`,
+  and
+  `c858532e87a0e90eb4acc22973113e7791494949872a8f8c2cda36b52738be06`.
+  Its expected legacy profile is attested and it reproduces the allowed arm
+  velocity-guard failure. The final baseline log SHA-256 is
+  `0f8b204744d6d8172174e2f4424f66d603f238910194e0f862e43fadc1408c6a`.
+- Candidate `1098179` failed closed before replay or video publication. It has
+  exactly immutable `capture.json`, `runtime.exit`, and `outer-srun.exit`; both
+  sidecars are exact `1\n`. Capture SHA-256 is
+  `7ab678b832141ad6f35aeb8d6a87c92d99c8ac3e3a13145da99397e4b4138142`
+  and log SHA-256 is
+  `414046990553f7466d0fe68e4a35f2a5b29158038763786bb4924b3d2d9866db`.
+  There is no candidate ready marker, video, validator result, or attestation,
+  so this attempt provides no dynamics or repair evidence.
+- The failure was the live config representation check, not the cap itself.
+  With equal legacy and simulation velocity fields, Isaac Lab 2.3 leaves both
+  live config values at `5.0`; the validator correctly expected live
+  `cfg.velocity_limit_sim == 5.0` but incorrectly retained the legacy-profile
+  requirement `cfg.velocity_limit is None`. The isolated repair is to make the
+  expected live legacy config field profile-specific (`None` for baseline,
+  exact `5.0` for candidate), retain every tensor/device/value check, add
+  adversarial unset-field tests, then repeat all gates and a fresh pair.
+- The minimal representation fix passes 259 focused diagnostic/finalizer tests
+  and the wider host suite at 449 tests plus 30 subtests, together with Ruff,
+  Python byte compilation, and `git diff --check`. Its pre-review source/test
+  diff SHA-256 is
+  `38e7f53ba061a5af47ad73131b7f9e9ba9d572a026991d3043b2f8bb727ae2f3`;
+  the updated diagnostic SHA-256/size is
+  `cc516fd2014d08b40626e25613ace010dd420bb1455a186d5fd6b619114a2e12`
+  / 179,386 bytes. Fresh independent review returned GO on that exact diff;
+  it independently passed nine targeted profile/config tests plus Ruff and
+  `git diff --check`, with no edits or remaining finding.
+- Both caches and staging directories are absent, the source is clean, both
+  nodes are idle, and no job remains queued.
