@@ -46,6 +46,8 @@ from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
 from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_PROFILE
 from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
 from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
+from polaris.eef_gripper_runtime import validate_eef_gripper_dynamic_evidence
+from polaris.eef_gripper_runtime import validate_eef_gripper_static_contract
 from polaris.eval_artifacts import EVAL_RESULT_COLUMNS
 from polaris.eval_artifacts import canonical_episode_result
 from polaris.eval_artifacts import probe_episode_video
@@ -53,6 +55,7 @@ from polaris.eval_artifacts import validate_episode_artifact_identity
 
 
 CANONICAL_EPISODE_STEPS = 450
+CANONICAL_INTERNAL_EPISODE_STEPS = 451
 CANONICAL_POLICY_HZ = 15.0
 CANONICAL_PHYSICS_HZ = 120.0
 CANONICAL_PHYSICS_DT = 1.0 / CANONICAL_PHYSICS_HZ
@@ -61,6 +64,49 @@ CANONICAL_IK_METHOD = "dls"
 CANONICAL_DLS_DAMPING = 0.01
 CANONICAL_ARM_SCALE = 1.0
 CANONICAL_ARM_JOINTS = tuple(f"panda_joint{index}" for index in range(1, 8))
+EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE = "ego_lap_eef_outer450_internal451_no_autoreset_v1"
+EGO_LAP_ENVIRONMENT_STATE_PROFILE = (
+    "isaaclab_single_env_episode_sim_common_camera_counters_v1"
+)
+EGO_LAP_TERMINAL_ROLLOUT_PROFILE = "ego_lap_eef_terminal_rollout_v1"
+EGO_LAP_CAMERA_SENSOR_NAMES = ("external_cam", "wrist_cam")
+EGO_LAP_RUNTIME_PROTOCOL_FIELDS = {
+    "profile",
+    "episode_steps",
+    "live_max_episode_length",
+    "autoreset_margin_steps",
+    "policy_hz",
+    "step_dt",
+    "physics_hz",
+    "physics_dt",
+    "decimation",
+    "camera_sensor_names",
+}
+EGO_LAP_TERMINAL_ROLLOUT_FIELDS = {
+    "schema_version",
+    "profile",
+    "environment_runtime_profile",
+    "episode_index",
+    "expected_outer_steps",
+    "actions_attempted",
+    "outer_steps_completed",
+    "last_outer_step_index",
+    "terminated_false_count",
+    "truncated_false_count",
+    "environment_before",
+    "environment_after",
+    "counter_deltas",
+    "camera_frame_deltas",
+    "episode_result",
+}
+EGO_LAP_ENVIRONMENT_STATE_FIELDS = {
+    "profile",
+    "live_max_episode_length",
+    "episode_length",
+    "sim_step_counter",
+    "common_step_counter",
+    "sensor_frame_counters",
+}
 SAFETY_COUNTER_FIELDS = {
     "apply_calls",
     "environment_substeps",
@@ -92,6 +138,14 @@ WRIST_ENERGY_BRAKE_STATIC_FIELDS = (
 WRIST_ENERGY_BRAKE_DYNAMIC_FIELDS = {
     "wrist_energy_brake_latch_remaining_substeps",
     "wrist_energy_brake_diagnostics",
+}
+GRIPPER_RUNTIME_EPISODE_FIELDS = {
+    "gripper_runtime_static",
+    "gripper_runtime_dynamic",
+}
+GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS = {
+    "max_abs_joint_velocity_rad_s",
+    "max_abs_joint_acceleration_rad_s2",
 }
 WRIST_ENERGY_BRAKE_DIAGNOSTIC_FIELDS = {
     "episode_index",
@@ -205,6 +259,7 @@ SAFETY_SIDECAR_FIELDS = {
     "episode_result",
     "artifact_identity",
     "cadence_evidence",
+    "terminal_rollout",
     "safety",
 }
 ARTIFACT_IDENTITY_FIELDS = {"video", "terminal_trace"}
@@ -220,13 +275,17 @@ TRACE_IDENTITY_FIELDS = {
     "filename",
     "size_bytes",
     "sha256",
+    "schema_version",
+    "trace_profile",
     "episode_result",
+    "terminal_rollout",
 }
 RUNTIME_EPISODE_FIELDS = {
     "episode_index",
     "episode_result",
     "artifact_identity",
     "cadence_evidence",
+    "terminal_rollout",
     "counters",
     "maxima",
     "guard_diagnostics",
@@ -255,8 +314,29 @@ def _unwrapped(env: Any) -> Any:
     return getattr(env, "unwrapped", env)
 
 
-def validate_ego_lap_runtime_protocol(env: Any) -> dict[str, float | int]:
-    """Fail unless the live simulator is exactly 450 policy steps at 15 Hz."""
+def configure_ego_lap_environment_timeout(env_cfg: Any) -> dict[str, Any]:
+    """Reserve one internal timeout step so outer step 449 cannot auto-reset."""
+
+    step_dt = float(env_cfg.sim.dt) * int(env_cfg.decimation)
+    expected_dt = 1.0 / CANONICAL_POLICY_HZ
+    if not math.isclose(step_dt, expected_dt, rel_tol=0.0, abs_tol=1e-10):
+        raise ValueError(
+            "Canonical Ego-LAP/PolaRiS evaluation requires 15 Hz control before "
+            f"timeout configuration; config step_dt={step_dt!r}"
+        )
+    env_cfg.episode_length_s = CANONICAL_INTERNAL_EPISODE_STEPS * step_dt
+    return {
+        "profile": EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE,
+        "outer_episode_steps": CANONICAL_EPISODE_STEPS,
+        "configured_internal_episode_steps": CANONICAL_INTERNAL_EPISODE_STEPS,
+        "autoreset_margin_steps": (
+            CANONICAL_INTERNAL_EPISODE_STEPS - CANONICAL_EPISODE_STEPS
+        ),
+    }
+
+
+def validate_ego_lap_runtime_protocol(env: Any) -> dict[str, Any]:
+    """Fail unless live timeout is 451 while the evaluator owns outer 450."""
 
     runtime = _unwrapped(env)
     horizon = int(getattr(env, "max_episode_length", runtime.max_episode_length))
@@ -268,10 +348,11 @@ def validate_ego_lap_runtime_protocol(env: Any) -> dict[str, float | int]:
     physics_dt = float(getattr(runtime, "physics_dt", runtime.cfg.sim.dt))
     decimation = int(getattr(runtime.cfg, "decimation", round(step_dt / physics_dt)))
     expected_dt = 1.0 / CANONICAL_POLICY_HZ
-    if horizon != CANONICAL_EPISODE_STEPS:
+    if horizon != CANONICAL_INTERNAL_EPISODE_STEPS:
         raise ValueError(
-            "Canonical Ego-LAP/PolaRiS evaluation requires exactly "
-            f"{CANONICAL_EPISODE_STEPS} policy steps; live environment has {horizon}"
+            "Canonical Ego-LAP/PolaRiS evaluation requires an internal timeout of "
+            f"{CANONICAL_INTERNAL_EPISODE_STEPS} steps for an outer "
+            f"{CANONICAL_EPISODE_STEPS}-step rollout; live environment has {horizon}"
         )
     if not math.isclose(step_dt, expected_dt, rel_tol=0.0, abs_tol=1e-10):
         raise ValueError(
@@ -294,13 +375,381 @@ def validate_ego_lap_runtime_protocol(env: Any) -> dict[str, float | int]:
             f"step_dt={step_dt!r}"
         )
     return {
-        "episode_steps": horizon,
+        "profile": EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE,
+        "episode_steps": CANONICAL_EPISODE_STEPS,
+        "live_max_episode_length": horizon,
+        "autoreset_margin_steps": horizon - CANONICAL_EPISODE_STEPS,
         "policy_hz": CANONICAL_POLICY_HZ,
         "step_dt": step_dt,
         "physics_hz": CANONICAL_PHYSICS_HZ,
         "physics_dt": physics_dt,
         "decimation": decimation,
+        "camera_sensor_names": list(EGO_LAP_CAMERA_SENSOR_NAMES),
     }
+
+
+def validate_ego_lap_protocol_evidence(
+    protocol: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the serialized live outer/internal cadence contract."""
+
+    if set(protocol) != EGO_LAP_RUNTIME_PROTOCOL_FIELDS:
+        raise ValueError("Ego-LAP runtime protocol schema drift")
+    exact = {
+        "profile": EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE,
+        "episode_steps": CANONICAL_EPISODE_STEPS,
+        "live_max_episode_length": CANONICAL_INTERNAL_EPISODE_STEPS,
+        "autoreset_margin_steps": 1,
+        "policy_hz": CANONICAL_POLICY_HZ,
+        "physics_hz": CANONICAL_PHYSICS_HZ,
+        "decimation": CANONICAL_DECIMATION,
+        "camera_sensor_names": list(EGO_LAP_CAMERA_SENSOR_NAMES),
+    }
+    if any(protocol.get(field) != value for field, value in exact.items()):
+        raise ValueError("Ego-LAP runtime protocol identity drift")
+    for field in ("step_dt", "physics_dt"):
+        value = protocol.get(field)
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(f"Ego-LAP runtime protocol {field} type drift")
+    if not math.isclose(
+        float(protocol["step_dt"]),
+        1.0 / CANONICAL_POLICY_HZ,
+        rel_tol=0.0,
+        abs_tol=1e-10,
+    ) or not math.isclose(
+        float(protocol["physics_dt"]),
+        CANONICAL_PHYSICS_DT,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("Ego-LAP runtime protocol time-step drift")
+    return dict(protocol)
+
+
+def _single_integer(value: Any, *, field: str) -> int:
+    array = _numpy(value)
+    while array.ndim > 0 and array.shape[0] == 1:
+        array = array[0]
+    if array.shape != ():
+        raise ValueError(f"{field} must be one scalar integer; got {array.shape}")
+    scalar = array.item()
+    if isinstance(scalar, (bool, np.bool_)) or not isinstance(
+        scalar, (int, np.integer)
+    ):
+        raise ValueError(f"{field} must be one scalar integer; got {scalar!r}")
+    return int(scalar)
+
+
+def _single_bool(value: Any, *, field: str) -> bool:
+    array = _numpy(value)
+    while array.ndim > 0 and array.shape[0] == 1:
+        array = array[0]
+    if array.shape != ():
+        raise ValueError(f"{field} must be one scalar bool; got {array.shape}")
+    scalar = array.item()
+    if not isinstance(scalar, (bool, np.bool_)):
+        raise ValueError(f"{field} must be one scalar bool; got {scalar!r}")
+    return bool(scalar)
+
+
+def capture_eef_environment_state(env: Any) -> dict[str, Any]:
+    """Capture the exact single-env counters that expose hidden auto-resets."""
+
+    runtime = _unwrapped(env)
+    live_horizon = int(getattr(env, "max_episode_length", runtime.max_episode_length))
+    if live_horizon != CANONICAL_INTERNAL_EPISODE_STEPS:
+        raise ValueError(
+            "Cannot capture production terminal evidence with a noncanonical live "
+            f"horizon: {live_horizon}"
+        )
+    sensor_frames: dict[str, int] = {}
+    for name in EGO_LAP_CAMERA_SENSOR_NAMES:
+        try:
+            sensor = runtime.scene[name]
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                f"Live environment has no camera sensor {name!r}"
+            ) from error
+        if not hasattr(sensor, "frame"):
+            raise ValueError(f"Camera sensor {name!r} exposes no frame counter")
+        sensor_frames[name] = _single_integer(sensor.frame, field=f"scene.{name}.frame")
+    state = {
+        "profile": EGO_LAP_ENVIRONMENT_STATE_PROFILE,
+        "live_max_episode_length": live_horizon,
+        "episode_length": _single_integer(
+            runtime.episode_length_buf, field="episode_length_buf"
+        ),
+        "sim_step_counter": _single_integer(
+            runtime._sim_step_counter, field="_sim_step_counter"
+        ),
+        "common_step_counter": _single_integer(
+            runtime.common_step_counter, field="common_step_counter"
+        ),
+        "sensor_frame_counters": sensor_frames,
+    }
+    validate_eef_environment_state(state)
+    return state
+
+
+def validate_eef_environment_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate one serialized environment counter snapshot."""
+
+    if set(state) != EGO_LAP_ENVIRONMENT_STATE_FIELDS:
+        raise ValueError("EEF environment state schema drift")
+    if state.get("profile") != EGO_LAP_ENVIRONMENT_STATE_PROFILE:
+        raise ValueError("EEF environment state profile drift")
+    if state.get("live_max_episode_length") != CANONICAL_INTERNAL_EPISODE_STEPS:
+        raise ValueError("EEF environment state live horizon drift")
+    for field in ("episode_length", "sim_step_counter", "common_step_counter"):
+        if type(state.get(field)) is not int or state[field] < 0:
+            raise ValueError(f"EEF environment state {field} is invalid")
+    frames = state.get("sensor_frame_counters")
+    if not isinstance(frames, Mapping) or set(frames) != set(
+        EGO_LAP_CAMERA_SENSOR_NAMES
+    ):
+        raise ValueError("EEF environment camera-frame schema drift")
+    if any(type(value) is not int or value < 0 for value in frames.values()):
+        raise ValueError("EEF environment camera-frame counters are invalid")
+    return dict(state)
+
+
+def validate_eef_outer_step_transition(
+    *,
+    step_index: int,
+    environment_before: Mapping[str, Any],
+    environment_after: Mapping[str, Any],
+    terminated: Any,
+    truncated: Any,
+) -> dict[str, Any]:
+    """Require one outer step with no reset and exact live-counter cadence."""
+
+    if type(step_index) is not int or not 0 <= step_index < CANONICAL_EPISODE_STEPS:
+        raise ValueError(f"Invalid Ego-LAP outer step index: {step_index!r}")
+    before = validate_eef_environment_state(environment_before)
+    after = validate_eef_environment_state(environment_after)
+    terminated_value = _single_bool(terminated, field="terminated")
+    truncated_value = _single_bool(truncated, field="truncated")
+    if terminated_value or truncated_value:
+        raise ValueError(
+            "Ego-LAP production rollout observed a termination/timeout before "
+            f"outer step {CANONICAL_EPISODE_STEPS}: step={step_index}, "
+            f"terminated={terminated_value}, truncated={truncated_value}"
+        )
+    expected_before_episode_length = step_index
+    if before["episode_length"] != expected_before_episode_length:
+        raise ValueError(
+            "EEF environment episode counter drift before outer step: "
+            f"step={step_index}, before={before['episode_length']}"
+        )
+    scalar_deltas = {
+        "episode_length": after["episode_length"] - before["episode_length"],
+        "sim_step_counter": (after["sim_step_counter"] - before["sim_step_counter"]),
+        "common_step_counter": (
+            after["common_step_counter"] - before["common_step_counter"]
+        ),
+    }
+    expected_scalar_deltas = {
+        "episode_length": 1,
+        "sim_step_counter": CANONICAL_DECIMATION,
+        "common_step_counter": 1,
+    }
+    if scalar_deltas != expected_scalar_deltas:
+        raise ValueError(
+            "EEF environment counter cadence drift: "
+            f"expected={expected_scalar_deltas!r}, actual={scalar_deltas!r}"
+        )
+    camera_deltas = {
+        name: (
+            after["sensor_frame_counters"][name] - before["sensor_frame_counters"][name]
+        )
+        for name in EGO_LAP_CAMERA_SENSOR_NAMES
+    }
+    expected_camera_deltas = {name: 1 for name in EGO_LAP_CAMERA_SENSOR_NAMES}
+    if camera_deltas != expected_camera_deltas:
+        raise ValueError(
+            "EEF environment camera cadence drift: "
+            f"expected={expected_camera_deltas!r}, actual={camera_deltas!r}"
+        )
+    return {
+        "step_index": step_index,
+        "terminated": False,
+        "truncated": False,
+        "environment_before": before,
+        "environment_after": after,
+        "counter_deltas": scalar_deltas,
+        "camera_frame_deltas": camera_deltas,
+    }
+
+
+def validate_terminal_rollout_evidence(
+    terminal: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the exact outer450/no-autoreset terminal evidence object."""
+
+    if set(terminal) != EGO_LAP_TERMINAL_ROLLOUT_FIELDS:
+        raise ValueError("Ego-LAP terminal rollout schema drift")
+    if (
+        type(terminal.get("schema_version")) is not int
+        or terminal.get("schema_version") != 1
+    ):
+        raise ValueError("Ego-LAP terminal rollout schema version drift")
+    if terminal.get("profile") != EGO_LAP_TERMINAL_ROLLOUT_PROFILE:
+        raise ValueError("Ego-LAP terminal rollout profile drift")
+    if (
+        terminal.get("environment_runtime_profile")
+        != EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE
+    ):
+        raise ValueError("Ego-LAP terminal environment profile drift")
+    result = canonical_episode_result(terminal.get("episode_result", {}))
+    if (
+        type(terminal.get("episode_index")) is not int
+        or terminal.get("episode_index") != result["episode"]
+    ):
+        raise ValueError("Ego-LAP terminal/result episode identity drift")
+    if terminal.get("expected_outer_steps") != CANONICAL_EPISODE_STEPS:
+        raise ValueError("Ego-LAP terminal expected horizon drift")
+    actions_attempted = terminal.get("actions_attempted")
+    completed = terminal.get("outer_steps_completed")
+    if type(actions_attempted) is not int or type(completed) is not int:
+        raise ValueError("Ego-LAP terminal action/step counts must be integers")
+    expected_completed = actions_attempted - int(result["numerical_failure"])
+    if actions_attempted != result["episode_length"] or completed != expected_completed:
+        raise ValueError("Ego-LAP terminal action/step counts disagree with result")
+    if result["numerical_failure"]:
+        if not 1 <= actions_attempted <= CANONICAL_EPISODE_STEPS:
+            raise ValueError("Numerical-failure terminal action count is invalid")
+    elif actions_attempted != CANONICAL_EPISODE_STEPS:
+        raise ValueError("Completed terminal rollout did not execute outer 450")
+    expected_last = completed - 1 if completed else None
+    last = terminal.get("last_outer_step_index")
+    if (expected_last is None and last is not None) or (
+        expected_last is not None and (type(last) is not int or last != expected_last)
+    ):
+        raise ValueError("Ego-LAP terminal last-step identity drift")
+    flag_counts = (
+        terminal.get("terminated_false_count"),
+        terminal.get("truncated_false_count"),
+    )
+    if any(type(count) is not int or count != completed for count in flag_counts):
+        raise ValueError("Ego-LAP terminal false-flag cadence drift")
+    before = validate_eef_environment_state(terminal["environment_before"])
+    after = validate_eef_environment_state(terminal["environment_after"])
+    if before["episode_length"] != 0 or after["episode_length"] != completed:
+        raise ValueError("Ego-LAP terminal episode counter indicates a hidden reset")
+    actual_counter_deltas = {
+        field: after[field] - before[field]
+        for field in ("episode_length", "sim_step_counter", "common_step_counter")
+    }
+    recorded_counter_deltas = terminal.get("counter_deltas")
+    if (
+        not isinstance(recorded_counter_deltas, dict)
+        or set(recorded_counter_deltas) != set(actual_counter_deltas)
+        or any(type(value) is not int for value in recorded_counter_deltas.values())
+        or recorded_counter_deltas != actual_counter_deltas
+    ):
+        raise ValueError("Ego-LAP terminal snapshots disagree with counter deltas")
+    expected_non_sim_counter_deltas = {
+        "episode_length": completed,
+        "common_step_counter": completed,
+    }
+    if any(
+        actual_counter_deltas[field] != expected
+        for field, expected in expected_non_sim_counter_deltas.items()
+    ):
+        raise ValueError("Ego-LAP terminal aggregate non-sim counter cadence drift")
+    completed_sim_steps = completed * CANONICAL_DECIMATION
+    sim_delta = actual_counter_deltas["sim_step_counter"]
+    if result["numerical_failure"]:
+        if (
+            not completed_sim_steps
+            < sim_delta
+            <= (completed + 1) * CANONICAL_DECIMATION
+        ):
+            raise ValueError("Ego-LAP numerical-failure sim-counter tail drift")
+    elif sim_delta != completed_sim_steps:
+        raise ValueError("Ego-LAP completed sim-counter cadence drift")
+    expected_camera_deltas = {name: completed for name in EGO_LAP_CAMERA_SENSOR_NAMES}
+    recorded_camera_deltas = terminal.get("camera_frame_deltas")
+    if (
+        not isinstance(recorded_camera_deltas, dict)
+        or set(recorded_camera_deltas) != set(expected_camera_deltas)
+        or any(type(value) is not int for value in recorded_camera_deltas.values())
+        or recorded_camera_deltas != expected_camera_deltas
+    ):
+        raise ValueError("Ego-LAP terminal aggregate camera cadence drift")
+    actual_camera_deltas = {
+        name: (
+            after["sensor_frame_counters"][name] - before["sensor_frame_counters"][name]
+        )
+        for name in EGO_LAP_CAMERA_SENSOR_NAMES
+    }
+    if actual_camera_deltas != expected_camera_deltas:
+        raise ValueError("Ego-LAP terminal snapshots disagree with camera deltas")
+    return {
+        **dict(terminal),
+        "environment_before": before,
+        "environment_after": after,
+        "episode_result": result,
+    }
+
+
+def build_terminal_rollout_evidence(
+    *,
+    episode_result: Mapping[str, Any],
+    environment_before: Mapping[str, Any],
+    environment_after: Mapping[str, Any],
+    terminated_false_count: int,
+    truncated_false_count: int,
+) -> dict[str, Any]:
+    """Build and validate one terminal object shared by trace and sidecar."""
+
+    result = canonical_episode_result(episode_result)
+    completed = result["episode_length"] - int(result["numerical_failure"])
+    before = validate_eef_environment_state(environment_before)
+    after = validate_eef_environment_state(environment_after)
+    terminal = {
+        "schema_version": 1,
+        "profile": EGO_LAP_TERMINAL_ROLLOUT_PROFILE,
+        "environment_runtime_profile": EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE,
+        "episode_index": result["episode"],
+        "expected_outer_steps": CANONICAL_EPISODE_STEPS,
+        "actions_attempted": result["episode_length"],
+        "outer_steps_completed": completed,
+        "last_outer_step_index": completed - 1 if completed else None,
+        "terminated_false_count": terminated_false_count,
+        "truncated_false_count": truncated_false_count,
+        "environment_before": before,
+        "environment_after": after,
+        "counter_deltas": {
+            field: after[field] - before[field]
+            for field in ("episode_length", "sim_step_counter", "common_step_counter")
+        },
+        "camera_frame_deltas": {
+            name: (
+                after["sensor_frame_counters"][name]
+                - before["sensor_frame_counters"][name]
+            )
+            for name in EGO_LAP_CAMERA_SENSOR_NAMES
+        },
+        "episode_result": result,
+    }
+    return validate_terminal_rollout_evidence(terminal)
+
+
+def _validate_terminal_apply_binding(
+    terminal: Mapping[str, Any], cadence: Mapping[str, Any]
+) -> None:
+    """Bind the live sim-counter delta to every attempted controller apply."""
+
+    apply_calls = cadence.get("apply_calls")
+    if type(apply_calls) is not int or apply_calls < 1:
+        raise ValueError("Ego-LAP terminal cadence has no valid apply-call count")
+    if terminal["counter_deltas"]["sim_step_counter"] != apply_calls:
+        raise ValueError("Ego-LAP terminal sim-counter/apply-call binding drift")
 
 
 def _numpy(value: Any) -> np.ndarray:
@@ -375,11 +824,16 @@ def _selected_safety_profile(candidate_enabled: bool) -> str:
     )
 
 
-def _episode_safety_fields(candidate_enabled: bool) -> set[str]:
-    return (
+def _episode_safety_fields(
+    candidate_enabled: bool, gripper_runtime_enabled: bool = False
+) -> set[str]:
+    fields = (
         WRIST_ENERGY_BRAKE_EPISODE_SAFETY_FIELDS
         if candidate_enabled
         else EPISODE_SAFETY_FIELDS
+    )
+    return fields | (
+        GRIPPER_RUNTIME_EPISODE_FIELDS if gripper_runtime_enabled else set()
     )
 
 
@@ -391,28 +845,39 @@ def _safety_counter_fields(candidate_enabled: bool) -> set[str]:
     )
 
 
-def _safety_static_fields(candidate_enabled: bool) -> tuple[str, ...]:
-    return (
+def _safety_static_fields(
+    candidate_enabled: bool, gripper_runtime_enabled: bool = False
+) -> tuple[str, ...]:
+    fields = (
         (*SAFETY_STATIC_FIELDS, *WRIST_ENERGY_BRAKE_STATIC_FIELDS)
         if candidate_enabled
         else SAFETY_STATIC_FIELDS
     )
+    return (*fields, "gripper_runtime_static") if gripper_runtime_enabled else fields
 
 
-def _aggregate_safety_fields(candidate_enabled: bool) -> set[str]:
-    return (
+def _aggregate_safety_fields(
+    candidate_enabled: bool, gripper_runtime_enabled: bool = False
+) -> set[str]:
+    fields = (
         WRIST_ENERGY_BRAKE_AGGREGATE_SAFETY_FIELDS
         if candidate_enabled
         else AGGREGATE_SAFETY_FIELDS
     )
+    if gripper_runtime_enabled:
+        fields = fields | {"gripper_runtime_static", "gripper_runtime_maxima"}
+    return fields
 
 
-def _runtime_episode_fields(candidate_enabled: bool) -> set[str]:
-    return (
+def _runtime_episode_fields(
+    candidate_enabled: bool, gripper_runtime_enabled: bool = False
+) -> set[str]:
+    fields = (
         WRIST_ENERGY_BRAKE_RUNTIME_EPISODE_FIELDS
         if candidate_enabled
         else RUNTIME_EPISODE_FIELDS
     )
+    return fields | ({"gripper_runtime_dynamic"} if gripper_runtime_enabled else set())
 
 
 def _candidate_enabled_from_safety(safety: Mapping[str, Any]) -> bool:
@@ -422,6 +887,19 @@ def _candidate_enabled_from_safety(safety: Mapping[str, Any]) -> bool:
     if profile == EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE:
         return True
     raise ValueError(f"Unknown EEF IK safety profile: {profile!r}")
+
+
+def _gripper_runtime_enabled_from_safety(safety: Mapping[str, Any]) -> bool:
+    static_present = "gripper_runtime_static" in safety
+    dynamic_present = "gripper_runtime_dynamic" in safety
+    aggregate_present = "gripper_runtime_maxima" in safety
+    if dynamic_present and not static_present:
+        raise ValueError("Gripper dynamic evidence has no static contract")
+    if aggregate_present and not static_present:
+        raise ValueError("Gripper aggregate maxima have no static contract")
+    if static_present and dynamic_present and aggregate_present:
+        raise ValueError("Gripper aggregate and episode schemas were mixed")
+    return static_present
 
 
 def _canonical_wrist_energy_brake_threshold() -> np.ndarray:
@@ -813,7 +1291,9 @@ def _validate_guard_diagnostic(
         raise ValueError("EEF IK diagnostic jacobian_finite must be bool or null")
 
 
-def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
+def validate_eef_runtime_safety(
+    env: Any, *, require_gripper_runtime: bool = False
+) -> dict[str, Any]:
     """Validate and return cumulative live EEF IK safety evidence."""
 
     runtime = _unwrapped(env)
@@ -825,7 +1305,12 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
     report = reporter()
     if not isinstance(report, dict):
         raise ValueError("Live Ego-LAP EEF IK safety reporter returned no object")
-    expected_report_fields = _episode_safety_fields(candidate_enabled)
+    gripper_runtime_enabled = _gripper_runtime_enabled_from_safety(report)
+    if require_gripper_runtime and not gripper_runtime_enabled:
+        raise ValueError("Production EEF evaluation lacks all-six gripper evidence")
+    expected_report_fields = _episode_safety_fields(
+        candidate_enabled, gripper_runtime_enabled
+    )
     if set(report) != expected_report_fields:
         raise ValueError(
             "Live EEF IK safety report schema drift: "
@@ -1253,6 +1738,13 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
             field="max-raw-delta",
             allowed_kinds={"max_raw_delta"},
         )
+    if gripper_runtime_enabled:
+        validate_eef_gripper_static_contract(report["gripper_runtime_static"])
+        dynamic = validate_eef_gripper_dynamic_evidence(
+            report["gripper_runtime_dynamic"]
+        )
+        if dynamic["apply_entry_samples"] != counters["apply_calls"]:
+            raise ValueError("All-six gripper/apply sample counts disagree")
     return report
 
 
@@ -1425,7 +1917,7 @@ def eef_episode_safety_report(env: Any, episode_index: int) -> dict[str, Any]:
     if not callable(reporter):
         raise ValueError("Live Ego-LAP EEF action has no episode safety reporter")
     report = reporter(episode_index)
-    validate_eef_runtime_safety(env)
+    validate_eef_runtime_safety(env, require_gripper_runtime=True)
     return report
 
 
@@ -1534,7 +2026,17 @@ def _validate_artifact_identity_schema(identity: Mapping[str, Any]) -> None:
         raise ValueError("Episode video identity schema drift")
     if not isinstance(trace, Mapping) or set(trace) != TRACE_IDENTITY_FIELDS:
         raise ValueError("Episode terminal-trace identity schema drift")
-    canonical_episode_result(trace.get("episode_result", {}))
+    result = canonical_episode_result(trace.get("episode_result", {}))
+    if trace.get("schema_version") != 2:
+        raise ValueError("Episode terminal-trace schema version drift")
+    if trace.get("trace_profile") != "ego_lap_eef_pose_runtime_trace_v2":
+        raise ValueError("Episode terminal-trace profile drift")
+    terminal = trace.get("terminal_rollout")
+    if not isinstance(terminal, Mapping):
+        raise ValueError("Episode terminal-trace has no terminal rollout evidence")
+    validated_terminal = validate_terminal_rollout_evidence(terminal)
+    if validated_terminal["episode_result"] != result:
+        raise ValueError("Episode trace identity/result terminal binding drift")
 
 
 def atomic_write_episode_safety(
@@ -1544,6 +2046,7 @@ def atomic_write_episode_safety(
     episode_result: Mapping[str, Any],
     safety: Mapping[str, Any],
     artifact_identity: Mapping[str, Any],
+    terminal_rollout: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Atomically persist an immutable, CSV-recoverable episode transaction."""
 
@@ -1559,17 +2062,24 @@ def atomic_write_episode_safety(
             f"expected={episode_index}, actual={safety.get('episode_index')!r}"
         )
     _validate_artifact_identity_schema(artifact_identity)
+    terminal = validate_terminal_rollout_evidence(terminal_rollout)
+    if terminal["episode_result"] != result:
+        raise ValueError("Episode sidecar terminal/result binding drift")
+    if artifact_identity["terminal_trace"]["terminal_rollout"] != terminal:
+        raise ValueError("Episode sidecar terminal/trace binding drift")
     cadence_evidence = validate_episode_safety_cadence(
         safety=safety,
         episode_result=result,
     )
+    _validate_terminal_apply_binding(terminal, cadence_evidence)
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "transaction_state": "prepared",
         "episode_index": episode_index,
         "episode_result": result,
         "artifact_identity": dict(artifact_identity),
         "cadence_evidence": cadence_evidence,
+        "terminal_rollout": terminal,
         "safety": dict(safety),
     }
     if path.exists():
@@ -1589,7 +2099,10 @@ def _validate_episode_safety_evidence_shape(
     """Validate the exact durable per-episode safety schema and counter mapping."""
 
     candidate_enabled = _candidate_enabled_from_safety(safety)
-    if set(safety) != _episode_safety_fields(candidate_enabled):
+    gripper_runtime_enabled = _gripper_runtime_enabled_from_safety(safety)
+    if set(safety) != _episode_safety_fields(
+        candidate_enabled, gripper_runtime_enabled
+    ):
         raise ValueError("Episode safety report schema drift")
     counters = safety.get("counters")
     maxima = safety.get("maxima")
@@ -1602,6 +2115,13 @@ def _validate_episode_safety_evidence_shape(
     if counters["environment_substeps"] != counters["apply_calls"]:
         raise ValueError("Episode safety environment/apply substeps disagree")
     apply_calls = counters["apply_calls"]
+    if gripper_runtime_enabled:
+        validate_eef_gripper_static_contract(safety["gripper_runtime_static"])
+        gripper_dynamic = validate_eef_gripper_dynamic_evidence(
+            safety["gripper_runtime_dynamic"]
+        )
+        if gripper_dynamic["apply_entry_samples"] != apply_calls:
+            raise ValueError("Episode gripper/apply sample counts disagree")
     if candidate_enabled:
         expected_candidate_static = {
             "wrist_energy_brake_profile": WRIST_ENERGY_BRAKE_PROFILE,
@@ -1795,6 +2315,34 @@ def validate_episode_safety_cadence(
         )
     )
     numerical_failure = result["numerical_failure"]
+    if "gripper_runtime_dynamic" in safety:
+        gripper_dynamic = validate_eef_gripper_dynamic_evidence(
+            safety["gripper_runtime_dynamic"]
+        )
+        expected_post_samples = (
+            episode_length - 1 if numerical_failure else episode_length
+        )
+        if gripper_dynamic["post_policy_step_samples"] != expected_post_samples:
+            raise ValueError(
+                "Episode all-six gripper post-step cadence mismatch: "
+                f"expected={expected_post_samples}, "
+                f"actual={gripper_dynamic['post_policy_step_samples']}"
+            )
+        nonfinite_samples = gripper_dynamic["nonfinite_samples"]
+        if numerical_failure:
+            if nonfinite_samples not in {0, 1}:
+                raise ValueError(
+                    "Numerical-failure gripper evidence has impossible "
+                    "nonfinite-sample cadence"
+                )
+        elif nonfinite_samples != 0:
+            raise ValueError(
+                "Completed rollout cannot contain a nonfinite gripper sample"
+            )
+        if nonfinite_samples and counters["nonfinite_aborts"] != 1:
+            raise ValueError(
+                "Nonfinite gripper sample lacks its controller abort evidence"
+            )
     if abort_count and not numerical_failure:
         raise ValueError(
             "Controller abort counters require numerical_failure=true: "
@@ -1960,7 +2508,7 @@ def load_episode_safety_sidecars(
         if set(payload) != SAFETY_SIDECAR_FIELDS:
             raise ValueError(f"Episode safety sidecar schema drift: {path}")
         if (
-            payload.get("schema_version") != 2
+            payload.get("schema_version") != 3
             or payload.get("transaction_state") != "prepared"
             or payload.get("episode_index") != episode_index
         ):
@@ -1974,9 +2522,20 @@ def load_episode_safety_sidecars(
         )
         if payload.get("cadence_evidence") != cadence:
             raise ValueError(f"Drifted cadence evidence in sidecar: {path}")
+        terminal = validate_terminal_rollout_evidence(
+            payload.get("terminal_rollout", {})
+        )
+        if terminal["episode_result"] != result:
+            raise ValueError(f"Drifted terminal/result binding in sidecar: {path}")
+        _validate_terminal_apply_binding(terminal, cadence)
         if not isinstance(payload.get("artifact_identity"), Mapping):
             raise ValueError(f"Missing artifact identity in sidecar: {path}")
         _validate_artifact_identity_schema(payload["artifact_identity"])
+        if (
+            payload["artifact_identity"]["terminal_trace"]["terminal_rollout"]
+            != terminal
+        ):
+            raise ValueError(f"Drifted terminal/trace binding in sidecar: {path}")
         payload["path"] = str(path)
         payload["sha256"] = _sha256(path)
         payloads.append(payload)
@@ -2058,7 +2617,7 @@ def reconcile_episode_safety_transactions(
         if set(payload) != SAFETY_SIDECAR_FIELDS:
             raise ValueError(f"Prepared safety sidecar schema drift: {path}")
         if (
-            payload.get("schema_version") != 2
+            payload.get("schema_version") != 3
             or payload.get("transaction_state") != "prepared"
             or payload.get("episode_index") != episode_index
         ):
@@ -2075,10 +2634,18 @@ def reconcile_episode_safety_transactions(
         )
         if payload.get("cadence_evidence") != cadence:
             raise ValueError(f"Sidecar cadence identity mismatch: {path}")
+        terminal = validate_terminal_rollout_evidence(
+            payload.get("terminal_rollout", {})
+        )
+        if terminal["episode_result"] != result:
+            raise ValueError(f"Sidecar terminal/result identity mismatch: {path}")
+        _validate_terminal_apply_binding(terminal, cadence)
         artifact_identity = payload.get("artifact_identity")
         if not isinstance(artifact_identity, Mapping):
             raise ValueError(f"Sidecar has no artifact identity: {path}")
         _validate_artifact_identity_schema(artifact_identity)
+        if artifact_identity["terminal_trace"]["terminal_rollout"] != terminal:
+            raise ValueError(f"Sidecar terminal/trace identity mismatch: {path}")
         validate_episode_artifact_identity(
             artifact_identity,
             run_folder=run_folder,
@@ -2111,11 +2678,14 @@ def aggregate_episode_safety(
     """Merge immutable per-episode reports without losing resume history."""
 
     candidate_enabled = _candidate_enabled_from_safety(live_template)
-    if set(live_template) != _episode_safety_fields(candidate_enabled):
+    gripper_runtime_enabled = _gripper_runtime_enabled_from_safety(live_template)
+    if set(live_template) != _episode_safety_fields(
+        candidate_enabled, gripper_runtime_enabled
+    ):
         raise ValueError("Live safety template schema drift")
     static = {
         field: live_template[field]
-        for field in _safety_static_fields(candidate_enabled)
+        for field in _safety_static_fields(candidate_enabled, gripper_runtime_enabled)
     }
     counter_names = set(live_template["counters"])
     if counter_names != _safety_counter_fields(candidate_enabled):
@@ -2123,11 +2693,23 @@ def aggregate_episode_safety(
     maxima_names = set(live_template["maxima"])
     counters = {field: 0 for field in counter_names}
     maxima = {field: [0.0] * 7 for field in maxima_names}
+    gripper_maxima = {
+        field: [0.0] * 6 for field in GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS
+    }
     episodes = []
     for sidecar in sidecars:
         safety = sidecar.get("safety")
         if not isinstance(safety, Mapping):
             raise ValueError("Episode safety sidecar has no safety object")
+        terminal = validate_terminal_rollout_evidence(
+            sidecar.get("terminal_rollout", {})
+        )
+        if terminal["episode_result"] != sidecar.get("episode_result"):
+            raise ValueError("Episode aggregate terminal/result binding drift")
+        cadence = sidecar.get("cadence_evidence")
+        if not isinstance(cadence, Mapping):
+            raise ValueError("Episode aggregate has no cadence evidence")
+        _validate_terminal_apply_binding(terminal, cadence)
         for field, expected in static.items():
             if safety.get(field) != expected:
                 raise ValueError(
@@ -2148,11 +2730,23 @@ def aggregate_episode_safety(
                     maxima[field], safety["maxima"][field], strict=True
                 )
             ]
+        if gripper_runtime_enabled:
+            dynamic = validate_eef_gripper_dynamic_evidence(
+                safety.get("gripper_runtime_dynamic")
+            )
+            for field in GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS:
+                gripper_maxima[field] = [
+                    max(previous, float(current))
+                    for previous, current in zip(
+                        gripper_maxima[field], dynamic[field], strict=True
+                    )
+                ]
         episode = {
             "episode_index": sidecar["episode_index"],
             "episode_result": sidecar["episode_result"],
             "artifact_identity": sidecar["artifact_identity"],
             "cadence_evidence": sidecar["cadence_evidence"],
+            "terminal_rollout": terminal,
             "counters": safety["counters"],
             "maxima": safety["maxima"],
             "guard_diagnostics": safety["guard_diagnostics"],
@@ -2164,6 +2758,8 @@ def aggregate_episode_safety(
             episode.update(
                 {field: safety[field] for field in WRIST_ENERGY_BRAKE_DYNAMIC_FIELDS}
             )
+        if gripper_runtime_enabled:
+            episode["gripper_runtime_dynamic"] = safety["gripper_runtime_dynamic"]
         episodes.append(episode)
     aggregate = {
         **static,
@@ -2172,12 +2768,118 @@ def aggregate_episode_safety(
         "maxima": maxima,
         "episodes": episodes,
     }
-    if set(aggregate) != _aggregate_safety_fields(candidate_enabled) or any(
-        set(episode) != _runtime_episode_fields(candidate_enabled)
+    if gripper_runtime_enabled:
+        aggregate["gripper_runtime_maxima"] = gripper_maxima
+    if set(aggregate) != _aggregate_safety_fields(
+        candidate_enabled, gripper_runtime_enabled
+    ) or any(
+        set(episode)
+        != _runtime_episode_fields(candidate_enabled, gripper_runtime_enabled)
         for episode in episodes
     ):
         raise ValueError("Aggregate EEF IK safety schema drift")
+    _validate_runtime_aggregate_consistency(
+        aggregate,
+        candidate_enabled=candidate_enabled,
+        gripper_runtime_enabled=gripper_runtime_enabled,
+    )
     return aggregate
+
+
+def _validate_runtime_aggregate_consistency(
+    ik_safety: Mapping[str, Any],
+    *,
+    candidate_enabled: bool,
+    gripper_runtime_enabled: bool,
+) -> None:
+    """Recompute every aggregate value from its immutable episode entries."""
+
+    episodes = ik_safety.get("episodes")
+    if not isinstance(episodes, list) or any(
+        not isinstance(episode, Mapping)
+        or set(episode)
+        != _runtime_episode_fields(candidate_enabled, gripper_runtime_enabled)
+        for episode in episodes
+    ):
+        raise ValueError("Runtime aggregate episode safety schema drift")
+    if type(ik_safety.get("episodes_completed")) is not int or ik_safety[
+        "episodes_completed"
+    ] != len(episodes):
+        raise ValueError("Runtime aggregate completed-episode count drift")
+    episode_indices = [episode.get("episode_index") for episode in episodes]
+    if episode_indices != list(range(len(episodes))):
+        raise ValueError("Runtime aggregate episode indices are not contiguous")
+
+    counter_fields = _safety_counter_fields(candidate_enabled)
+    expected_counters = {field: 0 for field in counter_fields}
+    expected_maxima = {field: [0.0] * 7 for field in SAFETY_MAXIMA_FIELDS}
+    expected_gripper_maxima = {
+        field: [0.0] * 6 for field in GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS
+    }
+    for episode in episodes:
+        result = canonical_episode_result(episode["episode_result"])
+        if result != episode["episode_result"] or (
+            result["episode"] != episode["episode_index"]
+        ):
+            raise ValueError("Runtime aggregate episode/result identity drift")
+        terminal = validate_terminal_rollout_evidence(episode["terminal_rollout"])
+        if terminal["episode_result"] != result:
+            raise ValueError("Runtime aggregate episode terminal/result binding drift")
+        cadence = episode.get("cadence_evidence")
+        if not isinstance(cadence, Mapping):
+            raise ValueError("Runtime aggregate episode cadence evidence drift")
+        _validate_terminal_apply_binding(terminal, cadence)
+
+        counters = episode.get("counters")
+        if (
+            not isinstance(counters, Mapping)
+            or set(counters) != counter_fields
+            or any(type(value) is not int or value < 0 for value in counters.values())
+        ):
+            raise ValueError("Runtime aggregate episode counter drift")
+        for field in counter_fields:
+            expected_counters[field] += counters[field]
+
+        maxima = episode.get("maxima")
+        if not isinstance(maxima, Mapping) or set(maxima) != SAFETY_MAXIMA_FIELDS:
+            raise ValueError("Runtime aggregate episode maxima schema drift")
+        for field in SAFETY_MAXIMA_FIELDS:
+            vector = _finite_numeric_vector(
+                maxima[field], size=7, field=f"runtime episode maximum {field}"
+            )
+            if field != "minimum_outer_joint_clearance_rad" and np.any(vector < 0):
+                raise ValueError(
+                    f"Runtime aggregate episode maximum {field} is negative"
+                )
+            expected_maxima[field] = [
+                max(previous, float(current))
+                for previous, current in zip(
+                    expected_maxima[field], vector, strict=True
+                )
+            ]
+
+        if gripper_runtime_enabled:
+            dynamic = validate_eef_gripper_dynamic_evidence(
+                episode["gripper_runtime_dynamic"]
+            )
+            for field in GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS:
+                expected_gripper_maxima[field] = [
+                    max(previous, float(current))
+                    for previous, current in zip(
+                        expected_gripper_maxima[field], dynamic[field], strict=True
+                    )
+                ]
+
+    counters = ik_safety.get("counters")
+    if not isinstance(counters, Mapping) or dict(counters) != expected_counters:
+        raise ValueError("Runtime aggregate counters disagree with episodes")
+    maxima = ik_safety.get("maxima")
+    if not isinstance(maxima, Mapping) or dict(maxima) != expected_maxima:
+        raise ValueError("Runtime aggregate maxima disagree with episodes")
+    if gripper_runtime_enabled:
+        maxima = ik_safety.get("gripper_runtime_maxima")
+        if not isinstance(maxima, Mapping) or dict(maxima) != expected_gripper_maxima:
+            raise ValueError("Runtime aggregate gripper maxima disagree with episodes")
 
 
 def atomic_write_runtime_contract(
@@ -2189,21 +2891,25 @@ def atomic_write_runtime_contract(
 ) -> None:
     """Atomically persist the live simulator/controller contract for this attempt."""
 
+    validated_protocol = validate_ego_lap_protocol_evidence(protocol)
     candidate_enabled = _candidate_enabled_from_safety(ik_safety)
-    if set(ik_safety) != _aggregate_safety_fields(candidate_enabled):
-        raise ValueError("Runtime aggregate EEF IK safety schema drift")
-    episodes = ik_safety.get("episodes")
-    if not isinstance(episodes, list) or any(
-        not isinstance(episode, Mapping)
-        or set(episode) != _runtime_episode_fields(candidate_enabled)
-        for episode in episodes
+    gripper_runtime_enabled = _gripper_runtime_enabled_from_safety(ik_safety)
+    if set(ik_safety) != _aggregate_safety_fields(
+        candidate_enabled, gripper_runtime_enabled
     ):
-        raise ValueError("Runtime aggregate episode safety schema drift")
+        raise ValueError("Runtime aggregate EEF IK safety schema drift")
+    _validate_runtime_aggregate_consistency(
+        ik_safety,
+        candidate_enabled=candidate_enabled,
+        gripper_runtime_enabled=gripper_runtime_enabled,
+    )
+    if gripper_runtime_enabled:
+        validate_eef_gripper_static_contract(ik_safety["gripper_runtime_static"])
     if frame.get("ik_safety_profile") != ik_safety.get("profile"):
         raise ValueError("Runtime frame and aggregate EEF IK safety profiles disagree")
     payload = {
-        "schema_version": 2,
-        "protocol": dict(protocol),
+        "schema_version": 3,
+        "protocol": validated_protocol,
         "frame": dict(frame),
         "ik_safety": dict(ik_safety),
     }

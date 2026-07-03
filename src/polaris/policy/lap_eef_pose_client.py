@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 import os
 import time
@@ -14,6 +15,9 @@ from scipy.spatial.transform import Rotation
 
 from polaris.config import LAP_EEF_FRAME, PolicyArgs
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
+from polaris.eval_artifacts import EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE
+from polaris.eval_artifacts import EGO_LAP_TRACE_PROFILE
+from polaris.eval_artifacts import EGO_LAP_TRACE_SCHEMA_VERSION
 from polaris.policy.abstract_client import InferenceClient
 from polaris.policy.ego_lap_contract import GRIPPER_EXECUTION_THRESHOLD
 from polaris.policy.ego_lap_contract import R6_COLUMNS_STATE_LAYOUT
@@ -533,6 +537,12 @@ class EgoLAPEefPoseClient(InferenceClient):
         self.query_index = 0
         self.step_index = 0
         self._image_io_logged = False
+        self._runtime_protocol: dict[str, Any] | None = None
+        self._rollout_environment_before: dict[str, Any] | None = None
+        self._last_environment_after: dict[str, Any] | None = None
+        self._pending_action_identity: tuple[int, int, int] | None = None
+        self._execution_count = 0
+        self._execution_failure_count = 0
 
     @property
     def rerender(self) -> bool:
@@ -560,8 +570,98 @@ class EgoLAPEefPoseClient(InferenceClient):
         self.episode_index = episode_index
         self.query_index = 0
         self.step_index = 0
+        self._rollout_environment_before = None
+        self._last_environment_after = None
+        self._pending_action_identity = None
+        self._execution_count = 0
+        self._execution_failure_count = 0
         self._begin_episode_trace()
-        self._write_trace({"event": "reset", "episode": self.episode_index})
+
+    def bind_runtime_contract(self, protocol: Mapping[str, Any]) -> None:
+        """Bind the live outer450/internal451 contract before any rollout."""
+
+        if self.episode_index >= 0:
+            raise RuntimeError("Bind the Ego-LAP runtime contract before reset")
+        if protocol.get("profile") != EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE:
+            raise ValueError("Ego-LAP client runtime profile drift")
+        if (
+            protocol.get("episode_steps") != 450
+            or protocol.get("live_max_episode_length") != 451
+            or protocol.get("autoreset_margin_steps") != 1
+        ):
+            raise ValueError("Ego-LAP client runtime horizon contract drift")
+        self._runtime_protocol = dict(protocol)
+
+    def begin_rollout(self, environment_before: Mapping[str, Any]) -> None:
+        """Record the post-reset counter snapshot before the first action."""
+
+        if self.episode_index < 0:
+            raise RuntimeError("Cannot begin an Ego-LAP rollout before reset")
+        if self._runtime_protocol is None:
+            raise RuntimeError("Ego-LAP runtime contract was not bound")
+        if self.step_index != 0 or self._rollout_environment_before is not None:
+            raise RuntimeError(
+                "Ego-LAP rollout start is not at a clean action boundary"
+            )
+        self._rollout_environment_before = dict(environment_before)
+        self._last_environment_after = dict(environment_before)
+        self._write_trace(
+            {
+                "event": "reset",
+                "episode": self.episode_index,
+                "environment_runtime_profile": EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE,
+                "environment_before": dict(environment_before),
+            }
+        )
+
+    def record_execution(self, transition: Mapping[str, Any]) -> None:
+        """Bind one emitted action to its successful simulator transition."""
+
+        if self._pending_action_identity is None:
+            raise RuntimeError("No pending Ego-LAP action is available for execution")
+        step, query, chunk = self._pending_action_identity
+        if transition.get("step_index") != step:
+            raise ValueError("Ego-LAP action/execution step identity drift")
+        environment_after = transition.get("environment_after")
+        if not isinstance(environment_after, Mapping):
+            raise ValueError("Ego-LAP execution has no environment-after snapshot")
+        self._write_trace(
+            {
+                "event": "execution",
+                "episode": self.episode_index,
+                "query": query,
+                "step": step,
+                "chunk_index": chunk,
+                "transition": dict(transition),
+            }
+        )
+        self._last_environment_after = dict(environment_after)
+        self._pending_action_identity = None
+        self._execution_count += 1
+
+    def record_execution_failure(self, numerical_failure_reason: str) -> None:
+        """Account for one emitted action whose environment step raised."""
+
+        if self._pending_action_identity is None:
+            raise RuntimeError("No pending Ego-LAP action is available for failure")
+        if (
+            not isinstance(numerical_failure_reason, str)
+            or not numerical_failure_reason
+        ):
+            raise ValueError("Execution failure requires a nonempty reason")
+        step, query, chunk = self._pending_action_identity
+        self._write_trace(
+            {
+                "event": "execution_failure",
+                "episode": self.episode_index,
+                "query": query,
+                "step": step,
+                "chunk_index": chunk,
+                "numerical_failure_reason": numerical_failure_reason,
+            }
+        )
+        self._pending_action_identity = None
+        self._execution_failure_count += 1
 
     def finalize_episode(
         self,
@@ -570,6 +670,7 @@ class EgoLAPEefPoseClient(InferenceClient):
         success: bool,
         progress: float,
         numerical_failure_reason: str = "",
+        terminal_rollout: Mapping[str, Any],
     ) -> Path | None:
         """Atomically publish the active episode trace after rollout artifacts exist."""
 
@@ -581,16 +682,67 @@ class EgoLAPEefPoseClient(InferenceClient):
                 f"episode_length={episode_length}, actions={self.step_index}"
             )
         numerical_failure = bool(numerical_failure_reason)
+        if self._rollout_environment_before is None:
+            raise RuntimeError("Cannot finalize an Ego-LAP trace before rollout start")
+        if self._pending_action_identity is not None:
+            raise RuntimeError("Cannot finalize an Ego-LAP trace with a pending action")
+        expected_execution_count = episode_length - int(numerical_failure)
+        if self._execution_count != expected_execution_count or (
+            self._execution_failure_count != int(numerical_failure)
+        ):
+            raise ValueError(
+                "Episode trace execution cadence mismatch: "
+                f"actions={episode_length}, executions={self._execution_count}, "
+                f"failures={self._execution_failure_count}"
+            )
+        terminal = dict(terminal_rollout)
+        expected_result = {
+            "episode": self.episode_index,
+            "episode_length": episode_length,
+            "success": bool(success),
+            "progress": float(progress),
+            "numerical_failure": numerical_failure,
+            "numerical_failure_reason": numerical_failure_reason,
+        }
+        if terminal.get("episode_result") != expected_result:
+            raise ValueError("Episode terminal rollout/result binding drift")
+        if terminal.get("environment_before") != self._rollout_environment_before:
+            raise ValueError("Episode terminal rollout-start snapshot drift")
+        terminal_environment = terminal.get("environment_after")
+        if numerical_failure:
+            if not isinstance(terminal_environment, Mapping) or not isinstance(
+                self._last_environment_after, Mapping
+            ):
+                raise ValueError("Episode numerical-failure terminal snapshot missing")
+            if any(
+                terminal_environment.get(field)
+                != self._last_environment_after.get(field)
+                for field in (
+                    "profile",
+                    "live_max_episode_length",
+                    "episode_length",
+                    "common_step_counter",
+                    "sensor_frame_counters",
+                )
+            ):
+                raise ValueError(
+                    "Episode numerical-failure advanced a completed-step counter"
+                )
+            terminal_sim = terminal_environment.get("sim_step_counter")
+            completed_sim = self._last_environment_after.get("sim_step_counter")
+            if type(terminal_sim) is not int or type(completed_sim) is not int:
+                raise ValueError("Episode numerical-failure sim-counter type drift")
+            sim_tail = terminal_sim - completed_sim
+            if not 1 <= sim_tail <= 8:
+                raise ValueError("Episode numerical-failure sim-counter tail drift")
+        elif terminal_environment != self._last_environment_after:
+            raise ValueError("Episode terminal rollout-end snapshot drift")
         self._write_trace(
             {
                 "event": "episode_complete",
-                "episode": self.episode_index,
-                "episode_length": episode_length,
                 "status": "numerical_failure" if numerical_failure else "completed",
-                "success": bool(success),
-                "progress": float(progress),
-                "numerical_failure": numerical_failure,
-                "numerical_failure_reason": numerical_failure_reason,
+                **expected_result,
+                "terminal_rollout": terminal,
             }
         )
         if self.trace_dir is None:
@@ -618,6 +770,10 @@ class EgoLAPEefPoseClient(InferenceClient):
     ) -> tuple[np.ndarray, np.ndarray | None]:
         """Infer or consume a chunk, anchoring the whole chunk exactly once."""
 
+        if self._rollout_environment_before is None:
+            raise RuntimeError("Begin the Ego-LAP rollout before inference")
+        if self._pending_action_identity is not None:
+            raise RuntimeError("Record the prior Ego-LAP action execution first")
         visualization = None
         needs_query = (
             self.pred_action_chunk is None
@@ -745,6 +901,11 @@ class EgoLAPEefPoseClient(InferenceClient):
                 "polaris_action": action.tolist(),
             }
         )
+        self._pending_action_identity = (
+            self.step_index,
+            self.query_index - 1,
+            chunk_index,
+        )
         self.actions_from_chunk_completed += 1
         self.step_index += 1
         return action, visualization
@@ -844,7 +1005,12 @@ class EgoLAPEefPoseClient(InferenceClient):
         )
         if path is None:
             return
-        payload = {"timestamp": time.time(), **record}
+        payload = {
+            "schema_version": EGO_LAP_TRACE_SCHEMA_VERSION,
+            "trace_profile": EGO_LAP_TRACE_PROFILE,
+            "timestamp": time.time(),
+            **record,
+        }
         with path.open("a", encoding="utf-8") as trace_file:
             trace_file.write(
                 json.dumps(

@@ -1264,7 +1264,12 @@ def test_eef_velocity_and_effort_limits_are_scoped_to_eef_setup():
         'elif eval_args.control_mode != "joint-position":'
     )
     assert eef_branch < configure_call < native_branch
-    assert "enable_gripper_velocity_limit" not in eval_source
+    gripper_limit_enable = eval_source.index("enable_gripper_velocity_limit=is_ego_lap")
+    assert configure_call < gripper_limit_enable < native_branch
+    reset = eval_source.index("obs, info = env.reset(")
+    gripper_install = eval_source.index("install_or_validate_gripper_runtime()", reset)
+    first_step = eval_source.index("obs, rew, term, trunc, info = env.step(")
+    assert reset < gripper_install < first_step
 
     native_physx_cfg = SimpleNamespace(solver_type=0)
     eef_physx_cfg = SimpleNamespace(solver_type=0)

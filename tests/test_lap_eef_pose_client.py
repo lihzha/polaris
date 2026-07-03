@@ -9,6 +9,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from polaris.config import LAP_EEF_FRAME, PolicyArgs
+from polaris.eef_runtime_contract import build_terminal_rollout_evidence
+from polaris.eval_artifacts import validate_episode_trace
 from polaris.policy.abstract_client import InferenceClient
 from polaris.policy.lap_eef_pose_client import (
     EgoLAPEefPoseClient,
@@ -36,6 +38,60 @@ from polaris.policy.ego_lap_contract import (
     persist_ego_lap_contract,
     validate_ego_lap_server_metadata,
 )
+
+
+def _runtime_protocol() -> dict:
+    return {
+        "profile": "ego_lap_eef_outer450_internal451_no_autoreset_v1",
+        "episode_steps": 450,
+        "live_max_episode_length": 451,
+        "autoreset_margin_steps": 1,
+        "policy_hz": 15.0,
+        "step_dt": 1.0 / 15.0,
+        "physics_hz": 120.0,
+        "physics_dt": 1.0 / 120.0,
+        "decimation": 8,
+        "camera_sensor_names": ["external_cam", "wrist_cam"],
+    }
+
+
+def _environment_state(step: int) -> dict:
+    return {
+        "profile": "isaaclab_single_env_episode_sim_common_camera_counters_v1",
+        "live_max_episode_length": 451,
+        "episode_length": step,
+        "sim_step_counter": step * 8,
+        "common_step_counter": step,
+        "sensor_frame_counters": {
+            "external_cam": step,
+            "wrist_cam": step,
+        },
+    }
+
+
+def _begin_client_rollout(
+    client: EgoLAPEefPoseClient, *, episode: int | None = None
+) -> None:
+    client.reset(episode_index=episode)
+    client.begin_rollout(_environment_state(0))
+
+
+def _record_client_execution(client: EgoLAPEefPoseClient, step: int) -> None:
+    client.record_execution(
+        {
+            "step_index": step,
+            "terminated": False,
+            "truncated": False,
+            "environment_before": _environment_state(step),
+            "environment_after": _environment_state(step + 1),
+            "counter_deltas": {
+                "episode_length": 1,
+                "sim_step_counter": 8,
+                "common_step_counter": 1,
+            },
+            "camera_frame_deltas": {"external_cam": 1, "wrist_cam": 1},
+        }
+    )
 
 
 def _serving_metadata(
@@ -1210,10 +1266,12 @@ class ClientContractTest(unittest.TestCase):
                 Path(temporary_directory) / "serving_contract.json"
             )
             client = EgoLAPEefPoseClient(args)
-            client.reset()
+            client.bind_runtime_contract(_runtime_protocol())
+            _begin_client_rollout(client)
             first_action, first_viz = client.infer(
                 observation, "pick up the cup", return_viz=True
             )
+            _record_client_execution(client, 0)
             self.assertTrue(client.rerender)
             client.args.render_every_step = False
             self.assertFalse(client.rerender)
@@ -1221,6 +1279,7 @@ class ClientContractTest(unittest.TestCase):
             second_action, second_viz = client.infer(
                 observation, "pick up the cup", return_viz=True
             )
+            _record_client_execution(client, 1)
             trace_records = [
                 json.loads(line)
                 for line in Path(args.trace_path).read_text().splitlines()
@@ -1287,7 +1346,7 @@ class ClientContractTest(unittest.TestCase):
         self.assertTrue(client.rerender)
         self.assertEqual(
             [record["event"] for record in trace_records],
-            ["reset", "query", "action", "action"],
+            ["reset", "query", "action", "execution", "action", "execution"],
         )
         self.assertEqual(trace_records[1]["eef_frame"], LAP_EEF_FRAME)
         self.assertEqual(trace_records[1]["policy_type"], "flow")
@@ -1336,8 +1395,10 @@ class ClientContractTest(unittest.TestCase):
             args.trace_path = str(Path(temporary_directory) / "trace.jsonl")
             args.contract_output = str(Path(temporary_directory) / "contract.json")
             client = EgoLAPEefPoseClient(args)
-            client.reset()
+            client.bind_runtime_contract(_runtime_protocol())
+            _begin_client_rollout(client)
             client.infer(observation, "move")
+            _record_client_execution(client, 0)
             records = [
                 json.loads(line)
                 for line in Path(args.trace_path).read_text().splitlines()
@@ -1393,8 +1454,10 @@ class ClientContractTest(unittest.TestCase):
             args.trace_path = str(Path(temporary_directory) / "trace.jsonl")
             args.contract_output = str(Path(temporary_directory) / "contract.json")
             client = EgoLAPEefPoseClient(args)
-            client.reset()
+            client.bind_runtime_contract(_runtime_protocol())
+            _begin_client_rollout(client)
             action, _ = client.infer(observation, "move")
+            _record_client_execution(client, 0)
 
         self.assertEqual(fake_server.requests[0]["observation"]["state"].shape, (10,))
         self.assertEqual(action.shape, (8,))
@@ -1439,8 +1502,12 @@ class ClientContractTest(unittest.TestCase):
             args.trace_path = str(Path(temporary_directory) / "trace.jsonl")
             args.contract_output = str(Path(temporary_directory) / "contract.json")
             client = EgoLAPEefPoseClient(args)
-            client.reset()
-            actions = [client.infer(observation, "move")[0] for _ in range(8)]
+            client.bind_runtime_contract(_runtime_protocol())
+            _begin_client_rollout(client)
+            actions = []
+            for step in range(8):
+                actions.append(client.infer(observation, "move")[0])
+                _record_client_execution(client, step)
             records = [
                 json.loads(line)
                 for line in Path(args.trace_path).read_text().splitlines()
@@ -1509,16 +1576,40 @@ class ClientContractTest(unittest.TestCase):
             args.trace_dir = str(trace_dir)
             args.contract_output = str(Path(temporary_directory) / "contract.json")
             client = EgoLAPEefPoseClient(args)
+            client.bind_runtime_contract(_runtime_protocol())
 
             # Simulate a preempted attempt, then reset the same global episode.
-            client.reset(episode_index=7)
+            _begin_client_rollout(client, episode=7)
             client.infer(observation, "move")
-            client.reset(episode_index=7)
-            client.infer(observation, "move")
+            _begin_client_rollout(client, episode=7)
+            for step in range(450):
+                client.infer(observation, "move")
+                _record_client_execution(client, step)
+            result = {
+                "episode": 7,
+                "episode_length": 450,
+                "success": False,
+                "progress": 0.25,
+                "numerical_failure": False,
+                "numerical_failure_reason": "",
+            }
             finalized = client.finalize_episode(
-                episode_length=1,
+                episode_length=450,
                 success=False,
                 progress=0.25,
+                terminal_rollout=build_terminal_rollout_evidence(
+                    episode_result=result,
+                    environment_before=_environment_state(0),
+                    environment_after=_environment_state(450),
+                    terminated_false_count=450,
+                    truncated_false_count=450,
+                ),
+            )
+            validated_trace = validate_episode_trace(
+                finalized,
+                episode=7,
+                expected_length=450,
+                expected_result=result,
             )
             records = [json.loads(line) for line in finalized.read_text().splitlines()]
 
@@ -1526,9 +1617,11 @@ class ClientContractTest(unittest.TestCase):
         self.assertEqual(records[0]["event"], "reset")
         self.assertEqual(records[-1]["event"], "episode_complete")
         self.assertTrue(all(record["episode"] == 7 for record in records))
-        self.assertEqual(sum(record["event"] == "action" for record in records), 1)
-        self.assertEqual(records[-1]["episode_length"], 1)
+        self.assertEqual(sum(record["event"] == "action" for record in records), 450)
+        self.assertEqual(len(records), 959)
+        self.assertEqual(records[-1]["episode_length"], 450)
         self.assertEqual(records[-1]["status"], "completed")
+        self.assertEqual(validated_trace["episode_result"], result)
 
     def test_client_rejects_non_droid_eef_frame(self):
         args = PolicyArgs(client="EgoLAPEefPose")

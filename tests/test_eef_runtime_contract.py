@@ -17,6 +17,7 @@ from polaris.eef_runtime_contract import atomic_write_runtime_contract
 from polaris.eef_runtime_contract import atomic_write_episode_safety
 from polaris.eef_runtime_contract import _validate_wrist_energy_brake_history
 from polaris.eef_runtime_contract import aggregate_episode_safety
+from polaris.eef_runtime_contract import build_terminal_rollout_evidence
 from polaris.eef_runtime_contract import load_episode_safety_sidecars
 from polaris.eef_runtime_contract import reconcile_episode_safety_transactions
 from polaris.eef_runtime_contract import validate_episode_safety_cadence
@@ -54,7 +55,11 @@ from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
 from polaris.eef_ik_safety import validate_one_step_adversarial_report
 from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
 from polaris.eval_artifacts import build_episode_artifact_identity
+from polaris.eval_artifacts import EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE
+from polaris.eval_artifacts import EGO_LAP_TRACE_PROFILE
+from polaris.eval_artifacts import EGO_LAP_TRACE_SCHEMA_VERSION
 from polaris.eval_artifacts import empty_eval_results
+from polaris.eval_artifacts import TRACE_QUERY_FIELDS
 
 
 def _wxyz(rotation: Rotation) -> np.ndarray:
@@ -223,7 +228,7 @@ def _runtime_fixture(*, wrist_energy_brake=False):
         arm_term.safety_report = candidate_report
     finger_term = SimpleNamespace(gripper_threshold_profile=GRIPPER_THRESHOLD_PROFILE)
     runtime = SimpleNamespace(
-        max_episode_length=450,
+        max_episode_length=451,
         step_dt=1.0 / 15.0,
         physics_dt=1.0 / 120.0,
         cfg=SimpleNamespace(sim=SimpleNamespace(dt=1.0 / 120.0), decimation=8),
@@ -232,7 +237,7 @@ def _runtime_fixture(*, wrist_energy_brake=False):
             _terms={"arm": arm_term, "finger_joint": finger_term}
         ),
     )
-    env = SimpleNamespace(unwrapped=runtime, max_episode_length=450)
+    env = SimpleNamespace(unwrapped=runtime, max_episode_length=451)
     observation = {
         "policy": {
             "eef_pos": relative_position[None, :],
@@ -388,21 +393,163 @@ def _candidate_two_substep_runtime():
     return env, observation, report
 
 
-def _write_completed_trace(path: Path, result):
-    records = [
-        {"event": "reset", "episode": result["episode"]},
-        *(
-            {"event": "action", "episode": result["episode"], "step": step}
-            for step in range(result["episode_length"])
-        ),
-        {
-            "event": "episode_complete",
-            **result,
-            "status": (
-                "numerical_failure" if result["numerical_failure"] else "completed"
-            ),
+def _environment_state(step: int) -> dict:
+    return {
+        "profile": "isaaclab_single_env_episode_sim_common_camera_counters_v1",
+        "live_max_episode_length": 451,
+        "episode_length": step,
+        "sim_step_counter": 8 * step,
+        "common_step_counter": step,
+        "sensor_frame_counters": {
+            "external_cam": step,
+            "wrist_cam": step,
         },
+    }
+
+
+def _terminal_rollout(result: dict) -> dict:
+    completed = result["episode_length"] - int(result["numerical_failure"])
+    environment_after = _environment_state(completed)
+    if result["numerical_failure"]:
+        # The fixture's failed action aborts on its third attempted substep.
+        environment_after["sim_step_counter"] += 3
+    return build_terminal_rollout_evidence(
+        episode_result=result,
+        environment_before=_environment_state(0),
+        environment_after=environment_after,
+        terminated_false_count=completed,
+        truncated_false_count=completed,
+    )
+
+
+def _trace_common(event: str, episode: int) -> dict:
+    return {
+        "schema_version": EGO_LAP_TRACE_SCHEMA_VERSION,
+        "trace_profile": EGO_LAP_TRACE_PROFILE,
+        "timestamp": 1.0,
+        "event": event,
+        "episode": episode,
+    }
+
+
+def _trace_query(episode: int, query_index: int) -> dict:
+    zero_chunk = [[0.0] * 7 for _ in range(16)]
+    anchored_chunk = [[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] for _ in range(16)]
+    record = {field: None for field in TRACE_QUERY_FIELDS}
+    record.update(_trace_common("query", episode))
+    record.update(
+        {
+            "query": query_index,
+            "step": query_index * 8,
+            "instruction": "perform the task",
+            "checkpoint_profile": "original_lap_public_3b_v1",
+            "checkpoint_path": "/checkpoints/LAP-3B",
+            "contract_sha256": "0" * 64,
+            "policy_type": "flow",
+            "response_semantics": "cumulative_delta_targets",
+            "execution_horizon": 8,
+            "ar_endpoint_interpolation_profile": None,
+            "ar_endpoint_interpolation_steps": None,
+            "gripper_execution_profile": "binary_model_open_gt_0p5_else_closed_v1",
+            "gripper_threshold": 0.5,
+            "action_sampler_profile": "flow_explicit_euler_t1_to_t0_v1",
+            "flow_num_steps": 10,
+            "initial_rng_seed": 0,
+            "ar_max_decoding_steps": None,
+            "ar_temperature": None,
+            "ar_stop_at_eos": None,
+            "frame_description": "robot base frame",
+            "eef_frame": "panda_link8",
+            "numeric_action_frame": "robot_base",
+            "normalization_scope": "category",
+            "normalization_stats_sha256": "1" * 64,
+            "normalization_profile": "q99_train_matched_v1",
+            "normalization_compute_dtype": "float32",
+            "normalization_input_formula": "q99_input_eps1e-8_clip_zero0_v1",
+            "normalization_output_formula": (
+                "q99_output_eps1e-8_zeroq01_extrapolate_v1"
+            ),
+            "normalization_formula_probe_sha256": "2" * 64,
+            "state_layout": "xyz+r6_first_two_rows+gripper_open",
+            "state_layout_mode": "public_lap_train_matched_rows_v1",
+            "polaris_profile": "panda_link8_eef_pose_single_arm_v1",
+            "anchor_position": [0.0, 0.0, 0.0],
+            "anchor_quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+            "state": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0],
+            "server_delta_chunk": zero_chunk,
+            "raw_delta_chunk": zero_chunk,
+            "base_delta_chunk": zero_chunk,
+            "anchored_action_chunk": anchored_chunk,
+            "reasoning": None,
+        }
+    )
+    return record
+
+
+def _write_completed_trace(path: Path, result):
+    episode = result["episode"]
+    records = [
+        {
+            **_trace_common("reset", episode),
+            "environment_runtime_profile": EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE,
+            "environment_before": _environment_state(0),
+        }
     ]
+    for step in range(result["episode_length"]):
+        if step % 8 == 0:
+            records.append(_trace_query(episode, step // 8))
+        identity = {
+            "query": step // 8,
+            "step": step,
+            "chunk_index": step % 8,
+        }
+        records.extend(
+            [
+                {
+                    **_trace_common("action", episode),
+                    **identity,
+                    "raw_delta": [0.0] * 7,
+                    "polaris_action": [
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0,
+                    ],
+                },
+                {
+                    **_trace_common("execution", episode),
+                    **identity,
+                    "transition": {
+                        "step_index": step,
+                        "terminated": False,
+                        "truncated": False,
+                        "environment_before": _environment_state(step),
+                        "environment_after": _environment_state(step + 1),
+                        "counter_deltas": {
+                            "episode_length": 1,
+                            "sim_step_counter": 8,
+                            "common_step_counter": 1,
+                        },
+                        "camera_frame_deltas": {
+                            "external_cam": 1,
+                            "wrist_cam": 1,
+                        },
+                    },
+                },
+            ]
+        )
+    records.append(
+        {
+            **_trace_common("episode_complete", episode),
+            **result,
+            "status": "completed",
+            "terminal_rollout": _terminal_rollout(result),
+        },
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "".join(json.dumps(record) + "\n" for record in records),
@@ -410,13 +557,13 @@ def _write_completed_trace(path: Path, result):
     )
 
 
-def _video_probe(_path: Path, *, frames=2):
+def _video_probe(_path: Path, *, frames=450):
     return {"frame_count": frames, "height": 224, "width": 448}
 
 
 def _prepare_episode_transaction(tmp_path: Path, *, episode: int):
-    result = _episode_result(episode=episode)
-    safety = _episode_safety(episode=episode)
+    result = _episode_result(episode=episode, length=450)
+    safety = _episode_safety(episode=episode, length=450)
     video_path = tmp_path / f"episode_{episode}.mp4"
     trace_dir = tmp_path / "policy_traces"
     trace_path = trace_dir / f"episode_{episode:06d}.jsonl"
@@ -435,22 +582,25 @@ def _prepare_episode_transaction(tmp_path: Path, *, episode: int):
         episode_result=result,
         safety=safety,
         artifact_identity=identity,
+        terminal_rollout=_terminal_rollout(result),
     )
     return result, sidecar_path, payload
 
 
-def test_runtime_protocol_requires_exact_450_steps_at_15hz():
+def test_runtime_protocol_requires_outer450_internal451_at_15hz():
     env, _ = _runtime_fixture()
     resolved = validate_ego_lap_runtime_protocol(env)
     assert resolved["episode_steps"] == 450
+    assert resolved["live_max_episode_length"] == 451
+    assert resolved["autoreset_margin_steps"] == 1
     assert resolved["policy_hz"] == 15.0
     assert resolved["physics_hz"] == 120.0
     assert resolved["decimation"] == 8
 
-    env.max_episode_length = 449
-    with pytest.raises(ValueError, match="450"):
-        validate_ego_lap_runtime_protocol(env)
     env.max_episode_length = 450
+    with pytest.raises(ValueError, match="451"):
+        validate_ego_lap_runtime_protocol(env)
+    env.max_episode_length = 451
     env.unwrapped.step_dt = 1.0 / 10.0
     with pytest.raises(ValueError, match="15 Hz"):
         validate_ego_lap_runtime_protocol(env)
@@ -505,19 +655,21 @@ def test_runtime_candidate_selects_exact_profile_schema_and_diagnostics(tmp_path
     assert validated["wrist_energy_brake_target_shift_fraction"] == 0.9
     assert validated["wrist_energy_brake_latch_remaining_substeps"] == [1]
 
-    durable = _episode_safety(wrist_energy_brake=True)
+    durable_result = _episode_result(length=450)
+    durable = _episode_safety(length=450, wrist_energy_brake=True)
     validate_episode_safety_cadence(
         safety=durable,
-        episode_result=_episode_result(),
+        episode_result=durable_result,
     )
     aggregate = aggregate_episode_safety(
         durable,
         [
             {
                 "episode_index": 0,
-                "episode_result": _episode_result(),
+                "episode_result": durable_result,
                 "artifact_identity": {},
-                "cadence_evidence": {"apply_calls": 16},
+                "cadence_evidence": {"apply_calls": 3600},
+                "terminal_rollout": _terminal_rollout(durable_result),
                 "safety": durable,
                 "path": "episode_000000.json",
                 "sha256": "0" * 64,
@@ -774,14 +926,18 @@ def test_runtime_contract_is_atomic_and_has_exact_evidence_schema():
         payload = json.loads(path.read_text(encoding="utf-8"))
 
         assert payload == {
-            "schema_version": 2,
+            "schema_version": 3,
             "protocol": {
+                "profile": "ego_lap_eef_outer450_internal451_no_autoreset_v1",
                 "episode_steps": 450,
+                "live_max_episode_length": 451,
+                "autoreset_margin_steps": 1,
                 "policy_hz": 15.0,
                 "step_dt": 1.0 / 15.0,
                 "physics_hz": 120.0,
                 "physics_dt": 1.0 / 120.0,
                 "decimation": 8,
+                "camera_sensor_names": ["external_cam", "wrist_cam"],
             },
             "frame": frame,
             "ik_safety": aggregate_safety,
@@ -790,8 +946,8 @@ def test_runtime_contract_is_atomic_and_has_exact_evidence_schema():
 
 
 def test_prepared_sidecar_recovers_exact_missing_csv_row(tmp_path: Path):
-    result = _episode_result()
-    safety = _episode_safety()
+    result = _episode_result(length=450)
+    safety = _episode_safety(length=450)
     video_path = tmp_path / "episode_0.mp4"
     trace_dir = tmp_path / "policy_traces"
     trace_path = trace_dir / "episode_000000.jsonl"
@@ -810,6 +966,7 @@ def test_prepared_sidecar_recovers_exact_missing_csv_row(tmp_path: Path):
         episode_result=result,
         safety=safety,
         artifact_identity=identity,
+        terminal_rollout=_terminal_rollout(result),
     )
 
     recovered, changed = reconcile_episode_safety_transactions(
@@ -842,7 +999,7 @@ def test_transaction_recovery_is_idempotent_after_csv_commit(tmp_path: Path):
     assert committed.to_dict(orient="records") == [result]
     assert json.loads(sidecar_path.read_text()) == payload
 
-    drifted_safety = _episode_safety()
+    drifted_safety = _episode_safety(length=450)
     drifted_safety["counters"]["slew_limit_events"] = 1
     drifted_safety["counters"]["slew_limited_joints"] = 1
     with pytest.raises(ValueError, match="Refusing to overwrite drifted"):
@@ -852,6 +1009,7 @@ def test_transaction_recovery_is_idempotent_after_csv_commit(tmp_path: Path):
             episode_result=result,
             safety=drifted_safety,
             artifact_identity=payload["artifact_identity"],
+            terminal_rollout=payload["terminal_rollout"],
         )
 
 
@@ -930,15 +1088,60 @@ def test_runtime_aggregate_reconstructs_all_resume_history(tmp_path: Path):
     aggregate = aggregate_episode_safety(live, sidecars)
 
     assert aggregate["episodes_completed"] == 2
-    assert aggregate["counters"]["apply_calls"] == 32
-    assert aggregate["counters"]["environment_substeps"] == 32
+    assert aggregate["counters"]["apply_calls"] == 7200
+    assert aggregate["counters"]["environment_substeps"] == 7200
     assert [item["episode_index"] for item in aggregate["episodes"]] == [0, 1]
     assert all(item["sidecar_sha256"] for item in aggregate["episodes"])
 
 
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        (
+            lambda aggregate: aggregate.__setitem__("episodes_completed", 1),
+            "completed-episode count",
+        ),
+        (
+            lambda aggregate: aggregate["counters"].__setitem__(
+                "apply_calls", aggregate["counters"]["apply_calls"] + 1
+            ),
+            "counters disagree",
+        ),
+        (
+            lambda aggregate: aggregate["maxima"][
+                "raw_delta_joint_pos_rad"
+            ].__setitem__(0, 1.0),
+            "maxima disagree",
+        ),
+        (
+            lambda aggregate: aggregate["episodes"][1].__setitem__("episode_index", 3),
+            "indices are not contiguous",
+        ),
+    ],
+)
+def test_runtime_writer_recomputes_aggregate_from_episode_entries(
+    tmp_path: Path, mutation, match
+):
+    for episode in range(2):
+        _prepare_episode_transaction(tmp_path, episode=episode)
+    sidecars = load_episode_safety_sidecars(tmp_path / "ik_safety", [0, 1])
+    env, observation = _runtime_fixture()
+    live = env.unwrapped.action_manager._terms["arm"].safety_report()
+    aggregate = aggregate_episode_safety(live, sidecars)
+    mutation(aggregate)
+
+    with pytest.raises(ValueError, match=match):
+        atomic_write_runtime_contract(
+            tmp_path / "runtime-mutated.json",
+            protocol=validate_ego_lap_runtime_protocol(env),
+            frame=validate_eef_runtime_frame(env, observation),
+            ik_safety=aggregate,
+        )
+
+
 def test_prepared_sidecar_recovery_rejects_csv_and_trace_drift(tmp_path: Path):
-    result = _episode_result()
-    safety = _episode_safety()
+    result = _episode_result(length=450)
+    safety = _episode_safety(length=450)
     (tmp_path / "episode_0.mp4").write_bytes(b"complete-video")
     trace_dir = tmp_path / "policy_traces"
     trace_path = trace_dir / "episode_000000.jsonl"
@@ -956,6 +1159,7 @@ def test_prepared_sidecar_recovery_rejects_csv_and_trace_drift(tmp_path: Path):
         episode_result=result,
         safety=safety,
         artifact_identity=identity,
+        terminal_rollout=_terminal_rollout(result),
     )
 
     drifted_row = {**result, "progress": 0.5}
@@ -1145,20 +1349,22 @@ def test_episode_safety_rejects_impossible_counter_and_diagnostic_history():
 
 
 def test_episode_sidecar_strict_json_rejects_nan(tmp_path: Path):
-    safety = _episode_safety()
+    result = _episode_result(length=450)
+    terminal = _terminal_rollout(result)
+    safety = _episode_safety(length=450)
     safety["maxima"]["raw_delta_joint_pos_rad"][0] = float("nan")
     with pytest.raises(ValueError, match="maximum raw_delta_joint_pos_rad is invalid"):
         atomic_write_episode_safety(
             tmp_path / "episode_000000.json",
             episode_index=0,
-            episode_result=_episode_result(),
+            episode_result=result,
             safety=safety,
             artifact_identity={
                 "video": {
                     "filename": "episode_0.mp4",
                     "size_bytes": 1,
                     "sha256": "0" * 64,
-                    "frame_count": 2,
+                    "frame_count": 450,
                     "height": 224,
                     "width": 448,
                 },
@@ -1166,11 +1372,64 @@ def test_episode_sidecar_strict_json_rejects_nan(tmp_path: Path):
                     "filename": "episode_000000.jsonl",
                     "size_bytes": 1,
                     "sha256": "0" * 64,
-                    "episode_result": _episode_result(),
+                    "schema_version": 2,
+                    "trace_profile": EGO_LAP_TRACE_PROFILE,
+                    "episode_result": result,
+                    "terminal_rollout": terminal,
                 },
             },
+            terminal_rollout=terminal,
         )
     assert not (tmp_path / "episode_000000.json").exists()
+
+
+def test_episode_sidecar_binds_failure_sim_tail_to_apply_calls(tmp_path: Path):
+    result = _episode_result(length=2, numerical_failure=True)
+    safety = _episode_safety(length=2, numerical_failure=True)
+    terminal = _terminal_rollout(result)
+    identity = {
+        "video": {
+            "filename": "episode_0.mp4",
+            "size_bytes": 1,
+            "sha256": "0" * 64,
+            "frame_count": 2,
+            "height": 224,
+            "width": 448,
+        },
+        "terminal_trace": {
+            "filename": "episode_000000.jsonl",
+            "size_bytes": 1,
+            "sha256": "0" * 64,
+            "schema_version": 2,
+            "trace_profile": EGO_LAP_TRACE_PROFILE,
+            "episode_result": result,
+            "terminal_rollout": terminal,
+        },
+    }
+    atomic_write_episode_safety(
+        tmp_path / "valid.json",
+        episode_index=0,
+        episode_result=result,
+        safety=safety,
+        artifact_identity=identity,
+        terminal_rollout=terminal,
+    )
+    assert terminal["counter_deltas"]["sim_step_counter"] == 11
+
+    mismatch = copy.deepcopy(terminal)
+    mismatch["environment_after"]["sim_step_counter"] += 1
+    mismatch["counter_deltas"]["sim_step_counter"] += 1
+    mismatch_identity = copy.deepcopy(identity)
+    mismatch_identity["terminal_trace"]["terminal_rollout"] = mismatch
+    with pytest.raises(ValueError, match="sim-counter/apply-call binding"):
+        atomic_write_episode_safety(
+            tmp_path / "mismatch.json",
+            episode_index=0,
+            episode_result=result,
+            safety=safety,
+            artifact_identity=mismatch_identity,
+            terminal_rollout=mismatch,
+        )
 
 
 def test_runtime_frame_rejects_observation_and_controller_drift():

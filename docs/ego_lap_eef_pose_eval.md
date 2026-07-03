@@ -134,6 +134,35 @@ the legacy real-robot helper's Euler-add endpoint. Use:
 The client rejects a flow response that is not `16x7`, an AR response that is
 not `1x7`, and any non-finite value.
 
+## Production Robotiq adaptation
+
+EEF evaluation installs the named
+`implicit_gripper_physx_velocity_limit5_followers5_cuda_actuator_cpu_static_physx_v1`
+runtime profile after the first explicit reset and before the first controller
+apply. The driven `finger_joint` retains its configured 5 rad/s and 200 Nm
+implicit-actuator limits on CUDA. The direct PhysX articulation view exposes
+the static 13-DOF maximum-velocity tensor on CPU: the evaluator requires the
+seven arm entries and driven finger entry to match their pinned pre-write
+values, changes only the five passive Robotiq mimic followers from
+`174.53292846679688` to `5.0`, calls
+`root_physx_view.set_dof_max_velocities` once with the full tensor, and requires
+an exact CPU readback. Later resets verify persistence and never rewrite it.
+
+The static contract also pins the source robot USD identity, every mimic axis,
+reference, gearing, natural frequency, damping ratio, exact joint order, and
+action/actuator ownership. Dynamic evidence samples all six gripper joints at
+every 120-Hz arm-controller entry and after every completed policy step. It
+records measured velocity and acceleration maxima plus their causal diagnostic
+and terminal vectors. The PhysX velocity setting is not represented as a hard
+bound on measured passive-joint velocity; values above 5 rad/s remain valid
+measurements and must not be hidden.
+
+Apply-entry samples are counted before finiteness rejection, so a gripper
+non-finite preserves exact controller cadence in the numerical-failure
+sidecar. A gripper non-finite first discovered only after a completed
+`env.step` is a hard job stop: the evaluator does not misrepresent that
+executed transition as an unexecuted numerical-failure tail.
+
 ## Rollout durability and numerical containment
 
 The v3 evaluator publishes one video, finalized per-episode policy trace,
@@ -159,13 +188,15 @@ controller evidence. EEF evaluations use the robust DLS action term:
   step and are recorded as `numerical_failure=True`, success false, progress
   zero.
 
-Before rollout, the evaluator also requires the live environment to expose
-exactly 450 policy steps at 15 Hz. After the first reset it compares the policy
+Before environment construction, the evaluator configures an internal timeout
+of 451 policy steps at 15 Hz, then owns an exact 450-step outer loop. This
+one-step margin prevents Isaac Lab's step-450 timeout path from auto-resetting
+the terminal observation. After the first reset it compares the policy
 observation to the articulation's direct `panda_link0 -> panda_link8` transform
 and verifies that the installed 7-D action term is absolute-pose differential
 IK on `panda_link8` with an identity body offset. These protocol, frame,
 controller-body, offset, command-mode, and action-dimension facts are written
-atomically to schema-2 `--runtime-contract-output` (defaulting to
+atomically to schema-3 `--runtime-contract-output` (defaulting to
 `RUN_FOLDER/polaris_runtime_contract.json`). A fully resumed task performs the
 same live reset, validation, and write before its completed-path early return.
 The contract binds 120-Hz physics with decimation 8, explicit arm
@@ -175,13 +206,43 @@ counters, finite-or-null diagnostics, and aggregate maxima. A nonfailed
 450-step rollout must record exactly 3600 controller apply calls; a failed
 attempt records its exact policy step and physics substep.
 
+Every successful outer step must return `terminated=false` and
+`truncated=false`, advance `episode_length_buf` and `common_step_counter` by
+one, `_sim_step_counter` by eight, and both `external_cam.frame` and
+`wrist_cam.frame` by one. These exact before/after transitions are written to
+the schema-2 `ego_lap_eef_pose_runtime_trace_v2`. With execute horizon 8, a
+completed rollout has exactly 959 records: one reset carrying the initial
+environment snapshot, 57 queries, 450 actions, 450 execution records, and one
+terminal record. Query placement, action/chunk identity, transition schemas,
+and the full counter chain are validated during artifact publication and
+resume.
+
+Trace-v2 query payloads are recomputed rather than accepted as opaque JSON:
+checkpoint hashes, sampler mode, normalization formula/dtype, state-R6,
+server/raw/base chunks, and anchored float32 actions must agree. Each action
+must equal its selected query chunk, query-static identity cannot drift within
+an episode, and an execution-failure reason must equal the terminal result.
+Runtime schema 3 likewise recomputes completed episode count, contiguous
+indices, counters, arm maxima, and all-six gripper maxima from the immutable
+episode entries before publication.
+
+The immutable episode sidecar is schema 3 and carries the same terminal object
+as the finalized trace. A normal terminal state has outer/common/camera deltas
+of 450 and a simulation-counter delta of 3600. On a numerical failure, the
+terminal snapshot is the actual live state after the failed controller apply:
+outer/common/camera deltas remain the number of completed steps, while the
+simulation-counter tail is strictly one through eight ticks. The sidecar binds
+that simulation delta exactly to the safety report's `apply_calls`; a stale
+last-success snapshot or a synthetic full-step terminal is rejected.
+
 The older v2 diagnostic runs remain preserved as historical evidence but are
 superseded for publication by the `panda_velocity_softlimit_v1` v3 contract.
 
 First run the standalone controller smoke and pin its exact live soft-limit
 bytes/digest in the paired Ego-LAP revision. Only that verified immutable
-revision may launch a checkpoint canary. Inspect the canary's schema-2 contract,
-sidecar, trace, CSV, complete video, 3600-call cadence, and wall time before
+revision may launch a checkpoint canary. Inspect the canary's schema-3 contract,
+sidecar, trace, CSV, complete video, 3600-call cadence, all-six gripper maxima,
+and wall time before
 scaling out.
 
 ## Controller smoke and focused tests
@@ -237,6 +298,15 @@ PYTHONPATH="$PWD/src:$PWD/third_party/openpi/packages/openpi-client/src" \
   tests/test_lap_image_resize.py \
   tests/test_eval_mode_contract.py
 ```
+
+The new terminal, artifact, client, and gripper contract tests use fake
+environments/tensors. They prove schema, mutation rejection, one-call control
+flow, and resume binding, but they do not prove the real camera counters or the
+CPU/CUDA PhysX device split. Do not promote this profile from host tests. The
+first one-rollout official LAP `scripts/eval.py` canary is the authoritative
+integrated real-Isaac gate and must validate all 450 transitions, 3600 applies,
+all-six gripper evidence, trace/sidecar/runtime artifacts, and the complete
+video before any scale-out.
 
 `tests/test_robust_differential_ik.py` requires the pinned Isaac Lab runtime.
 SciPy is a direct dependency because pose conversion and composition use its

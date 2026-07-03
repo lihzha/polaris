@@ -16,16 +16,23 @@ from polaris.eef_runtime_contract import atomic_write_runtime_contract
 from polaris.eef_runtime_contract import atomic_write_episode_safety
 from polaris.eef_runtime_contract import aggregate_episode_safety
 from polaris.eef_runtime_contract import begin_eef_safety_episode
+from polaris.eef_runtime_contract import build_terminal_rollout_evidence
+from polaris.eef_runtime_contract import capture_eef_environment_state
+from polaris.eef_runtime_contract import configure_ego_lap_environment_timeout
 from polaris.eef_runtime_contract import eef_episode_safety_report
 from polaris.eef_runtime_contract import load_episode_safety_sidecars
 from polaris.eef_runtime_contract import reconcile_episode_safety_transactions
 from polaris.eef_runtime_contract import validate_eef_runtime_frame
 from polaris.eef_runtime_contract import validate_eef_runtime_safety
 from polaris.eef_runtime_contract import validate_ego_lap_runtime_protocol
+from polaris.eef_runtime_contract import validate_eef_outer_step_transition
 from polaris.eval_artifacts import atomic_write_episode_video
 from polaris.eval_artifacts import atomic_write_results
 from polaris.eval_artifacts import build_episode_artifact_identity
 from polaris.eval_artifacts import load_resume_results
+from polaris.eef_gripper_runtime import install_eef_gripper_runtime
+from polaris.eef_gripper_runtime import record_eef_gripper_post_policy_step
+from polaris.eef_gripper_runtime import validate_eef_gripper_post_reset
 
 
 def main(eval_args: EvalArgs):
@@ -60,6 +67,8 @@ def main(eval_args: EvalArgs):
         num_envs=1,
         use_fabric=True,
     )
+    if is_ego_lap:
+        configure_ego_lap_environment_timeout(env_cfg)
     if eval_args.control_mode == "eef-pose":
         # Action managers are constructed by gym.make, so select the controller
         # on the config before creating the environment.
@@ -67,6 +76,7 @@ def main(eval_args: EvalArgs):
         configure_eef_pose_joint_safety(
             env_cfg.scene.robot,
             physx_cfg=env_cfg.sim.physx,
+            enable_gripper_velocity_limit=is_ego_lap,
         )
         frame_cfg = env_cfg.scene.lap_ee_frame
         target_cfg = frame_cfg.target_frames[0]
@@ -116,6 +126,7 @@ def main(eval_args: EvalArgs):
         )
     elif eval_args.control_mode != "joint-position":
         raise ValueError(f"Unsupported control mode: {eval_args.control_mode}")
+    robot_usd_path = Path(env_cfg.scene.robot.spawn.usd_path)
     env: ManagerBasedRLSplatEnv = gym.make(  # type: ignore[assignment]
         eval_args.environment, cfg=env_cfg
     )
@@ -124,7 +135,10 @@ def main(eval_args: EvalArgs):
         runtime_protocol = validate_ego_lap_runtime_protocol(env)
         print(
             "POLARIS_LAP_RUNTIME_PROTOCOL="
-            f"steps={runtime_protocol['episode_steps']};"
+            f"profile={runtime_protocol['profile']};"
+            f"outer_steps={runtime_protocol['episode_steps']};"
+            f"internal_steps={runtime_protocol['live_max_episode_length']};"
+            f"autoreset_margin={runtime_protocol['autoreset_margin_steps']};"
             f"policy_hz={runtime_protocol['policy_hz']};"
             f"step_dt={runtime_protocol['step_dt']};"
             f"physics_hz={runtime_protocol['physics_hz']};"
@@ -132,6 +146,11 @@ def main(eval_args: EvalArgs):
             f"decimation={runtime_protocol['decimation']}",
             flush=True,
         )
+    evaluation_horizon = (
+        int(runtime_protocol["episode_steps"])
+        if runtime_protocol is not None
+        else int(env.max_episode_length)
+    )
 
     default_instruction, initial_conditions = load_eval_initial_conditions(
         usd=env.usd_file,
@@ -183,7 +202,7 @@ def main(eval_args: EvalArgs):
         csv_path,
         run_folder=run_folder,
         expected_rollouts=rollouts,
-        expected_horizon=env.max_episode_length,
+        expected_horizon=evaluation_horizon,
         require_episode_artifacts=is_ego_lap,
         trace_dir=(
             Path(eval_args.policy.trace_dir)
@@ -204,7 +223,7 @@ def main(eval_args: EvalArgs):
             run_folder=run_folder,
             trace_dir=trace_dir,
             expected_rollouts=rollouts,
-            expected_horizon=env.max_episode_length,
+            expected_horizon=evaluation_horizon,
         )
         if recovered_row:
             atomic_write_results(episode_df, csv_path)
@@ -217,7 +236,7 @@ def main(eval_args: EvalArgs):
             csv_path,
             run_folder=run_folder,
             expected_rollouts=rollouts,
-            expected_horizon=env.max_episode_length,
+            expected_horizon=evaluation_horizon,
             require_episode_artifacts=True,
             trace_dir=trace_dir,
         )
@@ -227,8 +246,19 @@ def main(eval_args: EvalArgs):
         # Validate and persist the live serving contract even when a resumed task
         # already contains every rollout artifact.
         policy_client = InferenceClient.get_client(eval_args.policy)
+        policy_client.bind_runtime_contract(runtime_protocol)
 
     runtime_frame_evidence = None
+    gripper_runtime_contract = None
+
+    def install_or_validate_gripper_runtime():
+        nonlocal gripper_runtime_contract
+        if gripper_runtime_contract is None:
+            gripper_runtime_contract = install_eef_gripper_runtime(
+                env, robot_usd_path=robot_usd_path
+            )
+        else:
+            validate_eef_gripper_post_reset(env, gripper_runtime_contract)
 
     def persist_runtime_contract():
         if (
@@ -237,7 +267,7 @@ def main(eval_args: EvalArgs):
             or eval_args.runtime_contract_output is None
         ):
             raise RuntimeError("Ego-LAP runtime contract evidence is incomplete")
-        runtime_safety = validate_eef_runtime_safety(env)
+        runtime_safety = validate_eef_runtime_safety(env, require_gripper_runtime=True)
         committed_episode_indices = (
             [int(value) for value in episode_df["episode"].tolist()]
             if "episode" in episode_df
@@ -286,6 +316,7 @@ def main(eval_args: EvalArgs):
     if episode >= rollouts:
         if is_ego_lap:
             resumed_observation, _ = env.reset(object_positions=initial_conditions[0])
+            install_or_validate_gripper_runtime()
             validate_runtime_frame_and_persist(resumed_observation)
         print("All rollouts have been evaluated. Exiting.")
         env.close()
@@ -294,19 +325,28 @@ def main(eval_args: EvalArgs):
 
     if policy_client is None:
         policy_client = InferenceClient.get_client(eval_args.policy)
+        if is_ego_lap:
+            policy_client.bind_runtime_contract(runtime_protocol)
 
-    horizon = env.max_episode_length
+    horizon = evaluation_horizon
     runtime_frame_validated = False
     while episode < rollouts:
         # Index the initial condition with the episode being started. The old
         # loop reset before incrementing ``episode``, repeating condition zero.
         obs, info = env.reset(object_positions=initial_conditions[episode])
+        if is_ego_lap:
+            install_or_validate_gripper_runtime()
         if is_ego_lap and not runtime_frame_validated:
             validate_runtime_frame_and_persist(obs)
             runtime_frame_validated = True
         if is_ego_lap:
             policy_client.reset(episode_index=episode)
             begin_eef_safety_episode(env, episode)
+            rollout_environment_before = capture_eef_environment_state(env)
+            policy_client.begin_rollout(rollout_environment_before)
+            rollout_environment_after = rollout_environment_before
+            terminated_false_count = 0
+            truncated_false_count = 0
         else:
             policy_client.reset()
         video = []
@@ -323,12 +363,34 @@ def main(eval_args: EvalArgs):
                 # even when policy inference itself is open-loop chunked.
                 video.append(viz)
             try:
+                if is_ego_lap:
+                    environment_before = capture_eef_environment_state(env)
                 obs, rew, term, trunc, info = env.step(
                     torch.as_tensor(action, device=env.device).reshape(1, -1),
                     expensive=policy_client.rerender,
                 )
+                if is_ego_lap:
+                    record_eef_gripper_post_policy_step(env)
+                    environment_after = capture_eef_environment_state(env)
+                    transition = validate_eef_outer_step_transition(
+                        step_index=bar.n,
+                        environment_before=environment_before,
+                        environment_after=environment_after,
+                        terminated=term,
+                        truncated=trunc,
+                    )
+                    policy_client.record_execution(transition)
+                    rollout_environment_after = environment_after
+                    terminated_false_count += 1
+                    truncated_false_count += 1
             except (DifferentialIKNumericalError, torch.linalg.LinAlgError) as error:
                 numerical_failure_reason = f"{type(error).__name__}: {error}"
+                if is_ego_lap:
+                    # Isaac increments the sim counter before apply_action. Preserve
+                    # that one-to-eight-substep failed tail as the actual terminal
+                    # state; episode/common/camera counters must not advance.
+                    rollout_environment_after = capture_eef_environment_state(env)
+                    policy_client.record_execution_failure(numerical_failure_reason)
                 print(
                     f"Numerical failure in episode {episode} at action "
                     f"{bar.n}: {numerical_failure_reason}"
@@ -338,7 +400,7 @@ def main(eval_args: EvalArgs):
                 bar.update(1)
                 break
             bar.update(1)
-            if term[0] or trunc[0]:
+            if not is_ego_lap and (term[0] or trunc[0]):
                 break
 
         episode_length = bar.n
@@ -367,10 +429,18 @@ def main(eval_args: EvalArgs):
             "numerical_failure_reason": numerical_failure_reason,
         }
         if is_ego_lap:
+            terminal_rollout = build_terminal_rollout_evidence(
+                episode_result=episode_data,
+                environment_before=rollout_environment_before,
+                environment_after=rollout_environment_after,
+                terminated_false_count=terminated_false_count,
+                truncated_false_count=truncated_false_count,
+            )
             finalized_trace = policy_client.finalize_episode(
                 episode_length=episode_length,
                 success=bool(episode_data["success"]),
                 progress=float(episode_data["progress"]),
+                terminal_rollout=terminal_rollout,
                 numerical_failure_reason=numerical_failure_reason,
             )
             if finalized_trace is None:
@@ -389,6 +459,7 @@ def main(eval_args: EvalArgs):
                 episode_result=episode_data,
                 safety=episode_safety,
                 artifact_identity=artifact_identity,
+                terminal_rollout=terminal_rollout,
             )
         episode_df = pd.concat(
             [episode_df, pd.DataFrame([episode_data])], ignore_index=True

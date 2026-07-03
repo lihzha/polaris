@@ -52,6 +52,13 @@ from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_JOINT_NAMES
 from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
 from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_PROFILE
 from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
+from polaris.eef_gripper_runtime import EEF_GRIPPER_RUNTIME_PROFILE
+from polaris.eef_gripper_runtime import GRIPPER_JOINT_INDICES
+from polaris.eef_gripper_runtime import GRIPPER_JOINT_NAMES
+from polaris.eef_gripper_runtime import PINNED_DYNAMIC_DEVICE
+from polaris.eef_gripper_runtime import PINNED_TENSOR_DTYPE
+from polaris.eef_gripper_runtime import validate_eef_gripper_dynamic_evidence
+from polaris.eef_gripper_runtime import validate_eef_gripper_static_contract
 
 
 FAILURE_SUBSTEP_TRACE_CAPACITY = 64
@@ -109,6 +116,10 @@ class DifferentialIKNumericalError(RuntimeError):
 
 class DifferentialIKInvariantError(DifferentialIKNumericalError):
     """Raised when a finite controller state violates a safety invariant."""
+
+
+class GripperRuntimePostStepError(RuntimeError):
+    """Hard-stop when gripper evidence fails after an environment step completed."""
 
 
 def _require_finite(value: torch.Tensor, *, field: str) -> None:
@@ -648,6 +659,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             if self._wrist_energy_brake_enabled
             else EEF_IK_SAFETY_PROFILE
         )
+        self._gripper_runtime_static: dict[str, object] | None = None
         self._ik_controller = RobustDifferentialIKController(
             cfg=self.cfg.controller,
             num_envs=self.num_envs,
@@ -1128,8 +1140,229 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._max_raw_delta_diagnostic_jacobian_max_abs = torch.tensor(
             0.0, dtype=torch.float64, device=self.device
         )
+        if getattr(self, "_gripper_runtime_static", None) is not None:
+            self._reset_gripper_runtime_evidence()
         if self._failure_substep_trace_enabled:
             self._reset_failure_substep_trace_state()
+
+    def install_gripper_runtime_contract(self, contract: dict[str, object]) -> None:
+        """Bind the one-call production follower write to this action term."""
+
+        if getattr(self, "_gripper_runtime_static", None) is not None:
+            raise ValueError(
+                "PolaRiS EEF gripper runtime contract is already installed"
+            )
+        if self._apply_call_count != 0:
+            raise ValueError(
+                "PolaRiS EEF gripper contract must be installed before apply"
+            )
+        validated = validate_eef_gripper_static_contract(contract)
+        for field in (
+            "joint_pos",
+            "joint_vel",
+            "joint_acc",
+            "joint_pos_target",
+            "joint_vel_target",
+        ):
+            tensor = getattr(self._asset.data, field, None)
+            if (
+                not isinstance(tensor, torch.Tensor)
+                or str(tensor.device) != PINNED_DYNAMIC_DEVICE
+                or str(tensor.dtype) != PINNED_TENSOR_DTYPE
+                or tuple(tensor.shape) != (self.num_envs, len(self._asset.joint_names))
+            ):
+                raise ValueError(
+                    "PolaRiS EEF gripper dynamic tensor contract drift: "
+                    f"field={field!r}, shape={getattr(tensor, 'shape', None)!r}, "
+                    f"device={getattr(tensor, 'device', None)!r}, "
+                    f"dtype={getattr(tensor, 'dtype', None)!r}"
+                )
+        self._gripper_runtime_static = validated
+        self._reset_gripper_runtime_evidence()
+
+    def _reset_gripper_runtime_evidence(self) -> None:
+        dtype = self._asset.data.joint_pos.dtype
+        width = len(GRIPPER_JOINT_INDICES)
+        self._gripper_apply_entry_samples = 0
+        self._gripper_post_policy_step_samples = 0
+        self._gripper_nonfinite_samples = 0
+        self._gripper_dropped_diagnostics = 0
+        self._gripper_max_abs_joint_velocity = torch.zeros(
+            width, dtype=dtype, device=self.device
+        )
+        self._gripper_max_abs_joint_acceleration = torch.zeros_like(
+            self._gripper_max_abs_joint_velocity
+        )
+        self._gripper_max_velocity_value = torch.tensor(
+            -1.0, dtype=dtype, device=self.device
+        )
+        self._gripper_max_velocity_phase = torch.tensor(
+            -1, dtype=torch.int64, device=self.device
+        )
+        self._gripper_max_velocity_sample_index = torch.tensor(
+            -1, dtype=torch.int64, device=self.device
+        )
+        self._gripper_max_velocity_vectors = {
+            field: torch.zeros(width, dtype=dtype, device=self.device)
+            for field in (
+                "joint_position_rad",
+                "joint_velocity_rad_s",
+                "joint_acceleration_rad_s2",
+                "joint_position_target_rad",
+                "joint_velocity_target_rad_s",
+            )
+        }
+        self._gripper_terminal_sample_index = torch.tensor(
+            -1, dtype=torch.int64, device=self.device
+        )
+        self._gripper_terminal_vectors = {
+            field: torch.zeros(width, dtype=dtype, device=self.device)
+            for field in (
+                "joint_position_rad",
+                "joint_velocity_rad_s",
+                "joint_acceleration_rad_s2",
+                "joint_position_target_rad",
+                "joint_velocity_target_rad_s",
+            )
+        }
+
+    def _record_gripper_runtime_sample(self, *, phase: str) -> None:
+        if getattr(self, "_gripper_runtime_static", None) is None:
+            return
+        if phase not in {"apply_entry", "post_policy_step"}:
+            raise ValueError(f"Unknown EEF gripper sample phase: {phase!r}")
+        indices = list(GRIPPER_JOINT_INDICES)
+        vectors = {
+            "joint_position_rad": self._asset.data.joint_pos[:, indices],
+            "joint_velocity_rad_s": self._asset.data.joint_vel[:, indices],
+            "joint_acceleration_rad_s2": self._asset.data.joint_acc[:, indices],
+            "joint_position_target_rad": self._asset.data.joint_pos_target[:, indices],
+            "joint_velocity_target_rad_s": self._asset.data.joint_vel_target[
+                :, indices
+            ],
+        }
+        sample_index = (
+            self._gripper_apply_entry_samples + self._gripper_post_policy_step_samples
+        )
+        if phase == "apply_entry":
+            self._gripper_apply_entry_samples += 1
+        else:
+            self._gripper_post_policy_step_samples += 1
+        combined = torch.cat(tuple(vectors.values()), dim=-1)
+        if not torch.isfinite(combined).all():
+            self._gripper_nonfinite_samples += 1
+            try:
+                _require_finite(combined, field="all-six gripper runtime state")
+            except DifferentialIKNumericalError as error:
+                if phase == "post_policy_step":
+                    raise GripperRuntimePostStepError(
+                        "PolaRiS all-six gripper state became non-finite only "
+                        "after env.step completed; refusing to misclassify the "
+                        "executed action as an unexecuted numerical-failure tail"
+                    ) from error
+                raise
+        velocity = vectors["joint_velocity_rad_s"]
+        acceleration = vectors["joint_acceleration_rad_s2"]
+        self._gripper_max_abs_joint_velocity = torch.maximum(
+            self._gripper_max_abs_joint_velocity,
+            velocity.abs().amax(dim=0),
+        )
+        self._gripper_max_abs_joint_acceleration = torch.maximum(
+            self._gripper_max_abs_joint_acceleration,
+            acceleration.abs().amax(dim=0),
+        )
+        candidate = velocity[0].abs().amax()
+        replace = candidate > self._gripper_max_velocity_value
+        self._gripper_max_velocity_value = torch.where(
+            replace, candidate, self._gripper_max_velocity_value
+        )
+        self._gripper_max_velocity_phase = torch.where(
+            replace,
+            torch.tensor(
+                0 if phase == "apply_entry" else 1,
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            self._gripper_max_velocity_phase,
+        )
+        self._gripper_max_velocity_sample_index = torch.where(
+            replace,
+            torch.tensor(sample_index, dtype=torch.int64, device=self.device),
+            self._gripper_max_velocity_sample_index,
+        )
+        for field, vector in vectors.items():
+            self._gripper_max_velocity_vectors[field] = torch.where(
+                replace, vector[0], self._gripper_max_velocity_vectors[field]
+            )
+        if phase == "post_policy_step":
+            self._gripper_terminal_sample_index.fill_(sample_index)
+            for field, vector in vectors.items():
+                self._gripper_terminal_vectors[field].copy_(vector[0])
+
+    def record_gripper_post_policy_step(self) -> None:
+        """Capture the state after the eighth physics step and scene update."""
+
+        if self._active_episode_index is None:
+            raise ValueError(
+                "PolaRiS EEF gripper post-step sample has no active episode"
+            )
+        self._record_gripper_runtime_sample(phase="post_policy_step")
+
+    def _gripper_runtime_dynamic_report(self) -> dict[str, object]:
+        if getattr(self, "_gripper_runtime_static", None) is None:
+            raise ValueError("PolaRiS EEF gripper runtime contract is not installed")
+        total_samples = (
+            self._gripper_apply_entry_samples + self._gripper_post_policy_step_samples
+        )
+        finite_samples = total_samples - self._gripper_nonfinite_samples
+        if finite_samples == 0:
+            maximum = None
+        else:
+            phase_code = int(self._gripper_max_velocity_phase.detach().cpu().item())
+            maximum = {
+                "sample_phase": "apply_entry"
+                if phase_code == 0
+                else "post_policy_step",
+                "sample_index": int(
+                    self._gripper_max_velocity_sample_index.detach().cpu().item()
+                ),
+                **{
+                    field: vector.detach().cpu().tolist()
+                    for field, vector in self._gripper_max_velocity_vectors.items()
+                },
+            }
+        terminal = (
+            None
+            if self._gripper_post_policy_step_samples == 0
+            else {
+                "sample_index": int(
+                    self._gripper_terminal_sample_index.detach().cpu().item()
+                ),
+                **{
+                    field: vector.detach().cpu().tolist()
+                    for field, vector in self._gripper_terminal_vectors.items()
+                },
+            }
+        )
+        return validate_eef_gripper_dynamic_evidence(
+            {
+                "profile": EEF_GRIPPER_RUNTIME_PROFILE,
+                "joint_names": list(GRIPPER_JOINT_NAMES),
+                "joint_indices": list(GRIPPER_JOINT_INDICES),
+                "apply_entry_samples": self._gripper_apply_entry_samples,
+                "post_policy_step_samples": self._gripper_post_policy_step_samples,
+                "max_abs_joint_velocity_rad_s": self._gripper_max_abs_joint_velocity.detach()
+                .cpu()
+                .tolist(),
+                "max_abs_joint_acceleration_rad_s2": self._gripper_max_abs_joint_acceleration.detach()
+                .cpu()
+                .tolist(),
+                "max_velocity_diagnostic": maximum,
+                "terminal_state": terminal,
+                "nonfinite_samples": self._gripper_nonfinite_samples,
+                "dropped_diagnostics": self._gripper_dropped_diagnostics,
+            }
+        )
 
     def begin_safety_episode(self, episode_index: int) -> None:
         """Start isolated safety accounting for one rollout."""
@@ -1705,6 +1938,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         wrist_target_state_invalid = None
         fallback_count_before = self._ik_controller.fallback_count
         try:
+            self._record_gripper_runtime_sample(phase="apply_entry")
             current_state = torch.cat(
                 (ee_pos_curr, ee_quat_curr, joint_pos, joint_vel), dim=-1
             )
@@ -2461,6 +2695,11 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                     ),
                 }
             )
+        if getattr(self, "_gripper_runtime_static", None) is not None:
+            report["gripper_runtime_static"] = validate_eef_gripper_static_contract(
+                self._gripper_runtime_static
+            )
+            report["gripper_runtime_dynamic"] = self._gripper_runtime_dynamic_report()
         return report
 
     def episode_safety_report(self, episode_index: int) -> dict[str, object]:
