@@ -233,6 +233,14 @@ def build_expected_attestation(args: argparse.Namespace) -> dict[str, Any]:
         args.expected_fixture_sha256 == smoke.EXPECTED_FIXTURE_SHA256,
         "CLI fixture digest is not the protocol-pinned fixture",
     )
+    _require(
+        args.expected_safety_profile
+        in {
+            smoke.BASE_SAFETY_PROFILE,
+            smoke.WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE,
+        },
+        "expected safety profile is not supported",
+    )
 
     expected_raw_name = f"boundary-replay-smoke-{args.job_id}.json"
     expected_attestation_name = f"boundary-replay-smoke-{args.job_id}.attestation.json"
@@ -253,6 +261,17 @@ def build_expected_attestation(args: argparse.Namespace) -> dict[str, Any]:
     raw, raw_bytes, raw_sha256 = _read_json(args.raw_result, "raw result")
     _require(_mode(args.raw_result) == "0444", "raw result mode must be 0444")
     validation_summary = smoke.validate_success_payload(raw)
+    _require(
+        validation_summary.get("safety_profile") == args.expected_safety_profile,
+        "raw result safety profile does not match the expected controller",
+    )
+    _require(
+        raw.get("initial_ik_safety_capture", {}).get("profile")
+        == raw.get("runtime_frame", {}).get("ik_safety_profile")
+        == raw.get("ik_safety", {}).get("profile")
+        == args.expected_safety_profile,
+        "raw initial/frame/final safety profiles are not cross-bound",
+    )
     raw_identity = {
         "path": str(args.raw_result.resolve()),
         "size_bytes": len(raw_bytes),
@@ -365,6 +384,7 @@ def build_expected_attestation(args: argparse.Namespace) -> dict[str, Any]:
             },
             "polaris_repo": str(repo),
             "polaris_commit": commit,
+            "expected_safety_profile": args.expected_safety_profile,
             "runner": runner,
             "fixture": fixture,
             "fixture_source": smoke.EXPECTED_SOURCE,
@@ -390,6 +410,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--saved-job-script", required=True, type=Path)
     parser.add_argument("--polaris-repo", required=True, type=Path)
     parser.add_argument("--expected-polaris-commit", required=True)
+    parser.add_argument("--expected-safety-profile", required=True)
     parser.add_argument("--expected-runner-sha256", required=True)
     parser.add_argument("--expected-fixture-sha256", required=True)
     parser.add_argument("--container-image", required=True, type=Path)

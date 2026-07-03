@@ -10,6 +10,7 @@ direct inverse raises a linear-algebra error.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import math
 
@@ -36,6 +37,7 @@ from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
+from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
@@ -46,6 +48,10 @@ from polaris.eef_ik_safety import PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT
 from polaris.eef_ik_safety import PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT
 from polaris.eef_ik_safety import PANDA_EEF_PHYSX_SOLVER_TYPE
 from polaris.eef_ik_safety import TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
+from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_JOINT_NAMES
+from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
+from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_PROFILE
+from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
 
 
 FAILURE_SUBSTEP_TRACE_CAPACITY = 64
@@ -280,6 +286,107 @@ def _bound_joint_position_target(
     )
     safe_target = torch.where(position_limited, clipped_target, slew_limited_target)
     return safe_target, raw_delta_joint_pos, slew_limited, position_limited
+
+
+@dataclass(frozen=True)
+class _WristEnergyBrakeTarget:
+    """One pure, vectorized wrist energy-brake transition."""
+
+    applied_target: torch.Tensor
+    next_latch_remaining: torch.Tensor
+    trigger_joint_mask: torch.Tensor
+    active_environment_mask: torch.Tensor
+    attempted_joint_mask: torch.Tensor
+    braked_joint_mask: torch.Tensor
+    target_shift: torch.Tensor
+
+
+def _apply_wrist_energy_brake_target(
+    joint_pos: torch.Tensor,
+    joint_vel: torch.Tensor,
+    previous_applied_target: torch.Tensor,
+    reversal_detection_armed: torch.Tensor,
+    nominal_safe_target: torch.Tensor,
+    max_delta_joint_pos: torch.Tensor,
+    soft_joint_pos_limits: torch.Tensor,
+    latch_remaining: torch.Tensor,
+    wrist_joint_indices: tuple[int, int, int],
+) -> _WristEnergyBrakeTarget:
+    """Apply the opt-in two-substep group wrist energy brake.
+
+    A near-full-substep sign reversal of any *previously applied* wrist target
+    arms one group latch for the trigger call and the immediately following
+    physics substep.  While active, only nominal wrist spring terms with
+    ``position_error * velocity > 0`` are energy-injecting; those targets are
+    replaced by the ordinary slew/guard-bounded hold-at-current-position
+    target.  Dissipative or exactly neutral nominal targets remain bitwise
+    unchanged, as do all non-wrist targets.
+
+    The caller owns lifecycle validation and commits the returned latch state
+    only after both PhysX target setters succeed.
+    """
+
+    wrist_indices = list(wrist_joint_indices)
+    previous_error = (
+        previous_applied_target[:, wrist_indices] - joint_pos[:, wrist_indices]
+    )
+    nominal_error = nominal_safe_target[:, wrist_indices] - joint_pos[:, wrist_indices]
+    target_shift = (
+        nominal_safe_target[:, wrist_indices]
+        - previous_applied_target[:, wrist_indices]
+    ).abs()
+    trigger_threshold = (
+        max_delta_joint_pos[:, wrist_indices] * WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
+    )
+    trigger_joint_mask = (
+        reversal_detection_armed.unsqueeze(-1)
+        & ((previous_error * nominal_error) < 0.0)
+        & (target_shift >= trigger_threshold)
+    )
+    trigger_environment_mask = trigger_joint_mask.any(dim=-1)
+    refreshed_latch = torch.where(
+        trigger_environment_mask,
+        torch.full_like(latch_remaining, WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS),
+        latch_remaining,
+    )
+    active_environment_mask = refreshed_latch > 0
+    attempted_joint_mask = active_environment_mask.unsqueeze(-1) & (
+        nominal_error * joint_vel[:, wrist_indices] > 0.0
+    )
+
+    hold_target, _, _, _ = _bound_joint_position_target(
+        joint_pos,
+        joint_pos,
+        max_delta_joint_pos,
+        soft_joint_pos_limits,
+    )
+    full_brake_mask = torch.zeros_like(nominal_safe_target, dtype=torch.bool)
+    full_brake_mask[:, wrist_indices] = attempted_joint_mask
+    applied_target = torch.where(
+        full_brake_mask,
+        hold_target,
+        nominal_safe_target,
+    )
+    applied_wrist_target = applied_target[:, wrist_indices]
+    braked_joint_mask = (
+        attempted_joint_mask
+        & (applied_wrist_target != nominal_safe_target[:, wrist_indices])
+        & (
+            (applied_wrist_target - joint_pos[:, wrist_indices])
+            * joint_vel[:, wrist_indices]
+            <= 0.0
+        )
+    )
+    next_latch_remaining = torch.clamp(refreshed_latch - 1, min=0)
+    return _WristEnergyBrakeTarget(
+        applied_target=applied_target,
+        next_latch_remaining=next_latch_remaining,
+        trigger_joint_mask=trigger_joint_mask,
+        active_environment_mask=active_environment_mask,
+        attempted_joint_mask=attempted_joint_mask,
+        braked_joint_mask=braked_joint_mask,
+        target_shift=target_shift,
+    )
 
 
 def _require_current_joint_position_in_soft_limits(
@@ -527,6 +634,20 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             raise ValueError(
                 "PolaRiS EEF failure substep trace requires exactly one environment"
             )
+        wrist_energy_brake_enabled = self.cfg.enable_wrist_energy_brake
+        if type(wrist_energy_brake_enabled) is not bool:
+            raise ValueError("PolaRiS EEF wrist energy-brake enable flag must be bool")
+        self._wrist_energy_brake_enabled = wrist_energy_brake_enabled
+        if self._wrist_energy_brake_enabled and self.num_envs != 1:
+            raise ValueError(
+                "PolaRiS EEF wrist energy-brake candidate requires exactly "
+                "one environment"
+            )
+        self._safety_profile = (
+            EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+            if self._wrist_energy_brake_enabled
+            else EEF_IK_SAFETY_PROFILE
+        )
         self._ik_controller = RobustDifferentialIKController(
             cfg=self.cfg.controller,
             num_envs=self.num_envs,
@@ -670,6 +791,45 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._physx_hard_limit_write_count = 1
         self._zero_joint_velocity_target = torch.zeros_like(self._max_delta_joint_pos)
         self._max_guard_diagnostics = 32
+        if self._wrist_energy_brake_enabled:
+            resolved_indices = []
+            for joint_name in WRIST_ENERGY_BRAKE_JOINT_NAMES:
+                matches = [
+                    index
+                    for index, resolved_name in enumerate(self._joint_names)
+                    if resolved_name == joint_name
+                ]
+                if len(matches) != 1:
+                    raise ValueError(
+                        "PolaRiS EEF wrist energy brake requires one exact "
+                        f"{joint_name!r} joint; matches={matches!r}"
+                    )
+                resolved_indices.append(matches[0])
+            self._wrist_energy_brake_joint_indices = tuple(resolved_indices)
+            self._wrist_energy_brake_latch_remaining = torch.zeros(
+                self.num_envs,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self._wrist_energy_brake_previous_applied_target = torch.zeros_like(
+                self._max_delta_joint_pos
+            )
+            self._wrist_energy_brake_previous_target_valid = torch.zeros(
+                self.num_envs,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            self._wrist_energy_brake_reversal_detection_armed = torch.zeros(
+                self.num_envs,
+                dtype=torch.bool,
+                device=self.device,
+            )
+            self._wrist_energy_brake_target_shift_threshold = (
+                self._max_delta_joint_pos[
+                    :, list(self._wrist_energy_brake_joint_indices)
+                ]
+                * WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
+            )
         if self._failure_substep_trace_enabled:
             self._initialize_failure_substep_trace()
         self._reset_episode_safety_state(episode_index=None)
@@ -862,6 +1022,15 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         for buffer in self._failure_substep_trace_buffers.values():
             buffer.fill_(float("nan"))
 
+    def _reset_wrist_energy_brake_state(self, env_ids=None) -> None:
+        """Clear candidate controller state for the selected environments."""
+
+        selected = slice(None) if env_ids is None else env_ids
+        self._wrist_energy_brake_latch_remaining[selected] = 0
+        self._wrist_energy_brake_previous_applied_target[selected] = 0.0
+        self._wrist_energy_brake_previous_target_valid[selected] = False
+        self._wrist_energy_brake_reversal_detection_armed[selected] = False
+
     def _reset_episode_safety_state(self, episode_index: int | None) -> None:
         counter_dtype = torch.int64
         self._active_episode_index = episode_index
@@ -890,6 +1059,22 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._invariant_abort_count = torch.zeros(
             (), dtype=counter_dtype, device=self.device
         )
+        if self._wrist_energy_brake_enabled:
+            self._wrist_energy_brake_trigger_event_count = torch.zeros(
+                (), dtype=counter_dtype, device=self.device
+            )
+            self._wrist_energy_brake_active_substep_count = torch.zeros(
+                (), dtype=counter_dtype, device=self.device
+            )
+            self._wrist_energy_brake_attempted_joint_target_count = torch.zeros(
+                (), dtype=counter_dtype, device=self.device
+            )
+            self._wrist_energy_brake_braked_joint_target_count = torch.zeros(
+                (), dtype=counter_dtype, device=self.device
+            )
+            self._reset_wrist_energy_brake_state()
+            self._wrist_energy_brake_diagnostics: list[dict[str, object]] = []
+            self._wrist_energy_brake_diagnostics_dropped = 0
         self._max_raw_delta_joint_pos = torch.zeros(
             self._num_joints, dtype=torch.float32, device=self.device
         )
@@ -952,6 +1137,13 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         if type(episode_index) is not int or episode_index < 0:
             raise ValueError(f"Invalid EEF safety episode index: {episode_index!r}")
         self._reset_episode_safety_state(episode_index=episode_index)
+
+    def reset(self, env_ids=None) -> None:
+        """Reset base actions and all opt-in candidate state."""
+
+        super().reset(env_ids)
+        if self._wrist_energy_brake_enabled:
+            self._reset_wrist_energy_brake_state(env_ids)
 
     def _soft_joint_pos_limits(self) -> torch.Tensor:
         return self._asset.data.soft_joint_pos_limits[:, self._joint_ids, :]
@@ -1310,6 +1502,110 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             self._guard_diagnostics_dropped += 1
         return record
 
+    def _append_wrist_energy_brake_diagnostics(
+        self,
+        *,
+        result: _WristEnergyBrakeTarget,
+        joint_pos: torch.Tensor,
+        joint_vel: torch.Tensor,
+        previous_applied_target: torch.Tensor,
+        nominal_safe_target: torch.Tensor,
+    ) -> None:
+        """Capture a bounded tail of active-latch evidence after setters succeed."""
+
+        active_environments = (
+            result.active_environment_mask.nonzero(as_tuple=False)
+            .flatten()
+            .detach()
+            .cpu()
+            .tolist()
+        )
+        apply_index = self._apply_call_count - 1
+        for environment_index in active_environments:
+            if len(self._wrist_energy_brake_diagnostics) >= self._max_guard_diagnostics:
+                self._wrist_energy_brake_diagnostics.pop(0)
+                self._wrist_energy_brake_diagnostics_dropped += 1
+            self._wrist_energy_brake_diagnostics.append(
+                {
+                    "episode_index": self._active_episode_index,
+                    "apply_index": apply_index,
+                    "policy_step": apply_index // self._decimation,
+                    "physics_substep": apply_index % self._decimation,
+                    "environment_index": int(environment_index),
+                    "reversal_detection_armed": bool(
+                        self._wrist_energy_brake_reversal_detection_armed[
+                            environment_index
+                        ]
+                        .detach()
+                        .cpu()
+                        .item()
+                    ),
+                    "trigger_joint_mask": [
+                        bool(value)
+                        for value in result.trigger_joint_mask[environment_index]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ],
+                    "attempted_joint_mask": [
+                        bool(value)
+                        for value in result.attempted_joint_mask[environment_index]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ],
+                    "braked_joint_mask": [
+                        bool(value)
+                        for value in result.braked_joint_mask[environment_index]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ],
+                    "joint_pos_rad": [
+                        float(value)
+                        for value in joint_pos[environment_index]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ],
+                    "joint_vel_rad_s": [
+                        float(value)
+                        for value in joint_vel[environment_index]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ],
+                    "previous_applied_target_rad": [
+                        float(value)
+                        for value in previous_applied_target[environment_index]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ],
+                    "nominal_safe_target_rad": [
+                        float(value)
+                        for value in nominal_safe_target[environment_index]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ],
+                    "applied_target_rad": [
+                        float(value)
+                        for value in result.applied_target[environment_index]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ],
+                    "target_shift_rad": [
+                        float(value)
+                        for value in result.target_shift[environment_index]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ],
+                }
+            )
+
     def _update_max_raw_delta_diagnostic(
         self,
         *,
@@ -1371,8 +1667,13 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         ee_pos_curr, ee_quat_curr = self._compute_frame_pose()
         joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
         joint_vel = self._asset.data.joint_vel[:, self._joint_ids]
+        live_joint_pos_target = (
+            self._asset.data.joint_pos_target[:, self._joint_ids]
+            if (self._failure_substep_trace_enabled or self._wrist_energy_brake_enabled)
+            else None
+        )
         previous_joint_pos_target = (
-            self._asset.data.joint_pos_target[:, self._joint_ids].clone()
+            live_joint_pos_target.clone()
             if self._failure_substep_trace_enabled
             else None
         )
@@ -1401,6 +1702,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         jacobian = None
         pose_error = None
         raw_joint_pos_target = None
+        wrist_target_state_invalid = None
         fallback_count_before = self._ik_controller.fallback_count
         try:
             current_state = torch.cat(
@@ -1419,6 +1721,31 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             desired_quaternion_norms, desired_quaternion_norm_valid = (
                 _eef_quaternion_norm_is_valid(self._ik_controller.ee_quat_des)
             )
+            status_tensors = [
+                torch.isfinite(current_state).all(),
+                torch.isfinite(desired_state).all(),
+                current_quaternion_norm_valid.all(),
+                desired_quaternion_norm_valid.all(),
+                ~current_joint_invalid.any(),
+                ~current_joint_velocity_invalid.any(),
+            ]
+            if self._wrist_energy_brake_enabled:
+                if live_joint_pos_target is None:
+                    raise ValueError(
+                        "PolaRiS EEF wrist energy brake lacks live target state"
+                    )
+                wrist_target_state_invalid = (
+                    self._wrist_energy_brake_previous_target_valid
+                    & ~(
+                        live_joint_pos_target
+                        == self._wrist_energy_brake_previous_applied_target
+                    ).all(dim=-1)
+                )
+                status_tensors.append(~wrist_target_state_invalid.any())
+            status_values = tuple(
+                bool(value)
+                for value in torch.stack(status_tensors).detach().cpu().tolist()
+            )
             (
                 current_finite,
                 desired_finite,
@@ -1426,21 +1753,9 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 desired_quaternion_valid,
                 current_joint_valid,
                 current_joint_velocity_valid,
-            ) = (
-                bool(value)
-                for value in torch.stack(
-                    (
-                        torch.isfinite(current_state).all(),
-                        torch.isfinite(desired_state).all(),
-                        current_quaternion_norm_valid.all(),
-                        desired_quaternion_norm_valid.all(),
-                        ~current_joint_invalid.any(),
-                        ~current_joint_velocity_invalid.any(),
-                    )
-                )
-                .detach()
-                .cpu()
-                .tolist()
+            ) = status_values[:6]
+            wrist_target_state_valid = (
+                status_values[6] if self._wrist_energy_brake_enabled else True
             )
             if not current_finite:
                 # Re-enter the diagnostic helper only on the abort path; the
@@ -1536,6 +1851,26 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                     "PolaRiS EEF IK current joint velocity exceeds the live "
                     "simulation limit; aborting before DLS and PhysX"
                 )
+            if not wrist_target_state_valid:
+                if wrist_target_state_invalid is None:
+                    raise ValueError(
+                        "PolaRiS EEF wrist energy-brake target-state evidence is absent"
+                    )
+                self._invariant_abort_count += wrist_target_state_invalid.sum()
+                self._append_guard_diagnostic(
+                    kind="wrist_energy_brake_target_state_abort",
+                    joint_pos=joint_pos,
+                    raw_delta=None,
+                    raw_target=None,
+                    safe_target=None,
+                    pose_error=None,
+                    jacobian=None,
+                )
+                raise DifferentialIKInvariantError(
+                    "PolaRiS EEF wrist energy-brake stored applied target "
+                    "drifted from the live articulation mirror; aborting "
+                    "before DLS and PhysX"
+                )
             jacobian = self._compute_frame_jacobian()
             position_error, axis_angle_error = compute_pose_error(
                 ee_pos_curr,
@@ -1563,7 +1898,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             )
             raise
 
-        safe_target, raw_delta, slew_limited, position_limited = (
+        nominal_safe_target, raw_delta, slew_limited, position_limited = (
             _bound_joint_position_target(
                 joint_pos,
                 raw_joint_pos_target,
@@ -1571,6 +1906,22 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 soft_limits,
             )
         )
+        wrist_energy_brake_result = None
+        if self._wrist_energy_brake_enabled:
+            wrist_energy_brake_result = _apply_wrist_energy_brake_target(
+                joint_pos,
+                joint_vel,
+                self._wrist_energy_brake_previous_applied_target,
+                self._wrist_energy_brake_reversal_detection_armed,
+                nominal_safe_target,
+                self._max_delta_joint_pos,
+                soft_limits,
+                self._wrist_energy_brake_latch_remaining,
+                self._wrist_energy_brake_joint_indices,
+            )
+            safe_target = wrist_energy_brake_result.applied_target
+        else:
+            safe_target = nominal_safe_target
         applied_delta = safe_target - joint_pos
         raw_target_violation = torch.maximum(
             torch.clamp(lower - raw_joint_pos_target, min=0.0),
@@ -1722,6 +2073,38 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             self._joint_ids,
         )
         self._asset.set_joint_position_target(safe_target, self._joint_ids)
+        if self._wrist_energy_brake_enabled:
+            if wrist_energy_brake_result is None:
+                raise ValueError("PolaRiS EEF wrist energy-brake transition is absent")
+            self._append_wrist_energy_brake_diagnostics(
+                result=wrist_energy_brake_result,
+                joint_pos=joint_pos,
+                joint_vel=joint_vel,
+                previous_applied_target=(
+                    self._wrist_energy_brake_previous_applied_target
+                ),
+                nominal_safe_target=nominal_safe_target,
+            )
+            self._wrist_energy_brake_trigger_event_count += (
+                wrist_energy_brake_result.trigger_joint_mask.any(dim=-1).sum()
+            )
+            self._wrist_energy_brake_active_substep_count += (
+                wrist_energy_brake_result.active_environment_mask.sum()
+            )
+            self._wrist_energy_brake_attempted_joint_target_count += (
+                wrist_energy_brake_result.attempted_joint_mask.sum()
+            )
+            self._wrist_energy_brake_braked_joint_target_count += (
+                wrist_energy_brake_result.braked_joint_mask.sum()
+            )
+            self._wrist_energy_brake_latch_remaining.copy_(
+                wrist_energy_brake_result.next_latch_remaining
+            )
+            self._wrist_energy_brake_previous_applied_target.copy_(safe_target)
+            self._wrist_energy_brake_previous_target_valid.fill_(True)
+            self._wrist_energy_brake_reversal_detection_armed.copy_(
+                ~wrist_energy_brake_result.active_environment_mask
+            )
         if self._failure_substep_trace_enabled:
             if previous_joint_pos_target is None or pose_error is None:
                 raise ValueError(
@@ -1804,6 +2187,34 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             raise ValueError(
                 "PolaRiS EEF composed articulation solver readback drifted"
             )
+        if self._wrist_energy_brake_enabled:
+            live_position_target = self._asset.data.joint_pos_target[:, self._joint_ids]
+            stored_target_mismatch = self._wrist_energy_brake_previous_target_valid & ~(
+                live_position_target == self._wrist_energy_brake_previous_applied_target
+            ).all(dim=-1)
+            if bool(stored_target_mismatch.any().detach().cpu().item()):
+                raise ValueError(
+                    "PolaRiS EEF wrist energy-brake stored applied target "
+                    "drifted before safety reporting"
+                )
+            _require_finite(
+                self._wrist_energy_brake_previous_applied_target,
+                field="wrist energy-brake stored applied target",
+            )
+            if bool(
+                (
+                    (self._wrist_energy_brake_latch_remaining < 0)
+                    | (
+                        self._wrist_energy_brake_latch_remaining
+                        > WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
+                    )
+                )
+                .any()
+                .detach()
+                .cpu()
+                .item()
+            ):
+                raise ValueError("PolaRiS EEF wrist energy-brake latch state drifted")
         soft_limit_bytes = (
             soft_limits[0].detach().cpu().numpy().astype("<f4", copy=False).tobytes()
         )
@@ -1860,9 +2271,9 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 ),
                 "eef_quaternion_norm": None,
             }
-        return {
+        report: dict[str, object] = {
             "episode_index": self._active_episode_index,
-            "profile": EEF_IK_SAFETY_PROFILE,
+            "profile": self._safety_profile,
             "apply_actions_cadence": EEF_IK_APPLY_CADENCE,
             "physics_dt": self._physics_dt,
             "control_dt": self._control_dt,
@@ -1990,6 +2401,67 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             "guard_diagnostics": list(self._guard_diagnostics),
             "max_raw_delta_diagnostic": max_raw_delta_diagnostic,
         }
+        if self._wrist_energy_brake_enabled:
+            counters = report["counters"]
+            if not isinstance(counters, dict):
+                raise ValueError("PolaRiS EEF safety counter object drifted")
+            counters.update(
+                {
+                    "wrist_energy_brake_trigger_events": int(
+                        self._wrist_energy_brake_trigger_event_count.detach()
+                        .cpu()
+                        .item()
+                    ),
+                    "wrist_energy_brake_active_substeps": int(
+                        self._wrist_energy_brake_active_substep_count.detach()
+                        .cpu()
+                        .item()
+                    ),
+                    "wrist_energy_brake_attempted_joint_targets": int(
+                        self._wrist_energy_brake_attempted_joint_target_count.detach()
+                        .cpu()
+                        .item()
+                    ),
+                    "wrist_energy_brake_braked_joint_targets": int(
+                        self._wrist_energy_brake_braked_joint_target_count.detach()
+                        .cpu()
+                        .item()
+                    ),
+                    "wrist_energy_brake_diagnostics_dropped": (
+                        self._wrist_energy_brake_diagnostics_dropped
+                    ),
+                }
+            )
+            report.update(
+                {
+                    "wrist_energy_brake_profile": WRIST_ENERGY_BRAKE_PROFILE,
+                    "wrist_energy_brake_joint_names": list(
+                        WRIST_ENERGY_BRAKE_JOINT_NAMES
+                    ),
+                    "wrist_energy_brake_latch_substeps": (
+                        WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
+                    ),
+                    "wrist_energy_brake_target_shift_fraction": (
+                        WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
+                    ),
+                    "wrist_energy_brake_target_shift_threshold_rad": (
+                        self._wrist_energy_brake_target_shift_threshold[0]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                    ),
+                    "wrist_energy_brake_latch_remaining_substeps": [
+                        int(value)
+                        for value in self._wrist_energy_brake_latch_remaining.detach()
+                        .cpu()
+                        .tolist()
+                    ],
+                    "wrist_energy_brake_diagnostics": list(
+                        self._wrist_energy_brake_diagnostics
+                    ),
+                }
+            )
+        return report
 
     def episode_safety_report(self, episode_index: int) -> dict[str, object]:
         """Return the active episode report, rejecting lifecycle drift."""
@@ -2010,5 +2482,8 @@ class RobustDifferentialInverseKinematicsActionCfg(
 
     enable_failure_substep_trace: bool = False
     """Enable the separate failure-only device trace. Defaults to False."""
+
+    enable_wrist_energy_brake: bool = False
+    """Enable the isolated wrist transient diagnostic candidate."""
 
     class_type = RobustDifferentialInverseKinematicsAction

@@ -31,6 +31,20 @@ import zlib
 ENVIRONMENT = "DROID-FoodBussing"
 FIXTURE_PROFILE = "official_lap3b_foodbussing_v3_boundary_actions_v1"
 SMOKE_PROFILE = "panda_joint5_upper_solveriter1_boundary_replay_v2"
+BASE_SAFETY_PROFILE = "panda_velocity_physxlimit_solveriter1_v4"
+WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE = (
+    "panda_velocity_physxlimit_solveriter1_wristenergybrake_candidate_v1"
+)
+WRIST_ENERGY_BRAKE_PROFILE = (
+    "panda_j5_j7_applied_target_reversal_group_energy_brake_2substep_v1"
+)
+WRIST_ENERGY_BRAKE_JOINT_NAMES = [
+    "panda_joint5",
+    "panda_joint6",
+    "panda_joint7",
+]
+WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS = 2
+WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION = 0.9
 FIXTURE_PATH = (
     Path(__file__).resolve().parent
     / "fixtures"
@@ -194,6 +208,15 @@ SAFETY_FIELDS = {
     "guard_diagnostics",
     "max_raw_delta_diagnostic",
 }
+CANDIDATE_SAFETY_FIELDS = SAFETY_FIELDS | {
+    "wrist_energy_brake_profile",
+    "wrist_energy_brake_joint_names",
+    "wrist_energy_brake_latch_substeps",
+    "wrist_energy_brake_target_shift_fraction",
+    "wrist_energy_brake_target_shift_threshold_rad",
+    "wrist_energy_brake_latch_remaining_substeps",
+    "wrist_energy_brake_diagnostics",
+}
 SAFETY_COUNTER_FIELDS = {
     "apply_calls",
     "environment_substeps",
@@ -207,6 +230,30 @@ SAFETY_COUNTER_FIELDS = {
     "nonfinite_aborts",
     "dls_fallbacks",
     "guard_diagnostics_dropped",
+}
+CANDIDATE_SAFETY_COUNTER_FIELDS = SAFETY_COUNTER_FIELDS | {
+    "wrist_energy_brake_trigger_events",
+    "wrist_energy_brake_active_substeps",
+    "wrist_energy_brake_attempted_joint_targets",
+    "wrist_energy_brake_braked_joint_targets",
+    "wrist_energy_brake_diagnostics_dropped",
+}
+CANDIDATE_DIAGNOSTIC_FIELDS = {
+    "episode_index",
+    "apply_index",
+    "policy_step",
+    "physics_substep",
+    "environment_index",
+    "reversal_detection_armed",
+    "trigger_joint_mask",
+    "attempted_joint_mask",
+    "braked_joint_mask",
+    "joint_pos_rad",
+    "joint_vel_rad_s",
+    "previous_applied_target_rad",
+    "nominal_safe_target_rad",
+    "applied_target_rad",
+    "target_shift_rad",
 }
 SAFETY_MAXIMA_FIELDS = {
     "raw_delta_joint_pos_rad",
@@ -648,15 +695,265 @@ def _validate_diagnostic_vector(value: Any, field: str) -> list[float]:
     return values
 
 
+def _validate_wrist_energy_brake_diagnostics(
+    report: dict[str, Any], *, episode_index: int | None
+) -> None:
+    """Validate the candidate's bounded active-latch evidence."""
+
+    counters = report["counters"]
+    diagnostics = report.get("wrist_energy_brake_diagnostics")
+    _require(isinstance(diagnostics, list), "wrist energy-brake diagnostics")
+    trigger_events = counters["wrist_energy_brake_trigger_events"]
+    active_substeps = counters["wrist_energy_brake_active_substeps"]
+    attempted_targets = counters["wrist_energy_brake_attempted_joint_targets"]
+    braked_targets = counters["wrist_energy_brake_braked_joint_targets"]
+    dropped = counters["wrist_energy_brake_diagnostics_dropped"]
+    latch_remaining = report["wrist_energy_brake_latch_remaining_substeps"][0]
+    _require(
+        len(diagnostics) == min(active_substeps, 32)
+        and dropped == max(active_substeps - 32, 0),
+        "wrist energy-brake diagnostic count",
+    )
+    _require(
+        latch_remaining in (0, 1)
+        and active_substeps + latch_remaining
+        == WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS * trigger_events,
+        "wrist energy-brake latch/counter history",
+    )
+    diagnostic_apply_indices = []
+    tail_attempted_targets = 0
+    tail_braked_targets = 0
+    for index, diagnostic in enumerate(diagnostics):
+        field = f"wrist energy-brake diagnostic {index}"
+        _require(
+            isinstance(diagnostic, dict)
+            and set(diagnostic) == CANDIDATE_DIAGNOSTIC_FIELDS,
+            f"{field} schema",
+        )
+        _require(
+            diagnostic.get("episode_index") == episode_index,
+            f"{field} episode",
+        )
+        apply_index = diagnostic.get("apply_index")
+        environment_index = diagnostic.get("environment_index")
+        _require(
+            type(apply_index) is int
+            and apply_index >= 0
+            and apply_index < counters["apply_calls"]
+            and diagnostic.get("policy_step") == apply_index // DECIMATION
+            and diagnostic.get("physics_substep") == apply_index % DECIMATION,
+            f"{field} apply identity",
+        )
+        _require(
+            type(environment_index) is int and environment_index == 0,
+            f"{field} environment",
+        )
+        reversal_detection_armed = diagnostic.get("reversal_detection_armed")
+        _require(
+            type(reversal_detection_armed) is bool,
+            f"{field} arming state",
+        )
+        trigger_mask = diagnostic.get("trigger_joint_mask")
+        attempted_mask = diagnostic.get("attempted_joint_mask")
+        braked_mask = diagnostic.get("braked_joint_mask")
+        _require(
+            isinstance(trigger_mask, list)
+            and len(trigger_mask) == 3
+            and all(type(value) is bool for value in trigger_mask),
+            f"{field} trigger mask",
+        )
+        _require(
+            isinstance(attempted_mask, list)
+            and len(attempted_mask) == 3
+            and all(type(value) is bool for value in attempted_mask),
+            f"{field} attempted mask",
+        )
+        _require(
+            isinstance(braked_mask, list)
+            and len(braked_mask) == 3
+            and all(type(value) is bool for value in braked_mask),
+            f"{field} braked mask",
+        )
+        global_active_ordinal = dropped + index
+        expected_trigger_record = global_active_ordinal % 2 == 0
+        _require(
+            any(trigger_mask) is expected_trigger_record
+            and reversal_detection_armed is expected_trigger_record,
+            f"{field} two-substep sequence",
+        )
+        earliest_apply_index = (
+            1
+            + 3 * (global_active_ordinal // WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS)
+            + global_active_ordinal % WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
+        )
+        _require(
+            apply_index >= earliest_apply_index,
+            f"{field} initial/refractory arming cadence",
+        )
+        if index > 0:
+            previous_apply_index = diagnostics[index - 1]["apply_index"]
+            if expected_trigger_record:
+                _require(
+                    apply_index >= previous_apply_index + 2,
+                    f"{field} re-arm cadence",
+                )
+            else:
+                _require(
+                    apply_index == previous_apply_index + 1,
+                    f"{field} follow-up cadence",
+                )
+        vectors = {}
+        for vector_field, width in (
+            ("joint_pos_rad", 7),
+            ("joint_vel_rad_s", 7),
+            ("previous_applied_target_rad", 7),
+            ("nominal_safe_target_rad", 7),
+            ("applied_target_rad", 7),
+            ("target_shift_rad", 3),
+        ):
+            vectors[vector_field] = _finite_vector(
+                diagnostic.get(vector_field),
+                f"{field}.{vector_field}",
+                length=width,
+            )
+        q = vectors["joint_pos_rad"]
+        dq = vectors["joint_vel_rad_s"]
+        previous = vectors["previous_applied_target_rad"]
+        nominal = vectors["nominal_safe_target_rad"]
+        applied = vectors["applied_target_rad"]
+        target_shift = vectors["target_shift_rad"]
+        if index > 0 and not expected_trigger_record:
+            prior_applied = diagnostics[index - 1]["applied_target_rad"]
+            _require(
+                all(
+                    _same_float32(actual, expected)
+                    for actual, expected in zip(
+                        previous,
+                        prior_applied,
+                        strict=True,
+                    )
+                ),
+                f"{field} previous-target chain",
+            )
+        thresholds = report["wrist_energy_brake_target_shift_threshold_rad"]
+        for joint_index in range(4):
+            _require(
+                _same_float32(applied[joint_index], nominal[joint_index]),
+                f"{field} non-wrist target changed",
+            )
+        for local_index, joint_index in enumerate(range(4, 7)):
+            previous_error = _float32_subtract(previous[joint_index], q[joint_index])
+            nominal_error = _float32_subtract(nominal[joint_index], q[joint_index])
+            expected_shift = abs(
+                _float32_subtract(nominal[joint_index], previous[joint_index])
+            )
+            _require(
+                _same_float32(target_shift[local_index], expected_shift),
+                f"{field} target shift identity",
+            )
+            expected_trigger = (
+                reversal_detection_armed
+                and _float32_multiply(previous_error, nominal_error) < 0.0
+                and expected_shift >= thresholds[local_index]
+            )
+            _require(
+                trigger_mask[local_index] is expected_trigger,
+                f"{field} trigger identity",
+            )
+            expected_attempted = _float32_multiply(nominal_error, dq[joint_index]) > 0.0
+            _require(
+                attempted_mask[local_index] is expected_attempted,
+                f"{field} attempted spring-power identity",
+            )
+            if expected_attempted:
+                outer_lower, outer_upper = EXPECTED_OUTER_LIMITS_RAD[joint_index]
+                lower = EXPECTED_TARGET_LIMITS_RAD[joint_index][0] - min(
+                    max(outer_lower - q[joint_index], 0.0),
+                    1e-5,
+                )
+                upper = EXPECTED_TARGET_LIMITS_RAD[joint_index][1] + min(
+                    max(q[joint_index] - outer_upper, 0.0),
+                    1e-5,
+                )
+                expected_applied = min(max(q[joint_index], lower), upper)
+            else:
+                expected_applied = nominal[joint_index]
+            _require(
+                _same_float32(applied[joint_index], expected_applied),
+                f"{field} applied-target identity",
+            )
+            applied_error = _float32_subtract(applied[joint_index], q[joint_index])
+            expected_braked = (
+                expected_attempted
+                and not _same_float32(applied[joint_index], nominal[joint_index])
+                and _float32_multiply(applied_error, dq[joint_index]) <= 0.0
+            )
+            _require(
+                braked_mask[local_index] is expected_braked,
+                f"{field} effective brake identity",
+            )
+        tail_attempted_targets += sum(attempted_mask)
+        tail_braked_targets += sum(braked_mask)
+        diagnostic_apply_indices.append(apply_index)
+    _require(
+        diagnostic_apply_indices == sorted(set(diagnostic_apply_indices)),
+        "wrist energy-brake diagnostic ordering",
+    )
+    _require(
+        sum(any(item["trigger_joint_mask"]) for item in diagnostics)
+        + (dropped + 1) // 2
+        == trigger_events,
+        "wrist energy-brake trigger diagnostic count",
+    )
+    _require(
+        tail_attempted_targets
+        <= attempted_targets
+        <= tail_attempted_targets + 3 * dropped,
+        "wrist energy-brake attempted-target diagnostic count",
+    )
+    _require(
+        tail_braked_targets <= braked_targets <= tail_braked_targets + 3 * dropped,
+        "wrist energy-brake effective-target diagnostic count",
+    )
+    _require(
+        braked_targets - tail_braked_targets
+        <= attempted_targets - tail_attempted_targets,
+        "wrist energy-brake hidden effective/attempted count",
+    )
+    if latch_remaining == 1:
+        abort_attempts = sum(
+            counters[field]
+            for field in (
+                "current_joint_limit_aborts",
+                "invariant_aborts",
+                "nonfinite_aborts",
+            )
+        )
+        _require(
+            bool(diagnostics)
+            and diagnostics[-1]["apply_index"]
+            == counters["apply_calls"] - abort_attempts - 1,
+            "wrist energy-brake open-latch apply identity",
+        )
+
+
 def validate_safety_static(
     report: dict[str, Any], *, episode_index: int | None
 ) -> None:
     """Validate the closed solver-iteration safety schema and static fields."""
 
-    _require(isinstance(report, dict) and set(report) == SAFETY_FIELDS, "safety schema")
+    _require(isinstance(report, dict), "safety report object")
+    profile = report.get("profile")
+    candidate_enabled = profile == WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+    _require(
+        profile in {BASE_SAFETY_PROFILE, WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE},
+        "safety profile",
+    )
+    expected_fields = CANDIDATE_SAFETY_FIELDS if candidate_enabled else SAFETY_FIELDS
+    _require(set(report) == expected_fields, "safety schema")
     _require(report.get("episode_index") == episode_index, "safety episode index")
     exact = {
-        "profile": "panda_velocity_physxlimit_solveriter1_v4",
+        "profile": profile,
         "apply_actions_cadence": "physics_substep",
         "physics_dt": 1.0 / 120.0,
         "control_dt": 1.0 / 15.0,
@@ -735,8 +1032,11 @@ def validate_safety_static(
     _require(velocity_target == [0.0] * 7, "safety arm velocity target drift")
     counters = report.get("counters")
     maxima = report.get("maxima")
+    expected_counter_fields = (
+        CANDIDATE_SAFETY_COUNTER_FIELDS if candidate_enabled else SAFETY_COUNTER_FIELDS
+    )
     _require(
-        isinstance(counters, dict) and set(counters) == SAFETY_COUNTER_FIELDS,
+        isinstance(counters, dict) and set(counters) == expected_counter_fields,
         "safety counter schema",
     )
     _require(
@@ -753,6 +1053,68 @@ def validate_safety_static(
             field == "minimum_outer_joint_clearance_rad"
             or all(value >= 0.0 for value in values),
             f"maxima {field} negative",
+        )
+    if candidate_enabled:
+        _require(
+            report.get("wrist_energy_brake_profile") == WRIST_ENERGY_BRAKE_PROFILE,
+            "wrist energy-brake profile",
+        )
+        _require(
+            report.get("wrist_energy_brake_joint_names")
+            == WRIST_ENERGY_BRAKE_JOINT_NAMES,
+            "wrist energy-brake joints",
+        )
+        _require(
+            report.get("wrist_energy_brake_latch_substeps")
+            == WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS,
+            "wrist energy-brake latch",
+        )
+        _require(
+            report.get("wrist_energy_brake_target_shift_fraction")
+            == WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION,
+            "wrist energy-brake trigger fraction",
+        )
+        thresholds = _finite_vector(
+            report.get("wrist_energy_brake_target_shift_threshold_rad"),
+            "wrist energy-brake thresholds",
+            length=3,
+        )
+        expected_thresholds = [
+            _float32_multiply(
+                value,
+                WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION,
+            )
+            for value in EXPECTED_MAX_DELTA_RAD[4:]
+        ]
+        _require(
+            all(
+                _same_float32(actual, expected)
+                for actual, expected in zip(
+                    thresholds, expected_thresholds, strict=True
+                )
+            ),
+            "wrist energy-brake threshold drift",
+        )
+        latch_remaining = report.get("wrist_energy_brake_latch_remaining_substeps")
+        _require(
+            isinstance(latch_remaining, list)
+            and len(latch_remaining) == 1
+            and type(latch_remaining[0]) is int
+            and latch_remaining[0] in (0, 1),
+            "wrist energy-brake live latch",
+        )
+        active_substeps = counters["wrist_energy_brake_active_substeps"]
+        attempted_targets = counters["wrist_energy_brake_attempted_joint_targets"]
+        braked_targets = counters["wrist_energy_brake_braked_joint_targets"]
+        _require(
+            active_substeps <= counters["apply_calls"]
+            and attempted_targets <= 3 * active_substeps
+            and braked_targets <= attempted_targets,
+            "wrist energy-brake counter feasibility",
+        )
+        _validate_wrist_energy_brake_diagnostics(
+            report,
+            episode_index=episode_index,
         )
     hard_slop = _finite_vector(
         maxima["current_physx_hard_limit_violation_rad"],
@@ -1026,7 +1388,8 @@ def validate_boundary_result(
     validate_safety_static(safety, episode_index=0)
     _require(safety.get("episode_index") == 0, "boundary safety episode")
     _require(
-        safety.get("profile") == "panda_velocity_physxlimit_solveriter1_v4",
+        safety.get("profile")
+        in {BASE_SAFETY_PROFILE, WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE},
         "boundary safety profile",
     )
     _require(
@@ -1073,6 +1436,41 @@ def validate_boundary_result(
     )
     for field in ZERO_COUNTERS:
         _require(counters.get(field) == 0, f"boundary {field} must be zero")
+    if safety.get("profile") == WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE:
+        trigger_events = counters.get("wrist_energy_brake_trigger_events", 0)
+        active_substeps = counters.get("wrist_energy_brake_active_substeps", 0)
+        _require(
+            trigger_events >= 1,
+            "boundary candidate never triggered",
+        )
+        _require(
+            active_substeps == WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS * trigger_events,
+            "boundary candidate did not close every two-substep latch",
+        )
+        _require(
+            counters.get("wrist_energy_brake_attempted_joint_targets", 0) >= 1,
+            "boundary candidate never attempted a projection",
+        )
+        _require(
+            counters.get("wrist_energy_brake_braked_joint_targets", 0) >= 1,
+            "boundary candidate never produced an effective brake",
+        )
+        brake_diagnostics = safety.get("wrist_energy_brake_diagnostics")
+        _require(
+            isinstance(brake_diagnostics, list)
+            and any(any(item["trigger_joint_mask"]) for item in brake_diagnostics)
+            and any(not any(item["trigger_joint_mask"]) for item in brake_diagnostics)
+            and any(any(item["braked_joint_mask"]) for item in brake_diagnostics),
+            "boundary candidate lacks causal trigger/follow-up/effective evidence",
+        )
+        _require(
+            safety.get("wrist_energy_brake_latch_remaining_substeps") == [0],
+            "boundary candidate ended with an active latch",
+        )
+        _require(
+            counters.get("wrist_energy_brake_diagnostics_dropped") == 0,
+            "boundary candidate dropped causal brake diagnostics",
+        )
     _require(
         safety.get("guard_diagnostics") == [], "boundary diagnostics must be empty"
     )
@@ -1159,11 +1557,31 @@ def validate_boundary_result(
         "boundary exceeded a physics-substep slew bound",
     )
     return {
+        "safety_profile": safety["profile"],
         "apply_calls": EXPECTED_APPLY_CALLS,
         "position_limit_events": position_events,
         "max_consecutive_dwell_policy_steps": max_consecutive,
         "joint5_raw_outer_violation_rad": raw_outer[TARGET_JOINT_INDEX],
         "joint5_observed_max_rad": observed_max,
+        "wrist_energy_brake": (
+            {
+                "profile": safety["wrist_energy_brake_profile"],
+                "trigger_events": counters["wrist_energy_brake_trigger_events"],
+                "active_substeps": counters["wrist_energy_brake_active_substeps"],
+                "attempted_joint_targets": counters[
+                    "wrist_energy_brake_attempted_joint_targets"
+                ],
+                "braked_joint_targets": counters[
+                    "wrist_energy_brake_braked_joint_targets"
+                ],
+                "diagnostic_count": len(safety["wrist_energy_brake_diagnostics"]),
+                "diagnostics_dropped": counters[
+                    "wrist_energy_brake_diagnostics_dropped"
+                ],
+            }
+            if safety["profile"] == WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+            else None
+        ),
     }
 
 
@@ -1293,7 +1711,7 @@ def validate_success_payload(payload: dict[str, Any]) -> dict[str, Any]:
         ("action_dim", 7),
         (
             "ik_safety_profile",
-            "panda_velocity_physxlimit_solveriter1_v4",
+            payload.get("ik_safety", {}).get("profile"),
         ),
     ):
         _require(runtime_frame.get(field) == expected, f"payload frame {field}")
@@ -1318,8 +1736,16 @@ def validate_success_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "payload frame gripper semantics",
     )
     initial = payload.get("initial_ik_safety_capture")
+    final_safety = payload.get("ik_safety")
     _require(isinstance(initial, dict), "payload initial safety capture")
+    _require(isinstance(final_safety, dict), "payload final safety capture")
     validate_safety_static(initial, episode_index=None)
+    _require(
+        initial.get("profile")
+        == final_safety.get("profile")
+        == runtime_frame.get("ik_safety_profile"),
+        "payload initial/final/frame safety profile mismatch",
+    )
     _require(
         all(value == 0 for value in initial["counters"].values()),
         "initial safety counters are not zero",
@@ -1330,7 +1756,16 @@ def validate_success_payload(payload: dict[str, Any]) -> dict[str, Any]:
     )
     _require(initial.get("guard_diagnostics") == [], "initial diagnostics")
     _require(initial.get("max_raw_delta_diagnostic") is None, "initial max diagnostic")
-    return validate_boundary_result(payload["boundary"], payload["ik_safety"])
+    if initial["profile"] == WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE:
+        _require(
+            initial.get("wrist_energy_brake_latch_remaining_substeps") == [0],
+            "initial wrist energy-brake latch is not clear",
+        )
+        _require(
+            initial.get("wrist_energy_brake_diagnostics") == [],
+            "initial wrist energy-brake diagnostics are not empty",
+        )
+    return validate_boundary_result(payload["boundary"], final_safety)
 
 
 def _strict_json_bytes(payload: dict[str, Any]) -> bytes:
@@ -1999,6 +2434,7 @@ def _run_boundary_replay(
     )
     env_cfg.actions = EefPoseActionCfg()
     env_cfg.actions.arm.enable_failure_substep_trace = True
+    env_cfg.actions.arm.enable_wrist_energy_brake = args_cli.enable_wrist_energy_brake
     configure_eef_pose_joint_safety(
         env_cfg.scene.robot,
         physx_cfg=env_cfg.sim.physx,
@@ -2265,6 +2701,14 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
         type=Path,
         required=True,
         help="Required non-overwriting immutable raw result path.",
+    )
+    parser.add_argument(
+        "--enable-wrist-energy-brake",
+        action="store_true",
+        help=(
+            "Enable the isolated two-substep wrist energy-brake diagnostic "
+            "candidate. The canonical v4 controller remains the default."
+        ),
     )
     AppLauncher.add_app_launcher_args(parser)
     args_cli = parser.parse_args()

@@ -602,3 +602,53 @@
   An independent post-run audit also executed the source runner's complete
   failure-trace validator and accepted all transition, live-state, PD, counter,
   permission, link-count, and publication-boundary identities.
+- Started isolated branch `codex/eef-wrist-energy-brake-v1-20260703` from the
+  clean v13 evidence commit `09a8afd`. Two independent trace reviews agree the
+  smallest useful next experiment is an opt-in diagnostic canary, not a
+  proven controller repair: a near-full-substep applied-target error reversal
+  on any of Panda joints 5--7 arms a group latch for the trigger substep and
+  one following physics substep. While active, only wrist targets whose
+  nominal spring term has positive power (`error * velocity > 0`) are replaced
+  by the ordinary slew/guard-bounded hold-at-current-position target; all arm
+  velocity targets remain exactly zero. The post-hoc velocity-jump extension
+  was intentionally omitted. The existing v4 behavior and report schema stay
+  the default; the experiment has a separate candidate profile and must pass
+  the deterministic boundary replay before it can reach a full-horizon model
+  canary.
+- Implemented the candidate as an exact-name-bound, single-environment
+  two-substep state machine. Reset starts reversal detection disarmed; after
+  one ordinary nominal command it is armed. A trigger and its immediate
+  follow-up are both disarmed, followed by one ordinary refractory command
+  before re-arming. This prevents a moving joint from treating a brake-created
+  hold target as a fresh reversal. Normal action-term resets and explicit
+  episode resets both clear the latch, stored target, validity, and arming
+  state. Both PhysX target setters must finish before any candidate state,
+  counter, or diagnostic commit.
+- Split projection attempts from effective brakes. A projected wrist joint is
+  counted effective only when the applied target differs from nominal and the
+  residual float32 spring power is nonpositive. The bounded evidence tail now
+  records every active latch substep, not only triggers. Runtime and host
+  validators recompute float32 trigger/attempt/effective masks, enforce exact
+  `active + latch = 2 * trigger` history, trigger/follow-up alternation,
+  earliest initial/refractory arming cadence, immediate follow-up cadence,
+  float32-exact previous-target chaining, open-latch/last-successful-apply
+  identity, ordered apply indices, and exact or loss-bounded counter sums.
+  Hidden effective totals cannot exceed hidden projection attempts. The
+  deterministic boundary promotion gate rejects any dropped causal
+  diagnostics; a larger immutable capacity and rerun are required if the
+  current 32-record tail is insufficient.
+- Closed the launch/attestation surface after two initial independent NO-GO
+  reviews: the candidate now fails fast outside one environment, runtime frame
+  and safety profiles are cross-bound, initial/final/frame profiles must agree,
+  initial latch/diagnostics must be empty, and the finalizer requires the exact
+  expected base or candidate profile. Tamper tests cover mixed profiles, stale
+  latch state, impossible counters and apply indices, forged attempted/effective
+  totals, non-causal follow-up timing, and wrong-profile finalization.
+- Current host gates pass all 190 non-Isaac tests plus 30 subtests. A separate
+  lightweight Isaac-module stub run passes 19 focused wrist controller/helper/
+  reset tests with 55 deselected. Ruff format/check, Python byte compilation,
+  and `git diff --check` pass. Independent controller and artifact-contract
+  re-reviews are code-GO for an isolated L40S diagnostic canary; real-Isaac
+  collection and the immutable baseline/candidate target-surface A/B remain
+  required before this experiment can be called a repair or used for
+  checkpoint evaluation.

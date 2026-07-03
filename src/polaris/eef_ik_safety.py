@@ -6,6 +6,9 @@ import math
 from typing import Any
 
 EEF_IK_SAFETY_PROFILE = "panda_velocity_physxlimit_solveriter1_v4"
+EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE = (
+    "panda_velocity_physxlimit_solveriter1_wristenergybrake_candidate_v1"
+)
 EEF_IK_APPLY_CADENCE = "physics_substep"
 CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD = 1e-5
 TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE = "eef_physx_inner_hardlimit_one_substep_v2"
@@ -23,6 +26,24 @@ PANDA_EEF_PHYSX_SOLVER_TYPE = 1
 JOINT_SLEW_FLOAT32_TOLERANCE_RAD = 1e-6
 JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S = 1e-5
 EEF_QUATERNION_UNIT_NORM_TOLERANCE = 1e-3
+
+# Opt-in diagnostic candidate for the deterministic coupled wrist transient.
+# This is deliberately not part of EEF_IK_SAFETY_PROFILE until the target-
+# surface boundary replay and full-horizon canary both pass.  The trigger is a
+# near-full-substep reversal of an actually applied wrist target.  While the
+# two-substep group latch is active, a wrist spring term that would inject
+# energy is replaced by a safely bounded hold-at-current-position target; the
+# exact zero velocity target remains unchanged.
+WRIST_ENERGY_BRAKE_PROFILE = (
+    "panda_j5_j7_applied_target_reversal_group_energy_brake_2substep_v1"
+)
+WRIST_ENERGY_BRAKE_JOINT_NAMES = (
+    "panda_joint5",
+    "panda_joint6",
+    "panda_joint7",
+)
+WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS = 2
+WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION = 0.9
 
 PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S = (
     2.175,

@@ -591,6 +591,105 @@ def _safety_report(*, episode_index=0, apply_calls=smoke.EXPECTED_APPLY_CALLS):
     }
 
 
+def _candidate_safety_report(
+    *, episode_index=0, apply_calls=smoke.EXPECTED_APPLY_CALLS
+):
+    report = _safety_report(
+        episode_index=episode_index,
+        apply_calls=apply_calls,
+    )
+    active = apply_calls > 0
+    report["profile"] = smoke.WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+    report.update(
+        {
+            "wrist_energy_brake_profile": smoke.WRIST_ENERGY_BRAKE_PROFILE,
+            "wrist_energy_brake_joint_names": list(
+                smoke.WRIST_ENERGY_BRAKE_JOINT_NAMES
+            ),
+            "wrist_energy_brake_latch_substeps": (
+                smoke.WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
+            ),
+            "wrist_energy_brake_target_shift_fraction": (
+                smoke.WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
+            ),
+            "wrist_energy_brake_target_shift_threshold_rad": [
+                smoke._float32_multiply(  # noqa: SLF001
+                    value,
+                    smoke.WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION,
+                )
+                for value in smoke.EXPECTED_MAX_DELTA_RAD[4:]
+            ],
+            "wrist_energy_brake_latch_remaining_substeps": [0],
+            "wrist_energy_brake_diagnostics": [],
+        }
+    )
+    report["counters"].update(
+        {
+            "wrist_energy_brake_trigger_events": 1 if active else 0,
+            "wrist_energy_brake_active_substeps": 2 if active else 0,
+            "wrist_energy_brake_attempted_joint_targets": 5 if active else 0,
+            "wrist_energy_brake_braked_joint_targets": 5 if active else 0,
+            "wrist_energy_brake_diagnostics_dropped": 0,
+        }
+    )
+    if active:
+        q = [0.0] * 7
+        q[5] = 1.0
+        previous = [0.0] * 7
+        nominal = [0.0] * 7
+        applied = [0.0] * 7
+        previous[4] = -0.02
+        nominal[4] = 0.02
+        previous[5] = nominal[5] = 1.01
+        previous[6] = nominal[6] = -0.01
+        joint_vel = [0.0] * 7
+        joint_vel[4:] = [0.2, 0.2, -0.2]
+        applied[5] = 1.0
+        report["wrist_energy_brake_diagnostics"] = [
+            {
+                "episode_index": episode_index,
+                "apply_index": 896,
+                "policy_step": 112,
+                "physics_substep": 0,
+                "environment_index": 0,
+                "reversal_detection_armed": True,
+                "trigger_joint_mask": [True, False, False],
+                "attempted_joint_mask": [True, True, True],
+                "braked_joint_mask": [True, True, True],
+                "joint_pos_rad": q,
+                "joint_vel_rad_s": joint_vel,
+                "previous_applied_target_rad": previous,
+                "nominal_safe_target_rad": nominal,
+                "applied_target_rad": applied,
+                "target_shift_rad": [0.04, 0.0, 0.0],
+            },
+            {
+                "episode_index": episode_index,
+                "apply_index": 897,
+                "policy_step": 112,
+                "physics_substep": 1,
+                "environment_index": 0,
+                "reversal_detection_armed": False,
+                "trigger_joint_mask": [False, False, False],
+                "attempted_joint_mask": [True, True, False],
+                "braked_joint_mask": [True, True, False],
+                "joint_pos_rad": q,
+                "joint_vel_rad_s": [0.0, 0.0, 0.0, 0.0, 0.2, 0.2, 0.0],
+                "previous_applied_target_rad": applied,
+                "nominal_safe_target_rad": nominal,
+                "applied_target_rad": [
+                    applied[index] if index in (4, 5) else nominal[index]
+                    for index in range(7)
+                ],
+                "target_shift_rad": [
+                    abs(smoke._float32_subtract(nominal[index], applied[index]))
+                    for index in range(4, 7)
+                ],
+            },
+        ]
+    return report
+
+
 def _boundary_result():
     arm_q = [(lower + upper) / 2.0 for lower, upper in smoke.EXPECTED_OUTER_LIMITS_RAD]
     arm_q[smoke.TARGET_JOINT_INDEX] = 2.88
@@ -732,6 +831,19 @@ def _success_payload():
     }
 
 
+def _candidate_success_payload():
+    payload = _success_payload()
+    payload["runtime_frame"]["ik_safety_profile"] = (
+        smoke.WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+    )
+    payload["initial_ik_safety_capture"] = _candidate_safety_report(
+        episode_index=None,
+        apply_calls=0,
+    )
+    payload["ik_safety"] = _candidate_safety_report()
+    return payload
+
+
 def test_fixture_exact_identity_and_decoded_action_contract():
     identity, actions = smoke.load_replay_fixture()
 
@@ -807,6 +919,155 @@ def test_boundary_evidence_accepts_exact_full_state_dwell():
     assert summary["apply_calls"] == 3152
     assert summary["max_consecutive_dwell_policy_steps"] == 16
     assert summary["joint5_raw_outer_violation_rad"] == 0.04
+
+
+def test_candidate_boundary_evidence_is_closed_and_requires_brake_activity():
+    safety = _candidate_safety_report()
+
+    summary = smoke.validate_boundary_result(_boundary_result(), safety)
+
+    assert summary["apply_calls"] == smoke.EXPECTED_APPLY_CALLS
+    assert safety["counters"]["wrist_energy_brake_trigger_events"] == 1
+    assert safety["wrist_energy_brake_diagnostics"][0]["apply_index"] == 896
+
+    for field, value in (
+        ("wrist_energy_brake_trigger_events", 0),
+        ("wrist_energy_brake_active_substeps", 1),
+        ("wrist_energy_brake_attempted_joint_targets", 0),
+        ("wrist_energy_brake_braked_joint_targets", 0),
+    ):
+        tampered = _candidate_safety_report()
+        tampered["counters"][field] = value
+        with pytest.raises(smoke.BoundaryReplayValidationError):
+            smoke.validate_boundary_result(_boundary_result(), tampered)
+
+    tampered = _candidate_safety_report()
+    tampered["wrist_energy_brake_latch_remaining_substeps"] = [1]
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="latch"):
+        smoke.validate_boundary_result(_boundary_result(), tampered)
+
+    lossy = _candidate_safety_report()
+    trigger, follow_up = lossy["wrist_energy_brake_diagnostics"]
+    diagnostics = []
+    for pair_index in range(16):
+        trigger_copy = copy.deepcopy(trigger)
+        follow_up_copy = copy.deepcopy(follow_up)
+        trigger_apply_index = 896 + 4 * pair_index
+        trigger_copy.update(
+            {
+                "apply_index": trigger_apply_index,
+                "policy_step": trigger_apply_index // smoke.DECIMATION,
+                "physics_substep": trigger_apply_index % smoke.DECIMATION,
+            }
+        )
+        follow_up_apply_index = trigger_apply_index + 1
+        follow_up_copy.update(
+            {
+                "apply_index": follow_up_apply_index,
+                "policy_step": follow_up_apply_index // smoke.DECIMATION,
+                "physics_substep": follow_up_apply_index % smoke.DECIMATION,
+            }
+        )
+        diagnostics.extend((trigger_copy, follow_up_copy))
+    lossy["wrist_energy_brake_diagnostics"] = diagnostics
+    lossy["counters"].update(
+        {
+            "wrist_energy_brake_trigger_events": 17,
+            "wrist_energy_brake_active_substeps": 34,
+            "wrist_energy_brake_attempted_joint_targets": 85,
+            "wrist_energy_brake_braked_joint_targets": 85,
+            "wrist_energy_brake_diagnostics_dropped": 2,
+        }
+    )
+    smoke.validate_safety_static(lossy, episode_index=0)
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="dropped causal"):
+        smoke.validate_boundary_result(_boundary_result(), lossy)
+
+
+def test_candidate_success_payload_binds_runtime_profile_and_initial_schema():
+    payload = _candidate_success_payload()
+
+    smoke.validate_success_payload(payload)
+
+    tampered = copy.deepcopy(payload)
+    tampered["wrist_energy_brake_extra"] = True
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="schema"):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    tampered["ik_safety"]["wrist_energy_brake_diagnostics"][0]["physics_substep"] = 1
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="apply identity"):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    tampered["initial_ik_safety_capture"][
+        "wrist_energy_brake_latch_remaining_substeps"
+    ] = [2]
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="latch"):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    tampered["initial_ik_safety_capture"] = _safety_report(
+        episode_index=None,
+        apply_calls=0,
+    )
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="profile"):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    tampered["ik_safety"]["wrist_energy_brake_diagnostics"][0]["apply_index"] = 99_999
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="apply identity"):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    tampered["ik_safety"]["counters"]["wrist_energy_brake_active_substeps"] = 100
+    with pytest.raises(smoke.BoundaryReplayValidationError):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    tampered["ik_safety"]["counters"]["wrist_energy_brake_attempted_joint_targets"] = 6
+    with pytest.raises(
+        smoke.BoundaryReplayValidationError,
+        match="attempted-target diagnostic count",
+    ):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    tampered["ik_safety"]["counters"]["wrist_energy_brake_braked_joint_targets"] = 4
+    with pytest.raises(
+        smoke.BoundaryReplayValidationError,
+        match="effective-target diagnostic count",
+    ):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    follow_up = tampered["ik_safety"]["wrist_energy_brake_diagnostics"][1]
+    follow_up["apply_index"] = 1_000
+    follow_up["policy_step"] = 125
+    follow_up["physics_substep"] = 0
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="follow-up cadence"):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    trigger, follow_up = tampered["ik_safety"]["wrist_energy_brake_diagnostics"]
+    trigger.update({"apply_index": 0, "policy_step": 0, "physics_substep": 0})
+    follow_up.update({"apply_index": 1, "policy_step": 0, "physics_substep": 1})
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="arming cadence"):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    follow_up = tampered["ik_safety"]["wrist_energy_brake_diagnostics"][1]
+    changed_previous = list(follow_up["previous_applied_target_rad"])
+    changed_previous[4] = -0.01
+    follow_up["previous_applied_target_rad"] = changed_previous
+    follow_up["target_shift_rad"][0] = 0.03
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="previous-target"):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    tampered["ik_safety"]["counters"]["wrist_energy_brake_diagnostics_dropped"] = 1
+    with pytest.raises(smoke.BoundaryReplayValidationError):
+        smoke.validate_success_payload(tampered)
 
 
 @pytest.mark.parametrize(
@@ -974,6 +1235,7 @@ def test_host_finalizer_reconstructs_raw_ready_and_provenance(tmp_path, monkeypa
         saved_job_script=saved_script,
         polaris_repo=repo,
         expected_polaris_commit=commit,
+        expected_safety_profile=smoke.BASE_SAFETY_PROFILE,
         expected_runner_sha256=hashlib.sha256(runner.read_bytes()).hexdigest(),
         expected_fixture_sha256=smoke.EXPECTED_FIXTURE_SHA256,
         container_image=image,
@@ -991,6 +1253,12 @@ def test_host_finalizer_reconstructs_raw_ready_and_provenance(tmp_path, monkeypa
     assert expected["passed"] is True
     assert expected["raw_result"]["ready_marker"]["mode"] == "0444"
     assert expected["provenance"]["fixture_source"] == smoke.EXPECTED_SOURCE
+    assert expected["validation_summary"]["safety_profile"] == (
+        smoke.BASE_SAFETY_PROFILE
+    )
+    assert expected["provenance"]["expected_safety_profile"] == (
+        smoke.BASE_SAFETY_PROFILE
+    )
     assert expected["provenance"]["slurm"] == {
         "job_id": job_id,
         "nodelist": "pool0-00005",
@@ -1015,6 +1283,8 @@ def test_host_finalizer_reconstructs_raw_ready_and_provenance(tmp_path, monkeypa
         str(repo),
         "--expected-polaris-commit",
         commit,
+        "--expected-safety-profile",
+        smoke.BASE_SAFETY_PROFILE,
         "--expected-runner-sha256",
         args.expected_runner_sha256,
         "--expected-fixture-sha256",
@@ -1035,6 +1305,73 @@ def test_host_finalizer_reconstructs_raw_ready_and_provenance(tmp_path, monkeypa
     monkeypatch.setattr(sys, "argv", cli)
     assert finalizer.main() == 0
 
+    candidate_job_id = job_id + 1
+    candidate_payload = _candidate_success_payload()
+    candidate_payload["fixture"] = fixture
+    candidate_raw_path = tmp_path / f"boundary-replay-smoke-{candidate_job_id}.json"
+    candidate_raw_identity = smoke._atomic_write_immutable(
+        candidate_raw_path,
+        candidate_payload,
+    )
+    candidate_marker_path = candidate_raw_path.with_name(
+        candidate_raw_path.name + ".ready.json"
+    )
+    smoke._atomic_write_immutable(
+        candidate_marker_path,
+        {
+            "schema_version": 1,
+            "stage": "simulation_app_close_pending",
+            "raw_result": candidate_raw_identity,
+        },
+    )
+    candidate_attestation = (
+        tmp_path / f"boundary-replay-smoke-{candidate_job_id}.attestation.json"
+    )
+    candidate_args = copy.copy(args)
+    candidate_args.raw_result = candidate_raw_path
+    candidate_args.attestation = candidate_attestation
+    candidate_args.job_id = candidate_job_id
+    candidate_args.expected_safety_profile = smoke.WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+    monkeypatch.setenv("SLURM_JOB_ID", str(candidate_job_id))
+
+    candidate_expected = finalizer.build_expected_attestation(candidate_args)
+
+    assert candidate_expected["validation_summary"]["safety_profile"] == (
+        smoke.WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+    )
+    assert candidate_expected["validation_summary"]["wrist_energy_brake"] == {
+        "profile": smoke.WRIST_ENERGY_BRAKE_PROFILE,
+        "trigger_events": 1,
+        "active_substeps": 2,
+        "attempted_joint_targets": 5,
+        "braked_joint_targets": 5,
+        "diagnostic_count": 2,
+        "diagnostics_dropped": 0,
+    }
+    candidate_cli = list(cli)
+    candidate_cli[1] = "finalize"
+    for option, value in (
+        ("--raw-result", candidate_raw_path),
+        ("--attestation", candidate_attestation),
+        ("--job-id", candidate_job_id),
+        (
+            "--expected-safety-profile",
+            smoke.WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE,
+        ),
+    ):
+        candidate_cli[candidate_cli.index(option) + 1] = str(value)
+    monkeypatch.setattr(sys, "argv", candidate_cli)
+    assert finalizer.main() == 0
+    candidate_cli[1] = "verify"
+    monkeypatch.setattr(sys, "argv", candidate_cli)
+    assert finalizer.main() == 0
+
+    wrong_profile_args = copy.copy(candidate_args)
+    wrong_profile_args.expected_safety_profile = smoke.BASE_SAFETY_PROFILE
+    with pytest.raises(finalizer.FinalizationError, match="expected controller"):
+        finalizer.build_expected_attestation(wrong_profile_args)
+
+    monkeypatch.setenv("SLURM_JOB_ID", str(job_id))
     bad_marker = json.loads(marker_path.read_text())
     bad_marker["raw_result"]["sha256"] = "0" * 64
     marker_path.chmod(0o640)

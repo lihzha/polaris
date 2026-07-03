@@ -21,6 +21,7 @@ from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
+from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
@@ -40,6 +41,10 @@ from polaris.eef_ik_safety import PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256
 from polaris.eef_ik_safety import PHYSX_DERIVED_SOFT_LIMIT_PROFILE
 from polaris.eef_ik_safety import PHYSX_HARD_LIMIT_PROFILE
 from polaris.eef_ik_safety import TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
+from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_JOINT_NAMES
+from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
+from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_PROFILE
+from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
 from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
 from polaris.eval_artifacts import EVAL_RESULT_COLUMNS
 from polaris.eval_artifacts import canonical_episode_result
@@ -69,6 +74,41 @@ SAFETY_COUNTER_FIELDS = {
     "nonfinite_aborts",
     "dls_fallbacks",
     "guard_diagnostics_dropped",
+}
+WRIST_ENERGY_BRAKE_COUNTER_FIELDS = {
+    "wrist_energy_brake_trigger_events",
+    "wrist_energy_brake_active_substeps",
+    "wrist_energy_brake_attempted_joint_targets",
+    "wrist_energy_brake_braked_joint_targets",
+    "wrist_energy_brake_diagnostics_dropped",
+}
+WRIST_ENERGY_BRAKE_STATIC_FIELDS = (
+    "wrist_energy_brake_profile",
+    "wrist_energy_brake_joint_names",
+    "wrist_energy_brake_latch_substeps",
+    "wrist_energy_brake_target_shift_fraction",
+    "wrist_energy_brake_target_shift_threshold_rad",
+)
+WRIST_ENERGY_BRAKE_DYNAMIC_FIELDS = {
+    "wrist_energy_brake_latch_remaining_substeps",
+    "wrist_energy_brake_diagnostics",
+}
+WRIST_ENERGY_BRAKE_DIAGNOSTIC_FIELDS = {
+    "episode_index",
+    "apply_index",
+    "policy_step",
+    "physics_substep",
+    "environment_index",
+    "reversal_detection_armed",
+    "trigger_joint_mask",
+    "attempted_joint_mask",
+    "braked_joint_mask",
+    "joint_pos_rad",
+    "joint_vel_rad_s",
+    "previous_applied_target_rad",
+    "nominal_safe_target_rad",
+    "applied_target_rad",
+    "target_shift_rad",
 }
 SAFETY_MAXIMA_FIELDS = {
     "raw_delta_joint_pos_rad",
@@ -104,6 +144,10 @@ SAFETY_DIAGNOSTIC_COUNTERS = {
     "desired_eef_quaternion_invariant_abort": "invariant_aborts",
     "nonfinite_abort": "nonfinite_aborts",
     "dls_pseudoinverse_fallback": "dls_fallbacks",
+}
+WRIST_ENERGY_BRAKE_SAFETY_DIAGNOSTIC_COUNTERS = {
+    **SAFETY_DIAGNOSTIC_COUNTERS,
+    "wrist_energy_brake_target_state_abort": "invariant_aborts",
 }
 SAFETY_STATIC_FIELDS = (
     "profile",
@@ -149,6 +193,11 @@ EPISODE_SAFETY_FIELDS = {
     "guard_diagnostics",
     "max_raw_delta_diagnostic",
 }
+WRIST_ENERGY_BRAKE_EPISODE_SAFETY_FIELDS = {
+    *EPISODE_SAFETY_FIELDS,
+    *WRIST_ENERGY_BRAKE_STATIC_FIELDS,
+    *WRIST_ENERGY_BRAKE_DYNAMIC_FIELDS,
+}
 SAFETY_SIDECAR_FIELDS = {
     "schema_version",
     "transaction_state",
@@ -185,12 +234,20 @@ RUNTIME_EPISODE_FIELDS = {
     "sidecar_path",
     "sidecar_sha256",
 }
+WRIST_ENERGY_BRAKE_RUNTIME_EPISODE_FIELDS = {
+    *RUNTIME_EPISODE_FIELDS,
+    *WRIST_ENERGY_BRAKE_DYNAMIC_FIELDS,
+}
 AGGREGATE_SAFETY_FIELDS = {
     *SAFETY_STATIC_FIELDS,
     "episodes_completed",
     "counters",
     "maxima",
     "episodes",
+}
+WRIST_ENERGY_BRAKE_AGGREGATE_SAFETY_FIELDS = {
+    *AGGREGATE_SAFETY_FIELDS,
+    *WRIST_ENERGY_BRAKE_STATIC_FIELDS,
 }
 
 
@@ -298,6 +355,376 @@ def _finger_action_term(runtime: Any) -> Any:
     return terms["finger_joint"]
 
 
+def _wrist_energy_brake_enabled(arm_term: Any) -> bool:
+    """Return the exact opt-in flag without widening truthy config values."""
+
+    arm_cfg = getattr(arm_term, "cfg", None)
+    enabled = getattr(arm_cfg, "enable_wrist_energy_brake", False)
+    if type(enabled) is not bool:
+        raise ValueError(
+            "Live EEF IK wrist energy-brake enable flag must be exactly bool"
+        )
+    return enabled
+
+
+def _selected_safety_profile(candidate_enabled: bool) -> str:
+    return (
+        EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+        if candidate_enabled
+        else EEF_IK_SAFETY_PROFILE
+    )
+
+
+def _episode_safety_fields(candidate_enabled: bool) -> set[str]:
+    return (
+        WRIST_ENERGY_BRAKE_EPISODE_SAFETY_FIELDS
+        if candidate_enabled
+        else EPISODE_SAFETY_FIELDS
+    )
+
+
+def _safety_counter_fields(candidate_enabled: bool) -> set[str]:
+    return (
+        SAFETY_COUNTER_FIELDS | WRIST_ENERGY_BRAKE_COUNTER_FIELDS
+        if candidate_enabled
+        else SAFETY_COUNTER_FIELDS
+    )
+
+
+def _safety_static_fields(candidate_enabled: bool) -> tuple[str, ...]:
+    return (
+        (*SAFETY_STATIC_FIELDS, *WRIST_ENERGY_BRAKE_STATIC_FIELDS)
+        if candidate_enabled
+        else SAFETY_STATIC_FIELDS
+    )
+
+
+def _aggregate_safety_fields(candidate_enabled: bool) -> set[str]:
+    return (
+        WRIST_ENERGY_BRAKE_AGGREGATE_SAFETY_FIELDS
+        if candidate_enabled
+        else AGGREGATE_SAFETY_FIELDS
+    )
+
+
+def _runtime_episode_fields(candidate_enabled: bool) -> set[str]:
+    return (
+        WRIST_ENERGY_BRAKE_RUNTIME_EPISODE_FIELDS
+        if candidate_enabled
+        else RUNTIME_EPISODE_FIELDS
+    )
+
+
+def _candidate_enabled_from_safety(safety: Mapping[str, Any]) -> bool:
+    profile = safety.get("profile")
+    if profile == EEF_IK_SAFETY_PROFILE:
+        return False
+    if profile == EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE:
+        return True
+    raise ValueError(f"Unknown EEF IK safety profile: {profile!r}")
+
+
+def _canonical_wrist_energy_brake_threshold() -> np.ndarray:
+    max_delta = np.asarray(
+        PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S,
+        dtype=np.float32,
+    ) * np.float32(CANONICAL_PHYSICS_DT)
+    return (
+        max_delta[4:7] * np.float32(WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION)
+    ).astype(np.float32, copy=False)
+
+
+def _finite_numeric_vector(value: Any, *, size: int, field: str) -> np.ndarray:
+    if (
+        not isinstance(value, list)
+        or len(value) != size
+        or any(
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(float(item))
+            for item in value
+        )
+    ):
+        raise ValueError(f"EEF IK {field} must be one finite {size}-vector")
+    return np.asarray(value, dtype=np.float64)
+
+
+def _validate_wrist_energy_brake_diagnostic(
+    diagnostic: Any,
+    *,
+    episode_index: int | None,
+    apply_calls: int,
+    threshold: np.ndarray,
+    soft_joint_pos_limits: np.ndarray,
+    target_joint_pos_limits: np.ndarray,
+) -> int:
+    """Validate one closed-schema, single-environment active-latch diagnostic."""
+
+    if not isinstance(diagnostic, Mapping):
+        raise ValueError("EEF IK wrist energy-brake diagnostic is not an object")
+    if set(diagnostic) != WRIST_ENERGY_BRAKE_DIAGNOSTIC_FIELDS:
+        raise ValueError("EEF IK wrist energy-brake diagnostic schema drift")
+    if diagnostic.get("episode_index") != episode_index:
+        raise ValueError("EEF IK wrist energy-brake diagnostic episode drift")
+    for field in ("apply_index", "policy_step", "physics_substep", "environment_index"):
+        value = diagnostic.get(field)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"EEF IK wrist energy-brake diagnostic {field} is invalid")
+    apply_index = diagnostic["apply_index"]
+    if (
+        apply_index >= apply_calls
+        or diagnostic["policy_step"] != apply_index // CANONICAL_DECIMATION
+        or diagnostic["physics_substep"] != apply_index % CANONICAL_DECIMATION
+        or diagnostic["environment_index"] != 0
+    ):
+        raise ValueError("EEF IK wrist energy-brake diagnostic cadence drift")
+    reversal_detection_armed = diagnostic.get("reversal_detection_armed")
+    if type(reversal_detection_armed) is not bool:
+        raise ValueError("EEF IK wrist energy-brake diagnostic arming state is invalid")
+
+    masks: dict[str, list[bool]] = {}
+    for field in (
+        "trigger_joint_mask",
+        "attempted_joint_mask",
+        "braked_joint_mask",
+    ):
+        value = diagnostic.get(field)
+        if (
+            not isinstance(value, list)
+            or len(value) != len(WRIST_ENERGY_BRAKE_JOINT_NAMES)
+            or any(type(item) is not bool for item in value)
+        ):
+            raise ValueError(f"EEF IK wrist energy-brake diagnostic {field} is invalid")
+        masks[field] = value
+    vectors = {
+        field: _finite_numeric_vector(
+            diagnostic.get(field),
+            size=7,
+            field=f"wrist energy-brake diagnostic {field}",
+        )
+        for field in (
+            "joint_pos_rad",
+            "joint_vel_rad_s",
+            "previous_applied_target_rad",
+            "nominal_safe_target_rad",
+            "applied_target_rad",
+        )
+    }
+    target_shift = _finite_numeric_vector(
+        diagnostic.get("target_shift_rad"),
+        size=3,
+        field="wrist energy-brake diagnostic target_shift_rad",
+    )
+    vectors_float32 = {
+        field: vector.astype(np.float32) for field, vector in vectors.items()
+    }
+    previous_error = (
+        vectors_float32["previous_applied_target_rad"][4:7]
+        - vectors_float32["joint_pos_rad"][4:7]
+    )
+    nominal_error = (
+        vectors_float32["nominal_safe_target_rad"][4:7]
+        - vectors_float32["joint_pos_rad"][4:7]
+    )
+    recomputed_shift = np.abs(
+        vectors_float32["nominal_safe_target_rad"][4:7]
+        - vectors_float32["previous_applied_target_rad"][4:7]
+    )
+    if not np.array_equal(
+        target_shift.astype(np.float32),
+        recomputed_shift.astype(np.float32),
+    ):
+        raise ValueError("EEF IK wrist energy-brake diagnostic target-shift drift")
+    target_shift_float32 = target_shift.astype(np.float32)
+    expected_trigger = reversal_detection_armed & (
+        (np.multiply(previous_error, nominal_error, dtype=np.float32) < 0.0)
+        & (target_shift_float32 >= threshold.astype(np.float32))
+    )
+    if masks["trigger_joint_mask"] != expected_trigger.tolist():
+        raise ValueError("EEF IK wrist energy-brake diagnostic trigger-mask drift")
+    expected_attempted = (
+        np.multiply(
+            nominal_error,
+            vectors_float32["joint_vel_rad_s"][4:7],
+            dtype=np.float32,
+        )
+        > 0.0
+    )
+    if masks["attempted_joint_mask"] != expected_attempted.tolist():
+        raise ValueError("EEF IK wrist energy-brake diagnostic attempt-mask drift")
+    joint_pos = vectors_float32["joint_pos_rad"]
+    soft_limits_float32 = soft_joint_pos_limits.astype(np.float32)
+    target_limits_float32 = target_joint_pos_limits.astype(np.float32)
+    zero_float32 = np.float32(0.0)
+    limit_tolerance_float32 = np.float32(CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD)
+    effective_lower = target_limits_float32[:, 0] - np.clip(
+        soft_limits_float32[:, 0] - joint_pos,
+        zero_float32,
+        limit_tolerance_float32,
+    )
+    effective_upper = target_limits_float32[:, 1] + np.clip(
+        joint_pos - soft_limits_float32[:, 1],
+        zero_float32,
+        limit_tolerance_float32,
+    )
+    hold_target = np.clip(joint_pos, effective_lower, effective_upper)
+    expected_applied = vectors_float32["nominal_safe_target_rad"].copy()
+    expected_applied[4:7] = np.where(
+        np.asarray(masks["attempted_joint_mask"]),
+        hold_target[4:7],
+        expected_applied[4:7],
+    )
+    if not np.array_equal(
+        vectors_float32["applied_target_rad"],
+        expected_applied,
+    ):
+        raise ValueError("EEF IK wrist energy-brake diagnostic applied-target drift")
+    applied_error = (
+        vectors_float32["applied_target_rad"][4:7]
+        - vectors_float32["joint_pos_rad"][4:7]
+    )
+    expected_braked = (
+        expected_attempted
+        & (
+            vectors_float32["applied_target_rad"][4:7]
+            != vectors_float32["nominal_safe_target_rad"][4:7]
+        )
+        & (
+            np.multiply(
+                applied_error,
+                vectors_float32["joint_vel_rad_s"][4:7],
+                dtype=np.float32,
+            )
+            <= 0.0
+        )
+    )
+    if masks["braked_joint_mask"] != expected_braked.tolist():
+        raise ValueError("EEF IK wrist energy-brake diagnostic brake-mask drift")
+    return apply_index
+
+
+def _validate_wrist_energy_brake_history(
+    *,
+    counters: Mapping[str, Any],
+    latch_remaining: Any,
+    diagnostics: Any,
+    field: str,
+) -> None:
+    """Bind counters and the bounded tail to the exact two-substep machine."""
+
+    trigger_events = counters["wrist_energy_brake_trigger_events"]
+    active_substeps = counters["wrist_energy_brake_active_substeps"]
+    attempted_targets = counters["wrist_energy_brake_attempted_joint_targets"]
+    braked_targets = counters["wrist_energy_brake_braked_joint_targets"]
+    dropped = counters["wrist_energy_brake_diagnostics_dropped"]
+    if (
+        not isinstance(latch_remaining, list)
+        or len(latch_remaining) != 1
+        or type(latch_remaining[0]) is not int
+        or latch_remaining[0] not in (0, 1)
+    ):
+        raise ValueError(f"{field} wrist energy-brake latch state is invalid")
+    if (
+        active_substeps + latch_remaining[0]
+        != WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS * trigger_events
+    ):
+        raise ValueError(f"{field} wrist energy-brake latch/counter history drift")
+    if (
+        not isinstance(diagnostics, list)
+        or len(diagnostics) != min(active_substeps, 32)
+        or dropped != max(active_substeps - 32, 0)
+    ):
+        raise ValueError(f"{field} wrist energy-brake diagnostic accounting drift")
+
+    tail_attempted_targets = 0
+    tail_braked_targets = 0
+    tail_trigger_events = 0
+    for index, diagnostic in enumerate(diagnostics):
+        global_active_ordinal = dropped + index
+        expected_trigger_record = global_active_ordinal % 2 == 0
+        has_trigger = any(diagnostic["trigger_joint_mask"])
+        if (
+            has_trigger is not expected_trigger_record
+            or diagnostic["reversal_detection_armed"] is not expected_trigger_record
+        ):
+            raise ValueError(f"{field} wrist energy-brake two-substep sequence drift")
+        earliest_apply_index = (
+            1
+            + 3 * (global_active_ordinal // WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS)
+            + global_active_ordinal % WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
+        )
+        if diagnostic["apply_index"] < earliest_apply_index:
+            raise ValueError(
+                f"{field} wrist energy-brake initial/refractory arming cadence drift"
+            )
+        if index > 0:
+            previous_apply_index = diagnostics[index - 1]["apply_index"]
+            apply_index = diagnostic["apply_index"]
+            if expected_trigger_record:
+                if apply_index < previous_apply_index + 2:
+                    raise ValueError(f"{field} wrist energy-brake re-arm cadence drift")
+            else:
+                if apply_index != previous_apply_index + 1:
+                    raise ValueError(
+                        f"{field} wrist energy-brake follow-up cadence drift"
+                    )
+                if not np.array_equal(
+                    np.asarray(
+                        diagnostic["previous_applied_target_rad"],
+                        dtype=np.float32,
+                    ),
+                    np.asarray(
+                        diagnostics[index - 1]["applied_target_rad"],
+                        dtype=np.float32,
+                    ),
+                ):
+                    raise ValueError(
+                        f"{field} wrist energy-brake previous-target chain drift"
+                    )
+        tail_trigger_events += int(has_trigger)
+        tail_attempted_targets += sum(diagnostic["attempted_joint_mask"])
+        tail_braked_targets += sum(diagnostic["braked_joint_mask"])
+
+    if tail_trigger_events + (dropped + 1) // 2 != trigger_events:
+        raise ValueError(f"{field} wrist energy-brake trigger-tail count drift")
+    if not (
+        tail_attempted_targets
+        <= attempted_targets
+        <= tail_attempted_targets + len(WRIST_ENERGY_BRAKE_JOINT_NAMES) * dropped
+    ):
+        raise ValueError(f"{field} wrist energy-brake attempted-target count drift")
+    if not (
+        tail_braked_targets
+        <= braked_targets
+        <= tail_braked_targets + len(WRIST_ENERGY_BRAKE_JOINT_NAMES) * dropped
+    ):
+        raise ValueError(f"{field} wrist energy-brake effective-target count drift")
+    if (
+        braked_targets - tail_braked_targets
+        > attempted_targets - tail_attempted_targets
+    ):
+        raise ValueError(
+            f"{field} wrist energy-brake hidden effective/attempted count drift"
+        )
+    if latch_remaining[0] == 1:
+        abort_attempts = sum(
+            counters[name]
+            for name in (
+                "current_joint_limit_aborts",
+                "invariant_aborts",
+                "nonfinite_aborts",
+            )
+        )
+        if (
+            not diagnostics
+            or diagnostics[-1]["apply_index"]
+            != counters["apply_calls"] - abort_attempts - 1
+        ):
+            raise ValueError(
+                f"{field} wrist energy-brake open-latch apply identity drift"
+            )
+
+
 def _validate_guard_diagnostic(
     diagnostic: Any,
     *,
@@ -391,20 +818,22 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
 
     runtime = _unwrapped(env)
     arm_term = _arm_action_term(runtime)
+    candidate_enabled = _wrist_energy_brake_enabled(arm_term)
     reporter = getattr(arm_term, "safety_report", None)
     if not callable(reporter):
         raise ValueError("Live Ego-LAP EEF action has no IK safety reporter")
     report = reporter()
     if not isinstance(report, dict):
         raise ValueError("Live Ego-LAP EEF IK safety reporter returned no object")
-    if set(report) != EPISODE_SAFETY_FIELDS:
+    expected_report_fields = _episode_safety_fields(candidate_enabled)
+    if set(report) != expected_report_fields:
         raise ValueError(
             "Live EEF IK safety report schema drift: "
-            f"expected={sorted(EPISODE_SAFETY_FIELDS)!r}, "
+            f"expected={sorted(expected_report_fields)!r}, "
             f"actual={sorted(report)!r}"
         )
     exact_fields = {
-        "profile": EEF_IK_SAFETY_PROFILE,
+        "profile": _selected_safety_profile(candidate_enabled),
         "apply_actions_cadence": EEF_IK_APPLY_CADENCE,
         "target_soft_limit_guard_band_profile": TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE,
         "physx_hard_limit_profile": PHYSX_HARD_LIMIT_PROFILE,
@@ -419,6 +848,19 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         "decimation": CANONICAL_DECIMATION,
         "joint_names": list(CANONICAL_ARM_JOINTS),
     }
+    if candidate_enabled:
+        exact_fields.update(
+            {
+                "wrist_energy_brake_profile": WRIST_ENERGY_BRAKE_PROFILE,
+                "wrist_energy_brake_joint_names": list(WRIST_ENERGY_BRAKE_JOINT_NAMES),
+                "wrist_energy_brake_latch_substeps": (
+                    WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
+                ),
+                "wrist_energy_brake_target_shift_fraction": (
+                    WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
+                ),
+            }
+        )
     for field, expected in exact_fields.items():
         if report.get(field) != expected:
             raise ValueError(
@@ -653,11 +1095,26 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         np.zeros(7, dtype=np.float64),
     ):
         raise ValueError("Live EEF IK arm velocity target must be exactly zero")
+    wrist_threshold = None
+    if candidate_enabled:
+        wrist_threshold = _finite_numeric_vector(
+            report.get("wrist_energy_brake_target_shift_threshold_rad"),
+            size=3,
+            field="wrist energy-brake target-shift threshold",
+        )
+        canonical_wrist_threshold = _canonical_wrist_energy_brake_threshold()
+        if not np.array_equal(
+            wrist_threshold.astype(np.float32),
+            canonical_wrist_threshold,
+        ):
+            raise ValueError(
+                "Live EEF IK wrist energy-brake target-shift threshold mismatch"
+            )
     counters = report.get("counters")
     maxima = report.get("maxima")
     if not isinstance(counters, dict) or not isinstance(maxima, dict):
         raise ValueError("Live EEF IK safety requires counters and maxima objects")
-    expected_counters = SAFETY_COUNTER_FIELDS
+    expected_counters = _safety_counter_fields(candidate_enabled)
     if set(counters) != expected_counters or any(
         type(counters[field]) is not int or counters[field] < 0
         for field in expected_counters
@@ -666,6 +1123,46 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
     if counters["environment_substeps"] != counters["apply_calls"]:
         raise ValueError(
             "Single-environment EEF safety substep count must equal apply calls"
+        )
+    if candidate_enabled:
+        apply_calls = counters["apply_calls"]
+        trigger_events = counters["wrist_energy_brake_trigger_events"]
+        active_substeps = counters["wrist_energy_brake_active_substeps"]
+        attempted_targets = counters["wrist_energy_brake_attempted_joint_targets"]
+        braked_targets = counters["wrist_energy_brake_braked_joint_targets"]
+        if (
+            trigger_events > apply_calls
+            or active_substeps > apply_calls
+            or attempted_targets > len(WRIST_ENERGY_BRAKE_JOINT_NAMES) * active_substeps
+            or braked_targets > attempted_targets
+        ):
+            raise ValueError(
+                "Live EEF IK wrist energy-brake counter history is impossible"
+            )
+        latch_remaining = report.get("wrist_energy_brake_latch_remaining_substeps")
+        brake_diagnostics = report.get("wrist_energy_brake_diagnostics")
+        if not isinstance(brake_diagnostics, list):
+            raise ValueError("Live EEF IK wrist energy-brake diagnostics are invalid")
+        diagnostic_apply_indices = [
+            _validate_wrist_energy_brake_diagnostic(
+                diagnostic,
+                episode_index=episode_index,
+                apply_calls=apply_calls,
+                threshold=wrist_threshold,
+                soft_joint_pos_limits=soft_limits,
+                target_joint_pos_limits=target_limits,
+            )
+            for diagnostic in brake_diagnostics
+        ]
+        if diagnostic_apply_indices != sorted(set(diagnostic_apply_indices)):
+            raise ValueError(
+                "Live EEF IK wrist energy-brake diagnostics are out of order"
+            )
+        _validate_wrist_energy_brake_history(
+            counters=counters,
+            latch_remaining=latch_remaining,
+            diagnostics=brake_diagnostics,
+            field="Live EEF IK",
         )
     expected_maxima = SAFETY_MAXIMA_FIELDS
     if set(maxima) != expected_maxima:
@@ -726,14 +1223,19 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         "nonfinite_aborts": 0,
         "dls_fallbacks": 0,
     }
+    diagnostic_counter_mapping = (
+        WRIST_ENERGY_BRAKE_SAFETY_DIAGNOSTIC_COUNTERS
+        if candidate_enabled
+        else SAFETY_DIAGNOSTIC_COUNTERS
+    )
     for diagnostic in guard_diagnostics:
         _validate_guard_diagnostic(
             diagnostic,
             episode_index=episode_index,
             field="guard",
-            allowed_kinds=set(SAFETY_DIAGNOSTIC_COUNTERS),
+            allowed_kinds=set(diagnostic_counter_mapping),
         )
-        mapped_counts[SAFETY_DIAGNOSTIC_COUNTERS[diagnostic["kind"]]] += 1
+        mapped_counts[diagnostic_counter_mapping[diagnostic["kind"]]] += 1
     for counter, diagnostic_count in mapped_counts.items():
         if counters[counter] != diagnostic_count:
             raise ValueError(
@@ -826,6 +1328,7 @@ def validate_eef_runtime_frame(
             "Live Ego-LAP controller does not control physical panda_link8: "
             f"{getattr(arm_cfg, 'body_name', None)!r}"
         )
+    candidate_enabled = _wrist_energy_brake_enabled(arm_term)
     if not _identity_offset(getattr(arm_cfg, "body_offset", None)):
         raise ValueError("Live Ego-LAP controller body offset is not identity")
     controller_cfg = getattr(arm_cfg, "controller", None)
@@ -899,7 +1402,7 @@ def validate_eef_runtime_frame(
         "arm_scale": CANONICAL_ARM_SCALE,
         "arm_joint_names": list(CANONICAL_ARM_JOINTS),
         "gripper_threshold_profile": GRIPPER_THRESHOLD_PROFILE,
-        "ik_safety_profile": EEF_IK_SAFETY_PROFILE,
+        "ik_safety_profile": _selected_safety_profile(candidate_enabled),
         "action_dim": 7,
     }
 
@@ -1085,17 +1588,80 @@ def _validate_episode_safety_evidence_shape(
 ) -> None:
     """Validate the exact durable per-episode safety schema and counter mapping."""
 
-    if set(safety) != EPISODE_SAFETY_FIELDS:
+    candidate_enabled = _candidate_enabled_from_safety(safety)
+    if set(safety) != _episode_safety_fields(candidate_enabled):
         raise ValueError("Episode safety report schema drift")
     counters = safety.get("counters")
     maxima = safety.get("maxima")
-    if not isinstance(counters, Mapping) or set(counters) != SAFETY_COUNTER_FIELDS:
+    if not isinstance(counters, Mapping) or set(counters) != _safety_counter_fields(
+        candidate_enabled
+    ):
         raise ValueError("Episode safety counter schema drift")
     if any(type(value) is not int or value < 0 for value in counters.values()):
         raise ValueError("Episode safety counters must be nonnegative integers")
     if counters["environment_substeps"] != counters["apply_calls"]:
         raise ValueError("Episode safety environment/apply substeps disagree")
     apply_calls = counters["apply_calls"]
+    if candidate_enabled:
+        expected_candidate_static = {
+            "wrist_energy_brake_profile": WRIST_ENERGY_BRAKE_PROFILE,
+            "wrist_energy_brake_joint_names": list(WRIST_ENERGY_BRAKE_JOINT_NAMES),
+            "wrist_energy_brake_latch_substeps": WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS,
+            "wrist_energy_brake_target_shift_fraction": (
+                WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
+            ),
+        }
+        for field, expected in expected_candidate_static.items():
+            if safety.get(field) != expected:
+                raise ValueError(f"Episode wrist energy-brake {field} drift")
+        threshold = _finite_numeric_vector(
+            safety.get("wrist_energy_brake_target_shift_threshold_rad"),
+            size=3,
+            field="episode wrist energy-brake target-shift threshold",
+        )
+        if not np.array_equal(
+            threshold.astype(np.float32),
+            _canonical_wrist_energy_brake_threshold(),
+        ):
+            raise ValueError("Episode wrist energy-brake threshold drift")
+        trigger_events = counters["wrist_energy_brake_trigger_events"]
+        active_substeps = counters["wrist_energy_brake_active_substeps"]
+        attempted_targets = counters["wrist_energy_brake_attempted_joint_targets"]
+        braked_targets = counters["wrist_energy_brake_braked_joint_targets"]
+        if (
+            trigger_events > apply_calls
+            or active_substeps > apply_calls
+            or attempted_targets > len(WRIST_ENERGY_BRAKE_JOINT_NAMES) * active_substeps
+            or braked_targets > attempted_targets
+        ):
+            raise ValueError("Episode wrist energy-brake counter history is impossible")
+        latch_remaining = safety.get("wrist_energy_brake_latch_remaining_substeps")
+        brake_diagnostics = safety.get("wrist_energy_brake_diagnostics")
+        if not isinstance(brake_diagnostics, list):
+            raise ValueError("Episode wrist energy-brake diagnostics are invalid")
+        brake_indices = [
+            _validate_wrist_energy_brake_diagnostic(
+                diagnostic,
+                episode_index=episode_index,
+                apply_calls=apply_calls,
+                threshold=threshold,
+                soft_joint_pos_limits=_numpy(
+                    safety.get("soft_joint_pos_limits_rad")
+                ).astype(np.float64),
+                target_joint_pos_limits=_numpy(
+                    safety.get("target_joint_pos_limits_rad")
+                ).astype(np.float64),
+            )
+            for diagnostic in brake_diagnostics
+        ]
+        if brake_indices != sorted(set(brake_indices)):
+            raise ValueError("Episode wrist energy-brake diagnostics are out of order")
+        _validate_wrist_energy_brake_history(
+            counters=counters,
+            latch_remaining=latch_remaining,
+            diagnostics=brake_diagnostics,
+            field="Episode",
+        )
     for event_name, joint_name in (
         ("slew_limit_events", "slew_limited_joints"),
         ("position_limit_events", "position_limited_joints"),
@@ -1146,12 +1712,17 @@ def _validate_episode_safety_evidence_shape(
         "dls_fallbacks": 0,
     }
     diagnostic_indices = []
+    diagnostic_counter_mapping = (
+        WRIST_ENERGY_BRAKE_SAFETY_DIAGNOSTIC_COUNTERS
+        if candidate_enabled
+        else SAFETY_DIAGNOSTIC_COUNTERS
+    )
     for diagnostic in diagnostics:
         _validate_guard_diagnostic(
             diagnostic,
             episode_index=episode_index,
             field="guard",
-            allowed_kinds=set(SAFETY_DIAGNOSTIC_COUNTERS),
+            allowed_kinds=set(diagnostic_counter_mapping),
         )
         flattened_index = (
             diagnostic["policy_step"] * CANONICAL_DECIMATION
@@ -1160,7 +1731,7 @@ def _validate_episode_safety_evidence_shape(
         if flattened_index >= apply_calls:
             raise ValueError("Episode safety guard diagnostic is out of cadence")
         diagnostic_indices.append(flattened_index)
-        mapped_counts[SAFETY_DIAGNOSTIC_COUNTERS[diagnostic["kind"]]] += 1
+        mapped_counts[diagnostic_counter_mapping[diagnostic["kind"]]] += 1
     if diagnostic_indices != sorted(diagnostic_indices):
         raise ValueError("Episode safety guard diagnostics are out of order")
     for name, count in mapped_counts.items():
@@ -1539,10 +2110,16 @@ def aggregate_episode_safety(
 ) -> dict[str, Any]:
     """Merge immutable per-episode reports without losing resume history."""
 
-    if set(live_template) != EPISODE_SAFETY_FIELDS:
+    candidate_enabled = _candidate_enabled_from_safety(live_template)
+    if set(live_template) != _episode_safety_fields(candidate_enabled):
         raise ValueError("Live safety template schema drift")
-    static = {field: live_template[field] for field in SAFETY_STATIC_FIELDS}
+    static = {
+        field: live_template[field]
+        for field in _safety_static_fields(candidate_enabled)
+    }
     counter_names = set(live_template["counters"])
+    if counter_names != _safety_counter_fields(candidate_enabled):
+        raise ValueError("Live safety template counter schema drift")
     maxima_names = set(live_template["maxima"])
     counters = {field: 0 for field in counter_names}
     maxima = {field: [0.0] * 7 for field in maxima_names}
@@ -1571,20 +2148,23 @@ def aggregate_episode_safety(
                     maxima[field], safety["maxima"][field], strict=True
                 )
             ]
-        episodes.append(
-            {
-                "episode_index": sidecar["episode_index"],
-                "episode_result": sidecar["episode_result"],
-                "artifact_identity": sidecar["artifact_identity"],
-                "cadence_evidence": sidecar["cadence_evidence"],
-                "counters": safety["counters"],
-                "maxima": safety["maxima"],
-                "guard_diagnostics": safety["guard_diagnostics"],
-                "max_raw_delta_diagnostic": safety["max_raw_delta_diagnostic"],
-                "sidecar_path": sidecar["path"],
-                "sidecar_sha256": sidecar["sha256"],
-            }
-        )
+        episode = {
+            "episode_index": sidecar["episode_index"],
+            "episode_result": sidecar["episode_result"],
+            "artifact_identity": sidecar["artifact_identity"],
+            "cadence_evidence": sidecar["cadence_evidence"],
+            "counters": safety["counters"],
+            "maxima": safety["maxima"],
+            "guard_diagnostics": safety["guard_diagnostics"],
+            "max_raw_delta_diagnostic": safety["max_raw_delta_diagnostic"],
+            "sidecar_path": sidecar["path"],
+            "sidecar_sha256": sidecar["sha256"],
+        }
+        if candidate_enabled:
+            episode.update(
+                {field: safety[field] for field in WRIST_ENERGY_BRAKE_DYNAMIC_FIELDS}
+            )
+        episodes.append(episode)
     aggregate = {
         **static,
         "episodes_completed": len(episodes),
@@ -1592,8 +2172,9 @@ def aggregate_episode_safety(
         "maxima": maxima,
         "episodes": episodes,
     }
-    if set(aggregate) != AGGREGATE_SAFETY_FIELDS or any(
-        set(episode) != RUNTIME_EPISODE_FIELDS for episode in episodes
+    if set(aggregate) != _aggregate_safety_fields(candidate_enabled) or any(
+        set(episode) != _runtime_episode_fields(candidate_enabled)
+        for episode in episodes
     ):
         raise ValueError("Aggregate EEF IK safety schema drift")
     return aggregate
@@ -1608,14 +2189,18 @@ def atomic_write_runtime_contract(
 ) -> None:
     """Atomically persist the live simulator/controller contract for this attempt."""
 
-    if set(ik_safety) != AGGREGATE_SAFETY_FIELDS:
+    candidate_enabled = _candidate_enabled_from_safety(ik_safety)
+    if set(ik_safety) != _aggregate_safety_fields(candidate_enabled):
         raise ValueError("Runtime aggregate EEF IK safety schema drift")
     episodes = ik_safety.get("episodes")
     if not isinstance(episodes, list) or any(
-        not isinstance(episode, Mapping) or set(episode) != RUNTIME_EPISODE_FIELDS
+        not isinstance(episode, Mapping)
+        or set(episode) != _runtime_episode_fields(candidate_enabled)
         for episode in episodes
     ):
         raise ValueError("Runtime aggregate episode safety schema drift")
+    if frame.get("ik_safety_profile") != ik_safety.get("profile"):
+        raise ValueError("Runtime frame and aggregate EEF IK safety profiles disagree")
     payload = {
         "schema_version": 2,
         "protocol": dict(protocol),

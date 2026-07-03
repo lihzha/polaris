@@ -14,6 +14,7 @@ from polaris.robust_differential_ik import (
     DifferentialIKNumericalError,
     RobustDifferentialIKController,
     RobustDifferentialInverseKinematicsAction,
+    _apply_wrist_energy_brake_target,
     _bound_joint_position_target,
     _derive_isaac_soft_joint_position_limits,
     _eef_quaternion_norm_is_valid,
@@ -27,6 +28,8 @@ from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_RAD
 from polaris.eef_ik_safety import PANDA_SOFT_JOINT_POS_LIMITS_RAD
+from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
+from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
 
 
 _BOUNDARY_SMOKE_PATH = (
@@ -239,6 +242,430 @@ def test_joint_target_guard_band_does_not_consume_recovery_for_in_range_state(
     strict_inner = boundary - direction * max_delta
     assert position_limited.all()
     torch.testing.assert_close(safe, strict_inner, rtol=0.0, atol=0.0)
+
+
+_WRIST_JOINT_INDICES = (4, 5, 6)
+
+
+def _wrist_energy_brake_inputs(num_envs=1):
+    return {
+        "joint_pos": torch.zeros((num_envs, 7), dtype=torch.float32),
+        "joint_vel": torch.zeros((num_envs, 7), dtype=torch.float32),
+        "previous_applied_target": torch.zeros((num_envs, 7), dtype=torch.float32),
+        "reversal_detection_armed": torch.ones((num_envs,), dtype=torch.bool),
+        "nominal_safe_target": torch.zeros((num_envs, 7), dtype=torch.float32),
+        "max_delta_joint_pos": torch.full((num_envs, 7), 0.02, dtype=torch.float32),
+        "soft_joint_pos_limits": torch.tensor(
+            [[[-1.0, 1.0]] * 7] * num_envs,
+            dtype=torch.float32,
+        ),
+        "latch_remaining": torch.zeros((num_envs,), dtype=torch.int64),
+        "wrist_joint_indices": _WRIST_JOINT_INDICES,
+    }
+
+
+def test_wrist_energy_brake_disarmed_reversal_detection_is_bitwise_noop():
+    inputs = _wrist_energy_brake_inputs()
+    inputs["reversal_detection_armed"][0] = False
+    inputs["previous_applied_target"][0, 4] = -0.01
+    inputs["nominal_safe_target"][0, 4] = 0.01
+    nominal_bits = inputs["nominal_safe_target"].view(torch.int32).clone()
+
+    result = _apply_wrist_energy_brake_target(**inputs)
+
+    assert torch.equal(result.applied_target.view(torch.int32), nominal_bits)
+    assert result.next_latch_remaining.tolist() == [0]
+    assert not result.trigger_joint_mask.any()
+    assert not result.active_environment_mask.any()
+    assert not result.attempted_joint_mask.any()
+    assert not result.braked_joint_mask.any()
+    torch.testing.assert_close(
+        result.target_shift,
+        torch.tensor([[0.02, 0.0, 0.0]], dtype=torch.float32),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("target_shift", "expected_trigger"),
+    [(8.5, False), (9.0, True), (9.5, True)],
+)
+def test_wrist_energy_brake_target_shift_threshold_is_inclusive(
+    target_shift, expected_trigger
+):
+    inputs = _wrist_energy_brake_inputs()
+    inputs["max_delta_joint_pos"].fill_(10.0)
+    inputs["soft_joint_pos_limits"] = torch.tensor(
+        [[[-30.0, 30.0]] * 7], dtype=torch.float32
+    )
+    inputs["previous_applied_target"][0, 4] = -target_shift / 2
+    inputs["nominal_safe_target"][0, 4] = target_shift / 2
+    threshold = (
+        inputs["max_delta_joint_pos"][0, 4] * WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
+    )
+    assert threshold.item() == 9.0
+    assert (
+        inputs["nominal_safe_target"][0, 4] - inputs["previous_applied_target"][0, 4]
+    ).item() == target_shift
+
+    result = _apply_wrist_energy_brake_target(**inputs)
+
+    assert result.trigger_joint_mask[0, 0].item() is expected_trigger
+    assert result.trigger_joint_mask.sum().item() == int(expected_trigger)
+    assert result.active_environment_mask.tolist() == [expected_trigger]
+    assert result.next_latch_remaining.tolist() == [
+        WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS - 1 if expected_trigger else 0
+    ]
+
+
+@pytest.mark.parametrize(
+    ("previous_error", "nominal_error"),
+    [
+        (0.0, 1.0),
+        (-1.0, 0.0),
+        (0.1, 1.0),
+        (-1.0, -0.1),
+    ],
+)
+def test_wrist_energy_brake_requires_strict_error_sign_reversal(
+    previous_error, nominal_error
+):
+    inputs = _wrist_energy_brake_inputs()
+    inputs["max_delta_joint_pos"].fill_(1.0)
+    inputs["soft_joint_pos_limits"] = torch.tensor(
+        [[[-3.0, 3.0]] * 7], dtype=torch.float32
+    )
+    inputs["previous_applied_target"][0, 4] = previous_error
+    inputs["nominal_safe_target"][0, 4] = nominal_error
+
+    result = _apply_wrist_energy_brake_target(**inputs)
+
+    assert not result.trigger_joint_mask.any()
+    assert not result.active_environment_mask.any()
+    assert result.next_latch_remaining.tolist() == [0]
+    assert torch.equal(
+        result.applied_target.view(torch.int32),
+        inputs["nominal_safe_target"].view(torch.int32),
+    )
+
+
+@pytest.mark.parametrize("trigger_joint", _WRIST_JOINT_INDICES)
+def test_each_wrist_reversal_activates_group_brake_without_changing_arm_joints(
+    trigger_joint,
+):
+    inputs = _wrist_energy_brake_inputs()
+    inputs["nominal_safe_target"][0, :4] = torch.tensor(
+        [0.001, -0.002, 0.003, -0.004], dtype=torch.float32
+    )
+    inputs["nominal_safe_target"][0, 4:] = 0.01
+    inputs["previous_applied_target"].copy_(inputs["nominal_safe_target"])
+    inputs["previous_applied_target"][0, trigger_joint] = -0.01
+    inputs["joint_vel"][0, 4:] = 0.2
+    nominal_bits = inputs["nominal_safe_target"].view(torch.int32).clone()
+
+    result = _apply_wrist_energy_brake_target(**inputs)
+
+    expected_trigger = torch.zeros((1, 3), dtype=torch.bool)
+    expected_trigger[0, trigger_joint - _WRIST_JOINT_INDICES[0]] = True
+    expected_braked = torch.ones((1, 3), dtype=torch.bool)
+    assert torch.equal(result.trigger_joint_mask, expected_trigger)
+    assert result.active_environment_mask.tolist() == [True]
+    assert result.next_latch_remaining.tolist() == [
+        WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS - 1
+    ]
+    assert torch.equal(result.attempted_joint_mask, expected_braked)
+    assert torch.equal(result.braked_joint_mask, expected_braked)
+    assert torch.equal(
+        result.applied_target[0, :4].view(torch.int32), nominal_bits[0, :4]
+    )
+    assert torch.equal(result.applied_target[0, 4:], inputs["joint_pos"][0, 4:])
+    assert torch.equal(
+        result.target_shift,
+        (
+            inputs["nominal_safe_target"][:, 4:]
+            - inputs["previous_applied_target"][:, 4:]
+        ).abs(),
+    )
+
+
+def test_wrist_energy_brake_projects_only_strictly_positive_spring_power():
+    inputs = _wrist_energy_brake_inputs()
+    inputs["joint_pos"][0, 4:] = torch.tensor([0.1, 0.2, -0.1], dtype=torch.float32)
+    inputs["nominal_safe_target"][0, 4:] = inputs["joint_pos"][0, 4:] + torch.tensor(
+        [0.01, 0.01, -0.01], dtype=torch.float32
+    )
+    inputs["previous_applied_target"].copy_(inputs["nominal_safe_target"])
+    inputs["previous_applied_target"][0, 4] = inputs["joint_pos"][0, 4] - 0.01
+    inputs["joint_vel"][0, 4:] = torch.tensor([0.2, 0.0, -0.2], dtype=torch.float32)
+
+    result = _apply_wrist_energy_brake_target(**inputs)
+
+    assert result.active_environment_mask.tolist() == [True]
+    assert result.attempted_joint_mask[0].tolist() == [True, False, True]
+    assert result.braked_joint_mask[0].tolist() == [True, False, True]
+    torch.testing.assert_close(
+        result.applied_target[0, [4, 6]],
+        inputs["joint_pos"][0, [4, 6]],
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert result.applied_target[0, 5].view(torch.int32) == inputs[
+        "nominal_safe_target"
+    ][0, 5].view(torch.int32)
+    assert torch.equal(
+        result.target_shift,
+        (
+            inputs["nominal_safe_target"][:, 4:]
+            - inputs["previous_applied_target"][:, 4:]
+        ).abs(),
+    )
+
+
+def test_wrist_energy_brake_latch_covers_trigger_and_next_then_expires_and_retriggers():
+    inputs = _wrist_energy_brake_inputs()
+    inputs["nominal_safe_target"][0, 4:] = 0.01
+    inputs["previous_applied_target"].copy_(inputs["nominal_safe_target"])
+    inputs["previous_applied_target"][0, 4] = -0.01
+    inputs["joint_vel"][0, 4:] = 0.2
+
+    trigger = _apply_wrist_energy_brake_target(**inputs)
+    assert trigger.active_environment_mask.tolist() == [True]
+    assert trigger.next_latch_remaining.tolist() == [1]
+
+    inputs["previous_applied_target"] = trigger.applied_target
+    inputs["latch_remaining"] = trigger.next_latch_remaining
+    next_substep = _apply_wrist_energy_brake_target(**inputs)
+    assert not next_substep.trigger_joint_mask.any()
+    assert next_substep.active_environment_mask.tolist() == [True]
+    assert next_substep.next_latch_remaining.tolist() == [0]
+    assert next_substep.attempted_joint_mask[0].tolist() == [True, True, True]
+    assert next_substep.braked_joint_mask[0].tolist() == [True, True, True]
+
+    inputs["previous_applied_target"] = next_substep.applied_target
+    inputs["latch_remaining"] = next_substep.next_latch_remaining
+    expired = _apply_wrist_energy_brake_target(**inputs)
+    assert not expired.trigger_joint_mask.any()
+    assert not expired.active_environment_mask.any()
+    assert expired.next_latch_remaining.tolist() == [0]
+    assert torch.equal(
+        expired.applied_target.view(torch.int32),
+        inputs["nominal_safe_target"].view(torch.int32),
+    )
+
+    inputs["previous_applied_target"] = inputs["nominal_safe_target"].clone()
+    inputs["previous_applied_target"][0, 6] = -0.01
+    inputs["latch_remaining"] = torch.ones((1,), dtype=torch.int64)
+    retriggered = _apply_wrist_energy_brake_target(**inputs)
+    assert retriggered.trigger_joint_mask[0, 2]
+    assert retriggered.active_environment_mask.tolist() == [True]
+    assert retriggered.next_latch_remaining.tolist() == [1]
+
+
+def test_wrist_energy_brake_refractory_command_suppresses_hold_induced_retrigger():
+    inputs = _wrist_energy_brake_inputs()
+    inputs["previous_applied_target"][0, 4] = -0.01
+    inputs["nominal_safe_target"][0, 4] = 0.01
+    inputs["joint_vel"][0, 4] = 0.2
+
+    trigger = _apply_wrist_energy_brake_target(**inputs)
+    assert trigger.trigger_joint_mask[0, 0]
+    assert trigger.next_latch_remaining.tolist() == [1]
+
+    inputs["joint_pos"][0, 4] = 0.001
+    inputs["joint_vel"][0, 4] = 0.2
+    inputs["previous_applied_target"] = trigger.applied_target
+    inputs["reversal_detection_armed"] = torch.zeros((1,), dtype=torch.bool)
+    inputs["nominal_safe_target"][0, 4] = 0.021
+    inputs["latch_remaining"] = trigger.next_latch_remaining
+    follow_up = _apply_wrist_energy_brake_target(**inputs)
+    assert not follow_up.trigger_joint_mask.any()
+    assert follow_up.active_environment_mask.tolist() == [True]
+    assert follow_up.next_latch_remaining.tolist() == [0]
+
+    inputs["joint_pos"][0, 4] = 0.002
+    inputs["previous_applied_target"] = follow_up.applied_target
+    inputs["nominal_safe_target"][0, 4] = 0.022
+    inputs["latch_remaining"] = follow_up.next_latch_remaining
+    refractory = _apply_wrist_energy_brake_target(**inputs)
+    assert not refractory.trigger_joint_mask.any()
+    assert not refractory.active_environment_mask.any()
+    assert refractory.next_latch_remaining.tolist() == [0]
+    assert torch.equal(
+        refractory.applied_target.view(torch.int32),
+        inputs["nominal_safe_target"].view(torch.int32),
+    )
+
+
+def test_wrist_energy_brake_state_is_isolated_per_environment():
+    inputs = _wrist_energy_brake_inputs(num_envs=2)
+    inputs["nominal_safe_target"][:, 4:] = 0.01
+    inputs["previous_applied_target"].copy_(inputs["nominal_safe_target"])
+    inputs["previous_applied_target"][0, 6] = -0.01
+    inputs["joint_vel"][:, 4:] = 0.2
+
+    result = _apply_wrist_energy_brake_target(**inputs)
+
+    assert result.active_environment_mask.tolist() == [True, False]
+    assert result.next_latch_remaining.tolist() == [1, 0]
+    assert result.trigger_joint_mask[0].tolist() == [
+        False,
+        False,
+        True,
+    ]
+    assert not result.trigger_joint_mask[1].any()
+    assert result.attempted_joint_mask[0].tolist() == [True, True, True]
+    assert not result.attempted_joint_mask[1].any()
+    assert result.braked_joint_mask[0].tolist() == [True, True, True]
+    assert not result.braked_joint_mask[1].any()
+    assert torch.equal(result.applied_target[0, 4:], inputs["joint_pos"][0, 4:])
+    assert torch.equal(
+        result.applied_target[1].view(torch.int32),
+        inputs["nominal_safe_target"][1].view(torch.int32),
+    )
+
+
+@pytest.mark.parametrize("direction", [-1.0, 1.0])
+def test_wrist_energy_brake_near_limit_hold_remains_slew_and_guard_safe(direction):
+    inputs = _wrist_energy_brake_inputs()
+    inputs["latch_remaining"][0] = 1
+    inputs["joint_pos"][0, 4:] = direction * 0.995
+    inputs["nominal_safe_target"][0, 4:] = direction * 0.98
+    inputs["previous_applied_target"].copy_(inputs["nominal_safe_target"])
+    inputs["joint_vel"][0, 4:] = -direction * 0.2
+
+    result = _apply_wrist_energy_brake_target(**inputs)
+
+    strict_lower = (
+        inputs["soft_joint_pos_limits"][..., 0] + inputs["max_delta_joint_pos"]
+    )
+    strict_upper = (
+        inputs["soft_joint_pos_limits"][..., 1] - inputs["max_delta_joint_pos"]
+    )
+    assert result.active_environment_mask.tolist() == [True]
+    assert result.next_latch_remaining.tolist() == [0]
+    assert result.attempted_joint_mask[0].tolist() == [True, True, True]
+    assert result.braked_joint_mask[0].tolist() == [False, False, False]
+    assert torch.all(
+        (result.applied_target - inputs["joint_pos"]).abs()
+        <= inputs["max_delta_joint_pos"] + 1e-6
+    )
+    assert torch.all(result.applied_target >= strict_lower)
+    assert torch.all(result.applied_target <= strict_upper)
+    torch.testing.assert_close(
+        result.applied_target[0, 4:],
+        torch.full((3,), direction * 0.98, dtype=torch.float32),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_wrist_energy_brake_no_trigger_preserves_nominal_target_bits():
+    inputs = _wrist_energy_brake_inputs()
+    inputs["joint_pos"].fill_(1.0941112)
+    inputs["nominal_safe_target"].fill_(0.4359291)
+    inputs["previous_applied_target"].copy_(inputs["nominal_safe_target"])
+    # Even a large non-wrist sign reversal must not arm the wrist-group latch.
+    inputs["previous_applied_target"][0, 0] = 1.7522933
+    inputs["max_delta_joint_pos"].fill_(1.0)
+    inputs["soft_joint_pos_limits"] = torch.tensor(
+        [[[-3.0, 3.0]] * 7], dtype=torch.float32
+    )
+    nominal_bits = inputs["nominal_safe_target"].view(torch.int32).clone()
+
+    result = _apply_wrist_energy_brake_target(**inputs)
+
+    assert not result.trigger_joint_mask.any()
+    assert not result.active_environment_mask.any()
+    assert not result.attempted_joint_mask.any()
+    assert not result.braked_joint_mask.any()
+    assert torch.equal(result.applied_target.view(torch.int32), nominal_bits)
+    assert torch.equal(result.target_shift, torch.zeros_like(result.target_shift))
+
+
+@pytest.mark.parametrize(
+    (
+        "apply_index",
+        "joint_pos_wrist",
+        "joint_vel_wrist",
+        "previous_target_wrist",
+        "nominal_target_wrist",
+        "expected_trigger",
+        "expected_braked",
+    ),
+    [
+        (
+            896,
+            [-0.4672307, 2.4151399, -0.1759258],
+            [-0.1043425, 0.1041249, 0.0930457],
+            [-0.4880932, 2.4360042, -0.1573215],
+            [-0.4485214, 2.4252367, -0.1976758],
+            [True, False, True],
+            [False, True, False],
+        ),
+        (
+            912,
+            [-0.4592690, 2.4250145, -0.1891724],
+            [0.0340723, 0.1042351, -0.0813407],
+            [-0.4524480, 2.4458785, -0.2054473],
+            [-0.4754810, 2.4467645, -0.1938981],
+            [True, False, False],
+            [False, True, True],
+        ),
+        (
+            920,
+            [-0.4638891, 2.4321313, -0.1904860],
+            [-0.0588444, 0.1042782, -0.0162449],
+            [-0.4756514, 2.4529948, -0.1937413],
+            [-0.4842108, 2.4538813, -0.1732677],
+            [False, False, True],
+            [True, True, False],
+        ),
+    ],
+)
+def test_wrist_energy_brake_exact_v13_precursor_masks(
+    apply_index,
+    joint_pos_wrist,
+    joint_vel_wrist,
+    previous_target_wrist,
+    nominal_target_wrist,
+    expected_trigger,
+    expected_braked,
+):
+    del apply_index
+    inputs = _wrist_energy_brake_inputs()
+    inputs["max_delta_joint_pos"][0, 4:] = torch.tensor(
+        [2.61 / 120.0] * 3,
+        dtype=torch.float32,
+    )
+    inputs["joint_pos"][0, 4:] = torch.tensor(
+        joint_pos_wrist,
+        dtype=torch.float32,
+    )
+    inputs["joint_vel"][0, 4:] = torch.tensor(
+        joint_vel_wrist,
+        dtype=torch.float32,
+    )
+    inputs["previous_applied_target"][0, 4:] = torch.tensor(
+        previous_target_wrist,
+        dtype=torch.float32,
+    )
+    inputs["nominal_safe_target"][0, 4:] = torch.tensor(
+        nominal_target_wrist,
+        dtype=torch.float32,
+    )
+    inputs["soft_joint_pos_limits"] = torch.tensor(
+        [[[-4.0, 4.0]] * 7],
+        dtype=torch.float32,
+    )
+
+    result = _apply_wrist_energy_brake_target(**inputs)
+
+    assert result.trigger_joint_mask[0].tolist() == expected_trigger
+    assert result.attempted_joint_mask[0].tolist() == expected_braked
+    assert result.braked_joint_mask[0].tolist() == expected_braked
+    assert result.active_environment_mask.tolist() == [True]
+    assert result.next_latch_remaining.tolist() == [1]
 
 
 class _LimitData:
@@ -739,6 +1166,81 @@ def test_eef_pose_config_installs_robust_action_term():
     assert scene_cfg.ee_frame.target_frames[0].prim_path.endswith(
         "/robot/Gripper/Robotiq_2F_85/base_link"
     )
+
+
+def test_eef_wrist_energy_brake_config_defaults_disabled():
+    from polaris.environments.droid_cfg import EefPoseActionCfg
+
+    assert EefPoseActionCfg().arm.enable_wrist_energy_brake is False
+
+
+def test_wrist_energy_brake_state_resets_and_commits_only_after_target_setters():
+    episode_reset_source = inspect.getsource(
+        RobustDifferentialInverseKinematicsAction._reset_episode_safety_state
+    )
+    state_reset_source = inspect.getsource(
+        RobustDifferentialInverseKinematicsAction._reset_wrist_energy_brake_state
+    )
+    standard_reset_source = inspect.getsource(
+        RobustDifferentialInverseKinematicsAction.reset
+    )
+    begin_source = inspect.getsource(
+        RobustDifferentialInverseKinematicsAction.begin_safety_episode
+    )
+    apply_source = inspect.getsource(
+        RobustDifferentialInverseKinematicsAction.apply_actions
+    )
+
+    assert "self._reset_wrist_energy_brake_state()" in episode_reset_source
+    assert "self._wrist_energy_brake_latch_remaining[selected] = 0" in (
+        state_reset_source
+    )
+    assert "self._wrist_energy_brake_previous_applied_target[selected] = 0.0" in (
+        state_reset_source
+    )
+    assert "self._wrist_energy_brake_previous_target_valid[selected] = False" in (
+        state_reset_source
+    )
+    assert "self._wrist_energy_brake_reversal_detection_armed[selected] = False" in (
+        state_reset_source
+    )
+    assert "super().reset(env_ids)" in standard_reset_source
+    assert "self._reset_wrist_energy_brake_state(env_ids)" in standard_reset_source
+    assert "self._reset_episode_safety_state(episode_index=episode_index)" in (
+        begin_source
+    )
+    velocity_setter = apply_source.index("self._asset.set_joint_velocity_target(")
+    position_setter = apply_source.index("self._asset.set_joint_position_target(")
+    latch_commit = apply_source.index("self._wrist_energy_brake_latch_remaining.copy_(")
+    target_commit = apply_source.index(
+        "self._wrist_energy_brake_previous_applied_target.copy_(safe_target)"
+    )
+    validity_commit = apply_source.index(
+        "self._wrist_energy_brake_previous_target_valid.fill_(True)"
+    )
+    assert velocity_setter < position_setter < latch_commit < target_commit
+    assert target_commit < validity_commit
+
+
+def test_standard_action_reset_clears_selected_candidate_state():
+    action = _bare_robust_action()
+    action._raw_actions = torch.ones((1, 7), dtype=torch.float32)
+    action._wrist_energy_brake_enabled = True
+    action._wrist_energy_brake_latch_remaining = torch.ones(1, dtype=torch.int64)
+    action._wrist_energy_brake_previous_applied_target = torch.ones((1, 7))
+    action._wrist_energy_brake_previous_target_valid = torch.ones(1, dtype=torch.bool)
+    action._wrist_energy_brake_reversal_detection_armed = torch.ones(
+        1, dtype=torch.bool
+    )
+
+    action.reset([0])
+
+    assert torch.equal(action._raw_actions, torch.zeros_like(action._raw_actions))
+    assert action._wrist_energy_brake_latch_remaining.tolist() == [0]
+    assert not action._wrist_energy_brake_previous_applied_target.any()
+    assert not action._wrist_energy_brake_previous_target_valid.any()
+    assert not action._wrist_energy_brake_reversal_detection_armed.any()
+    action.__del__()
 
 
 def test_eef_velocity_and_effort_limits_are_scoped_to_eef_setup():

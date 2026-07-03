@@ -1,4 +1,5 @@
 import ast
+import copy
 import hashlib
 import json
 import math
@@ -14,6 +15,7 @@ from scipy.spatial.transform import Rotation
 
 from polaris.eef_runtime_contract import atomic_write_runtime_contract
 from polaris.eef_runtime_contract import atomic_write_episode_safety
+from polaris.eef_runtime_contract import _validate_wrist_energy_brake_history
 from polaris.eef_runtime_contract import aggregate_episode_safety
 from polaris.eef_runtime_contract import load_episode_safety_sidecars
 from polaris.eef_runtime_contract import reconcile_episode_safety_transactions
@@ -23,6 +25,7 @@ from polaris.eef_runtime_contract import validate_eef_runtime_safety
 from polaris.eef_runtime_contract import validate_ego_lap_runtime_protocol
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
+from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
@@ -44,6 +47,10 @@ from polaris.eef_ik_safety import PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256
 from polaris.eef_ik_safety import PHYSX_DERIVED_SOFT_LIMIT_PROFILE
 from polaris.eef_ik_safety import PHYSX_HARD_LIMIT_PROFILE
 from polaris.eef_ik_safety import TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
+from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_JOINT_NAMES
+from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
+from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_PROFILE
+from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
 from polaris.eef_ik_safety import validate_one_step_adversarial_report
 from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
 from polaris.eval_artifacts import build_episode_artifact_identity
@@ -54,7 +61,7 @@ def _wxyz(rotation: Rotation) -> np.ndarray:
     return rotation.as_quat()[[3, 0, 1, 2]]
 
 
-def _runtime_fixture():
+def _runtime_fixture(*, wrist_energy_brake=False):
     link0_rotation = Rotation.from_euler("z", 20, degrees=True)
     relative_rotation = Rotation.from_euler("xyz", [10, -5, 30], degrees=True)
     link8_rotation = link0_rotation * relative_rotation
@@ -81,6 +88,7 @@ def _runtime_fixture():
             body_offset=offset,
             controller=controller,
             scale=1.0,
+            enable_wrist_energy_brake=wrist_energy_brake,
         ),
         action_dim=7,
         _body_idx=1,
@@ -172,6 +180,47 @@ def _runtime_fixture():
         "guard_diagnostics": [],
         "max_raw_delta_diagnostic": None,
     }
+    if wrist_energy_brake:
+        base_reporter = arm_term.safety_report
+
+        def candidate_report():
+            report = base_reporter()
+            report["profile"] = EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+            report.update(
+                {
+                    "wrist_energy_brake_profile": WRIST_ENERGY_BRAKE_PROFILE,
+                    "wrist_energy_brake_joint_names": list(
+                        WRIST_ENERGY_BRAKE_JOINT_NAMES
+                    ),
+                    "wrist_energy_brake_latch_substeps": (
+                        WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
+                    ),
+                    "wrist_energy_brake_target_shift_fraction": (
+                        WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
+                    ),
+                    "wrist_energy_brake_target_shift_threshold_rad": [
+                        np.float32(
+                            np.float32(max_delta[index])
+                            * np.float32(WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION)
+                        ).item()
+                        for index in range(4, 7)
+                    ],
+                    "wrist_energy_brake_latch_remaining_substeps": [0],
+                    "wrist_energy_brake_diagnostics": [],
+                }
+            )
+            report["counters"].update(
+                {
+                    "wrist_energy_brake_trigger_events": 0,
+                    "wrist_energy_brake_active_substeps": 0,
+                    "wrist_energy_brake_attempted_joint_targets": 0,
+                    "wrist_energy_brake_braked_joint_targets": 0,
+                    "wrist_energy_brake_diagnostics_dropped": 0,
+                }
+            )
+            return report
+
+        arm_term.safety_report = candidate_report
     finger_term = SimpleNamespace(gripper_threshold_profile=GRIPPER_THRESHOLD_PROFILE)
     runtime = SimpleNamespace(
         max_episode_length=450,
@@ -206,8 +255,10 @@ def _episode_result(*, episode=0, length=2, numerical_failure=False):
     }
 
 
-def _episode_safety(*, episode=0, length=2, numerical_failure=False):
-    env, _ = _runtime_fixture()
+def _episode_safety(
+    *, episode=0, length=2, numerical_failure=False, wrist_energy_brake=False
+):
+    env, _ = _runtime_fixture(wrist_energy_brake=wrist_energy_brake)
     report = env.unwrapped.action_manager._terms["arm"].safety_report()
     report["episode_index"] = episode
     apply_calls = length * 8 if not numerical_failure else (length - 1) * 8 + 3
@@ -259,6 +310,82 @@ def _episode_safety(*, episode=0, length=2, numerical_failure=False):
             }
         ]
     return report
+
+
+def _candidate_trigger_runtime():
+    env, observation = _runtime_fixture(wrist_energy_brake=True)
+    report = env.unwrapped.action_manager._terms["arm"].safety_report()
+    report["episode_index"] = 0
+    report["counters"].update(
+        {
+            "apply_calls": 2,
+            "environment_substeps": 2,
+            "wrist_energy_brake_trigger_events": 1,
+            "wrist_energy_brake_active_substeps": 1,
+            "wrist_energy_brake_attempted_joint_targets": 1,
+            "wrist_energy_brake_braked_joint_targets": 1,
+        }
+    )
+    joint_pos = [0.0] * 7
+    joint_vel = [0.0] * 7
+    joint_vel[4] = 0.1
+    previous_target = [0.0] * 7
+    previous_target[4] = -0.02
+    nominal_target = [0.0] * 7
+    nominal_target[4] = 0.02
+    applied_target = list(nominal_target)
+    applied_target[4] = 0.0
+    report["wrist_energy_brake_latch_remaining_substeps"] = [1]
+    report["wrist_energy_brake_diagnostics"] = [
+        {
+            "episode_index": 0,
+            "apply_index": 1,
+            "policy_step": 0,
+            "physics_substep": 1,
+            "environment_index": 0,
+            "reversal_detection_armed": True,
+            "trigger_joint_mask": [True, False, False],
+            "attempted_joint_mask": [True, False, False],
+            "braked_joint_mask": [True, False, False],
+            "joint_pos_rad": joint_pos,
+            "joint_vel_rad_s": joint_vel,
+            "previous_applied_target_rad": previous_target,
+            "nominal_safe_target_rad": nominal_target,
+            "applied_target_rad": applied_target,
+            "target_shift_rad": [0.04, 0.0, 0.0],
+        }
+    ]
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: report
+    return env, observation, report
+
+
+def _candidate_two_substep_runtime():
+    env, observation, report = _candidate_trigger_runtime()
+    first = report["wrist_energy_brake_diagnostics"][0]
+    follow_up = copy.deepcopy(first)
+    follow_up.update(
+        {
+            "apply_index": 2,
+            "policy_step": 0,
+            "physics_substep": 2,
+            "reversal_detection_armed": False,
+            "trigger_joint_mask": [False, False, False],
+            "previous_applied_target_rad": list(first["applied_target_rad"]),
+            "target_shift_rad": [0.02, 0.0, 0.0],
+        }
+    )
+    report["counters"].update(
+        {
+            "apply_calls": 3,
+            "environment_substeps": 3,
+            "wrist_energy_brake_active_substeps": 2,
+            "wrist_energy_brake_attempted_joint_targets": 2,
+            "wrist_energy_brake_braked_joint_targets": 2,
+        }
+    )
+    report["wrist_energy_brake_latch_remaining_substeps"] = [0]
+    report["wrist_energy_brake_diagnostics"].append(follow_up)
+    return env, observation, report
 
 
 def _write_completed_trace(path: Path, result):
@@ -360,6 +487,273 @@ def test_runtime_frame_matches_direct_link8_and_absolute_action_term():
     )
     assert safety["target_joint_pos_limits_float32_sha256"] == (
         PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256
+    )
+
+
+def test_runtime_candidate_selects_exact_profile_schema_and_diagnostics(tmp_path):
+    env, observation, report = _candidate_trigger_runtime()
+
+    frame = validate_eef_runtime_frame(env, observation)
+    assert frame["ik_safety_profile"] == EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+    validated = validate_eef_runtime_safety(env)
+    assert validated is report
+    assert validated["wrist_energy_brake_profile"] == WRIST_ENERGY_BRAKE_PROFILE
+    assert validated["wrist_energy_brake_joint_names"] == list(
+        WRIST_ENERGY_BRAKE_JOINT_NAMES
+    )
+    assert validated["wrist_energy_brake_latch_substeps"] == 2
+    assert validated["wrist_energy_brake_target_shift_fraction"] == 0.9
+    assert validated["wrist_energy_brake_latch_remaining_substeps"] == [1]
+
+    durable = _episode_safety(wrist_energy_brake=True)
+    validate_episode_safety_cadence(
+        safety=durable,
+        episode_result=_episode_result(),
+    )
+    aggregate = aggregate_episode_safety(
+        durable,
+        [
+            {
+                "episode_index": 0,
+                "episode_result": _episode_result(),
+                "artifact_identity": {},
+                "cadence_evidence": {"apply_calls": 16},
+                "safety": durable,
+                "path": "episode_000000.json",
+                "sha256": "0" * 64,
+            }
+        ],
+    )
+    assert aggregate["profile"] == EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+    assert aggregate["wrist_energy_brake_profile"] == WRIST_ENERGY_BRAKE_PROFILE
+    assert aggregate["episodes"][0]["wrist_energy_brake_diagnostics"] == []
+    assert aggregate["episodes"][0]["wrist_energy_brake_latch_remaining_substeps"] == [
+        0
+    ]
+    atomic_write_runtime_contract(
+        tmp_path / "candidate-runtime.json",
+        protocol=validate_ego_lap_runtime_protocol(env),
+        frame=frame,
+        ik_safety=aggregate,
+    )
+    with pytest.raises(ValueError, match="profiles disagree"):
+        atomic_write_runtime_contract(
+            tmp_path / "candidate-runtime-mismatch.json",
+            protocol=validate_ego_lap_runtime_protocol(env),
+            frame={**frame, "ik_safety_profile": EEF_IK_SAFETY_PROFILE},
+            ik_safety=aggregate,
+        )
+
+
+def test_runtime_disabled_mode_retains_exact_v4_schema():
+    env, observation = _runtime_fixture()
+    report = validate_eef_runtime_safety(env)
+    frame = validate_eef_runtime_frame(env, observation)
+
+    assert report["profile"] == EEF_IK_SAFETY_PROFILE
+    assert frame["ik_safety_profile"] == EEF_IK_SAFETY_PROFILE
+    assert not any(key.startswith("wrist_energy_brake_") for key in report)
+    assert not any(key.startswith("wrist_energy_brake_") for key in report["counters"])
+
+
+def test_runtime_candidate_rejects_mode_schema_and_static_tampering():
+    env, _, report = _candidate_trigger_runtime()
+    arm_term = env.unwrapped.action_manager._terms["arm"]
+
+    arm_term.cfg.enable_wrist_energy_brake = False
+    with pytest.raises(ValueError, match="schema drift"):
+        validate_eef_runtime_safety(env)
+
+    arm_term.cfg.enable_wrist_energy_brake = "true"
+    with pytest.raises(ValueError, match="must be exactly bool"):
+        validate_eef_runtime_safety(env)
+
+    base_env, _ = _runtime_fixture()
+    base_env.unwrapped.action_manager._terms["arm"].cfg.enable_wrist_energy_brake = True
+    with pytest.raises(ValueError, match="schema drift"):
+        validate_eef_runtime_safety(base_env)
+
+    for field, tampered in (
+        ("profile", EEF_IK_SAFETY_PROFILE),
+        ("wrist_energy_brake_profile", "wrong"),
+        ("wrist_energy_brake_joint_names", ["panda_joint7"]),
+        ("wrist_energy_brake_latch_substeps", 3),
+        ("wrist_energy_brake_target_shift_fraction", 0.8),
+    ):
+        env, _, report = _candidate_trigger_runtime()
+        report[field] = tampered
+        with pytest.raises(ValueError, match=field):
+            validate_eef_runtime_safety(env)
+
+    env, _, report = _candidate_trigger_runtime()
+    report["wrist_energy_brake_target_shift_threshold_rad"][0] += 1e-3
+    with pytest.raises(ValueError, match="target-shift threshold mismatch"):
+        validate_eef_runtime_safety(env)
+
+
+def test_runtime_candidate_rejects_dynamic_counter_and_diagnostic_tampering():
+    env, _, report = _candidate_trigger_runtime()
+    report["wrist_energy_brake_latch_remaining_substeps"] = [3]
+    with pytest.raises(ValueError, match="latch state"):
+        validate_eef_runtime_safety(env)
+
+    env, _, report = _candidate_trigger_runtime()
+    report["counters"]["wrist_energy_brake_trigger_events"] = 2
+    with pytest.raises(ValueError, match="counter history"):
+        validate_eef_runtime_safety(env)
+
+    env, _, report = _candidate_trigger_runtime()
+    report["counters"]["wrist_energy_brake_diagnostics_dropped"] = 1
+    with pytest.raises(ValueError, match="diagnostic accounting"):
+        validate_eef_runtime_safety(env)
+
+    env, _, report = _candidate_trigger_runtime()
+    report["wrist_energy_brake_diagnostics"][0].update(
+        {"apply_index": 0, "policy_step": 0, "physics_substep": 0}
+    )
+    with pytest.raises(ValueError, match="arming cadence"):
+        validate_eef_runtime_safety(env)
+
+    env, _, report = _candidate_trigger_runtime()
+    report["counters"]["apply_calls"] = 10
+    report["counters"]["environment_substeps"] = 10
+    with pytest.raises(ValueError, match="open-latch apply identity"):
+        validate_eef_runtime_safety(env)
+
+    env, _, report = _candidate_trigger_runtime()
+    report["counters"]["wrist_energy_brake_attempted_joint_targets"] = 2
+    with pytest.raises(ValueError, match="attempted-target count"):
+        validate_eef_runtime_safety(env)
+
+    env, _, report = _candidate_trigger_runtime()
+    report["counters"]["wrist_energy_brake_braked_joint_targets"] = 0
+    with pytest.raises(ValueError, match="effective-target count"):
+        validate_eef_runtime_safety(env)
+
+    env, _, report = _candidate_two_substep_runtime()
+    validate_eef_runtime_safety(env)
+    follow_up = report["wrist_energy_brake_diagnostics"][1]
+    follow_up.update(
+        {
+            "apply_index": 1_000,
+            "policy_step": 125,
+            "physics_substep": 0,
+        }
+    )
+    report["counters"]["apply_calls"] = 1_001
+    report["counters"]["environment_substeps"] = 1_001
+    with pytest.raises(ValueError, match="follow-up cadence"):
+        validate_eef_runtime_safety(env)
+
+    env, _, report = _candidate_two_substep_runtime()
+    follow_up = report["wrist_energy_brake_diagnostics"][1]
+    follow_up["previous_applied_target_rad"][4] = -0.01
+    follow_up["target_shift_rad"][0] = 0.03
+    with pytest.raises(ValueError, match="previous-target chain"):
+        validate_eef_runtime_safety(env)
+
+    env, _, report = _candidate_trigger_runtime()
+    report["wrist_energy_brake_diagnostics"][0]["target_shift_rad"][0] += 1e-3
+    with pytest.raises(ValueError, match="target-shift drift"):
+        validate_eef_runtime_safety(env)
+
+    env, _, report = _candidate_trigger_runtime()
+    report["wrist_energy_brake_diagnostics"][0]["trigger_joint_mask"] = [
+        False,
+        True,
+        False,
+    ]
+    with pytest.raises(ValueError, match="trigger-mask drift"):
+        validate_eef_runtime_safety(env)
+
+    env, _, report = _candidate_trigger_runtime()
+    report["wrist_energy_brake_diagnostics"][0]["applied_target_rad"][4] = 0.01
+    with pytest.raises(ValueError, match="applied-target drift"):
+        validate_eef_runtime_safety(env)
+
+    env, _, report = _candidate_trigger_runtime()
+    report["wrist_energy_brake_diagnostics"][0]["unexpected"] = True
+    with pytest.raises(ValueError, match="diagnostic schema drift"):
+        validate_eef_runtime_safety(env)
+
+
+def test_runtime_candidate_rejects_impossible_hidden_effective_count():
+    diagnostics = []
+    for index in range(32):
+        global_active_ordinal = 2 + index
+        trigger_record = global_active_ordinal % 2 == 0
+        apply_index = (
+            1
+            + 3 * (global_active_ordinal // WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS)
+            + global_active_ordinal % WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
+        )
+        diagnostics.append(
+            {
+                "apply_index": apply_index,
+                "reversal_detection_armed": trigger_record,
+                "trigger_joint_mask": [trigger_record, False, False],
+                "attempted_joint_mask": (
+                    [True, True, True] if index == 0 else [False, False, False]
+                ),
+                "braked_joint_mask": [False, False, False],
+                "previous_applied_target_rad": [0.0] * 7,
+                "applied_target_rad": [0.0] * 7,
+            }
+        )
+    counters = {
+        "apply_calls": diagnostics[-1]["apply_index"] + 1,
+        "wrist_energy_brake_trigger_events": 17,
+        "wrist_energy_brake_active_substeps": 34,
+        "wrist_energy_brake_attempted_joint_targets": 3,
+        "wrist_energy_brake_braked_joint_targets": 3,
+        "wrist_energy_brake_diagnostics_dropped": 2,
+        "current_joint_limit_aborts": 0,
+        "invariant_aborts": 0,
+        "nonfinite_aborts": 0,
+    }
+
+    with pytest.raises(ValueError, match="hidden effective/attempted"):
+        _validate_wrist_energy_brake_history(
+            counters=counters,
+            latch_remaining=[0],
+            diagnostics=diagnostics,
+            field="test",
+        )
+
+
+def test_runtime_candidate_allows_bound_target_state_abort_only_in_candidate():
+    env, _, report = _candidate_trigger_runtime()
+    report["counters"]["apply_calls"] = 3
+    report["counters"]["environment_substeps"] = 3
+    report["counters"]["invariant_aborts"] = 1
+    report["guard_diagnostics"] = [
+        {
+            "kind": "wrist_energy_brake_target_state_abort",
+            "episode_index": 0,
+            "policy_step": 0,
+            "physics_substep": 2,
+            "joint_pos_rad": None,
+            "raw_delta_joint_pos_rad": None,
+            "raw_joint_pos_target_rad": None,
+            "safe_joint_pos_target_rad": None,
+            "pose_error_norm": None,
+            "jacobian_finite": None,
+            "jacobian_max_abs": None,
+            "eef_quaternion_norm": None,
+        }
+    ]
+    validate_eef_runtime_safety(env)
+
+    durable = _episode_safety(
+        numerical_failure=True,
+        wrist_energy_brake=True,
+    )
+    durable["counters"]["nonfinite_aborts"] = 0
+    durable["counters"]["invariant_aborts"] = 1
+    durable["guard_diagnostics"][0]["kind"] = "wrist_energy_brake_target_state_abort"
+    validate_episode_safety_cadence(
+        safety=durable,
+        episode_result=_episode_result(numerical_failure=True),
     )
 
 
