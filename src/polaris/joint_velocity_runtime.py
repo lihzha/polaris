@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.metadata
 import inspect
@@ -20,6 +21,7 @@ from polaris.pi05_droid_jointvelocity_contract import (
     PI05_DROID_ISAACLAB_SOURCE_SHA256,
     PI05_DROID_ISAACLAB_VERSION,
     PI05_DROID_JOINTVELOCITY_PROFILE,
+    PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256,
 )
 
 
@@ -58,9 +60,10 @@ def _require_float32_array(
     value: Any, expected: np.ndarray, *, field: str
 ) -> dict[str, Any]:
     actual, source_dtype, source_device = _to_numpy(value, field=field)
-    if source_dtype not in {"torch.float32", "float32"} or actual.dtype != np.float32:
+    if source_dtype != "torch.float32" or actual.dtype != np.float32:
         raise ValueError(
-            f"{field} must be live float32, got source={source_dtype}, numpy={actual.dtype}"
+            f"{field} must be a live torch.float32 tensor, "
+            f"got source={source_dtype}, numpy={actual.dtype}"
         )
     expected = np.asarray(expected, dtype=np.float32)
     if actual.shape != expected.shape or not np.array_equal(actual, expected):
@@ -84,6 +87,165 @@ def _canonical_sha256(value: dict[str, Any]) -> str:
             allow_nan=False,
         ).encode("ascii")
     ).hexdigest()
+
+
+def _validate_array_report(report: Any, expected: np.ndarray, *, field: str) -> None:
+    if not isinstance(report, dict) or set(report) != {
+        "shape",
+        "dtype",
+        "device",
+        "values",
+    }:
+        raise ValueError(f"{field} report schema mismatch")
+    expected = np.asarray(expected, dtype=np.float32)
+    if report["shape"] != list(expected.shape):
+        raise ValueError(f"{field} report shape mismatch")
+    if report["dtype"] != "torch.float32":
+        raise ValueError(f"{field} report must attest torch.float32")
+    if not isinstance(report["device"], str) or not report["device"]:
+        raise ValueError(f"{field} report device is missing")
+    actual = np.asarray(report["values"])
+    if (
+        actual.shape != expected.shape
+        or not np.issubdtype(actual.dtype, np.number)
+        or np.issubdtype(actual.dtype, np.bool_)
+        or not np.isfinite(actual).all()
+    ):
+        raise ValueError(f"{field} report values are invalid")
+    if not np.array_equal(actual.astype(np.float32), expected):
+        raise ValueError(f"{field} report values mismatch")
+
+
+def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
+    """Recompute and validate the complete live runtime contract document."""
+
+    if not isinstance(report, dict):
+        raise ValueError("Joint-velocity runtime contract must be an object")
+    required_keys = {
+        "schema_version",
+        "profile",
+        "status",
+        "isaaclab_version",
+        "isaaclab_source_sha256",
+        "polaris_runtime_source_sha256",
+        "policy_frequency_hz",
+        "physics_frequency_hz",
+        "decimation",
+        "joint_names",
+        "action_term_class",
+        "action_cfg_class",
+        "scale",
+        "offset",
+        "use_default_offset",
+        "clip",
+        "position_integration",
+        "velocity_drive",
+        "gripper",
+        "runtime_sha256",
+    }
+    if set(report) != required_keys:
+        raise ValueError("Joint-velocity runtime contract schema mismatch")
+    payload = copy.deepcopy(report)
+    claimed_digest = payload.pop("runtime_sha256")
+    if (
+        not isinstance(claimed_digest, str)
+        or len(claimed_digest) != 64
+        or any(character not in "0123456789abcdef" for character in claimed_digest)
+    ):
+        raise ValueError("Joint-velocity runtime SHA-256 is malformed")
+    if claimed_digest != _canonical_sha256(payload):
+        raise ValueError("Joint-velocity runtime contract SHA-256 mismatch")
+    expected_scalars = {
+        "schema_version": 1,
+        "profile": PI05_DROID_JOINTVELOCITY_PROFILE,
+        "status": "pass",
+        "isaaclab_version": PI05_DROID_ISAACLAB_VERSION,
+        "policy_frequency_hz": 15,
+        "physics_frequency_hz": 120,
+        "decimation": 8,
+        "joint_names": list(PANDA_ARM_JOINT_NAMES),
+        "action_term_class": _JOINT_VELOCITY_ACTION_CLASS,
+        "action_cfg_class": _JOINT_VELOCITY_CFG_CLASS,
+        "scale": 1.0,
+        "offset": 0.0,
+        "use_default_offset": False,
+        "position_integration": "absent_by_exact_action_class",
+    }
+    for key, expected in expected_scalars.items():
+        if report[key] != expected or type(report[key]) is not type(expected):
+            raise ValueError(f"Joint-velocity runtime contract {key} mismatch")
+    if report["isaaclab_source_sha256"] != PI05_DROID_ISAACLAB_SOURCE_SHA256:
+        raise ValueError("Joint-velocity runtime Isaac source manifest mismatch")
+    if (
+        report["polaris_runtime_source_sha256"]
+        != PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256
+    ):
+        raise ValueError("Joint-velocity runtime PolaRiS source manifest mismatch")
+    _validate_array_report(
+        report["clip"],
+        np.broadcast_to(np.asarray([-1.0, 1.0], dtype=np.float32), (1, 7, 2)),
+        field="action clip",
+    )
+    velocity_drive = report["velocity_drive"]
+    if not isinstance(velocity_drive, dict) or set(velocity_drive) != {
+        "position_stiffness",
+        "velocity_damping",
+        "buffered",
+        "direct_physx",
+    }:
+        raise ValueError("Joint-velocity drive report schema mismatch")
+    if (
+        velocity_drive["position_stiffness"] != PANDA_ARM_VELOCITY_DRIVE_STIFFNESS
+        or type(velocity_drive["position_stiffness"]) is not float
+    ):
+        raise ValueError("Joint-velocity drive stiffness mismatch")
+    if (
+        velocity_drive["velocity_damping"] != PANDA_ARM_VELOCITY_DRIVE_DAMPING
+        or type(velocity_drive["velocity_damping"]) is not float
+    ):
+        raise ValueError("Joint-velocity drive damping mismatch")
+    expected_arrays = {
+        "stiffness": np.zeros((1, 7), dtype=np.float32),
+        "damping": np.full((1, 7), PANDA_ARM_VELOCITY_DRIVE_DAMPING, dtype=np.float32),
+        "effort_limit": np.asarray([PANDA_ARM_EFFORT_LIMITS], dtype=np.float32),
+        "velocity_limit": np.asarray([PANDA_ARM_VELOCITY_LIMITS], dtype=np.float32),
+    }
+    for surface in ("buffered", "direct_physx"):
+        surface_report = velocity_drive[surface]
+        if not isinstance(surface_report, dict) or set(surface_report) != set(
+            expected_arrays
+        ):
+            raise ValueError(f"Joint-velocity {surface} report schema mismatch")
+        for name, expected in expected_arrays.items():
+            _validate_array_report(
+                surface_report[name], expected, field=f"{surface} {name}"
+            )
+    gripper = report["gripper"]
+    if not isinstance(gripper, dict) or set(gripper) != {
+        "action_class",
+        "joint_name",
+        "threshold",
+        "open_command",
+        "closed_command",
+    }:
+        raise ValueError("Joint-velocity gripper report schema mismatch")
+    if gripper["action_class"] != _BINARY_GRIPPER_ACTION_CLASS:
+        raise ValueError("Joint-velocity gripper action class mismatch")
+    if gripper["joint_name"] != "finger_joint":
+        raise ValueError("Joint-velocity gripper joint mismatch")
+    if gripper["threshold"] != "closed_if_gt_0p5_else_open":
+        raise ValueError("Joint-velocity gripper threshold mismatch")
+    _validate_array_report(
+        gripper["open_command"],
+        np.zeros((1, 1), dtype=np.float32),
+        field="gripper open command",
+    )
+    _validate_array_report(
+        gripper["closed_command"],
+        np.full((1, 1), np.pi / 4.0, dtype=np.float32),
+        field="gripper closed command",
+    )
+    return copy.deepcopy(report)
 
 
 def _installed_isaaclab_version() -> str:
@@ -116,6 +278,20 @@ def _verify_isaaclab_sources(
             )
         actual[source_name] = digest
     return actual
+
+
+def _verify_polaris_sources(*, finger_term: Any) -> dict[str, str]:
+    source_path_string = inspect.getsourcefile(type(finger_term))
+    if source_path_string is None:
+        raise ValueError("Cannot resolve PolaRiS gripper action source")
+    source_path = Path(source_path_string)
+    if source_path.is_symlink() or not source_path.is_file():
+        raise ValueError(f"PolaRiS runtime source is not regular: {source_path}")
+    digest = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    expected = PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256["droid_cfg.py"]
+    if digest != expected:
+        raise ValueError(f"PolaRiS DROID action source mismatch: {digest}")
+    return {"droid_cfg.py": digest}
 
 
 def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
@@ -197,6 +373,7 @@ def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
         robot=robot,
         actuator=robot.actuators["panda_shoulder"],
     )
+    polaris_runtime_source_sha256 = _verify_polaris_sources(finger_term=finger_term)
 
     expected_stiffness = np.zeros((1, 7), dtype=np.float32)
     expected_damping = np.full(
@@ -258,6 +435,7 @@ def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
         "status": "pass",
         "isaaclab_version": isaaclab_version,
         "isaaclab_source_sha256": isaaclab_source_sha256,
+        "polaris_runtime_source_sha256": polaris_runtime_source_sha256,
         "policy_frequency_hz": 15,
         "physics_frequency_hz": 120,
         "decimation": 8,
@@ -284,7 +462,7 @@ def validate_joint_velocity_runtime(env: Any) -> dict[str, Any]:
         },
     }
     report["runtime_sha256"] = _canonical_sha256(report)
-    return report
+    return validate_joint_velocity_runtime_report(report)
 
 
 def print_joint_velocity_runtime(report: dict[str, Any]) -> None:

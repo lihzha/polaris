@@ -14,7 +14,9 @@ from openpi_client import websocket_client_policy
 from polaris.pi05_droid_jointvelocity_contract import (
     PANDA_ARM_JOINT_NAMES,
     PI05_DROID_JOINTVELOCITY_PROFILE,
+    validate_persisted_serving_contract,
     validate_pi05_droid_server_metadata,
+    verify_openpi_git_checkout,
 )
 from polaris.policy.abstract_client import InferenceClient, PolicyArgs
 from polaris.policy.droid_jointpos_client import (
@@ -85,9 +87,17 @@ class DroidJointVelocityClient(InferenceClient):
         self.client = websocket_client_policy.WebsocketClientPolicy(
             host=args.host, port=args.port
         )
-        self.serving_contract = validate_pi05_droid_server_metadata(
-            self.client.get_server_metadata()
+        server_metadata = self.client.get_server_metadata()
+        self.serving_contract = validate_pi05_droid_server_metadata(server_metadata)
+        if (
+            not isinstance(args.serving_contract_path, str)
+            or not args.serving_contract_path
+        ):
+            raise ValueError("DroidJointVelocity requires serving_contract_path")
+        self.serving_contract_artifact = validate_persisted_serving_contract(
+            Path(args.serving_contract_path), server_metadata
         )
+        self.client_runtime_attestation = self._validate_client_runtime_origin()
         self.actions_from_chunk_completed = 0
         self.pred_action_chunk: np.ndarray | None = None
         self.open_loop_horizon = args.open_loop_horizon
@@ -105,6 +115,12 @@ class DroidJointVelocityClient(InferenceClient):
             "client": "DroidJointVelocity",
             "profile": PI05_DROID_JOINTVELOCITY_PROFILE,
             "serving_contract_sha256": self.serving_contract["contract_sha256"],
+            "serving_contract_artifact_sha256": self.serving_contract_artifact[
+                "sha256"
+            ],
+            "serving_contract_artifact_size": self.serving_contract_artifact["size"],
+            "serving_contract_path": self.serving_contract_artifact["path"],
+            "client_runtime_attestation": self.client_runtime_attestation,
             "open_loop_horizon": self.open_loop_horizon,
             "expected_action_horizon": args.expected_action_horizon,
             "expected_action_dim": args.expected_action_dim,
@@ -138,6 +154,68 @@ class DroidJointVelocityClient(InferenceClient):
                     f"DroidJointVelocity requires {field}={expected_value!r}; "
                     f"got {actual!r}"
                 )
+
+    def _validate_client_runtime_origin(self) -> dict[str, Any]:
+        if not isinstance(self.args.openpi_dir, str) or not self.args.openpi_dir:
+            raise ValueError("DroidJointVelocity requires openpi_dir")
+        checkout = verify_openpi_git_checkout(Path(self.args.openpi_dir))
+        root = Path(checkout["root"])
+        expected = {
+            "openpi_client.image_tools": (
+                image_tools,
+                "packages/openpi-client/src/openpi_client/image_tools.py",
+                "d48b4bd7f44e79fe6db8a8e07c9161144fa250be686e1245014a8b47e6171977",
+            ),
+            "openpi_client.websocket_client_policy": (
+                websocket_client_policy,
+                "packages/openpi-client/src/openpi_client/websocket_client_policy.py",
+                "36557cb0b91ccf31cd4fb4b508306850d76ed0feb4028dac5182d0f5a5d88005",
+            ),
+        }
+        records = []
+        for module_name, (module, relative_path, expected_digest) in expected.items():
+            module_file = getattr(module, "__file__", None)
+            if not isinstance(module_file, str):
+                raise ValueError(f"Imported {module_name} has no source origin")
+            raw_module_path = Path(module_file)
+            raw_expected_path = root / relative_path
+            if raw_module_path.is_symlink() or raw_expected_path.is_symlink():
+                raise ValueError(f"Imported {module_name} source must not be a symlink")
+            module_path = raw_module_path.resolve()
+            expected_path = raw_expected_path.resolve()
+            if module_path != expected_path or not module_path.is_file():
+                raise ValueError(
+                    f"Imported {module_name} escaped DroidJointVelocity openpi_dir"
+                )
+            digest = hashlib.sha256(module_path.read_bytes()).hexdigest()
+            if digest != expected_digest:
+                raise ValueError(f"Imported {module_name} source digest mismatch")
+            records.append(
+                {
+                    "module": module_name,
+                    "relative_path": relative_path,
+                    "sha256": digest,
+                }
+            )
+        records.sort(key=lambda record: record["module"])
+        identity = {
+            "schema_version": 1,
+            "openpi_dir": str(root),
+            "git_head": checkout["git_head"],
+            "git_tracked_and_untracked_clean": checkout[
+                "git_tracked_and_untracked_clean"
+            ],
+            "modules": records,
+        }
+        identity["sha256"] = hashlib.sha256(
+            json.dumps(
+                identity,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("ascii")
+        ).hexdigest()
+        return identity
 
     @property
     def rerender(self) -> bool:
@@ -228,12 +306,18 @@ class DroidJointVelocityClient(InferenceClient):
         current = self._extract_observation(obs)
         root_env = getattr(env, "unwrapped", env)
         arm_term = root_env.action_manager._terms["arm"]
+        finger_term = root_env.action_manager._terms["finger_joint"]
         robot = root_env.scene["robot"]
         joint_ids, joint_names = robot.find_joints(
             list(PANDA_ARM_JOINT_NAMES), preserve_order=True
         )
         if tuple(joint_names) != PANDA_ARM_JOINT_NAMES:
             raise ValueError(f"Live Panda joint order mismatch: {joint_names}")
+        finger_ids, finger_names = robot.find_joints(
+            ["finger_joint"], preserve_order=True
+        )
+        if finger_names != ["finger_joint"]:
+            raise ValueError(f"Live finger joint mismatch: {finger_names}")
 
         processed = _tensor_numpy(
             arm_term.processed_actions, field="arm processed actions"
@@ -258,6 +342,29 @@ class DroidJointVelocityClient(InferenceClient):
             raise ValueError("Action manager changed emitted joint velocity")
         if not np.array_equal(targets, expected):
             raise ValueError("Articulation joint-velocity target differs from emission")
+        processed_finger = _tensor_numpy(
+            finger_term.processed_actions, field="processed finger target"
+        )
+        finger_target = _tensor_numpy(
+            robot.data.joint_pos_target[:, finger_ids], field="finger position target"
+        )
+        if processed_finger.dtype != np.float32 or finger_target.dtype != np.float32:
+            raise ValueError("Live finger targets must be float32")
+        emitted_binary = self._pending_execution["binary_action"][7]
+        if emitted_binary not in (0.0, 1.0):
+            raise ValueError("Pending gripper emission is not binary")
+        expected_finger_value = (
+            np.float32(np.pi / 4.0) if emitted_binary == 1.0 else np.float32(0.0)
+        )
+        expected_finger = np.asarray([[expected_finger_value]], dtype=np.float32)
+        if processed_finger.shape != (1, 1) or not np.array_equal(
+            processed_finger, expected_finger
+        ):
+            raise ValueError("Action manager changed emitted binary gripper target")
+        if finger_target.shape != (1, 1) or not np.array_equal(
+            finger_target, expected_finger
+        ):
+            raise ValueError("Articulation finger target differs from binary emission")
 
         if self.trace_path is not None:
             pending = self._pending_execution
@@ -266,12 +373,14 @@ class DroidJointVelocityClient(InferenceClient):
                     "schema_version": 1,
                     "record_type": "openpi_joint_velocity_execution",
                     "profile": PI05_DROID_JOINTVELOCITY_PROFILE,
-                    "serving_contract_sha256": self.serving_contract["contract_sha256"],
+                    **self._trace_contract_identity(),
                     "reset_index": self.reset_index,
                     "query_index": pending["query_index"],
                     "chunk_action_index": pending["chunk_action_index"],
                     "processed_joint_velocity": processed[0].tolist(),
                     "articulation_joint_velocity_target": targets[0].tolist(),
+                    "processed_finger_position_target": processed_finger[0].tolist(),
+                    "articulation_finger_position_target": finger_target[0].tolist(),
                     "measured_joint_position_after": current["joint_position"].tolist(),
                     "measured_joint_velocity_after": current["joint_velocity"].tolist(),
                 }
@@ -286,6 +395,18 @@ class DroidJointVelocityClient(InferenceClient):
         _image_contract(external)
         _image_contract(wrist)
         return external, wrist
+
+    def _trace_contract_identity(self) -> dict[str, str | int]:
+        return {
+            "serving_contract_sha256": self.serving_contract["contract_sha256"],
+            "serving_contract_artifact_sha256": self.serving_contract_artifact[
+                "sha256"
+            ],
+            "serving_contract_artifact_size": self.serving_contract_artifact["size"],
+            "client_runtime_attestation_sha256": self.client_runtime_attestation[
+                "sha256"
+            ],
+        }
 
     def _trace_query(self, request: dict, action_chunk: np.ndarray) -> None:
         if self.trace_path is None:
@@ -302,7 +423,7 @@ class DroidJointVelocityClient(InferenceClient):
                 "schema_version": 1,
                 "record_type": "openpi_joint_velocity_query",
                 "profile": PI05_DROID_JOINTVELOCITY_PROFILE,
-                "serving_contract_sha256": self.serving_contract["contract_sha256"],
+                **self._trace_contract_identity(),
                 "reset_index": self.reset_index,
                 "query_index": self.query_index,
                 "prompt": request["prompt"],
@@ -346,7 +467,7 @@ class DroidJointVelocityClient(InferenceClient):
                 "schema_version": 1,
                 "record_type": "openpi_joint_velocity_action",
                 "profile": PI05_DROID_JOINTVELOCITY_PROFILE,
-                "serving_contract_sha256": self.serving_contract["contract_sha256"],
+                **self._trace_contract_identity(),
                 "reset_index": self.reset_index,
                 "query_index": pending["query_index"],
                 "chunk_action_index": pending["chunk_action_index"],

@@ -51,6 +51,8 @@ class PolicyArgs:
     expected_action_horizon: int | None = None
     expected_action_dim: int | None = None
     policy_profile: str | None = None
+    serving_contract_path: str | None = None
+    openpi_dir: str | None = None
 
 
 @dataclass

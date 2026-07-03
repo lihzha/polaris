@@ -4,84 +4,91 @@ import math
 import pytest
 
 from polaris.joint_velocity_smoke import (
-    SMOKE_PROFILE,
     build_joint_velocity_smoke_cases,
     validate_joint_velocity_smoke,
 )
-from polaris.pi05_droid_jointvelocity_contract import (
-    PI05_DROID_JOINTVELOCITY_PROFILE,
-)
 
 
-def _payload():
-    command_magnitude = 0.25
-    cases = []
-    for case in build_joint_velocity_smoke_cases(command_magnitude):
-        action = case["action"]
-        q_before = [0.0] * 7
-        q_after = [0.01 * value for value in action[:7]]
-        dq_after = [0.5 * value for value in action[:7]]
-        result = {
-            **case,
-            "joint_position_before": q_before,
-            "joint_velocity_before": [0.0] * 7,
-            "joint_position_after": q_after,
-            "joint_velocity_after": dq_after,
-            "processed_joint_velocity": action[:7],
-            "articulation_joint_velocity_target": action[:7],
-            "soft_joint_position_limits": [[-3.0, 3.0] for _ in range(7)],
-            "finger_position_target": (case.get("expected_finger_target", 0.0)),
-            "terminated": False,
-            "truncated": False,
-        }
-        cases.append(result)
-    return {
-        "schema_version": 1,
-        "smoke_profile": SMOKE_PROFILE,
-        "controller_profile": PI05_DROID_JOINTVELOCITY_PROFILE,
-        "environment": "DROID-FoodBussing",
-        "command_magnitude": command_magnitude,
-        "settle_steps": 5,
-        "runtime_contract": {
-            "status": "pass",
-            "profile": PI05_DROID_JOINTVELOCITY_PROFILE,
-        },
-        "cases": cases,
-        "reset_probe": {
-            "default_joint_position": [0.0] * 7,
-            "joint_position": [0.0] * 7,
-            "joint_velocity": [0.0] * 7,
-            "joint_velocity_target": [0.0] * 7,
-        },
+def test_smoke_plan_covers_hold_signed_joints_gripper_boundary_reset_and_limits():
+    cases = build_joint_velocity_smoke_cases()
+    assert len(cases) == 20
+    assert cases[0]["label"] == "hold"
+    assert sum(case["kind"] == "signed_joint" for case in cases) == 14
+    assert sum(case["kind"] == "gripper" for case in cases) == 3
+    assert sum(case["kind"] == "limit" for case in cases) == 2
+    assert cases[-4]["expected_finger_target"] == pytest.approx(math.pi / 4)
+    assert cases[-3] == {
+        "label": "gripper_boundary_0p5",
+        "action": [0.0] * 7 + [0.5],
+        "kind": "gripper",
+        "expected_finger_target": 0.0,
+        "threshold_boundary": 0.5,
     }
 
 
-def test_smoke_plan_covers_hold_signed_joints_gripper_reset_and_limits():
-    cases = build_joint_velocity_smoke_cases()
-    assert len(cases) == 19
-    assert cases[0]["label"] == "hold"
-    assert sum(case["kind"] == "signed_joint" for case in cases) == 14
-    assert sum(case["kind"] == "gripper" for case in cases) == 2
-    assert sum(case["kind"] == "limit" for case in cases) == 2
-    assert cases[-3]["expected_finger_target"] == pytest.approx(math.pi / 4)
-
-
-def test_smoke_validator_recomputes_direction_targets_limits_and_reset():
-    validated = validate_joint_velocity_smoke(_payload())
+def test_smoke_validator_recomputes_full_runtime_direction_targets_and_reset(
+    valid_joint_velocity_smoke_payload,
+):
+    validated = validate_joint_velocity_smoke(valid_joint_velocity_smoke_payload)
     assert validated["status"] == "pass"
-    assert validated["case_count"] == 19
+    assert validated["case_count"] == 20
 
-    wrong_direction = _payload()
+    wrong_direction = copy.deepcopy(valid_joint_velocity_smoke_payload)
     wrong_direction["cases"][1]["joint_position_after"][0] *= -1
     with pytest.raises(ValueError, match="commanded direction"):
         validate_joint_velocity_smoke(wrong_direction)
 
-    wrong_gripper = _payload()
-    wrong_gripper["cases"][-3]["finger_position_target"] = 0.0
-    with pytest.raises(ValueError, match="gripper target"):
+    wrong_gripper = copy.deepcopy(valid_joint_velocity_smoke_payload)
+    boundary = next(
+        case
+        for case in wrong_gripper["cases"]
+        if case["label"] == "gripper_boundary_0p5"
+    )
+    boundary["finger_position_target"] = math.pi / 4
+    with pytest.raises(ValueError, match="finger_position_target mismatch"):
         validate_joint_velocity_smoke(wrong_gripper)
 
-    leaked_reset = copy.deepcopy(_payload())
+    wrong_processed_gripper = copy.deepcopy(valid_joint_velocity_smoke_payload)
+    wrong_processed_gripper["cases"][0]["processed_finger_position_target"] = 0.1
+    with pytest.raises(ValueError, match="processed_finger_position_target mismatch"):
+        validate_joint_velocity_smoke(wrong_processed_gripper)
+
+    leaked_reset = copy.deepcopy(valid_joint_velocity_smoke_payload)
     leaked_reset["reset_probe"]["joint_velocity_target"][0] = 0.25
     with pytest.raises(ValueError, match="zero velocity target"):
         validate_joint_velocity_smoke(leaked_reset)
+
+    tampered_runtime = copy.deepcopy(valid_joint_velocity_smoke_payload)
+    tampered_runtime["runtime_contract"]["clip"]["values"][0][0][0] = -0.5
+    with pytest.raises(ValueError, match="runtime contract SHA-256 mismatch"):
+        validate_joint_velocity_smoke(tampered_runtime)
+
+
+def test_smoke_child_stage_cannot_claim_parent_completion_or_extra_fields(
+    valid_joint_velocity_smoke_payload,
+):
+    child = copy.deepcopy(valid_joint_velocity_smoke_payload)
+    child.pop("completion")
+    child["lifecycle"] = {
+        "env_close": "complete",
+        "simulation_app_close": "pending_child_exit",
+        "capture_stage": "kit_child_after_env_close_before_simulation_app_close",
+    }
+    validated = validate_joint_velocity_smoke(child, require_parent_completion=False)
+    assert validated["status"] == "close_validated_pending_parent"
+
+    child["completion"] = {
+        "child_exit_code": 0,
+        "publication_stage": "stdlib_parent_after_child_exit",
+        "child_capture_sha256": "a" * 64,
+        "child_capture_size": 1,
+        "child_capture_mode": "0400",
+        "child_capture_path": "/tmp/test-child-close.json",
+    }
+    with pytest.raises(ValueError, match="schema mismatch"):
+        validate_joint_velocity_smoke(child, require_parent_completion=False)
+
+    extra = copy.deepcopy(valid_joint_velocity_smoke_payload)
+    extra["unbound"] = True
+    with pytest.raises(ValueError, match="schema mismatch"):
+        validate_joint_velocity_smoke(extra)

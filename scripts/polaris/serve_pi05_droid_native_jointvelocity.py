@@ -1,21 +1,36 @@
 #!/usr/bin/env python3
-"""Serve the pinned official ``pi05_droid`` policy with exact metadata."""
+"""Serve pinned ``pi05_droid`` inference with an immutable full handshake."""
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import logging
-import subprocess
+import sys
 from pathlib import Path
 
 
-def _git_head(repository: Path) -> str:
-    return subprocess.run(
-        ["git", "-C", str(repository), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+def _install_controlled_openpi_path(openpi_dir: Path) -> None:
+    if any(
+        name == "openpi"
+        or name.startswith("openpi.")
+        or name == "openpi_client"
+        or name.startswith("openpi_client.")
+        for name in sys.modules
+    ):
+        raise RuntimeError("OpenPI was imported before --openpi-dir was bound")
+    requested_roots = [
+        openpi_dir / "src",
+        openpi_dir / "packages/openpi-client/src",
+    ]
+    for root in requested_roots:
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError(f"Missing regular OpenPI import root: {root}")
+    roots = [root.resolve() for root in requested_roots]
+    root_strings = [str(root) for root in roots]
+    sys.path[:] = [entry for entry in sys.path if entry not in root_strings]
+    sys.path[0:0] = root_strings
+    importlib.invalidate_caches()
 
 
 def main() -> None:
@@ -23,28 +38,35 @@ def main() -> None:
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
     parser.add_argument("--openpi-dir", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--serving-contract-output", type=Path, required=True)
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
 
-    from openpi.policies import policy_config
-    from openpi.serving import websocket_policy_server
-    from openpi.training import config
-    import jax
-
     from polaris.pi05_droid_jointvelocity_contract import (
-        PI05_DROID_OPENPI_COMMIT,
+        attest_imported_openpi_modules,
         expected_pi05_droid_server_metadata,
+        publish_immutable_serving_contract,
+        verify_openpi_git_checkout,
         verify_pi05_droid_checkpoint,
         verify_profile_source_files,
     )
 
-    openpi_dir = args.openpi_dir.resolve()
-    if _git_head(openpi_dir) != PI05_DROID_OPENPI_COMMIT:
-        raise ValueError(
-            f"OpenPI must be exactly {PI05_DROID_OPENPI_COMMIT}; "
-            f"got {_git_head(openpi_dir)}"
-        )
+    checkout = verify_openpi_git_checkout(args.openpi_dir)
+    openpi_dir = Path(checkout["root"])
     verify_profile_source_files(openpi_dir)
+    _install_controlled_openpi_path(openpi_dir)
+
+    # Imports are intentionally after path installation and the first clean-HEAD gate.
+    import jax
+    from openpi.models import model as openpi_model
+    from openpi.models import pi0 as openpi_pi0
+    from openpi.models import tokenizer as openpi_tokenizer
+    from openpi.policies import policy as openpi_policy
+    from openpi.policies import policy_config
+    from openpi.serving import websocket_policy_server
+    from openpi.training import config
+    import openpi.transforms as openpi_transforms
+
     if jax.config.x64_enabled:
         raise ValueError("pi05_droid serving requires JAX 64-bit mode to be disabled")
     checkpoint_report = verify_pi05_droid_checkpoint(
@@ -92,11 +114,31 @@ def main() -> None:
         )
     if jax.random.key_data(policy._rng).tolist() != [0, 0]:
         raise ValueError("Official pi05_droid policy RNG did not initialize from key 0")
+
+    # Keep explicit references alive and prove these exact modules were imported.
+    if openpi_model.__name__ != "openpi.models.model":
+        raise RuntimeError("Unexpected OpenPI model module")
+    if openpi_tokenizer.__name__ != "openpi.models.tokenizer":
+        raise RuntimeError("Unexpected OpenPI tokenizer module")
+    if openpi_pi0.__name__ != "openpi.models.pi0":
+        raise RuntimeError("Unexpected OpenPI pi0 module")
+    if openpi_policy.__name__ != "openpi.policies.policy":
+        raise RuntimeError("Unexpected OpenPI policy module")
+    if openpi_transforms.__name__ != "openpi.transforms":
+        raise RuntimeError("Unexpected OpenPI transforms module")
+    verify_openpi_git_checkout(openpi_dir)
+    runtime_attestation = attest_imported_openpi_modules(openpi_dir)
+    metadata = expected_pi05_droid_server_metadata(runtime_attestation)
+    contract_artifact = publish_immutable_serving_contract(
+        args.serving_contract_output, metadata
+    )
+    logging.info("Immutable serving contract: %s", contract_artifact)
+
     server = websocket_policy_server.WebsocketPolicyServer(
         policy=policy,
         host="0.0.0.0",
         port=args.port,
-        metadata=expected_pi05_droid_server_metadata(),
+        metadata=metadata,
     )
     server.serve_forever()
 

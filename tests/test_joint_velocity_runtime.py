@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 import polaris.joint_velocity_runtime as runtime
 from polaris.pi05_droid_jointvelocity_contract import (
@@ -10,6 +11,7 @@ from polaris.pi05_droid_jointvelocity_contract import (
     PANDA_ARM_VELOCITY_LIMITS,
     PI05_DROID_JOINTVELOCITY_PROFILE,
     PI05_DROID_ISAACLAB_SOURCE_SHA256,
+    PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256,
 )
 
 
@@ -51,18 +53,18 @@ class _View:
 
 class _Robot:
     def __init__(self):
-        stiffness = np.zeros((1, 7), dtype=np.float32)
-        damping = np.full((1, 7), 80.0, dtype=np.float32)
-        effort = np.asarray([PANDA_ARM_EFFORT_LIMITS], dtype=np.float32)
-        velocity = np.asarray([PANDA_ARM_VELOCITY_LIMITS], dtype=np.float32)
+        stiffness = torch.zeros((1, 7), dtype=torch.float32)
+        damping = torch.full((1, 7), 80.0, dtype=torch.float32)
+        effort = torch.tensor([PANDA_ARM_EFFORT_LIMITS], dtype=torch.float32)
+        velocity = torch.tensor([PANDA_ARM_VELOCITY_LIMITS], dtype=torch.float32)
         self.data = SimpleNamespace(
-            joint_stiffness=stiffness.copy(),
-            joint_damping=damping.copy(),
-            joint_effort_limits=effort.copy(),
-            joint_vel_limits=velocity.copy(),
+            joint_stiffness=stiffness.clone(),
+            joint_damping=damping.clone(),
+            joint_effort_limits=effort.clone(),
+            joint_vel_limits=velocity.clone(),
         )
         self.root_physx_view = _View(
-            stiffness.copy(), damping.copy(), effort.copy(), velocity.copy()
+            stiffness.clone(), damping.clone(), effort.clone(), velocity.clone()
         )
         self.actuators = {
             "panda_shoulder": ImplicitActuator(),
@@ -85,13 +87,16 @@ class _Env:
         arm._joint_names = list(PANDA_ARM_JOINT_NAMES)
         arm._scale = 1.0
         arm._offset = 0.0
-        arm._clip = np.broadcast_to(
-            np.asarray([-1.0, 1.0], dtype=np.float32), (1, 7, 2)
-        ).copy()
+        arm._clip = torch.tensor(
+            np.broadcast_to(
+                np.asarray([-1.0, 1.0], dtype=np.float32), (1, 7, 2)
+            ).copy(),
+            dtype=torch.float32,
+        )
         finger = BinaryGripperAction()
         finger._joint_names = ["finger_joint"]
-        finger._open_command = np.zeros((1, 1), dtype=np.float32)
-        finger._close_command = np.full((1, 1), np.pi / 4.0, dtype=np.float32)
+        finger._open_command = torch.zeros((1, 1), dtype=torch.float32)
+        finger._close_command = torch.full((1, 1), np.pi / 4.0, dtype=torch.float32)
         self.cfg = SimpleNamespace(decimation=8, sim=SimpleNamespace(dt=1.0 / 120.0))
         self.action_manager = SimpleNamespace(
             _terms={"arm": arm, "finger_joint": finger}
@@ -110,6 +115,11 @@ def _stub_isaaclab(monkeypatch):
         "_verify_isaaclab_sources",
         lambda **_: dict(PI05_DROID_ISAACLAB_SOURCE_SHA256),
     )
+    monkeypatch.setattr(
+        runtime,
+        "_verify_polaris_sources",
+        lambda **_: dict(PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256),
+    )
 
 
 def test_runtime_binds_action_class_order_affine_and_direct_physx_drive(monkeypatch):
@@ -124,7 +134,12 @@ def test_runtime_binds_action_class_order_affine_and_direct_physx_drive(monkeypa
     assert report["velocity_drive"]["velocity_damping"] == 80.0
     assert report["isaaclab_version"] == "2.3.0"
     assert report["isaaclab_source_sha256"] == PI05_DROID_ISAACLAB_SOURCE_SHA256
+    assert (
+        report["polaris_runtime_source_sha256"]
+        == PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256
+    )
     assert len(report["runtime_sha256"]) == 64
+    assert runtime.validate_joint_velocity_runtime_report(report) == report
 
 
 def test_runtime_rejects_position_stiffness_and_wrong_action_type(monkeypatch):
@@ -144,3 +159,18 @@ def test_runtime_rejects_unpinned_isaaclab(monkeypatch):
     monkeypatch.setattr(runtime, "_installed_isaaclab_version", lambda: "2.3.1")
     with pytest.raises(ValueError, match="requires Isaac Lab 2.3.0"):
         runtime.validate_joint_velocity_runtime(_Env())
+
+
+def test_runtime_report_recomputes_full_contract_and_rejects_minimal_report(
+    monkeypatch,
+):
+    _stub_isaaclab(monkeypatch)
+    report = runtime.validate_joint_velocity_runtime(_Env())
+    report["velocity_drive"]["direct_physx"]["damping"]["values"][0][0] = 79.0
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        runtime.validate_joint_velocity_runtime_report(report)
+
+    with pytest.raises(ValueError, match="schema mismatch"):
+        runtime.validate_joint_velocity_runtime_report(
+            {"status": "pass", "profile": PI05_DROID_JOINTVELOCITY_PROFILE}
+        )
