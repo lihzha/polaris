@@ -506,3 +506,71 @@
   `py_compile`, and `git diff --check`. A new immutable wrapper must require
   both zero `srun` status and exact `0\n` sidecar after host directory fsync,
   then run the full real-Isaac suite and expected-failure replay.
+- The independently reviewed v11 wrapper is mode 0444 at
+  `/lustre/fsw/portfolios/nvr/users/lzha/staging/polaris_v11_9b67e14/boundary-trace-v11.sbatch`,
+  SHA-256
+  `77f1b84f6fa8fdd322c3b281a3c11dbbca73c8a2e56afcff1d4cca341f3e8991`.
+  It adds an intentional no-tests-selected exit-5 probe, proves that the same
+  strict zero validator rejects its immutable `5\n` sidecar, then requires
+  both zero outer `srun` status and an immutable exact `0\n` sidecar for the
+  full real-Isaac suite. The sidecar validator rejects missing, symlinked,
+  non-0444, empty, truncated, extra-newline, nonzero, wrong-hash, leftover-temp,
+  and multi-link artifacts. It then runs all 141 host tests plus 22 subtests
+  and the exact controller-only expected-failure replay. Clean detached source
+  is `/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-trace-v11-9b67e14`
+  at commit `9b67e1496f5ecd6ce4f40953ca112f7b670ff423`.
+- Launched ordinary one-GPU Slurm job `1098101` on L40S `pool0-00013` at
+  2026-07-02 23:03 PDT. Log:
+  `/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris_eval/pol_v11_trace-1098101.out`.
+  Result root:
+  `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris_eval/controller_diagnostics_v11/9b67e14-factor1-trace64`.
+  Success requires both sidecar probes, all target-surface tests, an immutable
+  strictly accepted velocity-abort trace, no ready marker/attestation, and
+  wrapper exit zero; scheduler completion alone is insufficient.
+- Job `1098101` failed closed after the intentional pytest probe reported exit
+  5 while Pyxis again returned outer step status zero. The strict gate rejected
+  the missing sidecar and stopped before the positive suite or replay. The only
+  result artifact is its immutable saved wrapper; no raw trace, ready marker,
+  or attestation exists. Log SHA-256:
+  `d143bcf7e20e74f97aba0a388bd6dd96c25e5e9d0f751b5219bb9aab8cd1ad1c`.
+  A direct exact-container publisher probe, job `1098102`, completed and wrote
+  immutable `5\n` SHA-256
+  `f0b5c2c2211c8d67ed15e75e656c7862d086e9245420892a7de62cd9ec582a06`,
+  proving env transport, mount writability, and the publisher independent of
+  Kit. Minimal AppLauncher probes `1098103`/`1098104` segfaulted before launch
+  returned because their reduced runtime surface did not reproduce the full
+  validated container environment; they are infrastructure diagnostics only,
+  produced no sidecar, and are not controller evidence.
+- Early-capture rerun `1098107` at commit `841f4d6` printed the correct
+  sidecar path and pytest exit 5, but again produced no sidecar and failed the
+  strict gate before positive tests/replay. This proves the issue is not a
+  missing env value: pinned Kit termination prevents Python after
+  `SimulationApp.close()` from executing. Its only result is the immutable
+  saved wrapper; log SHA-256 is
+  `86b890b3c85f5e7bca452602f9edcf2ad640c9714c25c7150561117250d05823`.
+- Commit `2fca845f0e42c089dd6820cb8e0da21cc8a5c4a2` moves the final transaction
+  outside Kit. A standard-library parent spawns the Isaac child with an
+  anonymous write-only pipe; the child scrubs parent-only env, validates and
+  de-inherits the FD before imports, flushes pytest diagnostics, commits one
+  exact result byte, and only then closes Kit. The parent reaps native teardown,
+  requires one allowed byte plus EOF and a coherent direct-child status, kills
+  and rejects lingering process groups, handles timeout and TERM/INT cleanup,
+  and alone publishes the immutable final sidecar. Native fake-Kit regressions
+  reproduce `close() -> os._exit(0)` for pytest 0 and 5. Post-report close,
+  marker-flush, pipe, descriptor, signal, timeout, unreapable-child, and
+  sidecar failures are fail-closed. Three independent reviews accept the
+  boundary. Local gates pass 168 host tests plus 22 subtests, 56 focused
+  bootstrap tests, Ruff, `py_compile`, and `git diff --check`.
+- The independently reviewed v13 wrapper differs from v12 only in its six
+  provenance/output bindings and is staged mode 0444 at
+  `/lustre/fsw/portfolios/nvr/users/lzha/staging/polaris_v13_2fca845/boundary-trace-v13.sbatch`,
+  SHA-256
+  `eadeffbb02a09aaac60189cafdc91020ad393ded5f07bc2e71c34d46f5dc91ff`.
+  Clean detached source is
+  `/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-trace-v13-2fca845`.
+  Launched ordinary one-GPU job `1098116` on `pool0-00013`; log is
+  `/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris_eval/pol_v13_trace-1098116.out`,
+  result root is
+  `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris_eval/controller_diagnostics_v13/2fca845-factor1-trace64`.
+  It remains controller-only with no model, checkpoint, policy server, or
+  downstream chain.
