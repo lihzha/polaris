@@ -321,6 +321,27 @@ def test_raw_smoke_gate_requires_pending_full_evidence():
         finalizer._verify_raw(raw)
 
     raw = _valid_raw_result()
+    counters = raw["ik_safety_episodes"][0]["counters"]
+    counters["slew_limit_events"] = 1
+    counters["slew_limited_joints"] = 1
+    with pytest.raises(finalizer.VerificationError, match="activation mismatch"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    safety = raw["ik_safety_episodes"][0]
+    diagnostic = safety["max_raw_delta_diagnostic"]
+    q0 = diagnostic["joint_pos_rad"]["values"][0]
+    bound = finalizer.EXPECTED_MAX_DELTA[0]
+    raw_delta = bound + 0.01
+    safety["maxima"]["raw_delta_joint_pos_rad"][0] = raw_delta
+    safety["maxima"]["applied_delta_joint_pos_rad"][0] = bound
+    diagnostic["raw_delta_joint_pos_rad"]["values"][0] = raw_delta
+    diagnostic["raw_joint_pos_target_rad"]["values"][0] = q0 + raw_delta
+    diagnostic["safe_joint_pos_target_rad"]["values"][0] = q0 + bound
+    with pytest.raises(finalizer.VerificationError, match="activation mismatch"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
     raw["ik_safety_episodes"][0]["max_raw_delta_diagnostic"]["pose_error_norm"] = None
     with pytest.raises(finalizer.VerificationError, match="pose_error_norm"):
         finalizer._verify_raw(raw)
@@ -386,7 +407,7 @@ def test_raw_smoke_gate_requires_pending_full_evidence():
     diagnostic["raw_delta_joint_pos_rad"] = _diagnostic_vector([0.0] * 7)
     diagnostic["raw_joint_pos_target_rad"] = copy.deepcopy(diagnostic["joint_pos_rad"])
     diagnostic["safe_joint_pos_target_rad"] = copy.deepcopy(diagnostic["joint_pos_rad"])
-    with pytest.raises(finalizer.VerificationError, match="never exceed"):
+    with pytest.raises(finalizer.VerificationError, match="activation mismatch"):
         finalizer._verify_raw(raw)
 
     raw = _valid_raw_result()

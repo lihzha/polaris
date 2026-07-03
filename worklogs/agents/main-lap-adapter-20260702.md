@@ -318,4 +318,7 @@
   saved-sbatch SHA. It also reconstructs the actual ±0.04-m translation and
   right-multiplied, sign-aware ±15° rotation target matrix from the hold case,
   and bounds terminal adversarial dq by the configured velocity limits.
-  Probe-specific mutation tests cover every rejected case.
+  The finalizer additionally requires exact bidirectional agreement between
+  positive slew-event counters and a raw per-joint delta strictly above its
+  configured slew bound. Probe-specific mutation tests cover both mismatch
+  directions and every other rejected case.

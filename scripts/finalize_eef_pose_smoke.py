@@ -473,6 +473,16 @@ def _validate_safety_report(
         ),
         f"{field}.applied slew maxima",
     )
+    raw_slew_activated = any(
+        raw_delta > bound
+        for raw_delta, bound in zip(
+            maxima["raw_delta_joint_pos_rad"], EXPECTED_MAX_DELTA, strict=True
+        )
+    )
+    _require(
+        (counters["slew_limit_events"] > 0) is raw_slew_activated,
+        f"{field}.slew counters/maxima activation mismatch",
+    )
 
     diagnostics = _list(report.get("guard_diagnostics"), f"{field}.diagnostics")
     _require(len(diagnostics) <= 32, f"{field}.diagnostics unbounded")
