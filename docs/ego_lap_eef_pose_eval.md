@@ -157,6 +157,29 @@ and terminal vectors. The PhysX velocity setting is not represented as a hard
 bound on measured passive-joint velocity; values above 5 rad/s remain valid
 measurements and must not be hidden.
 
+The Ego-LAP EEF action profile additionally installs
+`eef_binary_driver_target_slew_live_limit_per_120hz_substep_v1`. The policy
+boundary and binary endpoints are unchanged: closed-positive values `>=0.5`
+request float32 `pi/4`, while smaller values request exact zero. After each
+action-term reset, the first apply anchors from the live driven-finger joint
+position, requires that anchor to lie inside the explicit float32
+tolerance-expanded endpoint bounds, and advances from that anchor toward the
+requested endpoint. Every apply advances the stored target by no more than the
+exact live float32 `velocity_limit_sim * physics_dt`, which is `5/120` radians
+in the pinned runtime. A represented float32 addition that would exceed this
+cap by one ULP is stepped one representable value back toward the previous
+target. The five passive-follower caps and eventual endpoint semantics do not
+change.
+
+The closed runtime contract records the profile, action class, reset anchor,
+live-limit source, tensor device/dtype, cap, process/apply cadence, endpoint
+changes and repeats, limited/reached counts, live-limit checks, target-step
+maximum, endpoint-error maxima, and final target. Nonfinite actions/state,
+profile or device/dtype drift, external target writes, or any live driver-limit
+drift fail before another target write. This action class is selected only by
+`EgoLapEefPoseActionCfg`; default DROID joint-position and non-Ego-LAP EEF
+actions retain their prior class and behavior.
+
 Apply-entry samples are counted before finiteness rejection, so a gripper
 non-finite preserves exact controller cadence in the numerical-failure
 sidecar. A gripper non-finite first discovered only after a completed
@@ -165,7 +188,7 @@ executed transition as an unexecuted numerical-failure tail.
 
 ## Rollout durability and numerical containment
 
-The v3 evaluator publishes one video, finalized per-episode policy trace,
+The production evaluator publishes one video, finalized per-episode policy trace,
 immutable `ik_safety/episode_XXXXXX.json` transaction, and then one CSV row per
 completed official initial condition. The sidecar binds the exact row, video
 size/hash/frame identity, terminal-trace size/hash/result, and isolated
@@ -196,7 +219,7 @@ observation to the articulation's direct `panda_link0 -> panda_link8` transform
 and verifies that the installed 7-D action term is absolute-pose differential
 IK on `panda_link8` with an identity body offset. These protocol, frame,
 controller-body, offset, command-mode, and action-dimension facts are written
-atomically to schema-3 `--runtime-contract-output` (defaulting to
+atomically to schema-5 `--runtime-contract-output` (defaulting to
 `RUN_FOLDER/polaris_runtime_contract.json`). A fully resumed task performs the
 same live reset, validation, and write before its completed-path early return.
 The contract binds 120-Hz physics with decimation 8, explicit arm
@@ -222,11 +245,11 @@ checkpoint hashes, sampler mode, normalization formula/dtype, state-R6,
 server/raw/base chunks, and anchored float32 actions must agree. Each action
 must equal its selected query chunk, query-static identity cannot drift within
 an episode, and an execution-failure reason must equal the terminal result.
-Runtime schema 3 likewise recomputes completed episode count, contiguous
+Runtime schema 5 likewise recomputes completed episode count, contiguous
 indices, counters, arm maxima, and all-six gripper maxima from the immutable
 episode entries before publication.
 
-The immutable episode sidecar is schema 3 and carries the same terminal object
+The immutable episode sidecar is schema 5 and carries the same terminal object
 as the finalized trace. A normal terminal state has outer/common/camera deltas
 of 450 and a simulation-counter delta of 3600. On a numerical failure, the
 terminal snapshot is the actual live state after the failed controller apply:
@@ -240,7 +263,7 @@ superseded for publication by the `panda_velocity_softlimit_v1` v3 contract.
 
 First run the standalone controller smoke and pin its exact live soft-limit
 bytes/digest in the paired Ego-LAP revision. Only that verified immutable
-revision may launch a checkpoint canary. Inspect the canary's schema-3 contract,
+revision may launch a checkpoint canary. Inspect the canary's schema-5 contract,
 sidecar, trace, CSV, complete video, 3600-call cadence, all-six gripper maxima,
 and wall time before
 scaling out.
@@ -249,8 +272,12 @@ scaling out.
 
 The headless controller smoke checks hold, both signs of XYZ translation, and
 both signs of XYZ rotation against the direct articulation `panda_link8`
-transform. A dedicated final phase resets, sends one deliberately oversized
-absolute +X target for exactly one policy step/eight physics substeps, captures
+transform. Its first hold case requests the unchanged closed endpoint for 45
+policy steps and independently requires exactly 18 limited driver-target
+applies before the 19th apply reaches float32 `pi/4`; subsequent reset cases
+hold the exact open endpoint. A dedicated final phase resets, sends one
+deliberately oversized absolute +X target for exactly one policy step/eight
+physics substeps, captures
 the report, and resets immediately. It passes only when the state/report stay
 finite, the slew guard activates, all applied maxima remain within
 `velocity/120 + 1e-6` rad, and abort/post-clamp violation counts remain zero.

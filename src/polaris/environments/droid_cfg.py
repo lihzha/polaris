@@ -15,6 +15,7 @@ from polaris.environments.robot_cfg import NVIDIA_DROID
 from polaris.config import LAP_EEF_FRAME
 from polaris.gripper_semantics import closed_positive_gripper_mask
 from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
+from polaris.eef_gripper_target_slew import EefGripperTargetSlewMixin
 from polaris.robust_differential_ik import (
     RobustDifferentialInverseKinematicsActionCfg,
 )
@@ -248,6 +249,19 @@ class BinaryJointPositionZeroToOneActionCfg(BinaryJointPositionActionCfg):
     class_type = BinaryJointPositionZeroToOneAction
 
 
+class EefBinaryJointPositionTargetSlewAction(
+    EefGripperTargetSlewMixin, BinaryJointPositionZeroToOneAction
+):
+    """EEF-only binary endpoint action with one live-limit step per apply."""
+
+
+@configclass
+class EefBinaryJointPositionTargetSlewActionCfg(BinaryJointPositionZeroToOneActionCfg):
+    """Configuration selecting the EEF-only driven-finger target slew."""
+
+    class_type = EefBinaryJointPositionTargetSlewAction
+
+
 @configclass
 class ActionCfg:
     """Default DROID joint-position actions (kept for backwards compatibility)."""
@@ -295,6 +309,18 @@ class EefPoseActionCfg:
     )
 
     finger_joint = BinaryJointPositionZeroToOneActionCfg(
+        asset_name="robot",
+        joint_names=["finger_joint"],
+        open_command_expr={"finger_joint": 0.0},
+        close_command_expr={"finger_joint": np.pi / 4},
+    )
+
+
+@configclass
+class EgoLapEefPoseActionCfg(EefPoseActionCfg):
+    """Ego-LAP EEF actions with live-limit driven-finger target slew."""
+
+    finger_joint = EefBinaryJointPositionTargetSlewActionCfg(
         asset_name="robot",
         joint_names=["finger_joint"],
         open_command_expr={"finger_joint": 0.0},

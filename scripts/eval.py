@@ -55,6 +55,7 @@ def main(eval_args: EvalArgs):
         ManagerBasedRLSplatEnv,
     )
     from polaris.environments.droid_cfg import EefPoseActionCfg
+    from polaris.environments.droid_cfg import EgoLapEefPoseActionCfg
     from polaris.environments.robot_cfg import configure_eef_pose_joint_safety
     from polaris.utils import load_eval_initial_conditions
     from polaris.policy import InferenceClient
@@ -72,7 +73,7 @@ def main(eval_args: EvalArgs):
     if eval_args.control_mode == "eef-pose":
         # Action managers are constructed by gym.make, so select the controller
         # on the config before creating the environment.
-        env_cfg.actions = EefPoseActionCfg()
+        env_cfg.actions = EgoLapEefPoseActionCfg() if is_ego_lap else EefPoseActionCfg()
         configure_eef_pose_joint_safety(
             env_cfg.scene.robot,
             physx_cfg=env_cfg.sim.physx,

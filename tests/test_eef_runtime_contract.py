@@ -27,6 +27,7 @@ from polaris.eef_runtime_contract import validate_episode_safety_cadence
 from polaris.eef_runtime_contract import validate_eef_runtime_frame
 from polaris.eef_runtime_contract import validate_eef_runtime_safety
 from polaris.eef_runtime_contract import validate_ego_lap_runtime_protocol
+from polaris import eef_runtime_contract as runtime_contract_module
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
@@ -329,6 +330,27 @@ def _episode_safety(
             }
         ]
     return report
+
+
+def _attach_stub_gripper_runtime(
+    safety,
+    *,
+    post_policy_step_samples,
+    target_process_calls,
+    target_apply_calls,
+):
+    apply_calls = safety["counters"]["apply_calls"]
+    safety["gripper_runtime_static"] = {"profile": "stub-static"}
+    safety["gripper_runtime_dynamic"] = {
+        "apply_entry_samples": apply_calls,
+        "post_policy_step_samples": post_policy_step_samples,
+        "nonfinite_samples": 0,
+        "driver_target_slew": {
+            "process_action_calls": target_process_calls,
+            "apply_calls": target_apply_calls,
+        },
+    }
+    return safety
 
 
 def _candidate_trigger_runtime():
@@ -776,7 +798,7 @@ def test_runtime_candidate_selects_exact_profile_schema_and_diagnostics(tmp_path
         )
 
 
-def test_runtime_disabled_mode_retains_exact_v4_schema():
+def test_runtime_disabled_mode_retains_exact_base_schema():
     env, observation = _runtime_fixture()
     report = validate_eef_runtime_safety(env)
     frame = validate_eef_runtime_frame(env, observation)
@@ -1092,10 +1114,10 @@ def test_transaction_recovery_is_idempotent_after_csv_commit(tmp_path: Path):
         )
 
 
-def test_sidecar_loader_and_reconciler_reject_obsolete_v3_schema(tmp_path: Path):
+def test_sidecar_loader_and_reconciler_reject_previous_v4_schema(tmp_path: Path):
     _result, sidecar_path, payload = _prepare_episode_transaction(tmp_path, episode=0)
-    assert payload["schema_version"] == EEF_SAFETY_SIDECAR_SCHEMA_VERSION == 4
-    payload["schema_version"] = 3
+    assert payload["schema_version"] == EEF_SAFETY_SIDECAR_SCHEMA_VERSION == 5
+    payload["schema_version"] = 4
     sidecar_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 
     with pytest.raises(ValueError, match="Invalid episode safety sidecar identity"):
@@ -1351,7 +1373,7 @@ def test_current_velocity_abort_preserves_sidecar_and_runtime_evidence(
         artifact_identity=_artifact_identity_for_terminal(result, terminal),
         terminal_rollout=terminal,
     )
-    assert payload["schema_version"] == EEF_SAFETY_SIDECAR_SCHEMA_VERSION == 4
+    assert payload["schema_version"] == EEF_SAFETY_SIDECAR_SCHEMA_VERSION == 5
     assert payload["safety"]["current_joint_velocity_abort"] == evidence
     aggregate = aggregate_episode_safety(
         safety,
@@ -1372,7 +1394,7 @@ def test_current_velocity_abort_preserves_sidecar_and_runtime_evidence(
         ik_safety=aggregate,
     )
     runtime_payload = json.loads(runtime_path.read_text(encoding="utf-8"))
-    assert runtime_payload["schema_version"] == EEF_RUNTIME_CONTRACT_SCHEMA_VERSION == 4
+    assert runtime_payload["schema_version"] == EEF_RUNTIME_CONTRACT_SCHEMA_VERSION == 5
 
     runtime_sign_drift = copy.deepcopy(aggregate)
     runtime_abort = runtime_sign_drift["episodes"][0]["current_joint_velocity_abort"]
@@ -1596,6 +1618,62 @@ def test_episode_safety_cadence_binds_success_and_failure_substep():
     with pytest.raises(ValueError, match="Completed episode controller cadence"):
         validate_episode_safety_cadence(
             safety=invalid, episode_result=_episode_result()
+        )
+
+
+def test_episode_cadence_cross_binds_gripper_target_slew_action_order(monkeypatch):
+    monkeypatch.setattr(
+        runtime_contract_module,
+        "validate_eef_gripper_static_contract",
+        lambda value: value,
+    )
+    monkeypatch.setattr(
+        runtime_contract_module,
+        "validate_eef_gripper_dynamic_evidence",
+        lambda value: value,
+    )
+
+    completed_safety = _attach_stub_gripper_runtime(
+        _episode_safety(),
+        post_policy_step_samples=2,
+        target_process_calls=2,
+        target_apply_calls=16,
+    )
+    completed = validate_episode_safety_cadence(
+        safety=completed_safety,
+        episode_result=_episode_result(),
+    )
+    assert completed["apply_calls"] == 16
+
+    # ActionManager applies arm before finger. On an arm abort at the third
+    # zero-indexed substep, arm evidence includes the failed 11th apply entry,
+    # while the finger target setter completed only the prior 10 applies.
+    failed_safety = _attach_stub_gripper_runtime(
+        _episode_safety(numerical_failure=True),
+        post_policy_step_samples=1,
+        target_process_calls=2,
+        target_apply_calls=10,
+    )
+    failed = validate_episode_safety_cadence(
+        safety=failed_safety,
+        episode_result=_episode_result(numerical_failure=True),
+    )
+    assert failed["failed_physics_substep"] == 2
+
+    drifted = copy.deepcopy(failed_safety)
+    drifted["gripper_runtime_dynamic"]["driver_target_slew"]["apply_calls"] = 11
+    with pytest.raises(ValueError, match="target-slew cadence mismatch"):
+        validate_episode_safety_cadence(
+            safety=drifted,
+            episode_result=_episode_result(numerical_failure=True),
+        )
+
+    drifted = copy.deepcopy(completed_safety)
+    drifted["gripper_runtime_dynamic"]["driver_target_slew"]["process_action_calls"] = 1
+    with pytest.raises(ValueError, match="target-slew cadence mismatch"):
+        validate_episode_safety_cadence(
+            safety=drifted,
+            episode_result=_episode_result(),
         )
 
 

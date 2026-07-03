@@ -21,6 +21,63 @@ def _tensor(values, *, shape, device):
     }
 
 
+def _target_slew_static():
+    return {
+        "profile": runtime.EEF_GRIPPER_TARGET_SLEW_PROFILE,
+        "scope": "eef_pose_only_native_joint_position_unchanged_v1",
+        "action_class": runtime.EEF_GRIPPER_TARGET_SLEW_ACTION_CLASS,
+        "driver_joint_name": runtime.DRIVEN_GRIPPER_JOINT_NAME,
+        "driver_joint_index": runtime.DRIVEN_GRIPPER_JOINT_INDEX,
+        "endpoint_semantics_profile": runtime.GRIPPER_THRESHOLD_PROFILE,
+        "open_target_rad": runtime.GRIPPER_OPEN_TARGET_FLOAT32,
+        "closed_target_rad": runtime.GRIPPER_CLOSED_TARGET_FLOAT32,
+        "velocity_limit_source": (
+            "live_implicit_actuator_velocity_limit_sim_float32_v1"
+        ),
+        "velocity_limit_rad_s": runtime.GRIPPER_DRIVER_VELOCITY_LIMIT_FLOAT32,
+        "physics_hz": runtime.GRIPPER_TARGET_SLEW_PHYSICS_HZ,
+        "physics_dt": runtime.GRIPPER_TARGET_SLEW_PHYSICS_DT,
+        "max_target_step_rad": runtime.GRIPPER_MAX_TARGET_STEP_FLOAT32,
+        "float32_tolerance_rad": (runtime.GRIPPER_TARGET_SLEW_FLOAT32_TOLERANCE_RAD),
+        "reset_profile": runtime.EEF_GRIPPER_TARGET_SLEW_RESET_PROFILE,
+        "tensor_dtype": runtime.PINNED_TENSOR_DTYPE,
+        "tensor_device": runtime.PINNED_ACTUATOR_DEVICE,
+    }
+
+
+def _target_slew_dynamic(*, process_calls=1, apply_calls=1):
+    return {
+        "profile": runtime.EEF_GRIPPER_TARGET_SLEW_PROFILE,
+        "process_action_calls": process_calls,
+        "apply_calls": apply_calls,
+        "initialization_count": int(apply_calls > 0),
+        "endpoint_change_count": 0,
+        "repeated_endpoint_process_count": max(process_calls - 1, 0),
+        "slew_limited_apply_count": apply_calls,
+        "endpoint_reached_apply_count": 0,
+        "live_limit_validation_count": apply_calls,
+        "max_abs_target_step_rad": (
+            runtime.GRIPPER_MAX_TARGET_STEP_FLOAT32 if apply_calls else 0.0
+        ),
+        "max_abs_endpoint_error_before_step_rad": (
+            runtime.GRIPPER_CLOSED_TARGET_FLOAT32 if apply_calls else 0.0
+        ),
+        "max_abs_endpoint_error_after_step_rad": (
+            runtime.GRIPPER_CLOSED_TARGET_FLOAT32
+            - runtime.GRIPPER_MAX_TARGET_STEP_FLOAT32
+            if apply_calls
+            else 0.0
+        ),
+        "initial_anchor_rad": 0.0 if apply_calls else None,
+        "last_requested_endpoint_rad": (
+            runtime.GRIPPER_CLOSED_TARGET_FLOAT32 if process_calls else None
+        ),
+        "last_applied_target_rad": (
+            runtime.GRIPPER_MAX_TARGET_STEP_FLOAT32 if apply_calls else None
+        ),
+    }
+
+
 def _static_contract():
     before = _tensor(
         runtime.EXPECTED_FULL_VELOCITY_LIMITS_BEFORE_WRITE,
@@ -75,6 +132,7 @@ def _static_contract():
             "articulation_indices": [0],
             "full_input": copy.deepcopy(after),
         },
+        "driver_target_slew": _target_slew_static(),
         "measured_velocity_is_hard_bounded_by_limit": False,
     }
 
@@ -112,6 +170,7 @@ def _dynamic_evidence():
         "max_abs_joint_acceleration_rad_s2": [0.0] * 6,
         "max_velocity_diagnostic": diagnostic,
         "terminal_state": terminal,
+        "driver_target_slew": _target_slew_dynamic(),
         "nonfinite_samples": 0,
         "dropped_diagnostics": 0,
     }
@@ -153,8 +212,24 @@ class _FakeArmTerm:
     def __init__(self):
         self.installed = None
 
-    def install_gripper_runtime_contract(self, contract):
+    def install_gripper_runtime_contract(self, contract, *, finger_term):
         self.installed = contract
+        self.finger_term = finger_term
+
+
+class EefBinaryJointPositionTargetSlewAction:
+    def __init__(self, static):
+        self.static = static
+        self.installed = None
+
+    def gripper_target_slew_static_contract(self):
+        return copy.deepcopy(self.static)
+
+    def install_gripper_target_slew_contract(self, contract):
+        self.installed = copy.deepcopy(contract)
+
+    def gripper_target_slew_dynamic_report(self):
+        return _target_slew_dynamic(process_calls=0, apply_calls=0)
 
 
 def test_static_contract_binds_one_follower_only_full_tensor_write():
@@ -171,12 +246,13 @@ def test_installer_performs_one_full_cpu_write_and_later_reset_only_reads(
 ):
     view = _FakePhysxView()
     arm_term = _FakeArmTerm()
+    finger_term = EefBinaryJointPositionTargetSlewAction(_target_slew_static())
     robot = SimpleNamespace(root_physx_view=view)
     env = SimpleNamespace(
         unwrapped=SimpleNamespace(
             scene={"robot": robot},
             action_manager=SimpleNamespace(
-                _terms={"arm": arm_term, "finger_joint": object()}
+                _terms={"arm": arm_term, "finger_joint": finger_term}
             ),
         )
     )
@@ -217,6 +293,8 @@ def test_installer_performs_one_full_cpu_write_and_later_reset_only_reads(
         runtime.EXPECTED_FULL_VELOCITY_LIMITS_AFTER_WRITE
     )
     assert arm_term.installed == contract
+    assert arm_term.finger_term is finger_term
+    assert finger_term.installed == contract["driver_target_slew"]
 
     runtime.validate_eef_gripper_post_reset(env, contract)
     assert len(view.setter_calls) == 1
@@ -315,6 +393,7 @@ def test_empty_dynamic_contract_requires_zero_maxima():
             "max_abs_joint_acceleration_rad_s2": [0.0] * 6,
             "max_velocity_diagnostic": None,
             "terminal_state": None,
+            "driver_target_slew": _target_slew_dynamic(process_calls=0, apply_calls=0),
         }
     )
     runtime.validate_eef_gripper_dynamic_evidence(evidence)

@@ -176,7 +176,113 @@ SAFETY_FIELDS = {
     "guard_diagnostics",
     "max_raw_delta_diagnostic",
     "current_joint_velocity_abort",
+    "gripper_runtime_static",
+    "gripper_runtime_dynamic",
 }
+GRIPPER_RUNTIME_STATIC_FIELDS = {
+    "profile",
+    "joint_names",
+    "gripper_joint_names",
+    "gripper_joint_indices",
+    "driver_joint_name",
+    "driver_joint_index",
+    "follower_joint_names",
+    "follower_joint_indices",
+    "actuator_joint_ownership",
+    "device_partition",
+    "driver_actuator",
+    "mimic_joint_contract",
+    "velocity_limits_before_write",
+    "velocity_limits_after_write",
+    "velocity_limit_write_contract",
+    "driver_target_slew",
+    "measured_velocity_is_hard_bounded_by_limit",
+}
+GRIPPER_RUNTIME_DYNAMIC_FIELDS = {
+    "profile",
+    "joint_names",
+    "joint_indices",
+    "apply_entry_samples",
+    "post_policy_step_samples",
+    "max_abs_joint_velocity_rad_s",
+    "max_abs_joint_acceleration_rad_s2",
+    "max_velocity_diagnostic",
+    "terminal_state",
+    "driver_target_slew",
+    "nonfinite_samples",
+    "dropped_diagnostics",
+}
+GRIPPER_TARGET_SLEW_STATIC_FIELDS = {
+    "profile",
+    "scope",
+    "action_class",
+    "driver_joint_name",
+    "driver_joint_index",
+    "endpoint_semantics_profile",
+    "open_target_rad",
+    "closed_target_rad",
+    "velocity_limit_source",
+    "velocity_limit_rad_s",
+    "physics_hz",
+    "physics_dt",
+    "max_target_step_rad",
+    "float32_tolerance_rad",
+    "reset_profile",
+    "tensor_dtype",
+    "tensor_device",
+}
+GRIPPER_TARGET_SLEW_DYNAMIC_FIELDS = {
+    "profile",
+    "process_action_calls",
+    "apply_calls",
+    "initialization_count",
+    "endpoint_change_count",
+    "repeated_endpoint_process_count",
+    "slew_limited_apply_count",
+    "endpoint_reached_apply_count",
+    "live_limit_validation_count",
+    "max_abs_target_step_rad",
+    "max_abs_endpoint_error_before_step_rad",
+    "max_abs_endpoint_error_after_step_rad",
+    "initial_anchor_rad",
+    "last_requested_endpoint_rad",
+    "last_applied_target_rad",
+}
+GRIPPER_TENSOR_FIELDS = {
+    "dtype",
+    "device",
+    "shape",
+    "values",
+    "finite_mask",
+    "finite_count",
+}
+GRIPPER_RUNTIME_PROFILE = (
+    "implicit_gripper_physx_velocity_limit5_followers5_"
+    "cuda_actuator_cpu_static_physx_v1"
+)
+GRIPPER_TARGET_SLEW_PROFILE = (
+    "eef_binary_driver_target_slew_live_limit_per_120hz_substep_v1"
+)
+GRIPPER_TARGET_SLEW_ACTION_CLASS = "EefBinaryJointPositionTargetSlewAction"
+GRIPPER_TARGET_SLEW_RESET_PROFILE = (
+    "first_apply_after_action_reset_anchor_live_driver_position_v1"
+)
+GRIPPER_JOINT_NAMES = [
+    "finger_joint",
+    "right_outer_knuckle_joint",
+    "left_inner_finger_joint",
+    "right_inner_finger_joint",
+    "left_inner_finger_knuckle_joint",
+    "right_inner_finger_knuckle_joint",
+]
+EXPECTED_DROID_JOINT_NAMES = [*EXPECTED_JOINT_NAMES, *GRIPPER_JOINT_NAMES]
+GRIPPER_MAX_TARGET_STEP = struct.unpack(
+    "<f",
+    struct.pack("<f", 5.0 * struct.unpack("<f", struct.pack("<f", 1.0 / 120.0))[0]),
+)[0]
+GRIPPER_CLOSED_TARGET = struct.unpack("<f", struct.pack("<f", math.pi / 4.0))[0]
+GRIPPER_MIN_ANCHOR = _float32(-_float32(1e-6))
+GRIPPER_MAX_ANCHOR = _float32(GRIPPER_CLOSED_TARGET + _float32(1e-6))
 COUNTER_FIELDS = {
     "apply_calls",
     "environment_substeps",
@@ -433,14 +539,488 @@ def _validate_diagnostic(
     return flattened, diagnostic
 
 
+def _same_float32(actual: Any, expected: float) -> bool:
+    return (
+        type(actual) is float
+        and math.isfinite(actual)
+        and struct.pack("<f", actual) == struct.pack("<f", expected)
+    )
+
+
+def _validate_gripper_tensor(
+    value: Any,
+    *,
+    field: str,
+    expected: list[float],
+    shape: list[int],
+    device: str,
+) -> dict[str, Any]:
+    tensor = _object(value, field)
+    _require(set(tensor) == GRIPPER_TENSOR_FIELDS, f"{field} schema drift")
+    _require(tensor.get("dtype") == "torch.float32", f"{field} dtype")
+    _require(tensor.get("device") == device, f"{field} device")
+    _require(tensor.get("shape") == shape, f"{field} shape")
+    values = _list(tensor.get("values"), f"{field}.values", length=len(expected))
+    _require(
+        tensor.get("finite_mask") == [True] * len(expected)
+        and tensor.get("finite_count") == len(expected),
+        f"{field} finite evidence",
+    )
+    _require(
+        all(
+            _same_float32(actual, wanted)
+            for actual, wanted in zip(values, expected, strict=True)
+        ),
+        f"{field} values",
+    )
+    return tensor
+
+
+def _validate_gripper_target_slew_static(value: Any, *, field: str) -> None:
+    contract = _object(value, field)
+    _require(
+        set(contract) == GRIPPER_TARGET_SLEW_STATIC_FIELDS,
+        f"{field} schema drift",
+    )
+    exact = {
+        "profile": GRIPPER_TARGET_SLEW_PROFILE,
+        "scope": "eef_pose_only_native_joint_position_unchanged_v1",
+        "action_class": GRIPPER_TARGET_SLEW_ACTION_CLASS,
+        "driver_joint_name": "finger_joint",
+        "driver_joint_index": 7,
+        "endpoint_semantics_profile": ("closed_positive_ge_0p5_inverse_open_gt_0p5_v1"),
+        "velocity_limit_source": (
+            "live_implicit_actuator_velocity_limit_sim_float32_v1"
+        ),
+        "physics_hz": 120.0,
+        "physics_dt": 1.0 / 120.0,
+        "float32_tolerance_rad": 1e-6,
+        "reset_profile": GRIPPER_TARGET_SLEW_RESET_PROFILE,
+        "tensor_dtype": "torch.float32",
+        "tensor_device": "cuda:0",
+    }
+    for name, expected in exact.items():
+        _require(
+            type(contract.get(name)) is type(expected)
+            and contract.get(name) == expected,
+            f"{field}.{name}",
+        )
+    for name, expected in (
+        ("open_target_rad", 0.0),
+        ("closed_target_rad", GRIPPER_CLOSED_TARGET),
+        ("velocity_limit_rad_s", 5.0),
+        ("max_target_step_rad", GRIPPER_MAX_TARGET_STEP),
+    ):
+        _require(_same_float32(contract.get(name), expected), f"{field}.{name}")
+    recomputed = _float32(
+        _float32(contract["velocity_limit_rad_s"]) * _float32(contract["physics_dt"])
+    )
+    _require(
+        _same_float32(recomputed, contract["max_target_step_rad"]),
+        f"{field} live-limit/cadence cap binding",
+    )
+
+
+def _validate_gripper_static(value: Any, *, field: str) -> None:
+    contract = _object(value, field)
+    _require(set(contract) == GRIPPER_RUNTIME_STATIC_FIELDS, f"{field} schema drift")
+    exact = {
+        "profile": GRIPPER_RUNTIME_PROFILE,
+        "joint_names": EXPECTED_DROID_JOINT_NAMES,
+        "gripper_joint_names": GRIPPER_JOINT_NAMES,
+        "gripper_joint_indices": list(range(7, 13)),
+        "driver_joint_name": "finger_joint",
+        "driver_joint_index": 7,
+        "follower_joint_names": GRIPPER_JOINT_NAMES[1:],
+        "follower_joint_indices": list(range(8, 13)),
+        "actuator_joint_ownership": {
+            "panda_shoulder": {
+                "joint_names": EXPECTED_JOINT_NAMES[:4],
+                "joint_indices": list(range(4)),
+            },
+            "panda_forearm": {
+                "joint_names": EXPECTED_JOINT_NAMES[4:],
+                "joint_indices": list(range(4, 7)),
+            },
+            "gripper": {"joint_names": ["finger_joint"], "joint_indices": [7]},
+        },
+        "device_partition": {
+            "profile": "nvidia_droid_cuda_dynamic_actuator_cpu_static_physx_v1",
+            "dynamic_articulation": "cuda:0",
+            "implicit_actuator": "cuda:0",
+            "static_physx": "cpu",
+            "dtype": "torch.float32",
+        },
+        "measured_velocity_is_hard_bounded_by_limit": False,
+    }
+    for name, expected in exact.items():
+        _require(_typed_equal(contract.get(name), expected), f"{field}.{name}")
+
+    actuator = _object(contract.get("driver_actuator"), f"{field}.driver_actuator")
+    actuator_fields = {
+        "cfg_velocity_limit",
+        "cfg_velocity_limit_sim",
+        "cfg_effort_limit",
+        "cfg_effort_limit_sim",
+        "resolved_velocity_limit",
+        "resolved_velocity_limit_sim",
+        "resolved_effort_limit",
+        "resolved_effort_limit_sim",
+    }
+    _require(set(actuator) == actuator_fields, f"{field}.driver_actuator schema")
+    for name, expected in (
+        ("cfg_velocity_limit", 5.0),
+        ("cfg_velocity_limit_sim", 5.0),
+        ("cfg_effort_limit", 200.0),
+        ("cfg_effort_limit_sim", 200.0),
+    ):
+        _exact_float(actuator.get(name), expected, f"{field}.driver_actuator.{name}")
+    for name in actuator_fields - {
+        "cfg_velocity_limit",
+        "cfg_velocity_limit_sim",
+        "cfg_effort_limit",
+        "cfg_effort_limit_sim",
+    }:
+        _validate_gripper_tensor(
+            actuator[name],
+            field=f"{field}.driver_actuator.{name}",
+            expected=[200.0 if "effort" in name else 5.0],
+            shape=[1, 1],
+            device="cuda:0",
+        )
+
+    mimic = _object(contract.get("mimic_joint_contract"), f"{field}.mimic")
+    _require(
+        set(mimic)
+        == {
+            "profile",
+            "robot_usd_sha256",
+            "driver_joint_name",
+            "driver_joint_index",
+            "driver_joint_prim_path",
+            "driver_physics_joint_type",
+            "driver_exclude_from_articulation",
+            "followers",
+        },
+        f"{field}.mimic schema",
+    )
+    _require(
+        mimic.get("profile") == "robotiq_2f85_source_usd_physx_mimic_joint_v1"
+        and mimic.get("robot_usd_sha256")
+        == "d8379925b103963dbf3e7c85bcc4ae101b81b7c1d7dabe7d2e964f41d069ec44"
+        and mimic.get("driver_joint_name") == "finger_joint"
+        and mimic.get("driver_joint_index") == 7
+        and mimic.get("driver_joint_prim_path")
+        == "/panda/Gripper/Robotiq_2F_85/Joints/finger_joint"
+        and mimic.get("driver_physics_joint_type") == "PhysicsRevoluteJoint"
+        and mimic.get("driver_exclude_from_articulation") is False,
+        f"{field}.mimic identity",
+    )
+    followers = _list(mimic.get("followers"), f"{field}.mimic.followers", length=5)
+    follower_fields = {
+        "joint_name",
+        "joint_index",
+        "prim_path",
+        "physics_joint_type",
+        "exclude_from_articulation",
+        "mimic_axis",
+        "reference_joint_path",
+        "gearing",
+        "natural_frequency_hz",
+        "damping_ratio",
+    }
+    _require(
+        [item.get("joint_name") for item in followers] == GRIPPER_JOINT_NAMES[1:]
+        and [item.get("joint_index") for item in followers] == list(range(8, 13))
+        and all(set(item) == follower_fields for item in followers)
+        and all(
+            item.get("physics_joint_type") == "PhysicsRevoluteJoint"
+            and item.get("exclude_from_articulation") is False
+            and item.get("prim_path")
+            == f"/panda/Gripper/Robotiq_2F_85/Joints/{item['joint_name']}"
+            and item.get("reference_joint_path") == mimic.get("driver_joint_prim_path")
+            for item in followers
+        ),
+        f"{field}.mimic followers",
+    )
+    expected_mimic_values = [
+        ("rotZ", -1.0, 1_000_000.0, 0.0),
+        ("rotX", 1.0, 1_000.0, 0.05000000074505806),
+        ("rotX", -1.0, 1_000.0, 0.05000000074505806),
+        ("rotX", 1.0, 1_000.0, 0.05000000074505806),
+        ("rotX", 1.0, 1_000.0, 0.05000000074505806),
+    ]
+    for index, (item, expected) in enumerate(
+        zip(followers, expected_mimic_values, strict=True)
+    ):
+        _require(
+            item.get("mimic_axis") == expected[0]
+            and _same_float32(item.get("gearing"), expected[1])
+            and _same_float32(item.get("natural_frequency_hz"), expected[2])
+            and _same_float32(item.get("damping_ratio"), expected[3]),
+            f"{field}.mimic follower {index} values",
+        )
+
+    before_values = [*EXPECTED_VELOCITY_LIMITS, 5.0, *([174.53292846679688] * 5)]
+    after_values = [*EXPECTED_VELOCITY_LIMITS, *([5.0] * 6)]
+    before = _validate_gripper_tensor(
+        contract.get("velocity_limits_before_write"),
+        field=f"{field}.before_write",
+        expected=before_values,
+        shape=[1, 13],
+        device="cpu",
+    )
+    after = _validate_gripper_tensor(
+        contract.get("velocity_limits_after_write"),
+        field=f"{field}.after_write",
+        expected=after_values,
+        shape=[1, 13],
+        device="cpu",
+    )
+    write = _object(contract.get("velocity_limit_write_contract"), f"{field}.write")
+    _require(
+        set(write)
+        == {
+            "profile",
+            "setter",
+            "timing",
+            "call_count",
+            "articulation_indices",
+            "full_input",
+        }
+        and write.get("profile")
+        == "live_root_physx_view_full_tensor_five_mimic_dofs_velocity_limit5_eef_production_v1"
+        and write.get("setter") == "root_physx_view.set_dof_max_velocities"
+        and write.get("timing") == "after_first_explicit_reset_before_first_apply_v1"
+        and write.get("call_count") == 1
+        and write.get("articulation_indices") == [0],
+        f"{field}.write identity",
+    )
+    full_input = _validate_gripper_tensor(
+        write.get("full_input"),
+        field=f"{field}.write.full_input",
+        expected=after_values,
+        shape=[1, 13],
+        device="cpu",
+    )
+    _require(_typed_equal(after, full_input), f"{field}.write/readback")
+    _require(before["values"][:8] == after["values"][:8], f"{field}.driver drift")
+    _validate_gripper_target_slew_static(
+        contract.get("driver_target_slew"), field=f"{field}.target_slew"
+    )
+
+
+def _validate_gripper_target_slew_dynamic(
+    value: Any, *, field: str, apply_calls: int, expect_closed_target: bool
+) -> None:
+    report = _object(value, field)
+    _require(
+        set(report) == GRIPPER_TARGET_SLEW_DYNAMIC_FIELDS,
+        f"{field} schema drift",
+    )
+    _require(report.get("profile") == GRIPPER_TARGET_SLEW_PROFILE, f"{field}.profile")
+    expected_process = apply_calls // 8
+    counters = {
+        name: report.get(name)
+        for name in (
+            "process_action_calls",
+            "apply_calls",
+            "initialization_count",
+            "endpoint_change_count",
+            "repeated_endpoint_process_count",
+            "slew_limited_apply_count",
+            "endpoint_reached_apply_count",
+            "live_limit_validation_count",
+        )
+    }
+    _require(
+        all(type(item) is int and item >= 0 for item in counters.values()),
+        f"{field}.counters",
+    )
+    _require(
+        counters["process_action_calls"] == expected_process
+        and counters["apply_calls"] == apply_calls
+        and counters["live_limit_validation_count"] == apply_calls
+        and counters["initialization_count"] == int(apply_calls > 0)
+        and counters["endpoint_change_count"] == 0
+        and counters["repeated_endpoint_process_count"] == max(expected_process - 1, 0)
+        and counters["slew_limited_apply_count"]
+        + counters["endpoint_reached_apply_count"]
+        == apply_calls,
+        f"{field}.cadence/history",
+    )
+    maxima = [
+        _finite_number(report.get(name), f"{field}.{name}")
+        for name in (
+            "max_abs_target_step_rad",
+            "max_abs_endpoint_error_before_step_rad",
+            "max_abs_endpoint_error_after_step_rad",
+        )
+    ]
+    _require(
+        all(item >= 0.0 for item in maxima)
+        and maxima[0] <= GRIPPER_MAX_TARGET_STEP + 1e-6
+        and maxima[1] <= GRIPPER_MAX_ANCHOR
+        and maxima[2] <= maxima[1] + 1e-6,
+        f"{field}.maxima",
+    )
+    if apply_calls == 0:
+        _require(
+            maxima == [0.0, 0.0, 0.0]
+            and report.get("initial_anchor_rad") is None
+            and report.get("last_requested_endpoint_rad") is None
+            and report.get("last_applied_target_rad") is None,
+            f"{field}.empty state",
+        )
+    else:
+        anchor = _finite_number(report.get("initial_anchor_rad"), f"{field}.anchor")
+        endpoint = _finite_number(
+            report.get("last_requested_endpoint_rad"), f"{field}.endpoint"
+        )
+        applied = _finite_number(
+            report.get("last_applied_target_rad"), f"{field}.applied"
+        )
+        expected_endpoint = GRIPPER_CLOSED_TARGET if expect_closed_target else 0.0
+        _require(
+            GRIPPER_MIN_ANCHOR <= anchor <= GRIPPER_MAX_ANCHOR
+            and _same_float32(endpoint, expected_endpoint)
+            and GRIPPER_MIN_ANCHOR <= applied <= GRIPPER_MAX_ANCHOR,
+            f"{field}.state",
+        )
+        if expect_closed_target:
+            _require(
+                apply_calls >= 19
+                and counters["slew_limited_apply_count"] == 18
+                and counters["endpoint_reached_apply_count"] == apply_calls - 18
+                and _same_float32(maxima[0], GRIPPER_MAX_TARGET_STEP)
+                and _same_float32(maxima[1], GRIPPER_CLOSED_TARGET)
+                and _same_float32(anchor, 0.0)
+                and _same_float32(applied, GRIPPER_CLOSED_TARGET),
+                f"{field}.closed transition",
+            )
+        else:
+            _require(
+                counters["slew_limited_apply_count"] == 0
+                and counters["endpoint_reached_apply_count"] == apply_calls
+                and maxima == [0.0, 0.0, 0.0]
+                and _same_float32(anchor, 0.0)
+                and _same_float32(applied, 0.0),
+                f"{field}.open hold",
+            )
+
+
+def _validate_gripper_dynamic(
+    value: Any, *, field: str, apply_calls: int, expect_closed_target: bool
+) -> None:
+    report = _object(value, field)
+    _require(set(report) == GRIPPER_RUNTIME_DYNAMIC_FIELDS, f"{field} schema drift")
+    _require(
+        report.get("profile") == GRIPPER_RUNTIME_PROFILE
+        and report.get("joint_names") == GRIPPER_JOINT_NAMES
+        and report.get("joint_indices") == list(range(7, 13)),
+        f"{field}.identity",
+    )
+    _require(
+        report.get("apply_entry_samples") == apply_calls
+        and report.get("post_policy_step_samples") == apply_calls // 8
+        and report.get("nonfinite_samples") == 0
+        and report.get("dropped_diagnostics") == 0,
+        f"{field}.cadence",
+    )
+    physical_maxima = {}
+    for name in (
+        "max_abs_joint_velocity_rad_s",
+        "max_abs_joint_acceleration_rad_s2",
+    ):
+        vector = _finite_vector(report.get(name), f"{field}.{name}", length=6)
+        _require(all(item >= 0.0 for item in vector), f"{field}.{name}")
+        physical_maxima[name] = vector
+    diagnostic = report.get("max_velocity_diagnostic")
+    terminal = report.get("terminal_state")
+    if apply_calls == 0:
+        _require(diagnostic is None and terminal is None, f"{field}.empty diagnostics")
+    else:
+        diagnostic = _object(diagnostic, f"{field}.max_velocity_diagnostic")
+        _require(
+            set(diagnostic)
+            == {
+                "sample_phase",
+                "sample_index",
+                "joint_position_rad",
+                "joint_velocity_rad_s",
+                "joint_acceleration_rad_s2",
+                "joint_position_target_rad",
+                "joint_velocity_target_rad_s",
+            }
+            and diagnostic.get("sample_phase") in {"apply_entry", "post_policy_step"}
+            and type(diagnostic.get("sample_index")) is int
+            and 0 <= diagnostic["sample_index"] < apply_calls + apply_calls // 8,
+            f"{field}.max_velocity_diagnostic identity",
+        )
+        diagnostic_vectors = {}
+        for name in (
+            "joint_position_rad",
+            "joint_velocity_rad_s",
+            "joint_acceleration_rad_s2",
+            "joint_position_target_rad",
+            "joint_velocity_target_rad_s",
+        ):
+            diagnostic_vectors[name] = _finite_vector(
+                diagnostic.get(name), f"{field}.diagnostic.{name}", length=6
+            )
+        _require(
+            _same_float32(
+                max(abs(item) for item in diagnostic_vectors["joint_velocity_rad_s"]),
+                max(physical_maxima["max_abs_joint_velocity_rad_s"]),
+            ),
+            f"{field}.diagnostic/velocity maximum",
+        )
+        terminal = _object(terminal, f"{field}.terminal")
+        _require(
+            set(terminal)
+            == {
+                "sample_index",
+                "joint_position_rad",
+                "joint_velocity_rad_s",
+                "joint_acceleration_rad_s2",
+                "joint_position_target_rad",
+                "joint_velocity_target_rad_s",
+            }
+            and terminal.get("sample_index") == (apply_calls // 8) * 9 - 1,
+            f"{field}.terminal identity",
+        )
+        for name in set(terminal) - {"sample_index"}:
+            _finite_vector(terminal.get(name), f"{field}.terminal.{name}", length=6)
+    _validate_gripper_target_slew_dynamic(
+        report.get("driver_target_slew"),
+        field=f"{field}.target_slew",
+        apply_calls=apply_calls,
+        expect_closed_target=expect_closed_target,
+    )
+
+
 def _validate_safety_report(
-    value: Any, *, field: str, episode_index: int | None, apply_calls: int
+    value: Any,
+    *,
+    field: str,
+    episode_index: int | None,
+    apply_calls: int,
+    expect_closed_target: bool = False,
 ) -> tuple[dict[str, int], dict[str, list[float]]]:
     report = _object(value, field)
     _require(set(report) == SAFETY_FIELDS, f"{field} schema drift")
     _require(
         report.get("current_joint_velocity_abort") is None,
         f"{field}.current_joint_velocity_abort must be null",
+    )
+    _validate_gripper_static(
+        report.get("gripper_runtime_static"), field=f"{field}.gripper_static"
+    )
+    _validate_gripper_dynamic(
+        report.get("gripper_runtime_dynamic"),
+        field=f"{field}.gripper_dynamic",
+        apply_calls=apply_calls,
+        expect_closed_target=expect_closed_target,
     )
     if episode_index is None:
         _require(report.get("episode_index") is None, f"{field}.episode_index")
@@ -1096,6 +1676,7 @@ def _verify_raw(raw: dict[str, Any]) -> dict[str, Any]:
             field=f"safety[{index}]",
             episode_index=index,
             apply_calls=360,
+            expect_closed_target=index == 0,
         )
 
     adversarial = _object(raw.get("ik_safety_adversarial"), "adversarial")

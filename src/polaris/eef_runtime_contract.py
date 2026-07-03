@@ -66,8 +66,8 @@ CANONICAL_IK_METHOD = "dls"
 CANONICAL_DLS_DAMPING = 0.01
 CANONICAL_ARM_SCALE = 1.0
 CANONICAL_ARM_JOINTS = tuple(f"panda_joint{index}" for index in range(1, 8))
-EEF_SAFETY_SIDECAR_SCHEMA_VERSION = 4
-EEF_RUNTIME_CONTRACT_SCHEMA_VERSION = 4
+EEF_SAFETY_SIDECAR_SCHEMA_VERSION = 5
+EEF_RUNTIME_CONTRACT_SCHEMA_VERSION = 5
 EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE = "ego_lap_eef_outer450_internal451_no_autoreset_v1"
 EGO_LAP_ENVIRONMENT_STATE_PROFILE = (
     "isaaclab_single_env_episode_sim_common_camera_counters_v1"
@@ -1928,6 +1928,12 @@ def _validate_eef_runtime_safety_report(
         )
         if dynamic["apply_entry_samples"] != counters["apply_calls"]:
             raise ValueError("All-six gripper/apply sample counts disagree")
+        target_slew = dynamic["driver_target_slew"]
+        if target_slew["apply_calls"] not in {
+            counters["apply_calls"],
+            max(counters["apply_calls"] - 1, 0),
+        }:
+            raise ValueError("Gripper target-slew/arm apply counts disagree")
     return report
 
 
@@ -2324,6 +2330,9 @@ def _validate_episode_safety_evidence_shape(
         )
         if gripper_dynamic["apply_entry_samples"] != apply_calls:
             raise ValueError("Episode gripper/apply sample counts disagree")
+        target_slew = gripper_dynamic["driver_target_slew"]
+        if target_slew["apply_calls"] not in {apply_calls, max(apply_calls - 1, 0)}:
+            raise ValueError("Episode target-slew/arm apply counts disagree")
     if candidate_enabled:
         expected_candidate_static = {
             "wrist_energy_brake_profile": WRIST_ENERGY_BRAKE_PROFILE,
@@ -2549,6 +2558,19 @@ def validate_episode_safety_cadence(
                 "Episode all-six gripper post-step cadence mismatch: "
                 f"expected={expected_post_samples}, "
                 f"actual={gripper_dynamic['post_policy_step_samples']}"
+            )
+        target_slew = gripper_dynamic["driver_target_slew"]
+        expected_target_apply_calls = apply_calls - int(numerical_failure)
+        if (
+            target_slew["process_action_calls"] != episode_length
+            or target_slew["apply_calls"] != expected_target_apply_calls
+        ):
+            raise ValueError(
+                "Episode gripper target-slew cadence mismatch: "
+                f"expected_process={episode_length}, "
+                f"actual_process={target_slew['process_action_calls']}, "
+                f"expected_apply={expected_target_apply_calls}, "
+                f"actual_apply={target_slew['apply_calls']}"
             )
         nonfinite_samples = gripper_dynamic["nonfinite_samples"]
         if numerical_failure:

@@ -28,6 +28,226 @@ def _diagnostic_vector(values):
     }
 
 
+def _gripper_tensor(values, *, shape, device):
+    return {
+        "dtype": "torch.float32",
+        "device": device,
+        "shape": list(shape),
+        "values": list(values),
+        "finite_mask": [True] * len(values),
+        "finite_count": len(values),
+    }
+
+
+def _gripper_static():
+    before_values = [
+        *finalizer.EXPECTED_VELOCITY_LIMITS,
+        5.0,
+        *([174.53292846679688] * 5),
+    ]
+    after_values = [*finalizer.EXPECTED_VELOCITY_LIMITS, *([5.0] * 6)]
+    before = _gripper_tensor(before_values, shape=(1, 13), device="cpu")
+    after = _gripper_tensor(after_values, shape=(1, 13), device="cpu")
+    root = "/panda/Gripper/Robotiq_2F_85/Joints"
+    driver_path = f"{root}/finger_joint"
+    follower_specs = [
+        ("right_outer_knuckle_joint", 8, "rotZ", -1.0, 1_000_000.0, 0.0),
+        ("left_inner_finger_joint", 9, "rotX", 1.0, 1_000.0, 0.05),
+        ("right_inner_finger_joint", 10, "rotX", -1.0, 1_000.0, 0.05),
+        ("left_inner_finger_knuckle_joint", 11, "rotX", 1.0, 1_000.0, 0.05),
+        ("right_inner_finger_knuckle_joint", 12, "rotX", 1.0, 1_000.0, 0.05),
+    ]
+    actuator = {
+        "cfg_velocity_limit": 5.0,
+        "cfg_velocity_limit_sim": 5.0,
+        "cfg_effort_limit": 200.0,
+        "cfg_effort_limit_sim": 200.0,
+        "resolved_velocity_limit": _gripper_tensor(
+            [5.0], shape=(1, 1), device="cuda:0"
+        ),
+        "resolved_velocity_limit_sim": _gripper_tensor(
+            [5.0], shape=(1, 1), device="cuda:0"
+        ),
+        "resolved_effort_limit": _gripper_tensor(
+            [200.0], shape=(1, 1), device="cuda:0"
+        ),
+        "resolved_effort_limit_sim": _gripper_tensor(
+            [200.0], shape=(1, 1), device="cuda:0"
+        ),
+    }
+    return {
+        "profile": finalizer.GRIPPER_RUNTIME_PROFILE,
+        "joint_names": finalizer.EXPECTED_DROID_JOINT_NAMES,
+        "gripper_joint_names": finalizer.GRIPPER_JOINT_NAMES,
+        "gripper_joint_indices": list(range(7, 13)),
+        "driver_joint_name": "finger_joint",
+        "driver_joint_index": 7,
+        "follower_joint_names": finalizer.GRIPPER_JOINT_NAMES[1:],
+        "follower_joint_indices": list(range(8, 13)),
+        "actuator_joint_ownership": {
+            "panda_shoulder": {
+                "joint_names": finalizer.EXPECTED_JOINT_NAMES[:4],
+                "joint_indices": list(range(4)),
+            },
+            "panda_forearm": {
+                "joint_names": finalizer.EXPECTED_JOINT_NAMES[4:],
+                "joint_indices": list(range(4, 7)),
+            },
+            "gripper": {"joint_names": ["finger_joint"], "joint_indices": [7]},
+        },
+        "device_partition": {
+            "profile": "nvidia_droid_cuda_dynamic_actuator_cpu_static_physx_v1",
+            "dynamic_articulation": "cuda:0",
+            "implicit_actuator": "cuda:0",
+            "static_physx": "cpu",
+            "dtype": "torch.float32",
+        },
+        "driver_actuator": actuator,
+        "mimic_joint_contract": {
+            "profile": "robotiq_2f85_source_usd_physx_mimic_joint_v1",
+            "robot_usd_sha256": (
+                "d8379925b103963dbf3e7c85bcc4ae101b81b7c1d7dabe7d2e964f41d069ec44"
+            ),
+            "driver_joint_name": "finger_joint",
+            "driver_joint_index": 7,
+            "driver_joint_prim_path": driver_path,
+            "driver_physics_joint_type": "PhysicsRevoluteJoint",
+            "driver_exclude_from_articulation": False,
+            "followers": [
+                {
+                    "joint_name": name,
+                    "joint_index": index,
+                    "prim_path": f"{root}/{name}",
+                    "physics_joint_type": "PhysicsRevoluteJoint",
+                    "exclude_from_articulation": False,
+                    "mimic_axis": axis,
+                    "reference_joint_path": driver_path,
+                    "gearing": gearing,
+                    "natural_frequency_hz": frequency,
+                    "damping_ratio": damping,
+                }
+                for name, index, axis, gearing, frequency, damping in follower_specs
+            ],
+        },
+        "velocity_limits_before_write": before,
+        "velocity_limits_after_write": after,
+        "velocity_limit_write_contract": {
+            "profile": (
+                "live_root_physx_view_full_tensor_five_mimic_dofs_"
+                "velocity_limit5_eef_production_v1"
+            ),
+            "setter": "root_physx_view.set_dof_max_velocities",
+            "timing": "after_first_explicit_reset_before_first_apply_v1",
+            "call_count": 1,
+            "articulation_indices": [0],
+            "full_input": copy.deepcopy(after),
+        },
+        "driver_target_slew": {
+            "profile": finalizer.GRIPPER_TARGET_SLEW_PROFILE,
+            "scope": "eef_pose_only_native_joint_position_unchanged_v1",
+            "action_class": finalizer.GRIPPER_TARGET_SLEW_ACTION_CLASS,
+            "driver_joint_name": "finger_joint",
+            "driver_joint_index": 7,
+            "endpoint_semantics_profile": (
+                "closed_positive_ge_0p5_inverse_open_gt_0p5_v1"
+            ),
+            "open_target_rad": 0.0,
+            "closed_target_rad": finalizer.GRIPPER_CLOSED_TARGET,
+            "velocity_limit_source": (
+                "live_implicit_actuator_velocity_limit_sim_float32_v1"
+            ),
+            "velocity_limit_rad_s": 5.0,
+            "physics_hz": 120.0,
+            "physics_dt": 1.0 / 120.0,
+            "max_target_step_rad": finalizer.GRIPPER_MAX_TARGET_STEP,
+            "float32_tolerance_rad": 1e-6,
+            "reset_profile": finalizer.GRIPPER_TARGET_SLEW_RESET_PROFILE,
+            "tensor_dtype": "torch.float32",
+            "tensor_device": "cuda:0",
+        },
+        "measured_velocity_is_hard_bounded_by_limit": False,
+    }
+
+
+def _gripper_dynamic(apply_calls, *, closed):
+    post_samples = apply_calls // 8
+    vector = [0.0] * 6
+    diagnostic = None
+    terminal = None
+    if apply_calls:
+        diagnostic = {
+            "sample_phase": "apply_entry",
+            "sample_index": 0,
+            "joint_position_rad": vector,
+            "joint_velocity_rad_s": vector,
+            "joint_acceleration_rad_s2": vector,
+            "joint_position_target_rad": vector,
+            "joint_velocity_target_rad_s": vector,
+        }
+        terminal = {
+            "sample_index": post_samples * 9 - 1,
+            "joint_position_rad": vector,
+            "joint_velocity_rad_s": vector,
+            "joint_acceleration_rad_s2": vector,
+            "joint_position_target_rad": vector,
+            "joint_velocity_target_rad_s": vector,
+        }
+    process_calls = post_samples
+    limited = min(18, apply_calls) if closed else 0
+    return {
+        "profile": finalizer.GRIPPER_RUNTIME_PROFILE,
+        "joint_names": finalizer.GRIPPER_JOINT_NAMES,
+        "joint_indices": list(range(7, 13)),
+        "apply_entry_samples": apply_calls,
+        "post_policy_step_samples": post_samples,
+        "max_abs_joint_velocity_rad_s": vector,
+        "max_abs_joint_acceleration_rad_s2": vector,
+        "max_velocity_diagnostic": diagnostic,
+        "terminal_state": terminal,
+        "driver_target_slew": {
+            "profile": finalizer.GRIPPER_TARGET_SLEW_PROFILE,
+            "process_action_calls": process_calls,
+            "apply_calls": apply_calls,
+            "initialization_count": int(apply_calls > 0),
+            "endpoint_change_count": 0,
+            "repeated_endpoint_process_count": max(process_calls - 1, 0),
+            "slew_limited_apply_count": limited,
+            "endpoint_reached_apply_count": apply_calls - limited,
+            "live_limit_validation_count": apply_calls,
+            "max_abs_target_step_rad": (
+                finalizer.GRIPPER_MAX_TARGET_STEP if apply_calls and closed else 0.0
+            ),
+            "max_abs_endpoint_error_before_step_rad": (
+                finalizer.GRIPPER_CLOSED_TARGET if apply_calls and closed else 0.0
+            ),
+            "max_abs_endpoint_error_after_step_rad": (
+                finalizer.GRIPPER_CLOSED_TARGET - finalizer.GRIPPER_MAX_TARGET_STEP
+                if apply_calls and closed
+                else 0.0
+            ),
+            "initial_anchor_rad": 0.0 if apply_calls else None,
+            "last_requested_endpoint_rad": (
+                finalizer.GRIPPER_CLOSED_TARGET
+                if apply_calls and closed
+                else 0.0
+                if apply_calls
+                else None
+            ),
+            "last_applied_target_rad": (
+                finalizer.GRIPPER_CLOSED_TARGET
+                if apply_calls >= 19 and closed
+                else finalizer.GRIPPER_MAX_TARGET_STEP * apply_calls
+                if apply_calls and closed
+                else 0.0
+                if apply_calls
+                else None
+            ),
+        },
+        "nonfinite_samples": 0,
+        "dropped_diagnostics": 0,
+    }
+
+
 def _safety_report(episode_index, apply_calls, *, adversarial=False):
     counters = {name: 0 for name in finalizer.COUNTER_FIELDS}
     counters["apply_calls"] = apply_calls
@@ -116,6 +336,10 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
         "guard_diagnostics": [],
         "max_raw_delta_diagnostic": max_raw,
         "current_joint_velocity_abort": None,
+        "gripper_runtime_static": _gripper_static(),
+        "gripper_runtime_dynamic": _gripper_dynamic(
+            apply_calls, closed=episode_index == 0
+        ),
     }
 
 
@@ -333,6 +557,68 @@ def test_raw_smoke_gate_requires_pending_full_evidence():
     raw = _valid_raw_result()
     raw["raw_ik_safety_capture"]["current_joint_velocity_abort"] = {}
     with pytest.raises(finalizer.VerificationError, match="must be null"):
+        finalizer._verify_raw(raw)
+
+    for path, value, match in (
+        (("gripper_runtime_static", "profile"), "wrong", "gripper_static.profile"),
+        (
+            (
+                "gripper_runtime_static",
+                "driver_target_slew",
+                "max_target_step_rad",
+            ),
+            0.1,
+            "target_slew.max_target_step",
+        ),
+        (
+            (
+                "gripper_runtime_static",
+                "driver_actuator",
+                "resolved_velocity_limit_sim",
+                "device",
+            ),
+            "cpu",
+            "device",
+        ),
+        (
+            ("gripper_runtime_dynamic", "driver_target_slew", "apply_calls"),
+            359,
+            "cadence/history",
+        ),
+        (
+            (
+                "gripper_runtime_dynamic",
+                "driver_target_slew",
+                "max_abs_target_step_rad",
+            ),
+            0.1,
+            "maxima",
+        ),
+        (
+            (
+                "gripper_runtime_dynamic",
+                "driver_target_slew",
+                "last_requested_endpoint_rad",
+            ),
+            0.0,
+            "state",
+        ),
+    ):
+        raw = _valid_raw_result()
+        target = raw["ik_safety_episodes"][0]
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        with pytest.raises(finalizer.VerificationError, match=match):
+            finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    open_slew = raw["ik_safety_episodes"][1]["gripper_runtime_dynamic"][
+        "driver_target_slew"
+    ]
+    open_slew["slew_limited_apply_count"] = 1
+    open_slew["endpoint_reached_apply_count"] -= 1
+    with pytest.raises(finalizer.VerificationError, match="open hold"):
         finalizer._verify_raw(raw)
 
     raw = _valid_raw_result()

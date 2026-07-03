@@ -1148,7 +1148,9 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         if self._failure_substep_trace_enabled:
             self._reset_failure_substep_trace_state()
 
-    def install_gripper_runtime_contract(self, contract: dict[str, object]) -> None:
+    def install_gripper_runtime_contract(
+        self, contract: dict[str, object], *, finger_term: object
+    ) -> None:
         """Bind the one-call production follower write to this action term."""
 
         if getattr(self, "_gripper_runtime_static", None) is not None:
@@ -1160,6 +1162,18 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 "PolaRiS EEF gripper contract must be installed before apply"
             )
         validated = validate_eef_gripper_static_contract(contract)
+        target_slew_static = getattr(
+            finger_term, "gripper_target_slew_static_contract", None
+        )
+        target_slew_dynamic = getattr(
+            finger_term, "gripper_target_slew_dynamic_report", None
+        )
+        if not callable(target_slew_static) or not callable(target_slew_dynamic):
+            raise ValueError(
+                "PolaRiS EEF gripper term lacks target-slew runtime evidence"
+            )
+        if target_slew_static() != validated["driver_target_slew"]:
+            raise ValueError("PolaRiS EEF gripper target-slew static evidence drifted")
         for field in (
             "joint_pos",
             "joint_vel",
@@ -1181,6 +1195,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                     f"dtype={getattr(tensor, 'dtype', None)!r}"
                 )
         self._gripper_runtime_static = validated
+        self._gripper_target_slew_term = finger_term
         self._reset_gripper_runtime_evidence()
 
     def _reset_gripper_runtime_evidence(self) -> None:
@@ -1347,6 +1362,13 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 },
             }
         )
+        target_slew_reporter = getattr(
+            getattr(self, "_gripper_target_slew_term", None),
+            "gripper_target_slew_dynamic_report",
+            None,
+        )
+        if not callable(target_slew_reporter):
+            raise ValueError("PolaRiS EEF gripper target-slew reporter is absent")
         return validate_eef_gripper_dynamic_evidence(
             {
                 "profile": EEF_GRIPPER_RUNTIME_PROFILE,
@@ -1362,6 +1384,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 .tolist(),
                 "max_velocity_diagnostic": maximum,
                 "terminal_state": terminal,
+                "driver_target_slew": target_slew_reporter(),
                 "nonfinite_samples": self._gripper_nonfinite_samples,
                 "dropped_diagnostics": self._gripper_dropped_diagnostics,
             }

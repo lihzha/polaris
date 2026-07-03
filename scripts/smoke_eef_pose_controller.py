@@ -208,7 +208,10 @@ def main(state: dict[str, object]) -> int:
     from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
     from polaris.eef_runtime_contract import begin_eef_safety_episode
     from polaris.eef_runtime_contract import eef_episode_safety_report
-    from polaris.environments.droid_cfg import EefPoseActionCfg
+    from polaris.eef_gripper_runtime import install_eef_gripper_runtime
+    from polaris.eef_gripper_runtime import record_eef_gripper_post_policy_step
+    from polaris.eef_gripper_runtime import validate_eef_gripper_post_reset
+    from polaris.environments.droid_cfg import EgoLapEefPoseActionCfg
     from polaris.environments.robot_cfg import configure_eef_pose_joint_safety
     from polaris.policy.lap_eef_pose_client import anchor_action_chunk
 
@@ -220,13 +223,19 @@ def main(state: dict[str, object]) -> int:
         num_envs=1,
         use_fabric=True,
     )
-    env_cfg.actions = EefPoseActionCfg()
+    env_cfg.actions = EgoLapEefPoseActionCfg()
     configure_eef_pose_joint_safety(
         env_cfg.scene.robot,
         physx_cfg=env_cfg.sim.physx,
+        enable_gripper_velocity_limit=True,
     )
+    robot_usd_path = Path(env_cfg.scene.robot.spawn.usd_path)
     env = gym.make(args_cli.environment, cfg=env_cfg)
     state["env"] = env
+    env.reset(expensive=False)
+    gripper_runtime_contract = install_eef_gripper_runtime(
+        env, robot_usd_path=robot_usd_path
+    )
 
     def validate_observation_frame(observation):
         result = validate_eef_runtime_frame(
@@ -278,6 +287,7 @@ def main(state: dict[str, object]) -> int:
         state["stage"] = "reset_case"
         state["case"] = label
         observation, _ = env.reset(expensive=False)
+        validate_eef_gripper_post_reset(env, gripper_runtime_contract)
         begin_eef_safety_episode(env, case_index)
         state["stage"] = "validate_reset_frame"
         reset_frame_position_error, reset_frame_rotation_error = (
@@ -285,13 +295,18 @@ def main(state: dict[str, object]) -> int:
         )
         anchor_position = observation["policy"]["eef_pos"][0].detach().cpu().numpy()
         anchor_quaternion = observation["policy"]["eef_quat"][0].detach().cpu().numpy()
-        lap_delta = np.concatenate([pose_delta, np.array([1.0])])[None, :]
+        # The first hold case closes the gripper long enough to prove the
+        # EEF-only 5/120 driver-target slew reaches its unchanged endpoint.
+        # All remaining pose cases keep the reset-default gripper open.
+        gripper_open = 0.0 if case_index == 0 else 1.0
+        lap_delta = np.concatenate([pose_delta, np.array([gripper_open])])[None, :]
         target = anchor_action_chunk(lap_delta, anchor_position, anchor_quaternion)[0]
         action = torch.as_tensor(target, device=env.device).reshape(1, -1)
 
         state["stage"] = "execute_case"
         for _ in range(args_cli.hold_steps):
             observation, _, terminated, truncated, _ = env.step(action, expensive=False)
+            record_eef_gripper_post_policy_step(env)
             if bool(terminated[0]) or bool(truncated[0]):
                 raise RuntimeError(f"Episode ended during smoke case {label!r}")
 
@@ -349,6 +364,7 @@ def main(state: dict[str, object]) -> int:
     state["stage"] = "reset_adversarial_case"
     state["case"] = "oversized absolute +x target for one policy step"
     observation, _ = env.reset(expensive=False)
+    validate_eef_gripper_post_reset(env, gripper_runtime_contract)
     begin_eef_safety_episode(env, adversarial_index)
     anchor_position = observation["policy"]["eef_pos"][0].detach().cpu().numpy()
     anchor_quaternion = observation["policy"]["eef_quat"][0].detach().cpu().numpy()
@@ -361,6 +377,7 @@ def main(state: dict[str, object]) -> int:
         torch.as_tensor(oversized_target, device=env.device).reshape(1, -1),
         expensive=False,
     )
+    record_eef_gripper_post_policy_step(env)
     robot = env.unwrapped.scene["robot"]
     joint_pos = robot.data.joint_pos[:, arm_term._joint_ids]
     joint_vel = robot.data.joint_vel[:, arm_term._joint_ids]
@@ -440,6 +457,7 @@ def main(state: dict[str, object]) -> int:
     )
     state["stage"] = "reset_after_adversarial_case"
     env.reset(expensive=False)
+    validate_eef_gripper_post_reset(env, gripper_runtime_contract)
 
     total_checks = len(test_cases) + 1
     print(f"EEF pose smoke: {total_checks - failures}/{total_checks} passed")
