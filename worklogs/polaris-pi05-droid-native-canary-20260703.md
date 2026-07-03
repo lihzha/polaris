@@ -217,3 +217,22 @@
   eval/config overlap, exact-client render isolation, gripper-cap integration,
   or spot-checked launcher/finalizer chain. Its independent focused selection
   passed 54 tests plus diff, Bash-syntax, and in-memory compilation checks.
+
+## Host-only handoff publication — 2026-07-03T17:17:28Z
+
+- Final implementation commit:
+  `f8067bb9baff954d4cd68ae09aefd7fdc5149c3d`
+  (`Add official pi0.5 native PolaRiS canary`).
+- The workstation-wide schema-2 record
+  `official-pi05-droid-native-jointvelocity-polaris` was advanced from
+  revision 1 to revision 2 through an agent-owned draft. Its one canonical
+  planned evaluation is
+  `polaris-food-bussing-flow-native-jointvelocity-canary1-v1`, bound to the
+  exact implementation commit, official checkpoint URI/content manifest,
+  global-DROID normalization, image routing/resolution, flow sampler, native
+  control/cadence, controller completions, container, Hub revision, and pinned
+  FoodBussing assets. Registry validation and rendering passed for all nine
+  records.
+- Registry state remains `planned`: zero episodes completed, no job IDs,
+  attempts, artifacts, result, or visual inspection. This publication records
+  the canary contract; it does not claim an evaluation result.
