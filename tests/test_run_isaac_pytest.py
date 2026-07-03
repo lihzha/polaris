@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import stat
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +25,7 @@ def _invoke_main(
     close_error=None,
     report_error=None,
     observations=None,
+    exit_code_file=None,
 ) -> int:
     if observations is None:
         observations = {}
@@ -78,6 +81,13 @@ def _invoke_main(
         lambda code: (_ for _ in ()).throw(_ExitSignal(code)),
     )
     monkeypatch.setattr(sys, "argv", ["run_isaac_pytest.py", "-q", "tests/test_x.py"])
+    if exit_code_file is None:
+        monkeypatch.delenv(run_isaac_pytest.EXIT_CODE_FILE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(
+            run_isaac_pytest.EXIT_CODE_FILE_ENV,
+            str(exit_code_file),
+        )
     if report_error is not None:
         monkeypatch.setattr(
             run_isaac_pytest.traceback,
@@ -160,6 +170,159 @@ def test_bootstrap_flush_failure_still_forces_nonzero_exit(monkeypatch):
     with pytest.raises(_ExitSignal) as captured:
         run_isaac_pytest._flush_and_exit(0, streams=(_BadStream(),))  # noqa: SLF001
     assert captured.value.code == 1
+
+
+@pytest.mark.parametrize("pytest_exit_code", [0, 1, 2, 4, 5])
+def test_bootstrap_publishes_exact_immutable_exit_code(
+    monkeypatch, tmp_path, pytest_exit_code
+):
+    exit_code_file = tmp_path / "isaac-pytest.exit"
+    assert (
+        _invoke_main(
+            monkeypatch,
+            pytest_exit_code=pytest_exit_code,
+            exit_code_file=exit_code_file,
+        )
+        == pytest_exit_code
+    )
+    assert exit_code_file.read_bytes() == f"{pytest_exit_code}\n".encode("ascii")
+    assert stat.S_IMODE(exit_code_file.stat().st_mode) == 0o444
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_bootstrap_exit_code_file_never_overwrites(monkeypatch, tmp_path):
+    exit_code_file = tmp_path / "isaac-pytest.exit"
+    exit_code_file.write_bytes(b"sentinel\n")
+
+    assert (
+        _invoke_main(
+            monkeypatch,
+            pytest_exit_code=0,
+            exit_code_file=exit_code_file,
+        )
+        == 1
+    )
+    assert exit_code_file.read_bytes() == b"sentinel\n"
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_bootstrap_exit_code_file_rejects_dangling_symlink(monkeypatch, tmp_path):
+    exit_code_file = tmp_path / "isaac-pytest.exit"
+    exit_code_file.symlink_to(tmp_path / "missing-target")
+
+    assert (
+        _invoke_main(
+            monkeypatch,
+            pytest_exit_code=0,
+            exit_code_file=exit_code_file,
+        )
+        == 1
+    )
+    assert exit_code_file.is_symlink()
+    assert not exit_code_file.resolve().exists()
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
+def test_bootstrap_exit_code_publish_failure_forces_one(monkeypatch, tmp_path):
+    exit_code_file = tmp_path / "missing" / "isaac-pytest.exit"
+    assert (
+        _invoke_main(
+            monkeypatch,
+            pytest_exit_code=0,
+            exit_code_file=exit_code_file,
+        )
+        == 1
+    )
+    assert not exit_code_file.exists()
+
+
+def test_bootstrap_flush_failure_publishes_one(monkeypatch, tmp_path):
+    class _BadStream:
+        def flush(self):
+            raise OSError("flush failed")
+
+    exit_code_file = tmp_path / "isaac-pytest.exit"
+    monkeypatch.setattr(
+        run_isaac_pytest.os,
+        "_exit",
+        lambda code: (_ for _ in ()).throw(_ExitSignal(code)),
+    )
+    with pytest.raises(_ExitSignal) as captured:
+        run_isaac_pytest._flush_and_exit(  # noqa: SLF001
+            0,
+            streams=(_BadStream(),),
+            exit_code_file=exit_code_file,
+        )
+    assert captured.value.code == 1
+    assert exit_code_file.read_bytes() == b"1\n"
+    assert stat.S_IMODE(exit_code_file.stat().st_mode) == 0o444
+
+
+@pytest.mark.parametrize("failure", ["import", "pytest", "close", "report"])
+def test_bootstrap_failures_publish_one(monkeypatch, tmp_path, failure):
+    exit_code_file = tmp_path / "isaac-pytest.exit"
+    kwargs = {"exit_code_file": exit_code_file}
+    if failure == "import":
+        kwargs["controller_import_error"] = ImportError("controller failed")
+    elif failure == "pytest":
+        kwargs["pytest_error"] = RuntimeError("pytest failed")
+    elif failure == "close":
+        kwargs["close_error"] = RuntimeError("close failed")
+    else:
+        kwargs["close_error"] = RuntimeError("close failed")
+        kwargs["report_error"] = OSError("stderr failed")
+
+    assert _invoke_main(monkeypatch, **kwargs) == 1
+    assert exit_code_file.read_bytes() == b"1\n"
+    assert stat.S_IMODE(exit_code_file.stat().st_mode) == 0o444
+
+
+@pytest.mark.parametrize("operation", ["write", "fsync", "link"])
+def test_bootstrap_publication_operation_failure_forces_one(
+    monkeypatch, tmp_path, operation
+):
+    exit_code_file = tmp_path / "isaac-pytest.exit"
+
+    def fail(*_args, **_kwargs):
+        raise OSError(f"{operation} failed")
+
+    monkeypatch.setattr(run_isaac_pytest.os, operation, fail)
+    assert (
+        _invoke_main(
+            monkeypatch,
+            pytest_exit_code=0,
+            exit_code_file=exit_code_file,
+        )
+        == 1
+    )
+    assert not exit_code_file.exists()
+    assert not exit_code_file.is_symlink()
+
+
+def test_bootstrap_unlink_failure_preserves_final_and_leaves_rejectable_temp(
+    monkeypatch, tmp_path
+):
+    exit_code_file = tmp_path / "isaac-pytest.exit"
+    temporary = tmp_path / ".isaac-pytest.exit.tmp"
+    original_unlink = Path.unlink
+
+    def reject_temporary_unlink(path, *args, **kwargs):
+        if path == temporary:
+            raise OSError("temporary unlink failed")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", reject_temporary_unlink)
+    assert (
+        _invoke_main(
+            monkeypatch,
+            pytest_exit_code=0,
+            exit_code_file=exit_code_file,
+        )
+        == 0
+    )
+    assert exit_code_file.read_bytes() == b"0\n"
+    assert stat.S_IMODE(exit_code_file.stat().st_mode) == 0o444
+    assert temporary.exists()
 
 
 def test_bootstrap_forwards_arguments_and_isolates_pytest_sys_argv(monkeypatch):

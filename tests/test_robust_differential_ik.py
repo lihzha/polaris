@@ -44,6 +44,21 @@ boundary_smoke = importlib.util.module_from_spec(_BOUNDARY_SMOKE_SPEC)
 _BOUNDARY_SMOKE_SPEC.loader.exec_module(boundary_smoke)
 
 
+def _bare_robust_action():
+    action = object.__new__(RobustDifferentialInverseKinematicsAction)
+    # ActionTerm.__del__ reads this field even when __init__ never ran.
+    action._debug_vis_handle = None
+    action._env = SimpleNamespace(num_envs=1, device="cpu")
+    return action
+
+
+def test_bare_robust_action_uses_real_action_term_properties_and_tears_down():
+    action = _bare_robust_action()
+    assert action.num_envs == 1
+    assert action.device == "cpu"
+    action.__del__()
+
+
 def _controller(controller_type, *, damping=0.01):
     cfg = DifferentialIKControllerCfg(
         command_type="pose",
@@ -523,7 +538,7 @@ def test_safety_report_rejects_live_velocity_target_mutation(monkeypatch):
     asset.data.joint_vel_target = torch.zeros((1, 7), dtype=torch.float32)
     asset.data.joint_vel_target[0, 4] = 1e-3
 
-    action = object.__new__(RobustDifferentialInverseKinematicsAction)
+    action = _bare_robust_action()
     action._asset = asset
     action._physx_cfg = SimpleNamespace(solver_type=1)
     action._physx_solver_type = 1
@@ -549,7 +564,7 @@ def test_safety_report_rejects_live_velocity_target_mutation(monkeypatch):
 
 
 def test_safety_report_rejects_physx_solver_type_drift():
-    action = object.__new__(RobustDifferentialInverseKinematicsAction)
+    action = _bare_robust_action()
     action._physx_cfg = SimpleNamespace(solver_type=0)
     action._physx_solver_type = 1
 
@@ -570,7 +585,7 @@ def test_safety_report_rejects_live_physx_joint_limit_drift(monkeypatch, limit_f
     )
     asset.data.joint_vel_target = torch.zeros((1, 7), dtype=torch.float32)
 
-    action = object.__new__(RobustDifferentialInverseKinematicsAction)
+    action = _bare_robust_action()
     action._asset = asset
     action._physx_cfg = SimpleNamespace(solver_type=1)
     action._physx_solver_type = 1
@@ -637,7 +652,7 @@ def test_eef_quaternion_named_unit_norm_guard_rejects_nonfinite():
 
 
 def test_huge_finite_diagnostic_scalars_remain_strict_json_finite():
-    action = object.__new__(RobustDifferentialInverseKinematicsAction)
+    action = _bare_robust_action()
     action._apply_call_count = 1
     action._active_episode_index = 0
     action._decimation = 8
@@ -781,13 +796,11 @@ def test_eef_pose_config_rejects_missing_articulation_properties():
 def _failure_substep_trace_action(
     *, episode_index=0, data_overrides=None, readback_overrides=None
 ):
-    action = object.__new__(RobustDifferentialInverseKinematicsAction)
+    action = _bare_robust_action()
     action._failure_substep_trace_enabled = True
-    action.num_envs = 1
     action._num_joints = 7
     action._joint_ids = list(range(7))
     action._joint_names = [f"panda_joint{index + 1}" for index in range(7)]
-    action.device = "cpu"
     action._decimation = robust_ik.FAILURE_SUBSTEP_TRACE_DECIMATION
     action._active_episode_index = episode_index
     action._apply_call_count = 0
@@ -908,7 +921,7 @@ def _trace_values(entry, field):
 
 
 def test_failure_substep_trace_is_disabled_by_default_and_separate_from_safety():
-    action = object.__new__(RobustDifferentialInverseKinematicsAction)
+    action = _bare_robust_action()
     action._failure_substep_trace_enabled = False
     with pytest.raises(ValueError, match="trace is disabled"):
         action.failure_substep_trace(episode_index=0)
