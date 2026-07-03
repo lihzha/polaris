@@ -31,10 +31,15 @@ def _target_slew_static():
         "endpoint_semantics_profile": runtime.GRIPPER_THRESHOLD_PROFILE,
         "open_target_rad": runtime.GRIPPER_OPEN_TARGET_FLOAT32,
         "closed_target_rad": runtime.GRIPPER_CLOSED_TARGET_FLOAT32,
-        "velocity_limit_source": (
+        "physical_velocity_limit_source": (
             "live_implicit_actuator_velocity_limit_sim_float32_v1"
         ),
-        "velocity_limit_rad_s": runtime.GRIPPER_DRIVER_VELOCITY_LIMIT_FLOAT32,
+        "physical_velocity_limit_rad_s": (
+            runtime.GRIPPER_DRIVER_VELOCITY_LIMIT_FLOAT32
+        ),
+        "target_slew_rate_source": runtime.GRIPPER_TARGET_SLEW_RATE_SOURCE,
+        "target_slew_rate_factor": (runtime.GRIPPER_TARGET_SLEW_RATE_FACTOR_FLOAT32),
+        "target_slew_rate_rad_s": runtime.GRIPPER_TARGET_SLEW_RATE_RAD_S_FLOAT32,
         "physics_hz": runtime.GRIPPER_TARGET_SLEW_PHYSICS_HZ,
         "physics_dt": runtime.GRIPPER_TARGET_SLEW_PHYSICS_DT,
         "max_target_step_rad": runtime.GRIPPER_MAX_TARGET_STEP_FLOAT32,

@@ -153,10 +153,15 @@ def _gripper_static():
             ),
             "open_target_rad": 0.0,
             "closed_target_rad": finalizer.GRIPPER_CLOSED_TARGET,
-            "velocity_limit_source": (
+            "physical_velocity_limit_source": (
                 "live_implicit_actuator_velocity_limit_sim_float32_v1"
             ),
-            "velocity_limit_rad_s": 5.0,
+            "physical_velocity_limit_rad_s": 5.0,
+            "target_slew_rate_source": (
+                "eef_profile_fraction_of_live_physical_velocity_limit_float32_v1"
+            ),
+            "target_slew_rate_factor": 0.5,
+            "target_slew_rate_rad_s": 2.5,
             "physics_hz": 120.0,
             "physics_dt": 1.0 / 120.0,
             "max_target_step_rad": finalizer.GRIPPER_MAX_TARGET_STEP,
@@ -169,7 +174,7 @@ def _gripper_static():
     }
 
 
-def _gripper_dynamic(apply_calls, *, closed):
+def _gripper_dynamic(apply_calls, *, closed, endpoint_changes=0):
     post_samples = apply_calls // 8
     vector = [0.0] * 6
     diagnostic = None
@@ -193,7 +198,7 @@ def _gripper_dynamic(apply_calls, *, closed):
             "joint_velocity_target_rad_s": vector,
         }
     process_calls = post_samples
-    limited = min(18, apply_calls) if closed else 0
+    limited = min(finalizer.GRIPPER_CLOSE_LIMITED_APPLIES, apply_calls) if closed else 0
     return {
         "profile": finalizer.GRIPPER_RUNTIME_PROFILE,
         "joint_names": finalizer.GRIPPER_JOINT_NAMES,
@@ -209,8 +214,10 @@ def _gripper_dynamic(apply_calls, *, closed):
             "process_action_calls": process_calls,
             "apply_calls": apply_calls,
             "initialization_count": int(apply_calls > 0),
-            "endpoint_change_count": 0,
-            "repeated_endpoint_process_count": max(process_calls - 1, 0),
+            "endpoint_change_count": endpoint_changes,
+            "repeated_endpoint_process_count": max(
+                process_calls - 1 - endpoint_changes, 0
+            ),
             "slew_limited_apply_count": limited,
             "endpoint_reached_apply_count": apply_calls - limited,
             "live_limit_validation_count": apply_calls,
@@ -235,7 +242,7 @@ def _gripper_dynamic(apply_calls, *, closed):
             ),
             "last_applied_target_rad": (
                 finalizer.GRIPPER_CLOSED_TARGET
-                if apply_calls >= 19 and closed
+                if apply_calls >= finalizer.GRIPPER_CLOSE_TRANSITION_APPLIES and closed
                 else finalizer.GRIPPER_MAX_TARGET_STEP * apply_calls
                 if apply_calls and closed
                 else 0.0
@@ -248,7 +255,16 @@ def _gripper_dynamic(apply_calls, *, closed):
     }
 
 
-def _safety_report(episode_index, apply_calls, *, adversarial=False):
+def _safety_report(
+    episode_index,
+    apply_calls,
+    *,
+    adversarial=False,
+    closed=None,
+    endpoint_changes=0,
+):
+    if closed is None:
+        closed = episode_index == 0
     counters = {name: 0 for name in finalizer.COUNTER_FIELDS}
     counters["apply_calls"] = apply_calls
     counters["environment_substeps"] = apply_calls
@@ -338,7 +354,9 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
         "current_joint_velocity_abort": None,
         "gripper_runtime_static": _gripper_static(),
         "gripper_runtime_dynamic": _gripper_dynamic(
-            apply_calls, closed=episode_index == 0
+            apply_calls,
+            closed=closed,
+            endpoint_changes=endpoint_changes,
         ),
     }
 
@@ -385,15 +403,40 @@ def _case_results():
 def _valid_raw_result():
     q = [(lower + upper) / 2 for lower, upper in finalizer.EXPECTED_LIMITS]
     reports = [_safety_report(index, 360) for index in range(13)]
-    adversarial_safety = _safety_report(13, 8, adversarial=True)
+    delayed_close_safety = _safety_report(
+        13,
+        finalizer.DELAYED_CLOSE_APPLY_CALLS,
+        closed=True,
+        endpoint_changes=1,
+    )
+    adversarial_safety = _safety_report(14, 8, adversarial=True)
+
+    def headroom_entry(safety):
+        maxima = safety["maxima"]["abs_joint_vel_rad_s"]
+        limits = safety["joint_velocity_limits_rad_s"]
+        ratios = [
+            maximum / limit for maximum, limit in zip(maxima, limits, strict=True)
+        ]
+        return {
+            "episode_index": safety["episode_index"],
+            "joint_names": safety["joint_names"],
+            "max_abs_joint_velocity_rad_s": maxima,
+            "joint_velocity_limit_rad_s": limits,
+            "velocity_to_limit_ratio": ratios,
+            "maximum_ratio": max(ratios),
+            "threshold_ratio": finalizer.CLOSE_ARM_VELOCITY_HEADROOM_MAX_RATIO,
+            "passed": True,
+        }
+
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "finalized": False,
         "passed": False,
         "stage": "simulation_app_close_pending",
         "case": None,
         "exit_code": 0,
         "failure": None,
+        "terminal_failure_evidence": None,
         "close_failures": [],
         "persistence_failures": [],
         "environment": "DROID-FoodBussing",
@@ -408,6 +451,26 @@ def _valid_raw_result():
         "raw_ik_safety_capture": _safety_report(None, 0),
         "results": _case_results(),
         "ik_safety_episodes": reports,
+        "gripper_delayed_close_replay": {
+            "profile": finalizer.DELAYED_CLOSE_REPLAY_PROFILE,
+            "case": "open 115 policy steps then close at the same arm pose",
+            "passed": True,
+            "episode_index": 13,
+            "open_policy_steps": finalizer.DELAYED_CLOSE_OPEN_POLICY_STEPS,
+            "close_policy_steps": finalizer.DELAYED_CLOSE_CLOSE_POLICY_STEPS,
+            "close_transition_substeps": (finalizer.GRIPPER_CLOSE_TRANSITION_APPLIES),
+            "terminated": False,
+            "truncated": False,
+            "arm_abort_count": 0,
+            "ik_safety": delayed_close_safety,
+        },
+        "gripper_close_velocity_headroom": {
+            "profile": finalizer.CLOSE_ARM_VELOCITY_HEADROOM_PROFILE,
+            "threshold_ratio": finalizer.CLOSE_ARM_VELOCITY_HEADROOM_MAX_RATIO,
+            "passed": True,
+            "immediate_close_hold": headroom_entry(reports[0]),
+            "delayed_close_replay": headroom_entry(delayed_close_safety),
+        },
         "ik_safety_adversarial": {
             "case": "oversized absolute +x target for one policy step",
             "passed": True,
@@ -515,11 +578,37 @@ def _attestation_args(tmp_path: Path, monkeypatch) -> Namespace:
 def test_raw_smoke_gate_requires_pending_full_evidence():
     summary = finalizer._verify_raw(_valid_raw_result())
     assert summary["ordinary_pass_count"] == 13
+    assert summary["delayed_close"]["apply_calls"] == 960
+    assert summary["delayed_close"]["slew_limited_apply_count"] == 37
+    assert summary["immediate_close_arm_velocity_headroom"]["maximum_ratio"] == 0.0
     assert summary["adversarial"]["slew_limit_events"] == 1
 
     raw = _valid_raw_result()
     raw["finalized"] = True
     with pytest.raises(finalizer.VerificationError, match="finalized"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["terminal_failure_evidence"] = {"status": "captured"}
+    with pytest.raises(finalizer.VerificationError, match="failure evidence"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["gripper_delayed_close_replay"]["ik_safety"]["gripper_runtime_dynamic"][
+        "driver_target_slew"
+    ]["slew_limited_apply_count"] = 36
+    with pytest.raises(finalizer.VerificationError, match="cadence/history"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    limit = finalizer.EXPECTED_VELOCITY_LIMITS[0]
+    maximum = limit * 0.96
+    raw["ik_safety_episodes"][0]["maxima"]["abs_joint_vel_rad_s"][0] = maximum
+    headroom = raw["gripper_close_velocity_headroom"]["immediate_close_hold"]
+    headroom["max_abs_joint_velocity_rad_s"][0] = maximum
+    headroom["velocity_to_limit_ratio"][0] = 0.96
+    headroom["maximum_ratio"] = 0.96
+    with pytest.raises(finalizer.VerificationError, match="five-percent"):
         finalizer._verify_raw(raw)
 
     raw = _valid_raw_result()

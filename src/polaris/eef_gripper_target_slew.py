@@ -4,7 +4,10 @@ The public DROID action remains binary: ``0`` requests the exact open joint
 target and ``pi/4`` requests the exact closed joint target.  This mixin changes
 only how the EEF action term reaches that endpoint.  It anchors once from the
 live post-reset driven-finger position and advances the position target by at
-most the live configured driver velocity limit times one physics step.
+most the EEF-only 2.5 rad/s target-slew rate times one physics step.  That
+command rate is a versioned float32 factor of the independently validated live
+5 rad/s physical driver limit; the physical actuator and mimic-joint limits are
+not changed here.
 
 The mixin deliberately has no Isaac Lab import.  Production composes it with
 Isaac Lab's pinned ``BinaryJointPositionAction`` implementation, while host
@@ -27,6 +30,9 @@ from polaris.eef_gripper_runtime import EEF_GRIPPER_TARGET_SLEW_RESET_PROFILE
 from polaris.eef_gripper_runtime import GRIPPER_CLOSED_TARGET_FLOAT32
 from polaris.eef_gripper_runtime import GRIPPER_DRIVER_VELOCITY_LIMIT_FLOAT32
 from polaris.eef_gripper_runtime import GRIPPER_OPEN_TARGET_FLOAT32
+from polaris.eef_gripper_runtime import GRIPPER_TARGET_SLEW_RATE_FACTOR_FLOAT32
+from polaris.eef_gripper_runtime import GRIPPER_TARGET_SLEW_RATE_RAD_S_FLOAT32
+from polaris.eef_gripper_runtime import GRIPPER_TARGET_SLEW_RATE_SOURCE
 from polaris.eef_gripper_runtime import GRIPPER_TARGET_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_gripper_runtime import GRIPPER_TARGET_SLEW_MAX_ANCHOR_FLOAT32
 from polaris.eef_gripper_runtime import GRIPPER_TARGET_SLEW_MIN_ANCHOR_FLOAT32
@@ -190,12 +196,34 @@ class EefGripperTargetSlewMixin:
         )
         return simulation
 
+    def _target_slew_rate_from_physical_limit(
+        self, physical_limit: torch.Tensor
+    ) -> torch.Tensor:
+        """Derive and validate the versioned EEF command rate in float32."""
+
+        factor = torch.full_like(
+            physical_limit, GRIPPER_TARGET_SLEW_RATE_FACTOR_FLOAT32
+        )
+        target_rate = torch.mul(physical_limit, factor)
+        _require(
+            bool(torch.isfinite(target_rate).all().item())
+            and bool((target_rate > 0).all().item())
+            and _same_float32_tensor(
+                target_rate, GRIPPER_TARGET_SLEW_RATE_RAD_S_FLOAT32
+            ),
+            "EEF gripper target slew physical-limit/factor/rate binding drift",
+        )
+        return target_rate
+
     def gripper_target_slew_static_contract(self) -> dict[str, Any]:
         """Capture the action-owned static profile from the live driver limit."""
 
-        limit = self._live_gripper_driver_limit()
-        physics_dt = torch.full_like(limit, self._gripper_target_slew_physics_dt)
-        max_step = torch.mul(limit, physics_dt)
+        physical_limit = self._live_gripper_driver_limit()
+        target_rate = self._target_slew_rate_from_physical_limit(physical_limit)
+        physics_dt = torch.full_like(
+            physical_limit, self._gripper_target_slew_physics_dt
+        )
+        max_step = torch.mul(target_rate, physics_dt)
         _require(
             bool(torch.isfinite(max_step).all().item())
             and bool((max_step > 0).all().item()),
@@ -210,10 +238,15 @@ class EefGripperTargetSlewMixin:
             "endpoint_semantics_profile": GRIPPER_THRESHOLD_PROFILE,
             "open_target_rad": float(self._open_command[0].detach().cpu().item()),
             "closed_target_rad": float(self._close_command[0].detach().cpu().item()),
-            "velocity_limit_source": (
+            "physical_velocity_limit_source": (
                 "live_implicit_actuator_velocity_limit_sim_float32_v1"
             ),
-            "velocity_limit_rad_s": float(limit[0, 0].detach().cpu().item()),
+            "physical_velocity_limit_rad_s": float(
+                physical_limit[0, 0].detach().cpu().item()
+            ),
+            "target_slew_rate_source": GRIPPER_TARGET_SLEW_RATE_SOURCE,
+            "target_slew_rate_factor": GRIPPER_TARGET_SLEW_RATE_FACTOR_FLOAT32,
+            "target_slew_rate_rad_s": float(target_rate[0, 0].detach().cpu().item()),
             "physics_hz": GRIPPER_TARGET_SLEW_PHYSICS_HZ,
             "physics_dt": self._gripper_target_slew_physics_dt,
             "max_target_step_rad": float(max_step[0, 0].detach().cpu().item()),
@@ -234,9 +267,12 @@ class EefGripperTargetSlewMixin:
         validated = validate_eef_gripper_target_slew_static(dict(contract))
         live = self.gripper_target_slew_static_contract()
         _require(validated == live, "EEF gripper target slew install identity drift")
-        limit = self._live_gripper_driver_limit()
-        physics_dt = torch.full_like(limit, self._gripper_target_slew_physics_dt)
-        self._gripper_target_slew_max_step = torch.mul(limit, physics_dt)
+        physical_limit = self._live_gripper_driver_limit()
+        target_rate = self._target_slew_rate_from_physical_limit(physical_limit)
+        physics_dt = torch.full_like(
+            physical_limit, self._gripper_target_slew_physics_dt
+        )
+        self._gripper_target_slew_max_step = torch.mul(target_rate, physics_dt)
         _require(
             float(self._gripper_target_slew_max_step[0, 0].detach().cpu().item())
             == validated["max_target_step_rad"],
@@ -350,8 +386,9 @@ class EefGripperTargetSlewMixin:
         )
         self._require_profile()
         live_limit = self._live_gripper_driver_limit()
+        live_target_rate = self._target_slew_rate_from_physical_limit(live_limit)
         live_max_step = torch.mul(
-            live_limit,
+            live_target_rate,
             torch.full_like(live_limit, self._gripper_target_slew_physics_dt),
         )
         _require(

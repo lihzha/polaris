@@ -14,11 +14,11 @@
 The official LAP-3B FoodBussing condition-0 canary reached a measured
 `panda_joint7` velocity of `+2.76075697 rad/s` at policy action 117, physics
 substep 3, after the model changed the gripper from open to closed at action
-115. The smallest next physical candidate is an EEF-only driven-finger
-position-target slew toward the unchanged binary `0`/`pi/4` endpoint. The
-per-physics-substep cap must be derived from the exact live configured gripper
-driver limit of `5 rad/s` at `120 Hz`; the five passive follower caps remain
-unchanged.
+115. The initial physical candidate was an EEF-only driven-finger
+position-target slew toward the unchanged binary `0`/`pi/4` endpoint at the
+full live driver rate. Job `1098286` subsequently disproved that command rate;
+the corrected contract separates a 2.5 rad/s EEF target rate from the unchanged
+physical 5 rad/s driver/follower limits, as recorded below.
 
 This candidate may reduce the coupled arm transient by removing the immediate
 `pi/4` driver-target jump. It does not establish task success or physical
@@ -33,7 +33,9 @@ bounded checkpoint canary.
 - Preserve the existing closed-positive `>=0.5` binary endpoint semantics and
   exact open/closed endpoints.
 - Anchor the first post-reset applied target to the live driven-finger joint
-  position, then move at most `float32(5 * (1/120))` radians per physics apply.
+  position, then move at most `float32(2.5 * float32(1/120))` radians per
+  physics apply. Bind source, `0.5` factor, and 2.5 rad/s rate separately from
+  the live physical 5 rad/s limit.
 - Reject nonfinite actions/state, tensor device/dtype drift, action-term
   profile drift, endpoint drift, external target drift, and live configured
   driver-limit drift before writing a new target.
@@ -50,9 +52,10 @@ bounded checkpoint canary.
 - Canonical Ego-LAP remained the primary `main` worktree; registry doctor
   passed before development.
 - Implemented `EefBinaryJointPositionTargetSlewAction` as an EEF-only mixin
-  over the unchanged binary action. It derives the exact float32 target cap
-  from the live implicit-actuator `velocity_limit_sim` tensor and the pinned
-  120 Hz physics cadence on every apply.
+  over the unchanged binary action. It validates the exact live implicit-
+  actuator `velocity_limit_sim` tensor on every apply, derives the versioned
+  2.5 rad/s EEF command rate as its float32 `0.5` factor, and binds that rate
+  to the pinned 120 Hz physics cadence.
 - The first apply after each action reset anchors from live `joint_pos`, not a
   potentially stale target. It rejects an anchor outside the endpoint range
   (with the named float32 tolerance) before any write. Subsequent writes
@@ -72,12 +75,13 @@ bounded checkpoint canary.
   classes; only Ego-LAP evaluation and the dedicated controller smoke select
   the candidate.
 - Extended the standalone smoke/finalizer contract. Case zero requests close
-  for 45 policy steps and must independently prove 18 cap-limited applies and
-  exact endpoint arrival on apply 19. All other ordinary and adversarial cases
-  hold the exact open endpoint. The finalizer independently validates the
-  complete gripper static/dynamic schemas and physical evidence.
+  for 45 policy steps and must independently prove 37 cap-limited applies and
+  exact endpoint arrival on apply 38. All other ordinary pose cases hold the
+  exact open endpoint. The finalizer independently validates the complete
+  gripper static/dynamic schemas and physical evidence; the delayed-close and
+  velocity-headroom additions are detailed below.
 
-## Host validation
+## Original pre-job host validation (historical)
 
 All commands used `CUDA_VISIBLE_DEVICES=`; no GPU, simulator, Slurm, registry,
 or deployment action was launched.
@@ -131,11 +135,94 @@ original `panda_joint7 +2.76075697 rad/s` action-117/substep-3 abort is removed
 without a new arm or all-six-gripper safety violation. Task success is not
 claimed.
 
+## Failed physical gate and corrected candidate
+
+The original 5 rad/s target-slew candidate was deployed and exercised by the
+separately reviewed controller-smoke wrapper. Slurm job `1098286` failed
+closed (`FAILED 1:0`, `srun` 1) in the first close-hold case at policy step 0,
+physics substep 4. The signed live `panda_joint5` velocity was
+`2.610020160675049 rad/s`; the float32 physical limit was
+`2.609999895095825 rad/s`, for the producer-recorded limit excess
+`2.0265579223632812e-5 rad/s`. The float32 guard threshold after its frozen
+`1e-5` tolerance was `2.6100099086761475 rad/s`, so the threshold overage was
+still `1.0251998901367188e-5 rad/s`. The current-abort evidence digest was
+`60f6ecaea1046e94bbb8b0d4995e130c7a390c242215f96478dfe7b5ea28a46a`.
+
+Preserved job evidence is exact:
+
+- raw failure JSON SHA-256:
+  `dc17ac7e91f59308b9ea4e60ded20b10fe60ac6069d5625edf3ce11a1688457b`;
+- complete log SHA-256:
+  `89932dd90d9d35716c9fe85026976543e665e8a62e2d02168e4b5421ba3c66e5`;
+- immutable saved wrapper SHA-256:
+  `7a07e760061863d14b98a0488993c1398e6d75696002ed7f4f9f44dcc7267afb`.
+
+The failure is not a reset-only or stale-state artifact. The arm action term is
+first in action-manager order; four successful finger writes occurred before
+the fifth arm entry rejected the live velocity, so the old target was already
+approximately `0.16666666 rad`. The old command cap equaled the physical limit
+with no tracking/acceleration margin:
+`float32(5 * float32(1/120)) = 0.0416666679084301 rad`. With the probed live
+driver stiffness `5729.578125 N*m/rad`, that first-step position error implies
+an unconstrained proportional demand of `238.732421875 N*m`, above the exact
+`200 N*m` effort cap. This explains the saturated impulse and measured arm
+coupling; relaxing the arm guard would hide it rather than fix it.
+
+The corrected EEF-only contract therefore keeps the independently validated
+physical driver and five follower velocity limits at exactly `5 rad/s`, but
+introduces a separate versioned target-rate source/factor/rate identity:
+factor `0.5`, rate `2.5 rad/s`. Its exact float32 target step is
+`0.02083333395421505 rad`, whose corresponding proportional demand is
+`119.3662109375 N*m`. Closing from exact zero reaches float32 `pi/4` on apply
+38: exactly 37 writes are slew-limited and apply 38 reaches the unchanged
+endpoint.
+
+The corrected smoke/evidence surface now additionally:
+
+- preserves all 13 ordinary pose cases;
+- runs a production-boundary episode that holds the same reset-anchored arm
+  pose open for 115 policy steps and closes for five, requiring exact
+  process/apply cadence `120/960`, one endpoint change, 37 limited writes,
+  exact endpoint arrival, and zero arm abort;
+- moves the one-step adversarial check to episode 14;
+- records arm velocity maxima/limits/ratios for both immediate-close and
+  delayed-close episodes and rejects promotion unless
+  `max_j |dq_j| / limit_j <= 0.95` for each;
+- captures, before environment close on failure, the live active safety and
+  current-abort report, signed seven-joint arm velocity, target-slew state, and
+  all-six gripper position/velocity/acceleration/target vectors. A secondary
+  capture error is recorded without masking the original exception.
+
+Physical relaunch is **pending**. No corrected real-Isaac smoke or checkpoint
+canary has been launched from this implementation task; promotion and task
+success remain unclaimed until the revised immutable wrapper passes review,
+the controller smoke satisfies both headroom gates, and artifacts are fully
+inspected and finalized.
+
+## Corrected host validation
+
+Validation used the existing Ego-LAP host environment with `PYTHONPATH=src:.`;
+no GPU, simulator, Slurm, registry, deployment, or shared checkout was touched.
+
+- Focused runtime/target-slew/finalizer/episode-contract suite:
+  `137 passed`.
+- Isolated robust-action production binding stub: `1 passed`.
+- Full host suite excluding only the real-Isaac
+  `tests/test_robust_differential_ik.py` module: `623 passed` (one unrelated
+  `pynvml` deprecation warning).
+- Ruff check and format check on all eight changed Python files, Python compile
+  checks, and `git diff --check`: passed.
+- A repository-wide Ruff invocation still reports ten pre-existing findings in
+  unrelated splat-renderer/environment/client files; none is in this diff.
+
 ## Git handoff
 
-- Implementation commit:
+- Original 5 rad/s candidate implementation commit:
   `dc1426d4c711c657e2e213dda9ab752fc6d83364`
 - Independently audited staged review hash:
   `260a24129bc61bbc138211bf013e33665adb91a8c3b1264268f2d42b20c303dc`
-- No simulator, GPU, Slurm, evaluation, or other persistent job was launched
-  from this worktree. No cleanup is pending.
+- Corrected 2.5 rad/s implementation commit: recorded by the follow-up handoff
+  entry after this diff is frozen.
+- No corrected simulator, GPU, Slurm, evaluation, or other persistent job was
+  launched from this implementation task. Relaunch is pending; no task-owned
+  process or local artifact cleanup remains.

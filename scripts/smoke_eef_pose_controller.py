@@ -36,6 +36,14 @@ args_cli, _ = parser.parse_known_args()
 args_cli.enable_cameras = True
 args_cli.headless = True
 
+DELAYED_CLOSE_REPLAY_PROFILE = "eef_open115_then_close5_same_arm_pose_v1"
+DELAYED_CLOSE_OPEN_POLICY_STEPS = 115
+DELAYED_CLOSE_CLOSE_POLICY_STEPS = 5
+DELAYED_CLOSE_TRANSITION_SUBSTEPS = 38
+DELAYED_CLOSE_LIMITED_APPLIES = DELAYED_CLOSE_TRANSITION_SUBSTEPS - 1
+CLOSE_ARM_VELOCITY_HEADROOM_PROFILE = "arm_velocity_max_over_limit_le_0p95_v1"
+CLOSE_ARM_VELOCITY_HEADROOM_MAX_RATIO = 0.95
+
 
 def _exception_evidence(error: BaseException) -> dict[str, str]:
     try:
@@ -120,7 +128,7 @@ def _result_payload(
     state: dict[str, object], *, finalized: bool, exit_code: int
 ) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "finalized": finalized,
         "environment": args_cli.environment,
         "eef_frame": state["eef_frame"],
@@ -145,6 +153,9 @@ def _result_payload(
             and not state["persistence_failures"]
         ),
         "results": state["results"],
+        "gripper_delayed_close_replay": state["delayed_close_result"],
+        "gripper_close_velocity_headroom": state["close_headroom_result"],
+        "terminal_failure_evidence": state["terminal_failure_evidence"],
         "failure": state["failure"],
         "close_failures": state["close_failures"],
         "persistence_failures": state["persistence_failures"],
@@ -193,6 +204,144 @@ def _strict_vector_evidence(tensor):
     }
 
 
+def _capture_terminal_failure_evidence(state: dict[str, object]) -> dict[str, object]:
+    """Best-effort live evidence captured before either environment is closed."""
+
+    evidence = {
+        "schema_version": 1,
+        "profile": "eef_smoke_live_terminal_failure_capture_v1",
+        "status": "unavailable",
+        "stage": state.get("stage"),
+        "case": state.get("case"),
+        "episode_index": state.get("active_episode_index"),
+        "safety_report": None,
+        "current_joint_velocity_abort": None,
+        "arm_joint_names": None,
+        "arm_joint_velocity_rad_s": None,
+        "all_six_gripper_state": None,
+        "driver_target_slew": None,
+        "capture_error": None,
+    }
+    env = state.get("env")
+    episode_index = state.get("active_episode_index")
+    reporter = state.get("episode_safety_reporter")
+    if env is None or type(episode_index) is not int or not callable(reporter):
+        return evidence
+    try:
+        safety_report = reporter(env, episode_index)
+        runtime = getattr(env, "unwrapped", env)
+        terms = runtime.action_manager._terms
+        arm_term = terms["arm"]
+        finger_term = terms["finger_joint"]
+        robot = runtime.scene["robot"]
+        target_slew_reporter = getattr(
+            finger_term, "gripper_target_slew_dynamic_report", None
+        )
+        if not callable(target_slew_reporter):
+            raise RuntimeError("Terminal finger target-slew reporter is unavailable")
+        driver_target_slew = target_slew_reporter()
+        gripper_dynamic = safety_report["gripper_runtime_dynamic"]
+        if driver_target_slew != gripper_dynamic["driver_target_slew"]:
+            raise RuntimeError("Terminal target-slew report changed during capture")
+
+        arm_joint_names = list(arm_term._joint_names)
+        arm_joint_velocity = _strict_vector_evidence(
+            robot.data.joint_vel[:, arm_term._joint_ids][0]
+        )
+        if len(arm_joint_names) != 7 or len(arm_joint_velocity["values"]) != 7:
+            raise RuntimeError("Terminal arm velocity evidence is not seven-joint")
+        current_abort = safety_report["current_joint_velocity_abort"]
+        if (
+            current_abort is not None
+            and current_abort["joint_velocity_rad_s"] != arm_joint_velocity["values"]
+        ):
+            raise RuntimeError("Terminal arm velocity/current-abort binding drift")
+
+        gripper_joint_names = list(gripper_dynamic["joint_names"])
+        gripper_joint_indices = list(gripper_dynamic["joint_indices"])
+        if len(gripper_joint_names) != 6 or len(gripper_joint_indices) != 6:
+            raise RuntimeError("Terminal gripper evidence is not all-six")
+        all_six_gripper_state = {
+            "joint_names": gripper_joint_names,
+            "joint_indices": gripper_joint_indices,
+            **{
+                output_field: _strict_vector_evidence(
+                    getattr(robot.data, source_field)[:, gripper_joint_indices][0]
+                )
+                for output_field, source_field in (
+                    ("joint_position_rad", "joint_pos"),
+                    ("joint_velocity_rad_s", "joint_vel"),
+                    ("joint_acceleration_rad_s2", "joint_acc"),
+                    ("joint_position_target_rad", "joint_pos_target"),
+                    ("joint_velocity_target_rad_s", "joint_vel_target"),
+                )
+            },
+        }
+        if any(
+            len(all_six_gripper_state[field]["values"]) != 6
+            for field in (
+                "joint_position_rad",
+                "joint_velocity_rad_s",
+                "joint_acceleration_rad_s2",
+                "joint_position_target_rad",
+                "joint_velocity_target_rad_s",
+            )
+        ):
+            raise RuntimeError("Terminal all-six gripper vector width drift")
+        evidence.update(
+            {
+                "status": "captured",
+                "safety_report": safety_report,
+                "current_joint_velocity_abort": current_abort,
+                "arm_joint_names": arm_joint_names,
+                "arm_joint_velocity_rad_s": arm_joint_velocity,
+                "all_six_gripper_state": all_six_gripper_state,
+                "driver_target_slew": driver_target_slew,
+            }
+        )
+    except BaseException as capture_error:
+        evidence["status"] = "capture_failed"
+        evidence["capture_error"] = _exception_evidence(capture_error)
+    return evidence
+
+
+def _arm_velocity_headroom_evidence(
+    safety_report: dict[str, object], *, episode_index: int
+) -> dict[str, object]:
+    maxima = list(safety_report["maxima"]["abs_joint_vel_rad_s"])
+    limits = list(safety_report["joint_velocity_limits_rad_s"])
+    joint_names = list(safety_report["joint_names"])
+    if (
+        safety_report["episode_index"] != episode_index
+        or len(joint_names) != 7
+        or len(maxima) != 7
+        or len(limits) != 7
+        or any(
+            not math.isfinite(float(maximum)) or float(maximum) < 0.0
+            for maximum in maxima
+        )
+        or any(
+            not math.isfinite(float(limit)) or float(limit) <= 0.0 for limit in limits
+        )
+    ):
+        raise RuntimeError("Close arm-velocity headroom input drift")
+    ratios = [
+        float(maximum) / float(limit)
+        for maximum, limit in zip(maxima, limits, strict=True)
+    ]
+    maximum_ratio = max(ratios)
+    return {
+        "episode_index": episode_index,
+        "joint_names": joint_names,
+        "max_abs_joint_velocity_rad_s": maxima,
+        "joint_velocity_limit_rad_s": limits,
+        "velocity_to_limit_ratio": ratios,
+        "maximum_ratio": maximum_ratio,
+        "threshold_ratio": CLOSE_ARM_VELOCITY_HEADROOM_MAX_RATIO,
+        "passed": maximum_ratio <= CLOSE_ARM_VELOCITY_HEADROOM_MAX_RATIO,
+    }
+
+
 def main(state: dict[str, object]) -> int:
     import gymnasium as gym
     import numpy as np
@@ -215,6 +364,7 @@ def main(state: dict[str, object]) -> int:
     from polaris.environments.robot_cfg import configure_eef_pose_joint_safety
     from polaris.policy.lap_eef_pose_client import anchor_action_chunk
 
+    state["episode_safety_reporter"] = eef_episode_safety_report
     state["eef_frame"] = LAP_EEF_FRAME
     state["stage"] = "build_environment"
     env_cfg = parse_env_cfg(
@@ -286,9 +436,11 @@ def main(state: dict[str, object]) -> int:
     for case_index, (label, pose_delta) in enumerate(test_cases):
         state["stage"] = "reset_case"
         state["case"] = label
+        state["active_episode_index"] = None
         observation, _ = env.reset(expensive=False)
         validate_eef_gripper_post_reset(env, gripper_runtime_contract)
         begin_eef_safety_episode(env, case_index)
+        state["active_episode_index"] = case_index
         state["stage"] = "validate_reset_frame"
         reset_frame_position_error, reset_frame_rotation_error = (
             validate_observation_frame(observation)
@@ -296,7 +448,7 @@ def main(state: dict[str, object]) -> int:
         anchor_position = observation["policy"]["eef_pos"][0].detach().cpu().numpy()
         anchor_quaternion = observation["policy"]["eef_quat"][0].detach().cpu().numpy()
         # The first hold case closes the gripper long enough to prove the
-        # EEF-only 5/120 driver-target slew reaches its unchanged endpoint.
+        # EEF-only 2.5/120 driver-target slew reaches its unchanged endpoint.
         # All remaining pose cases keep the reset-default gripper open.
         gripper_open = 0.0 if case_index == 0 else 1.0
         lap_delta = np.concatenate([pose_delta, np.array([gripper_open])])[None, :]
@@ -357,15 +509,147 @@ def main(state: dict[str, object]) -> int:
             f"rotation_error={math.degrees(rotation_error):.2f}deg"
         )
 
+    # Replay the official failure boundary without changing the ordinary
+    # 13-case contract: hold one reset-anchored arm pose open for policy steps
+    # 0..114, then request the same arm pose with close for five policy steps.
+    # At 2.5 rad/s and 120 Hz, the exact pi/4 endpoint is reached on close
+    # substep 38, leaving two endpoint-hold substeps in the fifth policy step.
+    delayed_close_index = len(test_cases)
+    state["stage"] = "reset_delayed_close_replay"
+    state["case"] = "open 115 policy steps then close at the same arm pose"
+    state["active_episode_index"] = None
+    observation, _ = env.reset(expensive=False)
+    validate_eef_gripper_post_reset(env, gripper_runtime_contract)
+    begin_eef_safety_episode(env, delayed_close_index)
+    state["active_episode_index"] = delayed_close_index
+    anchor_position = observation["policy"]["eef_pos"][0].detach().cpu().numpy()
+    anchor_quaternion = observation["policy"]["eef_quat"][0].detach().cpu().numpy()
+    zero_pose_delta = np.zeros(6)
+    open_target = anchor_action_chunk(
+        np.concatenate([zero_pose_delta, np.array([1.0])])[None, :],
+        anchor_position,
+        anchor_quaternion,
+    )[0]
+    close_target = anchor_action_chunk(
+        np.concatenate([zero_pose_delta, np.array([0.0])])[None, :],
+        anchor_position,
+        anchor_quaternion,
+    )[0]
+    if not np.array_equal(open_target[:7], close_target[:7]):
+        raise RuntimeError("Delayed-close replay changed the anchored arm target")
+    delayed_terminated = False
+    delayed_truncated = False
+    for phase, action_target, policy_steps in (
+        ("open", open_target, DELAYED_CLOSE_OPEN_POLICY_STEPS),
+        ("close", close_target, DELAYED_CLOSE_CLOSE_POLICY_STEPS),
+    ):
+        state["stage"] = f"execute_delayed_close_{phase}"
+        action = torch.as_tensor(action_target, device=env.device).reshape(1, -1)
+        for _ in range(policy_steps):
+            _, _, terminated, truncated, _ = env.step(action, expensive=False)
+            record_eef_gripper_post_policy_step(env)
+            delayed_terminated = delayed_terminated or bool(terminated[0])
+            delayed_truncated = delayed_truncated or bool(truncated[0])
+            if delayed_terminated or delayed_truncated:
+                raise RuntimeError(
+                    f"Episode ended during delayed-close {phase!r} phase"
+                )
+    state["stage"] = "validate_delayed_close_replay"
+    validate_eef_runtime_safety(env)
+    delayed_safety = eef_episode_safety_report(env, delayed_close_index)
+    delayed_counters = delayed_safety["counters"]
+    delayed_target_slew = delayed_safety["gripper_runtime_dynamic"][
+        "driver_target_slew"
+    ]
+    delayed_total_policy_steps = (
+        DELAYED_CLOSE_OPEN_POLICY_STEPS + DELAYED_CLOSE_CLOSE_POLICY_STEPS
+    )
+    delayed_apply_calls = delayed_total_policy_steps * 8
+    delayed_abort_count = sum(
+        delayed_counters[field]
+        for field in (
+            "current_joint_limit_aborts",
+            "invariant_aborts",
+            "nonfinite_aborts",
+        )
+    )
+    closed_target_rad = delayed_safety["gripper_runtime_static"]["driver_target_slew"][
+        "closed_target_rad"
+    ]
+    immediate_close_headroom = _arm_velocity_headroom_evidence(
+        safety_reports[0], episode_index=0
+    )
+    delayed_close_headroom = _arm_velocity_headroom_evidence(
+        delayed_safety, episode_index=delayed_close_index
+    )
+    close_headroom_passed = (
+        immediate_close_headroom["passed"] and delayed_close_headroom["passed"]
+    )
+    state["close_headroom_result"] = {
+        "profile": CLOSE_ARM_VELOCITY_HEADROOM_PROFILE,
+        "threshold_ratio": CLOSE_ARM_VELOCITY_HEADROOM_MAX_RATIO,
+        "passed": close_headroom_passed,
+        "immediate_close_hold": immediate_close_headroom,
+        "delayed_close_replay": delayed_close_headroom,
+    }
+    delayed_passed = (
+        not delayed_terminated
+        and not delayed_truncated
+        and delayed_safety["current_joint_velocity_abort"] is None
+        and delayed_abort_count == 0
+        and delayed_counters["apply_calls"] == delayed_apply_calls
+        and delayed_counters["environment_substeps"] == delayed_apply_calls
+        and delayed_target_slew["process_action_calls"] == delayed_total_policy_steps
+        and delayed_target_slew["apply_calls"] == delayed_apply_calls
+        and delayed_target_slew["endpoint_change_count"] == 1
+        and delayed_target_slew["repeated_endpoint_process_count"]
+        == delayed_total_policy_steps - 2
+        and delayed_target_slew["slew_limited_apply_count"]
+        == DELAYED_CLOSE_LIMITED_APPLIES
+        and delayed_target_slew["endpoint_reached_apply_count"]
+        == delayed_apply_calls - DELAYED_CLOSE_LIMITED_APPLIES
+        and delayed_target_slew["last_requested_endpoint_rad"] == closed_target_rad
+        and delayed_target_slew["last_applied_target_rad"] == closed_target_rad
+        and delayed_close_headroom["passed"]
+    )
+    state["delayed_close_result"] = {
+        "profile": DELAYED_CLOSE_REPLAY_PROFILE,
+        "case": "open 115 policy steps then close at the same arm pose",
+        "passed": delayed_passed,
+        "episode_index": delayed_close_index,
+        "open_policy_steps": DELAYED_CLOSE_OPEN_POLICY_STEPS,
+        "close_policy_steps": DELAYED_CLOSE_CLOSE_POLICY_STEPS,
+        "close_transition_substeps": DELAYED_CLOSE_TRANSITION_SUBSTEPS,
+        "terminated": delayed_terminated,
+        "truncated": delayed_truncated,
+        "arm_abort_count": delayed_abort_count,
+        "ik_safety": delayed_safety,
+    }
+    failures += int(not delayed_passed)
+    failures += int(not immediate_close_headroom["passed"])
+    print(
+        " delayed close: "
+        f"{'PASS' if delayed_passed else 'FAIL'} "
+        f"process={delayed_target_slew['process_action_calls']} "
+        f"apply={delayed_target_slew['apply_calls']} "
+        f"limited={delayed_target_slew['slew_limited_apply_count']} "
+        f"aborts={delayed_abort_count} "
+        f"immediate_dq_ratio={immediate_close_headroom['maximum_ratio']:.6f} "
+        f"delayed_dq_ratio={delayed_close_headroom['maximum_ratio']:.6f}",
+        flush=True,
+    )
+
     # One bounded adversarial target proves that the guard activates while
     # preserving a finite simulator state. Never hold this target beyond
     # the one policy step; reset immediately after evidence capture.
-    adversarial_index = len(test_cases)
+    adversarial_index = len(test_cases) + 1
     state["stage"] = "reset_adversarial_case"
     state["case"] = "oversized absolute +x target for one policy step"
+    state["active_episode_index"] = None
     observation, _ = env.reset(expensive=False)
     validate_eef_gripper_post_reset(env, gripper_runtime_contract)
     begin_eef_safety_episode(env, adversarial_index)
+    state["active_episode_index"] = adversarial_index
     anchor_position = observation["policy"]["eef_pos"][0].detach().cpu().numpy()
     anchor_quaternion = observation["policy"]["eef_quat"][0].detach().cpu().numpy()
     oversized_delta = np.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])
@@ -458,8 +742,9 @@ def main(state: dict[str, object]) -> int:
     state["stage"] = "reset_after_adversarial_case"
     env.reset(expensive=False)
     validate_eef_gripper_post_reset(env, gripper_runtime_contract)
+    state["active_episode_index"] = None
 
-    total_checks = len(test_cases) + 1
+    total_checks = len(test_cases) + 2
     print(f"EEF pose smoke: {total_checks - failures}/{total_checks} passed")
     state["stage"] = "main_complete"
     state["case"] = None
@@ -475,6 +760,11 @@ if __name__ == "__main__":
         "results": [],
         "safety_reports": [],
         "adversarial_result": None,
+        "delayed_close_result": None,
+        "close_headroom_result": None,
+        "terminal_failure_evidence": None,
+        "active_episode_index": None,
+        "episode_safety_reporter": None,
         "failure": None,
         "close_failures": [],
         "persistence_failures": [],
@@ -489,6 +779,28 @@ if __name__ == "__main__":
         exit_code = main(state)
     except BaseException as run_error:
         state["failure"] = _exception_evidence(run_error)
+        # This is intentionally secondary evidence: capture failures are
+        # recorded inside the payload and never replace the original error.
+        try:
+            state["terminal_failure_evidence"] = _capture_terminal_failure_evidence(
+                state
+            )
+        except BaseException as capture_error:
+            state["terminal_failure_evidence"] = {
+                "schema_version": 1,
+                "profile": "eef_smoke_live_terminal_failure_capture_v1",
+                "status": "capture_failed",
+                "stage": state.get("stage"),
+                "case": state.get("case"),
+                "episode_index": state.get("active_episode_index"),
+                "safety_report": None,
+                "current_joint_velocity_abort": None,
+                "arm_joint_names": None,
+                "arm_joint_velocity_rad_s": None,
+                "all_six_gripper_state": None,
+                "driver_target_slew": None,
+                "capture_error": _exception_evidence(capture_error),
+            }
         _print_exception(run_error)
         exit_code = 1
 

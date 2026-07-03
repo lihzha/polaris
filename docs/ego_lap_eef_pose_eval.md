@@ -158,21 +158,25 @@ bound on measured passive-joint velocity; values above 5 rad/s remain valid
 measurements and must not be hidden.
 
 The Ego-LAP EEF action profile additionally installs
-`eef_binary_driver_target_slew_live_limit_per_120hz_substep_v1`. The policy
+`eef_binary_driver_target_slew_rate2p5_from_live_limit5_per_120hz_substep_v2`.
+The policy
 boundary and binary endpoints are unchanged: closed-positive values `>=0.5`
 request float32 `pi/4`, while smaller values request exact zero. After each
 action-term reset, the first apply anchors from the live driven-finger joint
 position, requires that anchor to lie inside the explicit float32
 tolerance-expanded endpoint bounds, and advances from that anchor toward the
 requested endpoint. Every apply advances the stored target by no more than the
-exact live float32 `velocity_limit_sim * physics_dt`, which is `5/120` radians
-in the pinned runtime. A represented float32 addition that would exceed this
-cap by one ULP is stepped one representable value back toward the previous
-target. The five passive-follower caps and eventual endpoint semantics do not
-change.
+exact float32 `target_slew_rate_rad_s * physics_dt`, which is `2.5/120` radians
+in the pinned runtime. The command rate is separately bound as a versioned
+`0.5` factor of the validated live 5 rad/s physical driver limit. A represented
+float32 addition that would exceed this cap by one ULP is stepped one
+representable value back toward the previous target. The physical driver and
+five passive-follower caps remain 5 rad/s, and eventual endpoint semantics do
+not change.
 
 The closed runtime contract records the profile, action class, reset anchor,
-live-limit source, tensor device/dtype, cap, process/apply cadence, endpoint
+physical-limit source, target-rate source/factor/rate, tensor device/dtype, cap,
+process/apply cadence, endpoint
 changes and repeats, limited/reached counts, live-limit checks, target-step
 maximum, endpoint-error maxima, and final target. Nonfinite actions/state,
 profile or device/dtype drift, external target writes, or any live driver-limit
@@ -273,9 +277,17 @@ scaling out.
 The headless controller smoke checks hold, both signs of XYZ translation, and
 both signs of XYZ rotation against the direct articulation `panda_link8`
 transform. Its first hold case requests the unchanged closed endpoint for 45
-policy steps and independently requires exactly 18 limited driver-target
-applies before the 19th apply reaches float32 `pi/4`; subsequent reset cases
-hold the exact open endpoint. A dedicated final phase resets, sends one
+policy steps and independently requires exactly 37 limited driver-target
+applies before the 38th apply reaches float32 `pi/4`; subsequent reset cases
+hold the exact open endpoint. A separate production-boundary replay holds the
+same reset-anchored arm pose with the gripper open for 115 policy steps, then
+requests close for five policy steps. Its episode must contain exactly 120
+processed actions, 960 arm/gripper apply entries, one endpoint change, 37
+limited target writes, the exact closed endpoint, and no arm abort. Both the
+immediate-close hold and delayed-close replay record all seven arm velocity
+maxima, configured limits, and per-joint ratios; promotion independently
+recomputes those ratios and requires a maximum no greater than `0.95`.
+A dedicated final phase resets, sends one
 deliberately oversized absolute +X target for exactly one policy step/eight
 physics substeps, captures
 the report, and resets immediately. It passes only when the state/report stay
@@ -309,8 +321,13 @@ process returns zero and it independently verifies the raw record; it never
 rewrites the raw JSON. Both the raw JSON and its path/size/SHA-bound ready
 marker are non-overwriting, mode `0444`, and file/parent-directory fsynced.
 Failures retain the raw safety capture, completed partial cases, current
-stage/case, and flushed exception traceback; a failure path skips the explicit
-SimulationApp hard-exit call so it cannot mask the intended nonzero status.
+stage/case, and flushed exception traceback. Before environment close they also
+attempt a live terminal capture containing the active safety/current-abort
+report, signed seven-joint arm velocity, the driver target-slew report, and all
+six gripper position/velocity/acceleration/target vectors. Any secondary
+capture error is recorded without replacing the original failure. A failure
+path skips the explicit SimulationApp hard-exit call so it cannot mask the
+intended nonzero status.
 The host uses `scripts/finalize_eef_pose_smoke.py` in `finalize` and then
 `verify` mode; its attestation is a separate immutable object bound to the raw
 bytes, ready marker, Slurm job, `srun` status, commit, source, image, and saved

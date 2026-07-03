@@ -131,7 +131,7 @@ def _adjacent_float32(value, direction):
     ).item()
 
 
-def test_static_contract_uses_exact_live_float32_five_over_120_cap(
+def test_static_contract_separates_physical_limit_and_eef_target_rate(
     host_device_contract,
 ):
     action, _, static = _action()
@@ -140,7 +140,12 @@ def test_static_contract_uses_exact_live_float32_five_over_120_cap(
     assert static["endpoint_semantics_profile"] == runtime.GRIPPER_THRESHOLD_PROFILE
     assert static["open_target_rad"] == runtime.GRIPPER_OPEN_TARGET_FLOAT32
     assert static["closed_target_rad"] == runtime.GRIPPER_CLOSED_TARGET_FLOAT32
-    assert static["velocity_limit_rad_s"] == 5.0
+    assert static["physical_velocity_limit_rad_s"] == 5.0
+    assert static["target_slew_rate_source"] == (
+        runtime.GRIPPER_TARGET_SLEW_RATE_SOURCE
+    )
+    assert static["target_slew_rate_factor"] == 0.5
+    assert static["target_slew_rate_rad_s"] == 2.5
     assert static["physics_hz"] == 120.0
     assert static["max_target_step_rad"] == (runtime.GRIPPER_MAX_TARGET_STEP_FLOAT32)
     assert action._gripper_target_slew_max_step.item() == (
@@ -153,7 +158,7 @@ def test_open_close_exact_cap_no_overshoot_and_threshold_equality(
 ):
     action, asset, _ = _action()
     targets = []
-    for substeps in (8, 8, 8):
+    for substeps in (8, 8, 8, 8, 8):
         action.process_actions(torch.tensor([[0.5]], dtype=torch.float32))
         for _ in range(substeps):
             action.apply_actions()
@@ -166,7 +171,7 @@ def test_open_close_exact_cap_no_overshoot_and_threshold_equality(
     assert all(value <= runtime.GRIPPER_CLOSED_TARGET_FLOAT32 for value in targets)
 
     open_targets = []
-    for substeps in (8, 8, 8):
+    for substeps in (8, 8, 8, 8, 8):
         action.process_actions(torch.tensor([[0.49999997]], dtype=torch.float32))
         for _ in range(substeps):
             action.apply_actions()
@@ -176,10 +181,10 @@ def test_open_close_exact_cap_no_overshoot_and_threshold_equality(
     assert all(value >= runtime.GRIPPER_OPEN_TARGET_FLOAT32 for value in open_targets)
 
     report = action.gripper_target_slew_dynamic_report()
-    assert report["process_action_calls"] == 6
+    assert report["process_action_calls"] == 10
     assert report["endpoint_change_count"] == 1
-    assert report["repeated_endpoint_process_count"] == 4
-    assert report["apply_calls"] == 48
+    assert report["repeated_endpoint_process_count"] == 8
+    assert report["apply_calls"] == 80
     assert report["max_abs_target_step_rad"] == (
         runtime.GRIPPER_MAX_TARGET_STEP_FLOAT32
     )
@@ -190,8 +195,9 @@ def test_open_close_exact_cap_no_overshoot_and_threshold_equality(
 def test_float32_cap_boundary_never_exceeds_cap_and_then_reaches_endpoint(
     host_device_contract,
 ):
-    start = (
-        runtime.GRIPPER_CLOSED_TARGET_FLOAT32 - runtime.GRIPPER_MAX_TARGET_STEP_FLOAT32
+    start = _adjacent_float32(
+        runtime.GRIPPER_CLOSED_TARGET_FLOAT32 - runtime.GRIPPER_MAX_TARGET_STEP_FLOAT32,
+        -float("inf"),
     )
     action, asset, _ = _action(joint_position=start)
     action.process_actions(torch.tensor([[1.0]], dtype=torch.float32))
@@ -220,34 +226,35 @@ def test_float32_cap_boundary_never_exceeds_cap_and_then_reaches_endpoint(
     )
 
 
-def test_job1098263_repeated_open_then_persistent_close_sequence_is_slewed(
+def test_official_failure_boundary_open115_then_close5_reaches_endpoint_safely(
     host_device_contract,
 ):
     action, asset, _ = _action()
-    # Validated trace: closed_cmd=0 through action 114, flips to 1 at action
-    # 115, and remains 1 at actions 116/117. The original arm velocity abort
-    # occurred at action 117/substep 3, 19 physics applies after the flip.
-    for _policy_step in (112, 113, 114):
+    # Production replay: closed_cmd=0 through action 114, then flips to 1 at
+    # action 115. The former 5 rad/s profile reached the endpoint after 19
+    # close applies; the versioned 2.5 rad/s profile is still mid-slew there.
+    for _policy_step in range(115):
         _apply_policy_action(action, 0.0)
     assert asset.data.joint_pos_target[0, 7].item() == 0.0
 
     close_targets = []
-    for _policy_step in (115, 116, 117):
+    for _policy_step in range(115, 120):
         action.process_actions(torch.tensor([[1.0]], dtype=torch.float32))
         for _ in range(8):
             action.apply_actions()
             close_targets.append(asset.data.joint_pos_target[0, 7].item())
 
-    assert close_targets[17] < runtime.GRIPPER_CLOSED_TARGET_FLOAT32
-    assert close_targets[18] == runtime.GRIPPER_CLOSED_TARGET_FLOAT32
-    assert close_targets[19] == runtime.GRIPPER_CLOSED_TARGET_FLOAT32
+    assert close_targets[18] < runtime.GRIPPER_CLOSED_TARGET_FLOAT32
+    assert close_targets[36] < runtime.GRIPPER_CLOSED_TARGET_FLOAT32
+    assert close_targets[37] == runtime.GRIPPER_CLOSED_TARGET_FLOAT32
+    assert close_targets[38] == runtime.GRIPPER_CLOSED_TARGET_FLOAT32
     report = action.gripper_target_slew_dynamic_report()
-    assert report["process_action_calls"] == 6
+    assert report["process_action_calls"] == 120
     assert report["endpoint_change_count"] == 1
-    assert report["repeated_endpoint_process_count"] == 4
-    assert report["apply_calls"] == 48
-    assert report["slew_limited_apply_count"] == 18
-    assert report["endpoint_reached_apply_count"] == 30
+    assert report["repeated_endpoint_process_count"] == 118
+    assert report["apply_calls"] == 960
+    assert report["slew_limited_apply_count"] == 37
+    assert report["endpoint_reached_apply_count"] == 923
 
 
 def test_reset_clears_history_and_reanchors_from_live_position(host_device_contract):
@@ -546,7 +553,10 @@ def test_initialized_setter_readback_failure_retains_last_committed_evidence(
         ("profile", "wrong"),
         ("scope", "native_too"),
         ("action_class", "BinaryJointPositionZeroToOneAction"),
-        ("velocity_limit_rad_s", 4.0),
+        ("physical_velocity_limit_rad_s", 4.0),
+        ("target_slew_rate_source", "unversioned"),
+        ("target_slew_rate_factor", 1.0),
+        ("target_slew_rate_rad_s", 5.0),
         ("physics_hz", 15.0),
         ("max_target_step_rad", 5.0 / 15.0),
         ("tensor_dtype", "torch.float64"),
@@ -563,10 +573,13 @@ def test_static_contract_rejects_profile_limit_cadence_and_tensor_drift(field, v
         "endpoint_semantics_profile": runtime.GRIPPER_THRESHOLD_PROFILE,
         "open_target_rad": runtime.GRIPPER_OPEN_TARGET_FLOAT32,
         "closed_target_rad": runtime.GRIPPER_CLOSED_TARGET_FLOAT32,
-        "velocity_limit_source": (
+        "physical_velocity_limit_source": (
             "live_implicit_actuator_velocity_limit_sim_float32_v1"
         ),
-        "velocity_limit_rad_s": 5.0,
+        "physical_velocity_limit_rad_s": 5.0,
+        "target_slew_rate_source": runtime.GRIPPER_TARGET_SLEW_RATE_SOURCE,
+        "target_slew_rate_factor": 0.5,
+        "target_slew_rate_rad_s": 2.5,
         "physics_hz": 120.0,
         "physics_dt": 1.0 / 120.0,
         "max_target_step_rad": runtime.GRIPPER_MAX_TARGET_STEP_FLOAT32,
@@ -697,4 +710,11 @@ def test_public_eval_and_controller_smoke_install_candidate_before_first_apply()
     assert "validate_eef_gripper_post_reset(env, gripper_runtime_contract)" in (
         smoke_source
     )
-    assert smoke_source.count("record_eef_gripper_post_policy_step(env)") == 2
+    assert smoke_source.count("record_eef_gripper_post_policy_step(env)") == 3
+    assert "DELAYED_CLOSE_OPEN_POLICY_STEPS = 115" in smoke_source
+    assert "DELAYED_CLOSE_CLOSE_POLICY_STEPS = 5" in smoke_source
+    assert "DELAYED_CLOSE_TRANSITION_SUBSTEPS = 38" in smoke_source
+    assert "CLOSE_ARM_VELOCITY_HEADROOM_MAX_RATIO = 0.95" in smoke_source
+    assert '"terminal_failure_evidence": state["terminal_failure_evidence"]' in (
+        smoke_source
+    )

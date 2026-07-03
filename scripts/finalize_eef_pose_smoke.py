@@ -117,6 +117,9 @@ RAW_FIELDS = {
     "ik_safety_adversarial",
     "passed",
     "results",
+    "gripper_delayed_close_replay",
+    "gripper_close_velocity_headroom",
+    "terminal_failure_evidence",
     "failure",
     "close_failures",
     "persistence_failures",
@@ -221,8 +224,11 @@ GRIPPER_TARGET_SLEW_STATIC_FIELDS = {
     "endpoint_semantics_profile",
     "open_target_rad",
     "closed_target_rad",
-    "velocity_limit_source",
-    "velocity_limit_rad_s",
+    "physical_velocity_limit_source",
+    "physical_velocity_limit_rad_s",
+    "target_slew_rate_source",
+    "target_slew_rate_factor",
+    "target_slew_rate_rad_s",
     "physics_hz",
     "physics_dt",
     "max_target_step_rad",
@@ -261,7 +267,7 @@ GRIPPER_RUNTIME_PROFILE = (
     "cuda_actuator_cpu_static_physx_v1"
 )
 GRIPPER_TARGET_SLEW_PROFILE = (
-    "eef_binary_driver_target_slew_live_limit_per_120hz_substep_v1"
+    "eef_binary_driver_target_slew_rate2p5_from_live_limit5_per_120hz_substep_v2"
 )
 GRIPPER_TARGET_SLEW_ACTION_CLASS = "EefBinaryJointPositionTargetSlewAction"
 GRIPPER_TARGET_SLEW_RESET_PROFILE = (
@@ -276,11 +282,22 @@ GRIPPER_JOINT_NAMES = [
     "right_inner_finger_knuckle_joint",
 ]
 EXPECTED_DROID_JOINT_NAMES = [*EXPECTED_JOINT_NAMES, *GRIPPER_JOINT_NAMES]
-GRIPPER_MAX_TARGET_STEP = struct.unpack(
-    "<f",
-    struct.pack("<f", 5.0 * struct.unpack("<f", struct.pack("<f", 1.0 / 120.0))[0]),
-)[0]
+GRIPPER_PHYSICAL_VELOCITY_LIMIT = _float32(5.0)
+GRIPPER_TARGET_SLEW_RATE_FACTOR = _float32(0.5)
+GRIPPER_TARGET_SLEW_RATE = _float32(
+    GRIPPER_PHYSICAL_VELOCITY_LIMIT * GRIPPER_TARGET_SLEW_RATE_FACTOR
+)
+GRIPPER_TARGET_SLEW_PHYSICS_DT_FLOAT32 = _float32(1.0 / 120.0)
+GRIPPER_MAX_TARGET_STEP = _float32(
+    GRIPPER_TARGET_SLEW_RATE * GRIPPER_TARGET_SLEW_PHYSICS_DT_FLOAT32
+)
 GRIPPER_CLOSED_TARGET = struct.unpack("<f", struct.pack("<f", math.pi / 4.0))[0]
+GRIPPER_CLOSE_TRANSITION_APPLIES = math.ceil(
+    GRIPPER_CLOSED_TARGET / GRIPPER_MAX_TARGET_STEP
+)
+GRIPPER_CLOSE_LIMITED_APPLIES = GRIPPER_CLOSE_TRANSITION_APPLIES - 1
+if GRIPPER_CLOSE_TRANSITION_APPLIES != 38:
+    raise RuntimeError("EEF gripper close transition count drift")
 GRIPPER_MIN_ANCHOR = _float32(-_float32(1e-6))
 GRIPPER_MAX_ANCHOR = _float32(GRIPPER_CLOSED_TARGET + _float32(1e-6))
 COUNTER_FIELDS = {
@@ -344,6 +361,44 @@ ADVERSARIAL_FIELDS = {
     "guard_evidence",
     "guard_error",
     "ik_safety",
+}
+DELAYED_CLOSE_FIELDS = {
+    "profile",
+    "case",
+    "passed",
+    "episode_index",
+    "open_policy_steps",
+    "close_policy_steps",
+    "close_transition_substeps",
+    "terminated",
+    "truncated",
+    "arm_abort_count",
+    "ik_safety",
+}
+DELAYED_CLOSE_REPLAY_PROFILE = "eef_open115_then_close5_same_arm_pose_v1"
+DELAYED_CLOSE_OPEN_POLICY_STEPS = 115
+DELAYED_CLOSE_CLOSE_POLICY_STEPS = 5
+DELAYED_CLOSE_APPLY_CALLS = (
+    DELAYED_CLOSE_OPEN_POLICY_STEPS + DELAYED_CLOSE_CLOSE_POLICY_STEPS
+) * 8
+CLOSE_ARM_VELOCITY_HEADROOM_PROFILE = "arm_velocity_max_over_limit_le_0p95_v1"
+CLOSE_ARM_VELOCITY_HEADROOM_MAX_RATIO = 0.95
+CLOSE_HEADROOM_FIELDS = {
+    "profile",
+    "threshold_ratio",
+    "passed",
+    "immediate_close_hold",
+    "delayed_close_replay",
+}
+CLOSE_HEADROOM_ENTRY_FIELDS = {
+    "episode_index",
+    "joint_names",
+    "max_abs_joint_velocity_rad_s",
+    "joint_velocity_limit_rad_s",
+    "velocity_to_limit_ratio",
+    "maximum_ratio",
+    "threshold_ratio",
+    "passed",
 }
 
 
@@ -589,8 +644,11 @@ def _validate_gripper_target_slew_static(value: Any, *, field: str) -> None:
         "driver_joint_name": "finger_joint",
         "driver_joint_index": 7,
         "endpoint_semantics_profile": ("closed_positive_ge_0p5_inverse_open_gt_0p5_v1"),
-        "velocity_limit_source": (
+        "physical_velocity_limit_source": (
             "live_implicit_actuator_velocity_limit_sim_float32_v1"
+        ),
+        "target_slew_rate_source": (
+            "eef_profile_fraction_of_live_physical_velocity_limit_float32_v1"
         ),
         "physics_hz": 120.0,
         "physics_dt": 1.0 / 120.0,
@@ -608,16 +666,26 @@ def _validate_gripper_target_slew_static(value: Any, *, field: str) -> None:
     for name, expected in (
         ("open_target_rad", 0.0),
         ("closed_target_rad", GRIPPER_CLOSED_TARGET),
-        ("velocity_limit_rad_s", 5.0),
+        ("physical_velocity_limit_rad_s", GRIPPER_PHYSICAL_VELOCITY_LIMIT),
+        ("target_slew_rate_factor", GRIPPER_TARGET_SLEW_RATE_FACTOR),
+        ("target_slew_rate_rad_s", GRIPPER_TARGET_SLEW_RATE),
         ("max_target_step_rad", GRIPPER_MAX_TARGET_STEP),
     ):
         _require(_same_float32(contract.get(name), expected), f"{field}.{name}")
-    recomputed = _float32(
-        _float32(contract["velocity_limit_rad_s"]) * _float32(contract["physics_dt"])
+    recomputed_rate = _float32(
+        _float32(contract["physical_velocity_limit_rad_s"])
+        * _float32(contract["target_slew_rate_factor"])
     )
     _require(
-        _same_float32(recomputed, contract["max_target_step_rad"]),
-        f"{field} live-limit/cadence cap binding",
+        _same_float32(recomputed_rate, contract["target_slew_rate_rad_s"]),
+        f"{field} physical-limit/factor/rate binding",
+    )
+    recomputed_step = _float32(
+        _float32(contract["target_slew_rate_rad_s"]) * _float32(contract["physics_dt"])
+    )
+    _require(
+        _same_float32(recomputed_step, contract["max_target_step_rad"]),
+        f"{field} rate/cadence cap binding",
     )
 
 
@@ -811,7 +879,12 @@ def _validate_gripper_static(value: Any, *, field: str) -> None:
 
 
 def _validate_gripper_target_slew_dynamic(
-    value: Any, *, field: str, apply_calls: int, expect_closed_target: bool
+    value: Any,
+    *,
+    field: str,
+    apply_calls: int,
+    expect_closed_target: bool,
+    expected_endpoint_change_count: int = 0,
 ) -> None:
     report = _object(value, field)
     _require(
@@ -842,8 +915,9 @@ def _validate_gripper_target_slew_dynamic(
         and counters["apply_calls"] == apply_calls
         and counters["live_limit_validation_count"] == apply_calls
         and counters["initialization_count"] == int(apply_calls > 0)
-        and counters["endpoint_change_count"] == 0
-        and counters["repeated_endpoint_process_count"] == max(expected_process - 1, 0)
+        and counters["endpoint_change_count"] == expected_endpoint_change_count
+        and counters["repeated_endpoint_process_count"]
+        == max(expected_process - 1 - expected_endpoint_change_count, 0)
         and counters["slew_limited_apply_count"]
         + counters["endpoint_reached_apply_count"]
         == apply_calls,
@@ -889,9 +963,11 @@ def _validate_gripper_target_slew_dynamic(
         )
         if expect_closed_target:
             _require(
-                apply_calls >= 19
-                and counters["slew_limited_apply_count"] == 18
-                and counters["endpoint_reached_apply_count"] == apply_calls - 18
+                apply_calls >= GRIPPER_CLOSE_TRANSITION_APPLIES
+                and counters["slew_limited_apply_count"]
+                == GRIPPER_CLOSE_LIMITED_APPLIES
+                and counters["endpoint_reached_apply_count"]
+                == apply_calls - GRIPPER_CLOSE_LIMITED_APPLIES
                 and _same_float32(maxima[0], GRIPPER_MAX_TARGET_STEP)
                 and _same_float32(maxima[1], GRIPPER_CLOSED_TARGET)
                 and _same_float32(anchor, 0.0)
@@ -910,7 +986,12 @@ def _validate_gripper_target_slew_dynamic(
 
 
 def _validate_gripper_dynamic(
-    value: Any, *, field: str, apply_calls: int, expect_closed_target: bool
+    value: Any,
+    *,
+    field: str,
+    apply_calls: int,
+    expect_closed_target: bool,
+    expected_endpoint_change_count: int = 0,
 ) -> None:
     report = _object(value, field)
     _require(set(report) == GRIPPER_RUNTIME_DYNAMIC_FIELDS, f"{field} schema drift")
@@ -996,6 +1077,7 @@ def _validate_gripper_dynamic(
         field=f"{field}.target_slew",
         apply_calls=apply_calls,
         expect_closed_target=expect_closed_target,
+        expected_endpoint_change_count=expected_endpoint_change_count,
     )
 
 
@@ -1006,6 +1088,7 @@ def _validate_safety_report(
     episode_index: int | None,
     apply_calls: int,
     expect_closed_target: bool = False,
+    expected_endpoint_change_count: int = 0,
 ) -> tuple[dict[str, int], dict[str, list[float]]]:
     report = _object(value, field)
     _require(set(report) == SAFETY_FIELDS, f"{field} schema drift")
@@ -1021,6 +1104,7 @@ def _validate_safety_report(
         field=f"{field}.gripper_dynamic",
         apply_calls=apply_calls,
         expect_closed_target=expect_closed_target,
+        expected_endpoint_change_count=expected_endpoint_change_count,
     )
     if episode_index is None:
         _require(report.get("episode_index") is None, f"{field}.episode_index")
@@ -1608,9 +1692,67 @@ def _file_identity(path: Path, field: str) -> dict[str, Any]:
     }
 
 
+def _validate_close_headroom_entry(
+    value: Any,
+    *,
+    field: str,
+    episode_index: int,
+    safety_report: dict[str, Any],
+) -> dict[str, Any]:
+    entry = _object(value, field)
+    _require(set(entry) == CLOSE_HEADROOM_ENTRY_FIELDS, f"{field} schema drift")
+    _exact_int(entry.get("episode_index"), episode_index, f"{field}.episode_index")
+    _require(entry.get("joint_names") == EXPECTED_JOINT_NAMES, f"{field}.joint_names")
+    expected_maxima = safety_report["maxima"]["abs_joint_vel_rad_s"]
+    expected_limits = safety_report["joint_velocity_limits_rad_s"]
+    _exact_float_vector(
+        entry.get("max_abs_joint_velocity_rad_s"),
+        expected_maxima,
+        f"{field}.maxima",
+    )
+    _exact_float_vector(
+        entry.get("joint_velocity_limit_rad_s"),
+        expected_limits,
+        f"{field}.limits",
+    )
+    ratios = _finite_vector(
+        entry.get("velocity_to_limit_ratio"), f"{field}.ratios", length=7
+    )
+    recomputed = [
+        maximum / limit
+        for maximum, limit in zip(expected_maxima, expected_limits, strict=True)
+    ]
+    _require(
+        all(
+            math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-12)
+            for actual, expected in zip(ratios, recomputed, strict=True)
+        ),
+        f"{field}.ratio binding",
+    )
+    maximum_ratio = _finite_number(entry.get("maximum_ratio"), f"{field}.maximum")
+    _exact_float(
+        entry.get("threshold_ratio"),
+        CLOSE_ARM_VELOCITY_HEADROOM_MAX_RATIO,
+        f"{field}.threshold",
+    )
+    _require(
+        math.isclose(maximum_ratio, max(recomputed), rel_tol=0.0, abs_tol=1e-12),
+        f"{field}.maximum binding",
+    )
+    _require(
+        entry.get("passed") is True
+        and maximum_ratio <= CLOSE_ARM_VELOCITY_HEADROOM_MAX_RATIO,
+        f"{field} lacks required five-percent arm-velocity headroom",
+    )
+    return {
+        "maximum_ratio": maximum_ratio,
+        "max_abs_joint_velocity_rad_s": list(expected_maxima),
+    }
+
+
 def _verify_raw(raw: dict[str, Any]) -> dict[str, Any]:
     _require(set(raw) == RAW_FIELDS, "raw top-level schema drift")
-    _exact_int(raw.get("schema_version"), 1, "raw schema_version")
+    _exact_int(raw.get("schema_version"), 2, "raw schema_version")
     _require(raw.get("finalized") is False, "raw finalized must be false")
     _require(raw.get("passed") is False, "raw passed must be false")
     _require(
@@ -1620,6 +1762,10 @@ def _verify_raw(raw: dict[str, Any]) -> dict[str, Any]:
     _require(raw.get("case") is None, "raw case must be null")
     _exact_int(raw.get("exit_code"), 0, "raw exit_code")
     _require(raw.get("failure") is None, "raw failure must be null")
+    _require(
+        raw.get("terminal_failure_evidence") is None,
+        "successful raw terminal failure evidence must be null",
+    )
     _require(raw.get("close_failures") == [], "raw close failures must be empty")
     _require(
         raw.get("persistence_failures") == [],
@@ -1678,6 +1824,85 @@ def _verify_raw(raw: dict[str, Any]) -> dict[str, Any]:
             apply_calls=360,
             expect_closed_target=index == 0,
         )
+
+    delayed_close = _object(
+        raw.get("gripper_delayed_close_replay"), "delayed-close replay"
+    )
+    _require(
+        set(delayed_close) == DELAYED_CLOSE_FIELDS,
+        "delayed-close replay schema drift",
+    )
+    _require(
+        delayed_close.get("profile") == DELAYED_CLOSE_REPLAY_PROFILE
+        and delayed_close.get("case")
+        == "open 115 policy steps then close at the same arm pose",
+        "delayed-close replay identity",
+    )
+    _require(delayed_close.get("passed") is True, "delayed-close replay failed")
+    _exact_int(delayed_close.get("episode_index"), 13, "delayed-close episode")
+    _exact_int(
+        delayed_close.get("open_policy_steps"),
+        DELAYED_CLOSE_OPEN_POLICY_STEPS,
+        "delayed-close open steps",
+    )
+    _exact_int(
+        delayed_close.get("close_policy_steps"),
+        DELAYED_CLOSE_CLOSE_POLICY_STEPS,
+        "delayed-close close steps",
+    )
+    _exact_int(
+        delayed_close.get("close_transition_substeps"),
+        GRIPPER_CLOSE_TRANSITION_APPLIES,
+        "delayed-close transition substeps",
+    )
+    _exact_int(delayed_close.get("arm_abort_count"), 0, "delayed-close aborts")
+    _require(
+        delayed_close.get("terminated") is False
+        and delayed_close.get("truncated") is False,
+        "delayed-close replay terminated or truncated",
+    )
+    delayed_counters, _ = _validate_safety_report(
+        delayed_close.get("ik_safety"),
+        field="delayed-close safety",
+        episode_index=13,
+        apply_calls=DELAYED_CLOSE_APPLY_CALLS,
+        expect_closed_target=True,
+        expected_endpoint_change_count=1,
+    )
+    _require(
+        sum(delayed_counters[name] for name in ABORT_COUNTERS)
+        == delayed_close["arm_abort_count"],
+        "delayed-close abort counter binding",
+    )
+    close_headroom = _object(
+        raw.get("gripper_close_velocity_headroom"), "close velocity headroom"
+    )
+    _require(
+        set(close_headroom) == CLOSE_HEADROOM_FIELDS,
+        "close velocity headroom schema drift",
+    )
+    _require(
+        close_headroom.get("profile") == CLOSE_ARM_VELOCITY_HEADROOM_PROFILE,
+        "close velocity headroom profile",
+    )
+    _exact_float(
+        close_headroom.get("threshold_ratio"),
+        CLOSE_ARM_VELOCITY_HEADROOM_MAX_RATIO,
+        "close velocity headroom threshold",
+    )
+    _require(close_headroom.get("passed") is True, "close velocity headroom failed")
+    immediate_headroom_summary = _validate_close_headroom_entry(
+        close_headroom.get("immediate_close_hold"),
+        field="immediate-close headroom",
+        episode_index=0,
+        safety_report=reports[0],
+    )
+    delayed_headroom_summary = _validate_close_headroom_entry(
+        close_headroom.get("delayed_close_replay"),
+        field="delayed-close headroom",
+        episode_index=13,
+        safety_report=delayed_close["ik_safety"],
+    )
 
     adversarial = _object(raw.get("ik_safety_adversarial"), "adversarial")
     _require(set(adversarial) == ADVERSARIAL_FIELDS, "adversarial schema drift")
@@ -1747,7 +1972,7 @@ def _verify_raw(raw: dict[str, Any]) -> dict[str, Any]:
     counters, maxima = _validate_safety_report(
         adversarial.get("ik_safety"),
         field="adversarial safety",
-        episode_index=13,
+        episode_index=14,
         apply_calls=8,
     )
     slew_events = counters.get("slew_limit_events")
@@ -1806,6 +2031,18 @@ def _verify_raw(raw: dict[str, Any]) -> dict[str, Any]:
         "ordinary_pass_count": 13,
         "ordinary_safety_report_count": 13,
         "ordinary_apply_calls_each": 360,
+        "delayed_close": {
+            "passed": True,
+            "episode_index": 13,
+            "open_policy_steps": DELAYED_CLOSE_OPEN_POLICY_STEPS,
+            "close_policy_steps": DELAYED_CLOSE_CLOSE_POLICY_STEPS,
+            "apply_calls": DELAYED_CLOSE_APPLY_CALLS,
+            "close_transition_substeps": GRIPPER_CLOSE_TRANSITION_APPLIES,
+            "slew_limited_apply_count": GRIPPER_CLOSE_LIMITED_APPLIES,
+            "abort_count": 0,
+            "arm_velocity_headroom": delayed_headroom_summary,
+        },
+        "immediate_close_arm_velocity_headroom": immediate_headroom_summary,
         "soft_limit_digest": EXPECTED_DIGEST,
         "target_limit_digest": EXPECTED_TARGET_DIGEST,
         "physx_derived_soft_limit_digest": EXPECTED_PHYSX_DERIVED_SOFT_DIGEST,

@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
+import traceback
 from types import SimpleNamespace
 
 import numpy as np
@@ -2212,6 +2213,112 @@ def test_smoke_raw_json_publication_is_strict_and_nonoverwriting(tmp_path):
         writer(output, {"value": 2.0})
     assert output.read_bytes() == original
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_smoke_failure_capture_preserves_live_arm_gripper_and_original_error():
+    import torch
+
+    smoke_path = Path(__file__).parents[1] / "scripts" / "smoke_eef_pose_controller.py"
+    parsed = ast.parse(smoke_path.read_text())
+    helper_names = {
+        "_exception_evidence",
+        "_strict_vector_evidence",
+        "_capture_terminal_failure_evidence",
+        "_arm_velocity_headroom_evidence",
+    }
+    helper_nodes = [
+        node
+        for node in parsed.body
+        if isinstance(node, ast.FunctionDef) and node.name in helper_names
+    ]
+    assert {node.name for node in helper_nodes} == helper_names
+    namespace = {
+        "math": math,
+        "traceback": traceback,
+        "CLOSE_ARM_VELOCITY_HEADROOM_MAX_RATIO": 0.95,
+    }
+    exec(
+        compile(ast.Module(helper_nodes, type_ignores=[]), str(smoke_path), "exec"),
+        namespace,
+    )
+    capture = namespace["_capture_terminal_failure_evidence"]
+
+    arm_velocity = [0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7]
+    joint_vel = torch.zeros((1, 13), dtype=torch.float32)
+    joint_vel[0, :7] = torch.tensor(arm_velocity)
+    robot_data = SimpleNamespace(
+        joint_pos=torch.arange(13, dtype=torch.float32).reshape(1, 13),
+        joint_vel=joint_vel,
+        joint_acc=torch.ones((1, 13), dtype=torch.float32),
+        joint_pos_target=torch.arange(13, dtype=torch.float32).reshape(1, 13) / 10,
+        joint_vel_target=torch.zeros((1, 13), dtype=torch.float32),
+    )
+    target_slew = {"profile": "target-slew", "apply_calls": 4}
+    current_abort = {
+        "joint_velocity_rad_s": [float(value) for value in joint_vel[0, :7].tolist()]
+    }
+    safety = {
+        "episode_index": 0,
+        "joint_names": [f"panda_joint{index}" for index in range(1, 8)],
+        "joint_velocity_limits_rad_s": [1.0] * 7,
+        "maxima": {"abs_joint_vel_rad_s": [0.95, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+        "current_joint_velocity_abort": current_abort,
+        "gripper_runtime_dynamic": {
+            "joint_names": [f"gripper_{index}" for index in range(6)],
+            "joint_indices": list(range(7, 13)),
+            "driver_target_slew": target_slew,
+        },
+    }
+    arm_term = SimpleNamespace(
+        _joint_names=[f"panda_joint{index}" for index in range(1, 8)],
+        _joint_ids=list(range(7)),
+    )
+    finger_term = SimpleNamespace(
+        gripper_target_slew_dynamic_report=lambda: target_slew
+    )
+    runtime = SimpleNamespace(
+        action_manager=SimpleNamespace(
+            _terms={"arm": arm_term, "finger_joint": finger_term}
+        ),
+        scene={"robot": SimpleNamespace(data=robot_data)},
+    )
+    env = SimpleNamespace(unwrapped=runtime)
+    original_failure = {"type": "OriginalSafetyAbort", "message": "do not mask"}
+    state = {
+        "stage": "execute_case",
+        "case": "hold",
+        "active_episode_index": 0,
+        "env": env,
+        "episode_safety_reporter": lambda _env, _episode: safety,
+        "failure": original_failure,
+    }
+    evidence = capture(state)
+    assert state["failure"] is original_failure
+    assert evidence["status"] == "captured"
+    assert evidence["safety_report"] is safety
+    assert evidence["current_joint_velocity_abort"] is current_abort
+    assert (
+        evidence["arm_joint_velocity_rad_s"]["values"]
+        == current_abort["joint_velocity_rad_s"]
+    )
+    assert evidence["driver_target_slew"] is target_slew
+    assert len(evidence["all_six_gripper_state"]["joint_velocity_rad_s"]["values"]) == 6
+
+    def failed_reporter(_env, _episode):
+        raise RuntimeError("secondary capture failure")
+
+    state["episode_safety_reporter"] = failed_reporter
+    failed = capture(state)
+    assert state["failure"] is original_failure
+    assert failed["status"] == "capture_failed"
+    assert failed["capture_error"]["message"] == "secondary capture failure"
+
+    headroom = namespace["_arm_velocity_headroom_evidence"]
+    boundary = headroom(safety, episode_index=0)
+    assert boundary["maximum_ratio"] == 0.95
+    assert boundary["passed"] is True
+    safety["maxima"]["abs_joint_vel_rad_s"][0] = 0.950001
+    assert headroom(safety, episode_index=0)["passed"] is False
 
 
 @pytest.mark.parametrize(

@@ -75,11 +75,22 @@ GRIPPER_DRIVER_VELOCITY_LIMIT_FLOAT32 = 5.0
 GRIPPER_FOLLOWER_DEFAULT_VELOCITY_LIMIT_FLOAT32 = 174.53292846679688
 GRIPPER_FOLLOWER_VELOCITY_LIMIT_FLOAT32 = 5.0
 EEF_GRIPPER_TARGET_SLEW_PROFILE = (
-    "eef_binary_driver_target_slew_live_limit_per_120hz_substep_v1"
+    "eef_binary_driver_target_slew_rate2p5_from_live_limit5_per_120hz_substep_v2"
 )
 EEF_GRIPPER_TARGET_SLEW_ACTION_CLASS = "EefBinaryJointPositionTargetSlewAction"
 EEF_GRIPPER_TARGET_SLEW_RESET_PROFILE = (
     "first_apply_after_action_reset_anchor_live_driver_position_v1"
+)
+GRIPPER_TARGET_SLEW_RATE_SOURCE = (
+    "eef_profile_fraction_of_live_physical_velocity_limit_float32_v1"
+)
+GRIPPER_TARGET_SLEW_RATE_FACTOR_FLOAT32 = float(np.float32(0.5))
+GRIPPER_TARGET_SLEW_RATE_RAD_S_FLOAT32 = float(
+    np.multiply(
+        np.float32(GRIPPER_DRIVER_VELOCITY_LIMIT_FLOAT32),
+        np.float32(GRIPPER_TARGET_SLEW_RATE_FACTOR_FLOAT32),
+        dtype=np.float32,
+    )
 )
 GRIPPER_TARGET_SLEW_PHYSICS_HZ = 120.0
 GRIPPER_TARGET_SLEW_PHYSICS_DT = 1.0 / GRIPPER_TARGET_SLEW_PHYSICS_HZ
@@ -102,7 +113,7 @@ GRIPPER_TARGET_SLEW_MAX_ANCHOR_FLOAT32 = float(
 )
 GRIPPER_MAX_TARGET_STEP_FLOAT32 = float(
     np.multiply(
-        np.float32(GRIPPER_DRIVER_VELOCITY_LIMIT_FLOAT32),
+        np.float32(GRIPPER_TARGET_SLEW_RATE_RAD_S_FLOAT32),
         np.float32(GRIPPER_TARGET_SLEW_PHYSICS_DT),
         dtype=np.float32,
     )
@@ -224,8 +235,11 @@ TARGET_SLEW_STATIC_FIELDS = {
     "endpoint_semantics_profile",
     "open_target_rad",
     "closed_target_rad",
-    "velocity_limit_source",
-    "velocity_limit_rad_s",
+    "physical_velocity_limit_source",
+    "physical_velocity_limit_rad_s",
+    "target_slew_rate_source",
+    "target_slew_rate_factor",
+    "target_slew_rate_rad_s",
     "physics_hz",
     "physics_dt",
     "max_target_step_rad",
@@ -662,9 +676,10 @@ def validate_eef_gripper_target_slew_static(value: Any) -> dict[str, Any]:
         "driver_joint_name": DRIVEN_GRIPPER_JOINT_NAME,
         "driver_joint_index": DRIVEN_GRIPPER_JOINT_INDEX,
         "endpoint_semantics_profile": GRIPPER_THRESHOLD_PROFILE,
-        "velocity_limit_source": (
+        "physical_velocity_limit_source": (
             "live_implicit_actuator_velocity_limit_sim_float32_v1"
         ),
+        "target_slew_rate_source": GRIPPER_TARGET_SLEW_RATE_SOURCE,
         "reset_profile": EEF_GRIPPER_TARGET_SLEW_RESET_PROFILE,
         "tensor_dtype": PINNED_TENSOR_DTYPE,
         "tensor_device": PINNED_ACTUATOR_DEVICE,
@@ -677,7 +692,9 @@ def validate_eef_gripper_target_slew_static(value: Any) -> dict[str, Any]:
     numeric = {
         "open_target_rad": GRIPPER_OPEN_TARGET_FLOAT32,
         "closed_target_rad": GRIPPER_CLOSED_TARGET_FLOAT32,
-        "velocity_limit_rad_s": GRIPPER_DRIVER_VELOCITY_LIMIT_FLOAT32,
+        "physical_velocity_limit_rad_s": GRIPPER_DRIVER_VELOCITY_LIMIT_FLOAT32,
+        "target_slew_rate_factor": GRIPPER_TARGET_SLEW_RATE_FACTOR_FLOAT32,
+        "target_slew_rate_rad_s": GRIPPER_TARGET_SLEW_RATE_RAD_S_FLOAT32,
         "physics_hz": GRIPPER_TARGET_SLEW_PHYSICS_HZ,
         "physics_dt": GRIPPER_TARGET_SLEW_PHYSICS_DT,
         "max_target_step_rad": GRIPPER_MAX_TARGET_STEP_FLOAT32,
@@ -694,7 +711,9 @@ def validate_eef_gripper_target_slew_static(value: Any) -> dict[str, Any]:
         if field in {
             "open_target_rad",
             "closed_target_rad",
-            "velocity_limit_rad_s",
+            "physical_velocity_limit_rad_s",
+            "target_slew_rate_factor",
+            "target_slew_rate_rad_s",
             "max_target_step_rad",
         }:
             _require(
@@ -706,16 +725,27 @@ def validate_eef_gripper_target_slew_static(value: Any) -> dict[str, Any]:
                 float(actual) == float(expected),
                 f"gripper target-slew static {field} drift",
             )
-    recomputed = float(
+    recomputed_rate = float(
         np.multiply(
-            np.float32(value["velocity_limit_rad_s"]),
+            np.float32(value["physical_velocity_limit_rad_s"]),
+            np.float32(value["target_slew_rate_factor"]),
+            dtype=np.float32,
+        )
+    )
+    _require(
+        _same_float32(recomputed_rate, value["target_slew_rate_rad_s"]),
+        "gripper target-slew physical-limit/factor/rate binding drift",
+    )
+    recomputed_step = float(
+        np.multiply(
+            np.float32(value["target_slew_rate_rad_s"]),
             np.float32(value["physics_dt"]),
             dtype=np.float32,
         )
     )
     _require(
-        _same_float32(recomputed, value["max_target_step_rad"]),
-        "gripper target-slew live-limit/cadence cap binding drift",
+        _same_float32(recomputed_step, value["max_target_step_rad"]),
+        "gripper target-slew rate/cadence cap binding drift",
     )
     return dict(value)
 
