@@ -100,6 +100,20 @@ static = {"driver_target_slew": {"profile": "target-slew-static"}}
 
 
 class Finger:
+    def __init__(self):
+        # Match the exact live Isaac Lab BinaryJointPositionAction tensor
+        # layout: processed endpoints are per-environment ``(N, 1)`` tensors,
+        # while the open/close command constants are ``(1,)`` tensors.
+        self._gripper_target_slew_endpoint = torch.tensor(
+            [[0.0]], dtype=torch.float32
+        )
+        self._gripper_target_slew_endpoint_seen = True
+        self._gripper_target_slew_endpoint_change_count = 0
+        self._open_command = torch.tensor([0.0], dtype=torch.float32)
+        self._close_command = torch.tensor(
+            [torch.pi / 4.0], dtype=torch.float32
+        )
+
     def gripper_target_slew_static_contract(self):
         return {"profile": "target-slew-static"}
 
@@ -136,6 +150,62 @@ action = bare_action()
 action.install_gripper_runtime_contract(static, finger_term=finger)
 assert action._gripper_target_slew_term is finger
 assert action._gripper_runtime_static == static
+
+# Exercise the live tensor shapes, not just the pure countdown transition.
+# This is a regression test for the shape-strict torch.equal integration bug
+# found by the first official controller-candidate replay.
+action._gripper_close_arm_interlock_enabled = True
+action._gripper_close_arm_interlock_observed_endpoint_change_count = 0
+action._gripper_close_arm_interlock_endpoint_observed = False
+action._gripper_close_arm_interlock_remaining = 0
+opened = action._next_gripper_close_arm_interlock_transition()
+assert opened.active is False
+assert opened.endpoint_observed_after_successful_apply is True
+
+finger._gripper_target_slew_endpoint.fill_(torch.pi / 4.0)
+closed = action._next_gripper_close_arm_interlock_transition()
+assert closed.active is True
+assert closed.remaining_after_successful_apply == 47
+assert closed.activation_count_delta == 1
+
+finger._gripper_target_slew_endpoint.fill_(0.1)
+try:
+    action._next_gripper_close_arm_interlock_transition()
+except ValueError as error:
+    assert "binary endpoint" in str(error)
+else:
+    raise AssertionError("non-binary gripper endpoint was accepted")
+
+finger._gripper_target_slew_endpoint.fill_(0.0)
+valid_open = torch.tensor([0.0], dtype=torch.float32)
+valid_close = torch.tensor([torch.pi / 4.0], dtype=torch.float32)
+malformed_commands = (
+    ("empty close", valid_open, torch.empty(0, dtype=torch.float32)),
+    ("scalar open", torch.tensor(0.0, dtype=torch.float32), valid_close),
+    ("wider close", valid_open, torch.tensor([0.0, 0.0], dtype=torch.float32)),
+    ("wrong close dtype", valid_open, valid_close.to(torch.float64)),
+    (
+        "wrong close device",
+        valid_open,
+        torch.empty((1,), dtype=torch.float32, device="meta"),
+    ),
+    ("non-finite close", valid_open, torch.tensor([float("nan")])),
+    ("drifted close", valid_open, torch.tensor([0.2], dtype=torch.float32)),
+    ("drifted open", torch.tensor([0.2], dtype=torch.float32), valid_close),
+    ("aliased endpoints", valid_open, valid_open.clone()),
+)
+for label, open_command, close_command in malformed_commands:
+    finger._open_command = open_command
+    finger._close_command = close_command
+    try:
+        action._next_gripper_close_arm_interlock_transition()
+    except ValueError as error:
+        assert "endpoint state drift" in str(error), label
+    else:
+        raise AssertionError(f"{label} was accepted")
+finger._open_command = valid_open
+finger._close_command = valid_close
+
 report = action._gripper_runtime_dynamic_report()
 assert report["driver_target_slew"] == {"profile": "target-slew-dynamic"}
 assert captured_dynamic[-1] is report

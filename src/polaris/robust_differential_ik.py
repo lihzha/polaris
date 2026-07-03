@@ -67,8 +67,10 @@ from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
 from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_PROFILE
 from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION
 from polaris.eef_gripper_runtime import EEF_GRIPPER_RUNTIME_PROFILE
+from polaris.eef_gripper_runtime import GRIPPER_CLOSED_TARGET_FLOAT32
 from polaris.eef_gripper_runtime import GRIPPER_JOINT_INDICES
 from polaris.eef_gripper_runtime import GRIPPER_JOINT_NAMES
+from polaris.eef_gripper_runtime import GRIPPER_OPEN_TARGET_FLOAT32
 from polaris.eef_gripper_runtime import PINNED_DYNAMIC_DEVICE
 from polaris.eef_gripper_runtime import PINNED_TENSOR_DTYPE
 from polaris.eef_gripper_runtime import validate_eef_gripper_dynamic_evidence
@@ -1232,14 +1234,35 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             or not isinstance(close_command, torch.Tensor)
             or not isinstance(open_command, torch.Tensor)
             or endpoint.shape != (self.num_envs, 1)
+            or close_command.shape != (1,)
+            or open_command.shape != (1,)
             or endpoint.dtype != self._asset.data.joint_pos.dtype
+            or close_command.dtype != endpoint.dtype
+            or open_command.dtype != endpoint.dtype
             or endpoint.device != torch.device(self.device)
+            or close_command.device != endpoint.device
+            or open_command.device != endpoint.device
+            or not bool(torch.isfinite(endpoint).all().item())
+            or not bool(torch.isfinite(close_command).all().item())
+            or not bool(torch.isfinite(open_command).all().item())
             or type(endpoint_change_count) is not int
             or endpoint_change_count < 0
         ):
             raise ValueError("PolaRiS EEF close-interlock endpoint state drift")
-        endpoint_is_closed = torch.equal(endpoint, close_command)
-        if not endpoint_is_closed and not torch.equal(endpoint, open_command):
+        expected_close = torch.full_like(close_command, GRIPPER_CLOSED_TARGET_FLOAT32)
+        expected_open = torch.full_like(open_command, GRIPPER_OPEN_TARGET_FLOAT32)
+        if not torch.equal(close_command, expected_close) or not torch.equal(
+            open_command, expected_open
+        ):
+            raise ValueError("PolaRiS EEF close-interlock endpoint state drift")
+        # Isaac Lab stores the per-environment processed endpoint as ``(N, 1)``
+        # while BinaryJointPositionAction stores each endpoint command as
+        # ``(1,)``.  The interlock is itself restricted to one environment;
+        # reshape the now-validated constants to the exact live endpoint shape
+        # before using shape-strict equality.
+        endpoint_is_closed = torch.equal(endpoint, close_command.reshape(1, 1))
+        endpoint_is_open = torch.equal(endpoint, open_command.reshape(1, 1))
+        if not endpoint_is_closed and not endpoint_is_open:
             raise ValueError("PolaRiS EEF close interlock requires a binary endpoint")
         return advance_gripper_close_arm_interlock(
             enabled=True,
