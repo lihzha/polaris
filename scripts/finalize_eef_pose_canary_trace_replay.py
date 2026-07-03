@@ -358,6 +358,12 @@ def build_attestation(args: argparse.Namespace) -> dict[str, Any]:
         and saved_job_script["mode"] == "0444",
         "runtime/saved job script identity",
     )
+    job_script = {
+        "profile": "slurm_runtime_content_saved_copy_v1",
+        "runtime_content_size_bytes": runtime_job_script["size_bytes"],
+        "runtime_content_sha256": runtime_job_script["sha256"],
+        "saved_identity": saved_job_script,
+    }
     assets = _validate_live_assets(raw)
 
     tail = raw["all_six_gripper_tail"]
@@ -390,8 +396,7 @@ def build_attestation(args: argparse.Namespace) -> dict[str, Any]:
             "fixture_source": fixture_payload["source"],
             "assets": assets,
             "container_image": container,
-            "runtime_job_script": runtime_job_script,
-            "saved_job_script": saved_job_script,
+            "job_script": job_script,
         },
     }
     _require(set(result) == ATTESTATION_FIELDS, "attestation schema")

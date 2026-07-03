@@ -134,6 +134,9 @@ def test_status_writer_and_finalizer_bind_exact_srun_lifecycle(
     job_script = tmp_path / "job.sh"
     job_script.write_bytes(b"#!/bin/bash\n")
     job_script.chmod(0o444)
+    runtime_job_script = tmp_path / "slurm_script"
+    runtime_job_script.write_bytes(job_script.read_bytes())
+    runtime_job_script.chmod(0o700)
     attestation = raw_path.with_name(f"gate0-{variant}.attestation.json")
     scripts = repo / "scripts"
     args = argparse.Namespace(
@@ -160,7 +163,7 @@ def test_status_writer_and_finalizer_bind_exact_srun_lifecycle(
         ),
         container_image=container,
         expected_container_sha256=_source_sha(container),
-        runtime_job_script=job_script,
+        runtime_job_script=runtime_job_script,
         saved_job_script=job_script,
         expected_saved_job_script_sha256=_source_sha(job_script),
     )
@@ -168,6 +171,9 @@ def test_status_writer_and_finalizer_bind_exact_srun_lifecycle(
     finalizer._publish(attestation, expected)
     actual = replay.strict_json_loads(attestation.read_bytes(), field="attestation")
     assert actual == expected
+    runtime_job_script.unlink()
+    args.runtime_job_script = job_script
+    assert finalizer.build_attestation(args) == actual
     assert stat_mode(attestation) == "0444"
     assert expected["lifecycle"]["step_id"] == 0
     assert expected["validation_summary"]["arm_failure_ring_entries"] == 64
