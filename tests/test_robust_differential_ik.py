@@ -1252,8 +1252,10 @@ def test_current_joint_velocity_abort_uses_direct_float32_threshold(joint_index)
 
 def test_current_limit_and_slew_invariants_abort_before_physx_target_setter():
     source = inspect.getsource(RobustDifferentialInverseKinematicsAction.apply_actions)
-    setter = source.index("self._asset.set_joint_position_target")
-    velocity_setter = source.index("self._asset.set_joint_velocity_target")
+    setter = source.index("self._set_targets_and_commit_gripper_close_arm_interlock(")
+    transaction_source = inspect.getsource(
+        RobustDifferentialInverseKinematicsAction._set_targets_and_commit_gripper_close_arm_interlock
+    )
     assert source.index("if not current_quaternion_valid:") < setter
     assert source.index("if not desired_quaternion_valid:") < setter
     assert source.index("self._ik_controller.ee_quat_des") < setter
@@ -1300,7 +1302,9 @@ def test_current_limit_and_slew_invariants_abort_before_physx_target_setter():
     )
     assert source.index("if target_invalid:") < setter
     assert source.index("if slew_invalid:") < setter
-    assert velocity_setter < setter
+    assert transaction_source.index("self._asset.set_joint_velocity_target") < (
+        transaction_source.index("self._asset.set_joint_position_target")
+    )
     assert "write_joint_state_to_sim" not in source
 
     init_source = inspect.getsource(RobustDifferentialInverseKinematicsAction.__init__)
@@ -1423,8 +1427,9 @@ def test_wrist_energy_brake_state_resets_and_commits_only_after_target_setters()
     assert "self._reset_episode_safety_state(episode_index=episode_index)" in (
         begin_source
     )
-    velocity_setter = apply_source.index("self._asset.set_joint_velocity_target(")
-    position_setter = apply_source.index("self._asset.set_joint_position_target(")
+    transaction = apply_source.index(
+        "self._set_targets_and_commit_gripper_close_arm_interlock("
+    )
     latch_commit = apply_source.index("self._wrist_energy_brake_latch_remaining.copy_(")
     target_commit = apply_source.index(
         "self._wrist_energy_brake_previous_applied_target.copy_(safe_target)"
@@ -1432,7 +1437,7 @@ def test_wrist_energy_brake_state_resets_and_commits_only_after_target_setters()
     validity_commit = apply_source.index(
         "self._wrist_energy_brake_previous_target_valid.fill_(True)"
     )
-    assert velocity_setter < position_setter < latch_commit < target_commit
+    assert transaction < latch_commit < target_commit
     assert target_commit < validity_commit
 
 
@@ -1713,10 +1718,14 @@ def test_failure_substep_trace_is_disabled_by_default_and_separate_from_safety()
     assert apply_source.index("self._finalize_pending_failure_substep_trace(") < (
         apply_source.index("self._apply_call_count += 1")
     )
-    assert (
-        apply_source.index("self._asset.set_joint_velocity_target(")
-        < (apply_source.index("self._asset.set_joint_position_target("))
-        < apply_source.index("self._stage_failure_substep_trace(")
+    assert apply_source.index(
+        "self._set_targets_and_commit_gripper_close_arm_interlock("
+    ) < apply_source.index("self._stage_failure_substep_trace(")
+    transaction_source = inspect.getsource(
+        RobustDifferentialInverseKinematicsAction._set_targets_and_commit_gripper_close_arm_interlock
+    )
+    assert transaction_source.index("self._asset.set_joint_velocity_target(") < (
+        transaction_source.index("self._asset.set_joint_position_target(")
     )
     assert "new_joint_vel_target=self._zero_joint_velocity_target" in apply_source
     assert "new_joint_effort_target=self._asset.data.joint_effort_target[" in (

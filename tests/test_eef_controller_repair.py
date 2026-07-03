@@ -43,6 +43,12 @@ def test_candidate_constants_are_bounded_and_exact():
     assert slow.close_limited_applies == 75
     assert slow.close_nextafter_corrections == 41
     assert slow.close_interlock_substeps == 86
+    assert slow.close_interlock_profile == (
+        "eef_gripper_close_fixed_activation_anchor_86_physics_substeps_v2"
+    )
+    assert slow.fixed_activation_anchor is True
+    baseline = eef_gripper_target_slew_profile(EEF_GRIPPER_TARGET_SLEW_PROFILE)
+    assert baseline.fixed_activation_anchor is False
 
 
 def test_pure_interlock_uses_the_explicit_profile_bound_duration():
@@ -138,6 +144,8 @@ def test_disabled_interlock_is_a_zero_state_identity():
     assert transition.observed_endpoint_change_count == 0
     assert transition.endpoint_observed_after_successful_apply is False
     assert transition.activation_count_delta == 0
+    assert transition.completion_count_delta == 0
+    assert transition.open_cancel_count_delta == 0
 
 
 def test_initial_close_starts_bounded_countdown_without_refresh():
@@ -165,6 +173,7 @@ def test_initial_close_starts_bounded_countdown_without_refresh():
         )
         assert transition.remaining_after_successful_apply == expected_remaining
         assert transition.activation_count_delta == 0
+        assert transition.completion_count_delta == int(expected_remaining == 0)
     assert transition.active is True
 
     released = advance_gripper_close_arm_interlock(
@@ -217,6 +226,8 @@ def test_open_transition_cancels_close_countdown_and_reclose_reactivates():
     assert opened.active is False
     assert opened.remaining_after_successful_apply == 0
     assert opened.observed_endpoint_change_count == 2
+    assert opened.open_cancel_count_delta == 1
+    assert opened.completion_count_delta == 0
 
     reclosed = advance_gripper_close_arm_interlock(
         enabled=True,
@@ -228,6 +239,7 @@ def test_open_transition_cancels_close_countdown_and_reclose_reactivates():
     )
     assert reclosed.active is True
     assert reclosed.activation_count_delta == 1
+    assert reclosed.open_cancel_count_delta == 0
 
 
 @pytest.mark.parametrize(
@@ -315,6 +327,121 @@ def test_default_off_bound_is_bitwise_identical_to_explicit_physical_guard():
     assert all(torch.equal(left, right) for left, right in zip(inherited, explicit))
 
 
+def test_job1098476_drift_returns_toward_activation_anchor_without_direct_jump():
+    # Exact apply-920 activation q and apply-967 current q from the immutable
+    # job-1098476 failure ring.  A direct anchor write exceeds the nominal
+    # bound on joints 5 and 7; the production bounding helper must not.
+    anchor = torch.tensor(
+        [
+            [
+                -0.20430134236812592,
+                -0.24422302842140198,
+                -0.245017409324646,
+                -2.8719422817230225,
+                -0.47118961811065674,
+                2.4242470264434814,
+                -0.16500917077064514,
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    joint_pos = torch.tensor(
+        [
+            [
+                -0.20517736673355103,
+                -0.2497541606426239,
+                -0.24595116078853607,
+                -2.866048574447632,
+                -0.4345424473285675,
+                2.419935464859009,
+                -0.1930602639913559,
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    nominal_delta = torch.tensor(
+        [
+            [
+                0.017218751832842827,
+                0.017218751832842827,
+                0.017218751832842827,
+                0.017218751832842827,
+                0.020662499591708183,
+                0.020662499591708183,
+                0.020662499591708183,
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    physical_delta = torch.tensor(
+        [
+            [
+                0.018125001341104507,
+                0.018125001341104507,
+                0.018125001341104507,
+                0.018125001341104507,
+                0.02174999937415123,
+                0.02174999937415123,
+                0.02174999937415123,
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    limits = torch.tensor(
+        [
+            [
+                [-2.8973, 2.8973],
+                [-1.7628, 1.7628],
+                [-2.8973, 2.8973],
+                [-3.0718, -0.0698],
+                [-2.8973, 2.8973],
+                [-0.0175, 3.7525],
+                [-2.8973, 2.8973],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+
+    safe, raw_delta, slew_limited, position_limited = bound_joint_position_target(
+        joint_pos,
+        anchor,
+        nominal_delta,
+        limits,
+        target_guard_band_delta_joint_pos=physical_delta,
+    )
+
+    assert (raw_delta.abs() > nominal_delta).tolist() == [
+        [False, False, False, False, True, False, True]
+    ]
+    assert slew_limited.tolist() == [[False, False, False, False, True, False, True]]
+    assert not position_limited.any()
+    assert not torch.equal(safe, anchor)
+    assert ((safe - joint_pos).abs() <= nominal_delta + 1e-6).all()
+    assert (safe >= torch.minimum(joint_pos, anchor)).all()
+    assert (safe <= torch.maximum(joint_pos, anchor)).all()
+    assert ((anchor - safe).abs() <= (anchor - joint_pos).abs()).all()
+
+
+def test_first_fixed_anchor_target_is_bitwise_exact_when_anchor_is_current_q():
+    joint_pos = torch.tensor([[0.4, -0.3]], dtype=torch.float32)
+    anchor = joint_pos.detach().clone()
+    nominal_delta = torch.tensor([[0.095, 0.095]], dtype=torch.float32)
+    physical_delta = torch.tensor([[0.10, 0.10]], dtype=torch.float32)
+    limits = torch.tensor([[[-2.0, 2.0], [-2.0, 2.0]]], dtype=torch.float32)
+
+    safe, _, slew_limited, position_limited = bound_joint_position_target(
+        joint_pos,
+        anchor,
+        nominal_delta,
+        limits,
+        target_guard_band_delta_joint_pos=physical_delta,
+    )
+
+    assert torch.equal(safe, anchor)
+    assert not slew_limited.any()
+    assert not position_limited.any()
+
+
 def test_controller_candidates_are_explicit_default_off_config_and_wired():
     source = (ROOT / "src/polaris/robust_differential_ik.py").read_text()
     assert source.count("enable_arm_slew_headroom: bool = False") == 1
@@ -323,13 +450,31 @@ def test_controller_candidates_are_explicit_default_off_config_and_wired():
     assert "ARM_SLEW_HEADROOM_RATIO if self._arm_slew_headroom_enabled" in source
     assert source.count("self._nominal_max_delta_joint_pos,") >= 2
     assert "if close_interlock_transition.active:" in source
-    assert "joint_pos,\n                joint_pos," in source
-    setter_index = source.index("self._asset.set_joint_position_target(safe_target")
-    commit_index = source.index(
-        "self._gripper_close_arm_interlock_remaining = (", setter_index
+    assert "fixed_anchor_for_apply.unsqueeze(0)" in source
+    assert "fixed_anchor_for_apply = joint_pos[0].detach().clone()" in source
+    assert "self._gripper_close_arm_interlock_anchor.detach().clone()" in source
+    transaction_start = source.index(
+        "def _set_targets_and_commit_gripper_close_arm_interlock("
     )
-    assert setter_index < commit_index
+    velocity_setter_index = source.index(
+        "self._asset.set_joint_velocity_target(", transaction_start
+    )
+    setter_index = source.index(
+        "self._asset.set_joint_position_target(safe_target", transaction_start
+    )
+    anchor_commit_index = source.index(
+        "self._gripper_close_arm_interlock_anchor = staged.anchor", setter_index
+    )
+    commit_index = source.index(
+        "self._gripper_close_arm_interlock_remaining = staged.remaining",
+        setter_index,
+    )
+    assert velocity_setter_index < setter_index < anchor_commit_index < commit_index
+    assert "_StagedGripperCloseArmInterlockState(" in source
+    assert "self._set_targets_and_commit_gripper_close_arm_interlock(" in source
     assert "self._reset_gripper_close_arm_interlock_state()" in source
+    assert "self._gripper_close_arm_interlock_anchor_valid = False" in source
+    assert "self._gripper_close_arm_interlock_anchor_refresh_count = 0" in source
     assert (
         "if self._gripper_close_arm_interlock_enabled\n"
         "            else DISABLED_GRIPPER_CLOSE_ARM_INTERLOCK_TRANSITION"

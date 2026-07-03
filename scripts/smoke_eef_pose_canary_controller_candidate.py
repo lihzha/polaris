@@ -3,16 +3,17 @@
 
 This is a model-free promotion gate. Both variants use one identical default-
 off controller profile: 0.95 nominal arm slew, factor-0.25 gripper target slew,
-and the profile-bound 86-substep close/arm interlock. After the 120 content-
-pinned actions, seven repeats of the final recorded action give the official
-close transition exactly 96 applies: 86 interlocked and 10 released. The open
-reasoning fixture proves the same static controller identity without activating
-the close interlock.
+and the profile-bound 86-substep fixed activation-anchor close interlock. After
+the 120 content-pinned actions, seven repeats of the final recorded action give
+the official close transition exactly 96 applies: 86 anchored and 10 released.
+The open reasoning fixture proves the same static controller identity without
+activating the close interlock.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -24,7 +25,7 @@ from typing import Any
 import smoke_eef_pose_canary_trace_replay as gate0
 
 
-PROFILE = "polaris_eef_canary_controller_candidate_replay_v1"
+PROFILE = "polaris_eef_canary_controller_candidate_replay_v2"
 FIXTURE_ACTION_COUNT = 120
 POST_FIXTURE_REPEAT_COUNT = 7
 TOTAL_ACTION_COUNT = FIXTURE_ACTION_COUNT + POST_FIXTURE_REPEAT_COUNT
@@ -95,8 +96,10 @@ if CANDIDATE_CLOSE_SIMULATION != {
 CANDIDATE_CLOSE_TRANSITION_APPLIES = CANDIDATE_CLOSE_SIMULATION["endpoint_applies"]
 CANDIDATE_CLOSE_LIMITED_APPLIES = CANDIDATE_CLOSE_SIMULATION["limited_applies"]
 CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS = CANDIDATE_CLOSE_TRANSITION_APPLIES + 10
-CANDIDATE_CLOSE_INTERLOCK_PROFILE = "eef_gripper_close_hold_arm_86_physics_substeps_v1"
-CANDIDATE_PROFILE = "arm_slew_0p95_plus_gripper_rate0p25_close_interlock86_v1"
+CANDIDATE_CLOSE_INTERLOCK_PROFILE = (
+    "eef_gripper_close_fixed_activation_anchor_86_physics_substeps_v2"
+)
+CANDIDATE_PROFILE = "arm_slew_0p95_plus_gripper_rate0p25_fixed_anchor86_v2"
 CANDIDATE_BY_VARIANT = {
     "official_lap3b": CANDIDATE_PROFILE,
     "reasoning_43075": CANDIDATE_PROFILE,
@@ -117,6 +120,22 @@ INTERLOCK_CANDIDATE_FIELDS = {
     "endpoint_observed",
     "activation_count",
     "active_apply_count",
+    "anchor_valid",
+    "anchor_capture_count",
+    "anchor_target_apply_count",
+    "anchor_first_exact_target_count",
+    "anchor_refresh_count",
+    "anchor_slew_limit_event_count",
+    "anchor_slew_limited_joint_count",
+    "anchor_position_limit_event_count",
+    "anchor_position_limited_joint_count",
+    "anchor_completion_count",
+    "anchor_open_cancel_count",
+    "last_activation_apply_index",
+    "last_anchor_joint_pos_rad",
+    "last_anchor_little_endian_float32_sha256",
+    "max_abs_current_anchor_residual_rad",
+    "max_abs_target_anchor_residual_rad",
     "max_abs_active_delta_joint_pos_rad",
     "released_apply_count",
     "max_abs_released_delta_joint_pos_rad",
@@ -132,7 +151,7 @@ ZERO_SAFETY_COUNTERS = {
     "post_clamp_target_violations",
 }
 CONTROLLER_ABORT_CAPTURE_PROFILE = (
-    "polaris_eef_controller_candidate_transactional_abort_capture_v1"
+    "polaris_eef_controller_candidate_transactional_abort_capture_v2"
 )
 CONTROLLER_ABORT_CAPTURE_FIELDS = {
     "profile",
@@ -380,13 +399,24 @@ def validate_candidate_report(
         and interlock.get("configured_substeps") == CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS,
         "close-interlock candidate identity drift",
     )
-    for name in (
+    counter_fields = (
         "remaining_substeps",
         "observed_endpoint_change_count",
         "activation_count",
         "active_apply_count",
         "released_apply_count",
-    ):
+        "anchor_capture_count",
+        "anchor_target_apply_count",
+        "anchor_first_exact_target_count",
+        "anchor_refresh_count",
+        "anchor_slew_limit_event_count",
+        "anchor_slew_limited_joint_count",
+        "anchor_position_limit_event_count",
+        "anchor_position_limited_joint_count",
+        "anchor_completion_count",
+        "anchor_open_cancel_count",
+    )
+    for name in counter_fields:
         _require(
             type(interlock.get(name)) is int and interlock[name] >= 0,
             f"close-interlock {name} type/range drift",
@@ -395,11 +425,19 @@ def validate_candidate_report(
         type(interlock.get("endpoint_observed")) is bool,
         "close-interlock endpoint_observed type drift",
     )
+    _require(
+        type(interlock.get("anchor_valid")) is bool,
+        "close-interlock anchor_valid type drift",
+    )
     active_vector = interlock.get("max_abs_active_delta_joint_pos_rad")
     released_vector = interlock.get("max_abs_released_delta_joint_pos_rad")
+    current_anchor_residual = interlock.get("max_abs_current_anchor_residual_rad")
+    target_anchor_residual = interlock.get("max_abs_target_anchor_residual_rad")
     for field, vector in (
         ("active", active_vector),
         ("released", released_vector),
+        ("current-anchor residual", current_anchor_residual),
+        ("target-anchor residual", target_anchor_residual),
     ):
         _require(
             isinstance(vector, list)
@@ -413,69 +451,173 @@ def validate_candidate_report(
             ),
             f"close-interlock {field} vector",
         )
+    for index, (active_delta, bound) in enumerate(
+        zip(active_vector, nominal, strict=True)
+    ):
+        _require(
+            float(active_delta) <= float(bound) + 1e-6,
+            f"close-interlock active slew bound {index}",
+        )
+    for index, (target_residual, current_residual) in enumerate(
+        zip(target_anchor_residual, current_anchor_residual, strict=True)
+    ):
+        _require(
+            float(target_residual) <= float(current_residual) + 1e-6,
+            f"close-interlock anchor direction {index}",
+        )
+
+    activation_count = interlock["activation_count"]
+    active_count = interlock["active_apply_count"]
+    released_count = interlock["released_apply_count"]
+    remaining = interlock["remaining_substeps"]
+    anchor_valid = interlock["anchor_valid"]
+    capture_count = interlock["anchor_capture_count"]
+    anchor_target_count = interlock["anchor_target_apply_count"]
+    first_exact_count = interlock["anchor_first_exact_target_count"]
+    completion_count = interlock["anchor_completion_count"]
+    open_cancel_count = interlock["anchor_open_cancel_count"]
+    _require(
+        remaining <= CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS
+        and activation_count in (0, 1)
+        and active_count <= CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS
+        and capture_count == activation_count
+        and anchor_target_count == active_count
+        and first_exact_count == capture_count
+        and interlock["anchor_refresh_count"] == 0
+        and anchor_valid == (remaining > 0)
+        and completion_count + open_cancel_count + int(anchor_valid) == capture_count,
+        "close-interlock fixed activation-anchor lifecycle drift",
+    )
+    for prefix in ("slew", "position"):
+        event_count = interlock[f"anchor_{prefix}_limit_event_count"]
+        joint_count = interlock[f"anchor_{prefix}_limited_joint_count"]
+        _require(
+            event_count <= anchor_target_count
+            and event_count <= joint_count <= 7 * event_count,
+            f"close-interlock anchor {prefix}-limit counter drift",
+        )
+
+    last_activation_apply_index = interlock.get("last_activation_apply_index")
+    last_anchor = interlock.get("last_anchor_joint_pos_rad")
+    last_anchor_digest = interlock.get("last_anchor_little_endian_float32_sha256")
+    if capture_count == 0:
+        _require(
+            last_activation_apply_index is None
+            and last_anchor is None
+            and last_anchor_digest is None,
+            "close-interlock inactive anchor evidence drift",
+        )
+    else:
+        _require(
+            type(last_activation_apply_index) is int
+            and last_activation_apply_index == 920,
+            "close-interlock activation apply index drift",
+        )
+        _require(
+            isinstance(last_anchor, list)
+            and len(last_anchor) == 7
+            and all(
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(float(value))
+                and _float32(float(value)) == float(value)
+                for value in last_anchor
+            ),
+            "close-interlock last anchor vector drift",
+        )
+        _require(
+            isinstance(last_anchor_digest, str)
+            and len(last_anchor_digest) == 64
+            and all(
+                character in "0123456789abcdef" for character in last_anchor_digest
+            ),
+            "close-interlock last anchor digest shape drift",
+        )
+        expected_anchor_digest = hashlib.sha256(
+            struct.pack("<7f", *(float(value) for value in last_anchor))
+        ).hexdigest()
+        _require(
+            last_anchor_digest == expected_anchor_digest,
+            "close-interlock last anchor digest mismatch",
+        )
+
+    zero_anchor_vectors = all(
+        float(value) == 0.0
+        for vector in (current_anchor_residual, target_anchor_residual)
+        for value in vector
+    )
     if final is False:
         _require(
-            interlock.get("remaining_substeps") == 0
+            remaining == 0
             and interlock.get("observed_endpoint_change_count") == 0
             and interlock.get("endpoint_observed") is False
-            and interlock.get("activation_count") == 0
-            and interlock.get("active_apply_count") == 0
-            and interlock.get("released_apply_count") == 0
+            and activation_count == 0
+            and active_count == 0
+            and released_count == 0
+            and zero_anchor_vectors
             and all(float(value) == 0.0 for value in active_vector)
             and all(float(value) == 0.0 for value in released_vector),
             "initial close-interlock state is not empty",
         )
     elif final is True and variant == "official_lap3b":
         _require(
-            interlock.get("remaining_substeps") == 0
+            remaining == 0
             and interlock.get("observed_endpoint_change_count") == 1
             and interlock.get("endpoint_observed") is True
-            and interlock.get("activation_count") == 1
-            and interlock.get("active_apply_count")
-            == CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS
-            and interlock.get("released_apply_count") == 10
-            and all(float(value) == 0.0 for value in active_vector)
+            and activation_count == 1
+            and active_count == CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS
+            and released_count == 10
+            and capture_count == 1
+            and anchor_target_count == CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS
+            and first_exact_count == 1
+            and completion_count == 1
+            and open_cancel_count == 0
+            and anchor_valid is False
+            and interlock["anchor_position_limit_event_count"] == 0
+            and interlock["anchor_position_limited_joint_count"] == 0
             and any(float(value) > 0.0 for value in released_vector),
-            "official close interlock did not activate, release, and resume",
+            "official fixed-anchor interlock did not complete and release",
         )
     elif final is True:
         _require(
-            interlock.get("remaining_substeps") == 0
+            remaining == 0
             and interlock.get("observed_endpoint_change_count") == 0
             and interlock.get("endpoint_observed") is True
-            and interlock.get("activation_count") == 0
-            and interlock.get("active_apply_count") == 0
-            and interlock.get("released_apply_count") == 0
+            and activation_count == 0
+            and active_count == 0
+            and released_count == 0
+            and zero_anchor_vectors
             and all(float(value) == 0.0 for value in active_vector)
             and all(float(value) == 0.0 for value in released_vector),
             "reasoning open replay unexpectedly activated the close interlock",
         )
     else:
-        activation_count = interlock["activation_count"]
-        active_count = interlock["active_apply_count"]
-        released_count = interlock["released_apply_count"]
-        remaining = interlock["remaining_substeps"]
         _require(
-            activation_count in (0, 1)
-            and active_count <= CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS
-            and remaining <= CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS
-            and all(float(value) == 0.0 for value in active_vector),
+            open_cancel_count == 0
+            and (variant == "official_lap3b" or activation_count == 0),
             "captured close-interlock state is impossible",
         )
         if activation_count == 0:
             _require(
                 active_count == released_count == remaining == 0
+                and zero_anchor_vectors
+                and all(float(value) == 0.0 for value in active_vector)
                 and all(float(value) == 0.0 for value in released_vector),
                 "inactive captured close-interlock state retained evidence",
             )
-        elif released_count == 0:
+        elif remaining > 0:
             _require(
-                active_count + remaining == CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS,
+                released_count == 0
+                and completion_count == 0
+                and anchor_valid is True
+                and active_count + remaining == CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS,
                 "active captured close-interlock countdown drift",
             )
         else:
             _require(
-                active_count == CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS and remaining == 0,
+                active_count == CANDIDATE_CLOSE_INTERLOCK_SUBSTEPS
+                and completion_count == 1
+                and anchor_valid is False,
                 "released captured close-interlock countdown drift",
             )
     return dict(report)
@@ -541,6 +683,30 @@ def validate_controller_abort_capture(value: Any, *, variant: str) -> dict[str, 
         active_candidate["gripper_close_arm_interlock"]["enabled"] is True,
         "controller-abort close interlock was not enabled",
     )
+    if (
+        variant == "official_lap3b"
+        and parsed["policy_step"] == 121
+        and parsed["physics_substep"] == 0
+    ):
+        interlock = active_candidate["gripper_close_arm_interlock"]
+        counters = active_safety.get("counters")
+        _require(
+            isinstance(counters, dict)
+            and counters.get("apply_calls") == 969
+            and target_slew.get("apply_calls") == 968
+            and target_slew.get("slew_limited_apply_count") == 48
+            and target_slew.get("endpoint_reached_apply_count") == 920
+            and interlock["activation_count"] == 1
+            and interlock["active_apply_count"] == 48
+            and interlock["remaining_substeps"] == 38
+            and interlock["anchor_valid"] is True
+            and interlock["anchor_capture_count"] == 1
+            and interlock["anchor_target_apply_count"] == 48
+            and interlock["anchor_completion_count"] == 0
+            and interlock["anchor_open_cancel_count"] == 0
+            and interlock["last_activation_apply_index"] == 920,
+            "policy121/substep0 transactional fixed-anchor state drift",
+        )
     return dict(value)
 
 
@@ -709,8 +875,9 @@ def validate_candidate_replay_evidence(
         == TOTAL_ACTION_COUNT - 1 - expected_changes,
         "candidate gripper target-slew cadence drift",
     )
+    interlock = report["gripper_close_arm_interlock"]
     return {
-        "profile": "polaris_eef_candidate_exact_cadence_and_nominal_bound_v1",
+        "profile": "polaris_eef_candidate_exact_cadence_anchor_and_bound_v2",
         "arm_apply_calls": counters["apply_calls"],
         "gripper_apply_calls": driver["apply_calls"],
         "process_action_calls": driver["process_action_calls"],
@@ -721,6 +888,12 @@ def validate_candidate_replay_evidence(
             "endpoint_reached_apply_count"
         ],
         "slew_limit_events": counters["slew_limit_events"],
+        "anchor_capture_count": interlock["anchor_capture_count"],
+        "anchor_target_apply_count": interlock["anchor_target_apply_count"],
+        "anchor_completion_count": interlock["anchor_completion_count"],
+        "anchor_open_cancel_count": interlock["anchor_open_cancel_count"],
+        "last_activation_apply_index": interlock["last_activation_apply_index"],
+        "anchor_digest_verified": True,
         "dls_fallbacks": 0,
         "abort_count": 0,
         "nominal_applied_delta_bound_passed": True,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 from pathlib import Path
+import struct
 import sys
 
 import pytest
@@ -32,9 +34,29 @@ candidate = _load_script("smoke_eef_pose_canary_controller_candidate")
 def _candidate_report(*, official: bool, final: bool):
     physical = [0.018125, 0.018125, 0.018125, 0.018125, 0.02175, 0.02175, 0.02175]
     nominal = [value * 0.95 for value in physical]
-    vector = [0.0] * 7
+    released_vector = [0.0] * 7
+    active_vector = [0.0] * 7
+    current_anchor_residual = [0.0] * 7
+    target_anchor_residual = [0.0] * 7
+    last_anchor = None
+    last_anchor_digest = None
     if official and final:
-        vector[4] = nominal[4]
+        released_vector[4] = nominal[4]
+        active_vector[0] = nominal[0]
+        current_anchor_residual[0] = 0.2
+        target_anchor_residual[0] = 0.2 - nominal[0]
+        last_anchor = [
+            -0.20430134236812592,
+            -0.24422302842140198,
+            -0.245017409324646,
+            -2.8719422817230225,
+            -0.47118961811065674,
+            2.4242470264434814,
+            -0.16500917077064514,
+        ]
+        last_anchor_digest = hashlib.sha256(
+            struct.pack("<7f", *last_anchor)
+        ).hexdigest()
     return {
         "arm_slew_headroom": {
             "enabled": True,
@@ -45,18 +67,49 @@ def _candidate_report(*, official: bool, final: bool):
         },
         "gripper_close_arm_interlock": {
             "enabled": True,
-            "profile": "eef_gripper_close_hold_arm_86_physics_substeps_v1",
+            "profile": candidate.CANDIDATE_CLOSE_INTERLOCK_PROFILE,
             "configured_substeps": 86,
             "remaining_substeps": 0,
             "observed_endpoint_change_count": 1 if official and final else 0,
             "endpoint_observed": final,
             "activation_count": 1 if official and final else 0,
             "active_apply_count": 86 if official and final else 0,
-            "max_abs_active_delta_joint_pos_rad": [0.0] * 7,
+            "anchor_valid": False,
+            "anchor_capture_count": 1 if official and final else 0,
+            "anchor_target_apply_count": 86 if official and final else 0,
+            "anchor_first_exact_target_count": 1 if official and final else 0,
+            "anchor_refresh_count": 0,
+            "anchor_slew_limit_event_count": 1 if official and final else 0,
+            "anchor_slew_limited_joint_count": 1 if official and final else 0,
+            "anchor_position_limit_event_count": 0,
+            "anchor_position_limited_joint_count": 0,
+            "anchor_completion_count": 1 if official and final else 0,
+            "anchor_open_cancel_count": 0,
+            "last_activation_apply_index": 920 if official and final else None,
+            "last_anchor_joint_pos_rad": last_anchor,
+            "last_anchor_little_endian_float32_sha256": last_anchor_digest,
+            "max_abs_current_anchor_residual_rad": current_anchor_residual,
+            "max_abs_target_anchor_residual_rad": target_anchor_residual,
+            "max_abs_active_delta_joint_pos_rad": active_vector,
             "released_apply_count": 10 if official and final else 0,
-            "max_abs_released_delta_joint_pos_rad": vector,
+            "max_abs_released_delta_joint_pos_rad": released_vector,
         },
     }
+
+
+def _partial_fixed_anchor_report(*, active_count: int, remaining: int):
+    report = _candidate_report(official=True, final=True)
+    interlock = report["gripper_close_arm_interlock"]
+    interlock.update(
+        remaining_substeps=remaining,
+        active_apply_count=active_count,
+        anchor_valid=remaining > 0,
+        anchor_target_apply_count=active_count,
+        anchor_completion_count=int(remaining == 0),
+        released_apply_count=0,
+        max_abs_released_delta_joint_pos_rad=[0.0] * 7,
+    )
+    return report
 
 
 def _failure_context():
@@ -195,19 +248,19 @@ def test_final_candidate_report_requires_expected_isolation(variant):
 @pytest.mark.parametrize(
     ("field", "value", "match"),
     [
-        ("activation_count", 0, "did not activate"),
-        ("active_apply_count", 85, "did not activate"),
-        ("remaining_substeps", 1, "did not activate"),
-        ("released_apply_count", 9, "did not activate"),
+        ("activation_count", 0, "lifecycle drift"),
+        ("active_apply_count", 85, "lifecycle drift"),
+        ("remaining_substeps", 1, "lifecycle drift"),
+        ("released_apply_count", 9, "did not complete"),
         (
             "max_abs_released_delta_joint_pos_rad",
             [0.0] * 7,
-            "did not activate",
+            "did not complete",
         ),
         (
             "max_abs_active_delta_joint_pos_rad",
-            [0.0] * 6 + [1e-3],
-            "did not activate",
+            [0.1] + [0.0] * 6,
+            "active slew bound 0",
         ),
     ],
 )
@@ -220,11 +273,55 @@ def test_official_final_report_rejects_incomplete_release(field, value, match):
         )
 
 
+def test_partial_failure_report_keeps_only_successfully_committed_anchor_applies():
+    report = _partial_fixed_anchor_report(active_count=48, remaining=38)
+    validated = candidate.validate_candidate_report(
+        report, variant="official_lap3b", final=None
+    )
+    interlock = validated["gripper_close_arm_interlock"]
+    assert interlock["anchor_valid"] is True
+    assert interlock["anchor_capture_count"] == 1
+    assert interlock["anchor_target_apply_count"] == 48
+    assert interlock["remaining_substeps"] == 38
+    assert interlock["anchor_completion_count"] == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "match"),
+    [
+        ("anchor_target_apply_count", 49, "lifecycle drift"),
+        ("anchor_capture_count", True, "type/range"),
+        ("anchor_refresh_count", 1, "lifecycle drift"),
+        ("anchor_valid", False, "lifecycle drift"),
+        ("last_activation_apply_index", 921, "activation apply index"),
+        (
+            "last_anchor_little_endian_float32_sha256",
+            "0" * 64,
+            "digest mismatch",
+        ),
+        (
+            "max_abs_target_anchor_residual_rad",
+            [0.3] + [0.0] * 6,
+            "anchor direction 0",
+        ),
+    ],
+)
+def test_fixed_anchor_report_rejects_lifecycle_and_digest_tampering(
+    field, value, match
+):
+    report = _partial_fixed_anchor_report(active_count=48, remaining=38)
+    report["gripper_close_arm_interlock"][field] = value
+    with pytest.raises(candidate.CandidateReplayValidationError, match=match):
+        candidate.validate_candidate_report(
+            report, variant="official_lap3b", final=None
+        )
+
+
 def test_reasoning_final_report_rejects_interlock_activation():
     report = _candidate_report(official=False, final=True)
     report["gripper_close_arm_interlock"]["activation_count"] = 1
     with pytest.raises(
-        candidate.CandidateReplayValidationError, match="unexpectedly activated"
+        candidate.CandidateReplayValidationError, match="lifecycle drift"
     ):
         candidate.validate_candidate_report(
             report, variant="reasoning_43075", final=True
@@ -312,7 +409,7 @@ def test_candidate_replay_evidence_binds_exact_cadence_and_nominal_slew(variant)
         _final_safety(official=official), report, variant=variant
     )
     assert summary == {
-        "profile": "polaris_eef_candidate_exact_cadence_and_nominal_bound_v1",
+        "profile": "polaris_eef_candidate_exact_cadence_anchor_and_bound_v2",
         "arm_apply_calls": 1016,
         "gripper_apply_calls": 1016,
         "process_action_calls": 127,
@@ -321,6 +418,12 @@ def test_candidate_replay_evidence_binds_exact_cadence_and_nominal_slew(variant)
         "target_slew_limited_apply_count": 75 if official else 0,
         "target_slew_endpoint_reached_apply_count": 941 if official else 1016,
         "slew_limit_events": 10,
+        "anchor_capture_count": 1 if official else 0,
+        "anchor_target_apply_count": 86 if official else 0,
+        "anchor_completion_count": 1 if official else 0,
+        "anchor_open_cancel_count": 0,
+        "last_activation_apply_index": 920 if official else None,
+        "anchor_digest_verified": True,
         "dls_fallbacks": 0,
         "abort_count": 0,
         "nominal_applied_delta_bound_passed": True,
@@ -389,7 +492,7 @@ def test_container_argument_is_closed_and_exact():
 
 def _abort_capture(monkeypatch):
     message = (
-        "joint='panda_joint5', policy_step=117, physics_substep=6, "
+        "joint='panda_joint5', policy_step=114, physics_substep=6, "
         f"evidence_sha256={'a' * 64})"
     )
     target = {"profile": candidate.CANDIDATE_TARGET_SLEW_PROFILE}
@@ -403,7 +506,7 @@ def _abort_capture(monkeypatch):
 
     def validate_arm(value, *, expected_failure):
         assert value["controller_substep_trace"] == {"entries": ["validated"]}
-        assert expected_failure["policy_step"] == 117
+        assert expected_failure["policy_step"] == 114
         return value
 
     def validate_tail(value, *, expected_failure):
@@ -424,7 +527,7 @@ def _abort_capture(monkeypatch):
         },
         "parsed_failure": {
             "joint_name": "panda_joint5",
-            "policy_step": 117,
+            "policy_step": 114,
             "physics_substep": 6,
             "evidence_sha256": "a" * 64,
         },
@@ -457,6 +560,53 @@ def test_transactional_abort_capture_requires_arm_ring_all_six_and_target_state(
             candidate.validate_controller_abort_capture(
                 tampered, variant="official_lap3b"
             )
+
+
+def test_policy121_substep0_abort_keeps_committed_48_not_staged_49(monkeypatch):
+    capture = _abort_capture(monkeypatch)
+    message = (
+        "joint='panda_joint5', policy_step=121, physics_substep=0, "
+        f"evidence_sha256={'a' * 64})"
+    )
+    capture["failure_exception"]["message"] = message
+    capture["parsed_failure"] = {
+        "joint_name": "panda_joint5",
+        "policy_step": 121,
+        "physics_substep": 0,
+        "evidence_sha256": "a" * 64,
+    }
+    capture["active_candidate"] = _partial_fixed_anchor_report(
+        active_count=48, remaining=38
+    )
+    capture["active_safety"]["counters"] = {"apply_calls": 969}
+    capture["active_target_slew"]["apply_calls"] = 968
+    capture["active_target_slew"]["slew_limited_apply_count"] = 48
+    capture["active_target_slew"]["endpoint_reached_apply_count"] = 920
+    monkeypatch.setattr(
+        candidate.gate0,
+        "_validate_arm_failure_runtime_evidence",
+        lambda value, *, expected_failure: value,
+    )
+    monkeypatch.setattr(
+        candidate.gate0,
+        "validate_gripper_tail",
+        lambda value, *, expected_failure: value,
+    )
+
+    assert candidate.validate_controller_abort_capture(
+        capture, variant="official_lap3b"
+    )
+
+    staged = copy.deepcopy(capture)
+    staged_interlock = staged["active_candidate"]["gripper_close_arm_interlock"]
+    staged_interlock["active_apply_count"] = 49
+    staged_interlock["anchor_target_apply_count"] = 49
+    staged_interlock["remaining_substeps"] = 37
+    with pytest.raises(
+        candidate.CandidateReplayValidationError,
+        match="policy121/substep0 transactional",
+    ):
+        candidate.validate_controller_abort_capture(staged, variant="official_lap3b")
 
 
 def test_built_abort_capture_is_retained_before_forced_validation_failure(

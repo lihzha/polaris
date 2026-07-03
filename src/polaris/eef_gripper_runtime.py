@@ -222,6 +222,7 @@ class EefGripperTargetSlewProfileSpec:
     close_nextafter_corrections: int
     close_interlock_profile: str
     close_interlock_substeps: int
+    fixed_activation_anchor: bool
 
 
 def _target_slew_profile_spec(
@@ -232,6 +233,8 @@ def _target_slew_profile_spec(
     max_target_step_rad_float32: float,
     close_transition_applies: int,
     close_nextafter_corrections: int,
+    close_interlock_profile: str | None = None,
+    fixed_activation_anchor: bool = False,
 ) -> EefGripperTargetSlewProfileSpec:
     close_interlock_substeps = close_transition_applies + GRIPPER_CLOSE_SETTLE_SUBSTEPS
     return EefGripperTargetSlewProfileSpec(
@@ -244,9 +247,11 @@ def _target_slew_profile_spec(
         close_limited_applies=close_transition_applies - 1,
         close_nextafter_corrections=close_nextafter_corrections,
         close_interlock_profile=(
-            f"eef_gripper_close_hold_arm_{close_interlock_substeps}_physics_substeps_v1"
+            close_interlock_profile
+            or f"eef_gripper_close_hold_arm_{close_interlock_substeps}_physics_substeps_v1"
         ),
         close_interlock_substeps=close_interlock_substeps,
+        fixed_activation_anchor=fixed_activation_anchor,
     )
 
 
@@ -272,6 +277,10 @@ _EEF_GRIPPER_TARGET_SLEW_PROFILES = MappingProxyType(
                 close_nextafter_corrections=(
                     _GRIPPER_CLOSE_TRANSITION_0P25.nextafter_correction_count
                 ),
+                close_interlock_profile=(
+                    "eef_gripper_close_fixed_activation_anchor_86_physics_substeps_v2"
+                ),
+                fixed_activation_anchor=True,
             )
         ),
     }

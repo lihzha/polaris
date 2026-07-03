@@ -85,6 +85,9 @@ pxr.UsdPhysics = types.SimpleNamespace()
 
 import polaris.robust_differential_ik as robust
 from polaris.eef_gripper_runtime import EEF_GRIPPER_TARGET_SLEW_PROFILE
+from polaris.eef_gripper_runtime import (
+    EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE,
+)
 
 robust.PINNED_DYNAMIC_DEVICE = "cpu"
 robust.validate_eef_gripper_static_contract = lambda value, **_kwargs: dict(value)
@@ -210,6 +213,102 @@ for label, open_command, close_command in malformed_commands:
         raise AssertionError(f"{label} was accepted")
 finger._open_command = valid_open
 finger._close_command = valid_close
+
+
+class SetterAsset:
+    def __init__(self, failure):
+        self.failure = failure
+        self.calls = []
+
+    def set_joint_velocity_target(self, target, joint_ids):
+        self.calls.append(("velocity", target.clone(), list(joint_ids)))
+        if self.failure == "velocity":
+            raise RuntimeError("forced velocity setter failure")
+
+    def set_joint_position_target(self, target, joint_ids):
+        self.calls.append(("position", target.clone(), list(joint_ids)))
+        if self.failure == "position":
+            raise RuntimeError("forced position setter failure")
+
+
+anchor = torch.arange(7, dtype=torch.float32)
+zero = torch.zeros(7, dtype=torch.float32)
+staged = robust._StagedGripperCloseArmInterlockState(
+    anchor=anchor,
+    max_abs_current_anchor_residual=torch.ones(7),
+    max_abs_target_anchor_residual=torch.full((7,), 0.5),
+    max_abs_active_delta=torch.full((7,), 0.25),
+    max_abs_released_delta=zero,
+    anchor_valid=True,
+    anchor_capture_count=1,
+    anchor_target_apply_count=1,
+    anchor_first_exact_target_count=1,
+    anchor_slew_limit_event_count=0,
+    anchor_slew_limited_joint_count=0,
+    anchor_position_limit_event_count=0,
+    anchor_position_limited_joint_count=0,
+    anchor_completion_count=0,
+    anchor_open_cancel_count=0,
+    last_activation_apply_index=920,
+    remaining=85,
+    observed_endpoint_change_count=1,
+    endpoint_observed=True,
+    activation_count=1,
+    active_apply_count=1,
+    released_apply_count=0,
+)
+safe_target = torch.zeros((1, 7), dtype=torch.float32)
+for failure, expected_calls in (("velocity", 1), ("position", 2)):
+    transactional = object.__new__(
+        robust.RobustDifferentialInverseKinematicsAction
+    )
+    transactional._asset = SetterAsset(failure)
+    transactional._zero_joint_velocity_target = zero.unsqueeze(0)
+    transactional._joint_ids = list(range(7))
+    retained_anchor = torch.full((7,), -1.0)
+    transactional._gripper_close_arm_interlock_anchor = retained_anchor
+    transactional._gripper_close_arm_interlock_anchor_valid = True
+    transactional._gripper_close_arm_interlock_anchor_capture_count = 1
+    transactional._gripper_close_arm_interlock_anchor_target_apply_count = 48
+    transactional._gripper_close_arm_interlock_remaining = 38
+    transactional._gripper_close_arm_interlock_activation_count = 1
+    transactional._gripper_close_arm_interlock_active_apply_count = 48
+    try:
+        transactional._set_targets_and_commit_gripper_close_arm_interlock(
+            safe_target, staged
+        )
+    except RuntimeError as error:
+        assert f"forced {failure} setter failure" in str(error)
+    else:
+        raise AssertionError(f"{failure} setter failure was swallowed")
+    assert len(transactional._asset.calls) == expected_calls
+    assert transactional._gripper_close_arm_interlock_anchor is retained_anchor
+    assert transactional._gripper_close_arm_interlock_anchor_valid is True
+    assert transactional._gripper_close_arm_interlock_anchor_capture_count == 1
+    assert transactional._gripper_close_arm_interlock_anchor_target_apply_count == 48
+    assert transactional._gripper_close_arm_interlock_remaining == 38
+    assert transactional._gripper_close_arm_interlock_activation_count == 1
+    assert transactional._gripper_close_arm_interlock_active_apply_count == 48
+
+transactional = object.__new__(robust.RobustDifferentialInverseKinematicsAction)
+transactional._asset = SetterAsset(None)
+transactional._zero_joint_velocity_target = zero.unsqueeze(0)
+transactional._joint_ids = list(range(7))
+transactional._set_targets_and_commit_gripper_close_arm_interlock(
+    safe_target, staged
+)
+assert [entry[0] for entry in transactional._asset.calls] == [
+    "velocity", "position"
+]
+assert transactional._gripper_close_arm_interlock_anchor is anchor
+assert transactional._gripper_close_arm_interlock_anchor_valid is True
+assert transactional._gripper_close_arm_interlock_anchor_capture_count == 1
+assert transactional._gripper_close_arm_interlock_anchor_target_apply_count == 1
+assert transactional._gripper_close_arm_interlock_anchor_first_exact_target_count == 1
+assert transactional._gripper_close_arm_interlock_remaining == 85
+assert transactional._gripper_close_arm_interlock_activation_count == 1
+assert transactional._gripper_close_arm_interlock_active_apply_count == 1
+assert transactional._gripper_close_arm_interlock_last_activation_apply_index == 920
 
 report = action._gripper_runtime_dynamic_report()
 assert report["driver_target_slew"] == {"profile": "target-slew-dynamic"}

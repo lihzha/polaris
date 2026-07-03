@@ -79,3 +79,77 @@ Implementation and host validation are complete. No local process or job was
 launched. Target-surface Isaac/Pyxis behavior remains deliberately untested in
 this implementation handoff; the next authorized step is independent diff
 review followed by a separately approved committed/deployed model-free replay.
+
+## Fixed activation-anchor follow-up
+
+- Agent: `gripper_rate025_impl`
+- Worktree:
+  `/home/lzha/code/PolaRiS-worktrees/eef-fixed-anchor-v5-20260703`
+- Branch: `codex/eef-fixed-anchor-v5-20260703`
+- Exact base: `de2b73e571651ea5c7fa1e5e452f9177a7b3afbb`
+- State: intentionally uncommitted; no push, deployment, simulator run, or
+  cluster launch.
+
+### Root cause and immutable evidence
+
+The first 86-substep candidate retargeted the arm to the live joint position
+on every active apply. It therefore reported zero active target delta while
+allowing the arm to drift, rather than retaining a restoring position target.
+The immutable official job-1098476 failure capture confirms the transactional
+boundary: attempted arm apply 969 failed at policy step 121 / physics substep
+0, while the gripper and interlock retained 968 and 48 successful applies,
+respectively, with 38 interlock applies remaining. Its ring records the close
+activation at apply 920. By apply 967, joints 5 and 7 differed from that
+activation pose by more than the nominal 0.95-slew step, proving that a direct
+write back to the activation pose would itself violate the live bound.
+
+### Follow-up implementation
+
+- Kept the existing baseline/current-position interlock behavior unchanged.
+  Only the existing default-off factor-0.25 target-slew candidate now binds
+  `eef_gripper_close_fixed_activation_anchor_86_physics_substeps_v2`.
+- On each distinct close activation, stage a detached float32 clone of live
+  arm q. Every active target uses the existing joint-target bounding helper
+  with that immutable anchor as the raw goal, the unchanged nominal 0.95 slew
+  bound, and the unchanged physical target guard band.
+- Require the first activation target to equal its anchor bit-for-bit. Later
+  active targets remain componentwise between current q and the anchor and
+  within the nominal step including the existing float32 tolerance.
+- Stage the complete countdown, endpoint, anchor, maxima, and counter state
+  before either arm setter. The velocity setter and then position setter run
+  first; only then does one isolated helper install precomputed tensor
+  references followed by scalar lifecycle state. Either setter failure leaves
+  the prior anchor/countdown/counters unchanged.
+- A completed countdown or an open transition invalidates but retains the last
+  anchor as evidence. Open cancellation is immediate; a later close captures
+  a fresh anchor. Episode and ordinary action resets clear all anchor state.
+- Extended the closed candidate report with validity, capture/target/
+  first-exact/refresh, slew- and position-limit, completion/cancel counters,
+  last activation index, the retained float32 anchor and explicit little-
+  endian SHA-256, and current/target anchor residual maxima.
+- The official exact plan remains apply index 920 activation, 86 active and 10
+  released applies. Reasoning must retain zero/null anchor evidence. The
+  policy-121/substep-0 failure validator requires committed `48/38`, never the
+  staged `49/37` state.
+- Bumped only the candidate replay, controller profile, interlock profile, and
+  failure-capture identities required by the nested semantic change. The raw,
+  ready, independent-validation, srun-status, and attestation outer schemas
+  remain unchanged.
+
+### Follow-up validation
+
+- Focused affected host suite: `145 passed`.
+- Broad host suite excluding the Isaac-Lab-only
+  `tests/test_robust_differential_ik.py`: `752 passed, 30 subtests passed`.
+  The isolated robust host stub covers both velocity- and position-setter
+  failures and post-success lifecycle commit. The excluded module compiles;
+  local collection is unavailable because the host environment has no
+  `isaaclab` package.
+- The exact job-1098476 activation/current vectors exercise the production
+  bounding helper and prove joints 5 and 7 slew toward, but do not jump to,
+  the fixed anchor.
+- Ruff check/format, Python compilation, `git diff --check`, shell wrapper
+  syntax/shellcheck, and default-off leakage checks pass.
+
+The diff is ready for independent adversarial review. A simulator or L40S
+replay remains a separately reviewed and explicitly approved next step.

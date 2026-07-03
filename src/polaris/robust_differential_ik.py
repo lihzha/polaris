@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import math
+import struct
 
 import omni.log
 import omni.usd
@@ -126,6 +127,48 @@ FAILURE_SUBSTEP_TRACE_VECTOR_WIDTHS = {
     "approximate_pd_effort_preclip_nm": 7,
     "approximate_pd_effort_postclip_nm": 7,
 }
+
+
+@dataclass(frozen=True)
+class _StagedGripperCloseArmInterlockState:
+    """Fully prepared interlock state committed only after both setters."""
+
+    anchor: torch.Tensor
+    max_abs_current_anchor_residual: torch.Tensor
+    max_abs_target_anchor_residual: torch.Tensor
+    max_abs_active_delta: torch.Tensor
+    max_abs_released_delta: torch.Tensor
+    anchor_valid: bool
+    anchor_capture_count: int
+    anchor_target_apply_count: int
+    anchor_first_exact_target_count: int
+    anchor_slew_limit_event_count: int
+    anchor_slew_limited_joint_count: int
+    anchor_position_limit_event_count: int
+    anchor_position_limited_joint_count: int
+    anchor_completion_count: int
+    anchor_open_cancel_count: int
+    last_activation_apply_index: int | None
+    remaining: int
+    observed_endpoint_change_count: int
+    endpoint_observed: bool
+    activation_count: int
+    active_apply_count: int
+    released_apply_count: int
+
+
+def _little_endian_float32_vector_sha256(value: torch.Tensor) -> str:
+    """Hash one finite rank-1 float32 vector with explicit byte order."""
+
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.ndim != 1
+        or value.dtype != torch.float32
+        or not bool(torch.isfinite(value).all().item())
+    ):
+        raise ValueError("PolaRiS EEF anchor digest requires one finite float32 vector")
+    components = value.detach().cpu().tolist()
+    return hashlib.sha256(struct.pack(f"<{len(components)}f", *components)).hexdigest()
 
 
 class DifferentialIKNumericalError(RuntimeError):
@@ -639,6 +682,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._gripper_target_slew_profile: str | None = None
         self._gripper_close_arm_interlock_profile: str | None = None
         self._gripper_close_arm_interlock_configured_substeps: int | None = None
+        self._gripper_close_arm_interlock_fixed_activation_anchor: bool | None = None
         self._ik_controller = RobustDifferentialIKController(
             cfg=self.cfg.controller,
             num_envs=self.num_envs,
@@ -1040,6 +1084,27 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._gripper_close_arm_interlock_activation_count = 0
         self._gripper_close_arm_interlock_active_apply_count = 0
         self._gripper_close_arm_interlock_released_apply_count = 0
+        self._gripper_close_arm_interlock_anchor_valid = False
+        self._gripper_close_arm_interlock_anchor = torch.zeros_like(
+            self._max_delta_joint_pos[0]
+        )
+        self._gripper_close_arm_interlock_anchor_capture_count = 0
+        self._gripper_close_arm_interlock_anchor_target_apply_count = 0
+        self._gripper_close_arm_interlock_anchor_first_exact_target_count = 0
+        self._gripper_close_arm_interlock_anchor_refresh_count = 0
+        self._gripper_close_arm_interlock_anchor_slew_limit_event_count = 0
+        self._gripper_close_arm_interlock_anchor_slew_limited_joint_count = 0
+        self._gripper_close_arm_interlock_anchor_position_limit_event_count = 0
+        self._gripper_close_arm_interlock_anchor_position_limited_joint_count = 0
+        self._gripper_close_arm_interlock_anchor_completion_count = 0
+        self._gripper_close_arm_interlock_anchor_open_cancel_count = 0
+        self._gripper_close_arm_interlock_last_activation_apply_index: int | None = None
+        self._gripper_close_arm_interlock_max_abs_current_anchor_residual = (
+            torch.zeros_like(self._max_delta_joint_pos[0])
+        )
+        self._gripper_close_arm_interlock_max_abs_target_anchor_residual = (
+            torch.zeros_like(self._max_delta_joint_pos[0])
+        )
         self._gripper_close_arm_interlock_max_abs_active_delta = torch.zeros_like(
             self._max_delta_joint_pos[0]
         )
@@ -1219,6 +1284,9 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._gripper_close_arm_interlock_configured_substeps = (
             bound_interlock_spec.close_interlock_substeps
         )
+        self._gripper_close_arm_interlock_fixed_activation_anchor = (
+            bound_interlock_spec.fixed_activation_anchor
+        )
         self._reset_gripper_runtime_evidence()
 
     def _next_gripper_close_arm_interlock_transition(
@@ -1307,6 +1375,146 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             endpoint_is_closed=endpoint_is_closed,
             remaining_before_apply=self._gripper_close_arm_interlock_remaining,
             configured_substeps=configured_substeps,
+        )
+
+    def _validate_gripper_close_arm_interlock_anchor_state(self) -> None:
+        """Reject fixed-anchor lifecycle drift before staging a transition."""
+
+        fixed_activation_anchor = (
+            self._gripper_close_arm_interlock_fixed_activation_anchor
+        )
+        if type(fixed_activation_anchor) is not bool:
+            raise ValueError(
+                "PolaRiS EEF close interlock has no fixed-anchor profile binding"
+            )
+        if not fixed_activation_anchor:
+            return
+        counter_values = (
+            self._gripper_close_arm_interlock_remaining,
+            self._gripper_close_arm_interlock_activation_count,
+            self._gripper_close_arm_interlock_active_apply_count,
+            self._gripper_close_arm_interlock_anchor_capture_count,
+            self._gripper_close_arm_interlock_anchor_target_apply_count,
+            self._gripper_close_arm_interlock_anchor_first_exact_target_count,
+            self._gripper_close_arm_interlock_anchor_refresh_count,
+            self._gripper_close_arm_interlock_anchor_slew_limit_event_count,
+            self._gripper_close_arm_interlock_anchor_slew_limited_joint_count,
+            self._gripper_close_arm_interlock_anchor_position_limit_event_count,
+            self._gripper_close_arm_interlock_anchor_position_limited_joint_count,
+            self._gripper_close_arm_interlock_anchor_completion_count,
+            self._gripper_close_arm_interlock_anchor_open_cancel_count,
+        )
+        if any(type(value) is not int or value < 0 for value in counter_values):
+            raise ValueError("PolaRiS EEF fixed activation-anchor counter drift")
+        expected_anchor_valid = self._gripper_close_arm_interlock_remaining > 0
+        anchor = self._gripper_close_arm_interlock_anchor
+        if (
+            type(self._gripper_close_arm_interlock_anchor_valid) is not bool
+            or self._gripper_close_arm_interlock_anchor_valid != expected_anchor_valid
+            or not isinstance(anchor, torch.Tensor)
+            or tuple(anchor.shape) != (self._num_joints,)
+            or anchor.dtype != torch.float32
+            or anchor.device != torch.device(self.device)
+            or not bool(torch.isfinite(anchor).all().item())
+            or self._gripper_close_arm_interlock_anchor_capture_count
+            != self._gripper_close_arm_interlock_activation_count
+            or self._gripper_close_arm_interlock_anchor_target_apply_count
+            != self._gripper_close_arm_interlock_active_apply_count
+            or self._gripper_close_arm_interlock_anchor_first_exact_target_count
+            != self._gripper_close_arm_interlock_anchor_capture_count
+            or self._gripper_close_arm_interlock_anchor_refresh_count != 0
+        ):
+            raise ValueError("PolaRiS EEF fixed activation-anchor state drift")
+        capture_count = self._gripper_close_arm_interlock_anchor_capture_count
+        terminal_count = (
+            self._gripper_close_arm_interlock_anchor_completion_count
+            + self._gripper_close_arm_interlock_anchor_open_cancel_count
+        )
+        last_activation_apply_index = (
+            self._gripper_close_arm_interlock_last_activation_apply_index
+        )
+        if (
+            terminal_count + int(expected_anchor_valid) != capture_count
+            or (capture_count == 0) != (last_activation_apply_index is None)
+            or (
+                last_activation_apply_index is not None
+                and (
+                    type(last_activation_apply_index) is not int
+                    or last_activation_apply_index < 0
+                    or last_activation_apply_index >= self._apply_call_count
+                )
+            )
+        ):
+            raise ValueError("PolaRiS EEF fixed activation-anchor lifecycle drift")
+
+    def _set_targets_and_commit_gripper_close_arm_interlock(
+        self,
+        safe_target: torch.Tensor,
+        staged: _StagedGripperCloseArmInterlockState,
+    ) -> None:
+        """Set both arm targets, then commit the already-prepared lifecycle."""
+
+        self._asset.set_joint_velocity_target(
+            self._zero_joint_velocity_target,
+            self._joint_ids,
+        )
+        self._asset.set_joint_position_target(safe_target, self._joint_ids)
+        # Tensor references come first.  The remaining operations are plain
+        # assignments of prevalidated Python scalars/references and cannot
+        # split a staged activation from its anchor.
+        self._gripper_close_arm_interlock_anchor = staged.anchor
+        self._gripper_close_arm_interlock_max_abs_current_anchor_residual = (
+            staged.max_abs_current_anchor_residual
+        )
+        self._gripper_close_arm_interlock_max_abs_target_anchor_residual = (
+            staged.max_abs_target_anchor_residual
+        )
+        self._gripper_close_arm_interlock_max_abs_active_delta = (
+            staged.max_abs_active_delta
+        )
+        self._gripper_close_arm_interlock_max_abs_released_delta = (
+            staged.max_abs_released_delta
+        )
+        self._gripper_close_arm_interlock_anchor_valid = staged.anchor_valid
+        self._gripper_close_arm_interlock_anchor_capture_count = (
+            staged.anchor_capture_count
+        )
+        self._gripper_close_arm_interlock_anchor_target_apply_count = (
+            staged.anchor_target_apply_count
+        )
+        self._gripper_close_arm_interlock_anchor_first_exact_target_count = (
+            staged.anchor_first_exact_target_count
+        )
+        self._gripper_close_arm_interlock_anchor_slew_limit_event_count = (
+            staged.anchor_slew_limit_event_count
+        )
+        self._gripper_close_arm_interlock_anchor_slew_limited_joint_count = (
+            staged.anchor_slew_limited_joint_count
+        )
+        self._gripper_close_arm_interlock_anchor_position_limit_event_count = (
+            staged.anchor_position_limit_event_count
+        )
+        self._gripper_close_arm_interlock_anchor_position_limited_joint_count = (
+            staged.anchor_position_limited_joint_count
+        )
+        self._gripper_close_arm_interlock_anchor_completion_count = (
+            staged.anchor_completion_count
+        )
+        self._gripper_close_arm_interlock_anchor_open_cancel_count = (
+            staged.anchor_open_cancel_count
+        )
+        self._gripper_close_arm_interlock_last_activation_apply_index = (
+            staged.last_activation_apply_index
+        )
+        self._gripper_close_arm_interlock_remaining = staged.remaining
+        self._gripper_close_arm_interlock_observed_endpoint_change_count = (
+            staged.observed_endpoint_change_count
+        )
+        self._gripper_close_arm_interlock_endpoint_observed = staged.endpoint_observed
+        self._gripper_close_arm_interlock_activation_count = staged.activation_count
+        self._gripper_close_arm_interlock_active_apply_count = staged.active_apply_count
+        self._gripper_close_arm_interlock_released_apply_count = (
+            staged.released_apply_count
         )
 
     def _reset_gripper_runtime_evidence(self) -> None:
@@ -2088,6 +2296,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 post_joint_vel=self._asset.data.joint_vel[:, self._joint_ids],
             )
         self._apply_call_count += 1
+        if self._gripper_close_arm_interlock_enabled:
+            self._validate_gripper_close_arm_interlock_anchor_state()
         close_interlock_transition = (
             self._next_gripper_close_arm_interlock_transition()
             if self._gripper_close_arm_interlock_enabled
@@ -2357,14 +2567,86 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             safe_target = wrist_energy_brake_result.applied_target
         else:
             safe_target = nominal_safe_target
+        fixed_anchor_for_apply = None
+        anchor_slew_limited = None
+        anchor_position_limited = None
+        current_anchor_residual = None
+        target_anchor_residual = None
         if close_interlock_transition.active:
-            safe_target, _, _, _ = _bound_joint_position_target(
-                joint_pos,
-                joint_pos,
-                self._nominal_max_delta_joint_pos,
-                soft_limits,
-                target_guard_band_delta_joint_pos=self._max_delta_joint_pos,
-            )
+            if self._gripper_close_arm_interlock_fixed_activation_anchor:
+                if close_interlock_transition.activation_count_delta:
+                    if self._gripper_close_arm_interlock_anchor_valid:
+                        raise ValueError(
+                            "PolaRiS EEF fixed activation anchor refreshed while valid"
+                        )
+                    fixed_anchor_for_apply = joint_pos[0].detach().clone()
+                else:
+                    if not self._gripper_close_arm_interlock_anchor_valid:
+                        raise ValueError(
+                            "PolaRiS EEF active close interlock has no valid anchor"
+                        )
+                    fixed_anchor_for_apply = (
+                        self._gripper_close_arm_interlock_anchor.detach().clone()
+                    )
+                if (
+                    fixed_anchor_for_apply.dtype != torch.float32
+                    or tuple(fixed_anchor_for_apply.shape) != (self._num_joints,)
+                    or not bool(torch.isfinite(fixed_anchor_for_apply).all().item())
+                ):
+                    raise ValueError("PolaRiS EEF staged fixed activation anchor drift")
+                safe_target, _, anchor_slew_limited, anchor_position_limited = (
+                    _bound_joint_position_target(
+                        joint_pos,
+                        fixed_anchor_for_apply.unsqueeze(0),
+                        self._nominal_max_delta_joint_pos,
+                        soft_limits,
+                        target_guard_band_delta_joint_pos=self._max_delta_joint_pos,
+                    )
+                )
+                current_anchor_residual = fixed_anchor_for_apply - joint_pos[0]
+                target_anchor_residual = fixed_anchor_for_apply - safe_target[0]
+                target_min = torch.minimum(joint_pos[0], fixed_anchor_for_apply)
+                target_max = torch.maximum(joint_pos[0], fixed_anchor_for_apply)
+                target_between_current_and_anchor = (
+                    (safe_target[0] >= target_min - JOINT_SLEW_FLOAT32_TOLERANCE_RAD)
+                    & (safe_target[0] <= target_max + JOINT_SLEW_FLOAT32_TOLERANCE_RAD)
+                    & (
+                        target_anchor_residual.abs()
+                        <= current_anchor_residual.abs()
+                        + JOINT_SLEW_FLOAT32_TOLERANCE_RAD
+                    )
+                )
+                if not bool(target_between_current_and_anchor.all().item()):
+                    raise ValueError(
+                        "PolaRiS EEF fixed activation-anchor target moved past anchor"
+                    )
+                if bool(
+                    (
+                        (safe_target - joint_pos).abs()
+                        > self._nominal_max_delta_joint_pos
+                        + JOINT_SLEW_FLOAT32_TOLERANCE_RAD
+                    )
+                    .any()
+                    .item()
+                ):
+                    raise ValueError(
+                        "PolaRiS EEF fixed activation-anchor target exceeded slew"
+                    )
+                if (
+                    close_interlock_transition.activation_count_delta
+                    and not torch.equal(safe_target[0], fixed_anchor_for_apply)
+                ):
+                    raise ValueError(
+                        "PolaRiS EEF first fixed activation-anchor target was not exact"
+                    )
+            else:
+                safe_target, _, _, _ = _bound_joint_position_target(
+                    joint_pos,
+                    joint_pos,
+                    self._nominal_max_delta_joint_pos,
+                    soft_limits,
+                    target_guard_band_delta_joint_pos=self._max_delta_joint_pos,
+                )
         applied_delta = safe_target - joint_pos
         raw_target_violation = torch.maximum(
             torch.clamp(lower - raw_joint_pos_target, min=0.0),
@@ -2511,45 +2793,186 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             self._max_applied_delta_joint_pos,
             applied_delta.abs().amax(dim=0).to(self._max_applied_delta_joint_pos.dtype),
         )
-        self._asset.set_joint_velocity_target(
-            self._zero_joint_velocity_target,
-            self._joint_ids,
+        anchor_slew_limit_event_delta = 0
+        anchor_slew_limited_joint_delta = 0
+        anchor_position_limit_event_delta = 0
+        anchor_position_limited_joint_delta = 0
+        if fixed_anchor_for_apply is not None:
+            if (
+                anchor_slew_limited is None
+                or anchor_position_limited is None
+                or current_anchor_residual is None
+                or target_anchor_residual is None
+            ):
+                raise ValueError("PolaRiS EEF fixed activation-anchor staging drift")
+            anchor_slew_limit_event_delta = int(
+                anchor_slew_limited.any().detach().cpu().item()
+            )
+            anchor_slew_limited_joint_delta = int(
+                anchor_slew_limited.sum().detach().cpu().item()
+            )
+            anchor_position_limit_event_delta = int(
+                anchor_position_limited.any().detach().cpu().item()
+            )
+            anchor_position_limited_joint_delta = int(
+                anchor_position_limited.sum().detach().cpu().item()
+            )
+        if (
+            self._gripper_close_arm_interlock_fixed_activation_anchor
+            and close_interlock_transition.active
+            and (
+                fixed_anchor_for_apply is None
+                or current_anchor_residual is None
+                or target_anchor_residual is None
+            )
+        ):
+            raise ValueError("PolaRiS EEF fixed activation-anchor staging drift")
+
+        next_interlock_remaining = (
+            close_interlock_transition.remaining_after_successful_apply
         )
-        self._asset.set_joint_position_target(safe_target, self._joint_ids)
-        activation_count_after_apply = (
+        next_interlock_observed_endpoint_change_count = (
+            close_interlock_transition.observed_endpoint_change_count
+        )
+        next_interlock_endpoint_observed = (
+            close_interlock_transition.endpoint_observed_after_successful_apply
+        )
+        next_interlock_activation_count = (
             self._gripper_close_arm_interlock_activation_count
             + close_interlock_transition.activation_count_delta
         )
-        self._gripper_close_arm_interlock_remaining = (
-            close_interlock_transition.remaining_after_successful_apply
+        next_interlock_active_apply_count = (
+            self._gripper_close_arm_interlock_active_apply_count
+            + int(close_interlock_transition.active)
         )
-        self._gripper_close_arm_interlock_observed_endpoint_change_count = (
-            close_interlock_transition.observed_endpoint_change_count
-        )
-        self._gripper_close_arm_interlock_endpoint_observed = (
-            close_interlock_transition.endpoint_observed_after_successful_apply
-        )
-        self._gripper_close_arm_interlock_activation_count += (
-            close_interlock_transition.activation_count_delta
-        )
-        self._gripper_close_arm_interlock_active_apply_count += int(
-            close_interlock_transition.active
-        )
-        if close_interlock_transition.active:
-            self._gripper_close_arm_interlock_max_abs_active_delta = torch.maximum(
+        next_interlock_max_abs_active_delta = (
+            torch.maximum(
                 self._gripper_close_arm_interlock_max_abs_active_delta,
                 applied_delta[0].abs(),
             )
-        if (
+            if close_interlock_transition.active
+            else self._gripper_close_arm_interlock_max_abs_active_delta
+        )
+        released_apply_delta = int(
             self._gripper_close_arm_interlock_enabled
-            and activation_count_after_apply > 0
+            and next_interlock_activation_count > 0
             and not close_interlock_transition.active
-        ):
-            self._gripper_close_arm_interlock_released_apply_count += 1
-            self._gripper_close_arm_interlock_max_abs_released_delta = torch.maximum(
+        )
+        next_interlock_released_apply_count = (
+            self._gripper_close_arm_interlock_released_apply_count
+            + released_apply_delta
+        )
+        next_interlock_max_abs_released_delta = (
+            torch.maximum(
                 self._gripper_close_arm_interlock_max_abs_released_delta,
                 applied_delta[0].abs(),
             )
+            if released_apply_delta
+            else self._gripper_close_arm_interlock_max_abs_released_delta
+        )
+
+        next_anchor = self._gripper_close_arm_interlock_anchor
+        next_anchor_valid = self._gripper_close_arm_interlock_anchor_valid
+        next_anchor_capture_count = (
+            self._gripper_close_arm_interlock_anchor_capture_count
+        )
+        next_anchor_target_apply_count = (
+            self._gripper_close_arm_interlock_anchor_target_apply_count
+        )
+        next_anchor_first_exact_target_count = (
+            self._gripper_close_arm_interlock_anchor_first_exact_target_count
+        )
+        next_anchor_slew_limit_event_count = (
+            self._gripper_close_arm_interlock_anchor_slew_limit_event_count
+        )
+        next_anchor_slew_limited_joint_count = (
+            self._gripper_close_arm_interlock_anchor_slew_limited_joint_count
+        )
+        next_anchor_position_limit_event_count = (
+            self._gripper_close_arm_interlock_anchor_position_limit_event_count
+        )
+        next_anchor_position_limited_joint_count = (
+            self._gripper_close_arm_interlock_anchor_position_limited_joint_count
+        )
+        next_anchor_completion_count = (
+            self._gripper_close_arm_interlock_anchor_completion_count
+        )
+        next_anchor_open_cancel_count = (
+            self._gripper_close_arm_interlock_anchor_open_cancel_count
+        )
+        next_last_activation_apply_index = (
+            self._gripper_close_arm_interlock_last_activation_apply_index
+        )
+        next_max_abs_current_anchor_residual = (
+            self._gripper_close_arm_interlock_max_abs_current_anchor_residual
+        )
+        next_max_abs_target_anchor_residual = (
+            self._gripper_close_arm_interlock_max_abs_target_anchor_residual
+        )
+        if self._gripper_close_arm_interlock_fixed_activation_anchor:
+            if close_interlock_transition.active:
+                if close_interlock_transition.activation_count_delta:
+                    next_anchor = fixed_anchor_for_apply
+                    next_anchor_capture_count += 1
+                    next_anchor_first_exact_target_count += 1
+                    next_last_activation_apply_index = self._apply_call_count - 1
+                next_anchor_target_apply_count += 1
+                next_anchor_slew_limit_event_count += anchor_slew_limit_event_delta
+                next_anchor_slew_limited_joint_count += anchor_slew_limited_joint_delta
+                next_anchor_position_limit_event_count += (
+                    anchor_position_limit_event_delta
+                )
+                next_anchor_position_limited_joint_count += (
+                    anchor_position_limited_joint_delta
+                )
+                next_max_abs_current_anchor_residual = torch.maximum(
+                    next_max_abs_current_anchor_residual,
+                    current_anchor_residual.abs(),
+                )
+                next_max_abs_target_anchor_residual = torch.maximum(
+                    next_max_abs_target_anchor_residual,
+                    target_anchor_residual.abs(),
+                )
+            next_anchor_completion_count += (
+                close_interlock_transition.completion_count_delta
+            )
+            next_anchor_open_cancel_count += (
+                close_interlock_transition.open_cancel_count_delta
+            )
+            next_anchor_valid = next_interlock_remaining > 0
+
+        staged_interlock_state = _StagedGripperCloseArmInterlockState(
+            anchor=next_anchor,
+            max_abs_current_anchor_residual=(next_max_abs_current_anchor_residual),
+            max_abs_target_anchor_residual=next_max_abs_target_anchor_residual,
+            max_abs_active_delta=next_interlock_max_abs_active_delta,
+            max_abs_released_delta=next_interlock_max_abs_released_delta,
+            anchor_valid=next_anchor_valid,
+            anchor_capture_count=next_anchor_capture_count,
+            anchor_target_apply_count=next_anchor_target_apply_count,
+            anchor_first_exact_target_count=next_anchor_first_exact_target_count,
+            anchor_slew_limit_event_count=next_anchor_slew_limit_event_count,
+            anchor_slew_limited_joint_count=next_anchor_slew_limited_joint_count,
+            anchor_position_limit_event_count=(next_anchor_position_limit_event_count),
+            anchor_position_limited_joint_count=(
+                next_anchor_position_limited_joint_count
+            ),
+            anchor_completion_count=next_anchor_completion_count,
+            anchor_open_cancel_count=next_anchor_open_cancel_count,
+            last_activation_apply_index=next_last_activation_apply_index,
+            remaining=next_interlock_remaining,
+            observed_endpoint_change_count=(
+                next_interlock_observed_endpoint_change_count
+            ),
+            endpoint_observed=next_interlock_endpoint_observed,
+            activation_count=next_interlock_activation_count,
+            active_apply_count=next_interlock_active_apply_count,
+            released_apply_count=next_interlock_released_apply_count,
+        )
+        self._set_targets_and_commit_gripper_close_arm_interlock(
+            safe_target,
+            staged_interlock_state,
+        )
         if self._wrist_energy_brake_enabled:
             if wrist_energy_brake_result is None:
                 raise ValueError("PolaRiS EEF wrist energy-brake transition is absent")
@@ -2620,6 +3043,49 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             interlock_profile=interlock_profile,
             configured_substeps=configured_substeps,
         )
+        if (
+            bound_profile.fixed_activation_anchor
+            is not self._gripper_close_arm_interlock_fixed_activation_anchor
+        ):
+            raise ValueError("PolaRiS EEF close-interlock anchor profile drift")
+        self._validate_gripper_close_arm_interlock_anchor_state()
+        anchor_scalar_evidence = (
+            self._gripper_close_arm_interlock_anchor_capture_count,
+            self._gripper_close_arm_interlock_anchor_target_apply_count,
+            self._gripper_close_arm_interlock_anchor_first_exact_target_count,
+            self._gripper_close_arm_interlock_anchor_refresh_count,
+            self._gripper_close_arm_interlock_anchor_slew_limit_event_count,
+            self._gripper_close_arm_interlock_anchor_slew_limited_joint_count,
+            self._gripper_close_arm_interlock_anchor_position_limit_event_count,
+            self._gripper_close_arm_interlock_anchor_position_limited_joint_count,
+            self._gripper_close_arm_interlock_anchor_completion_count,
+            self._gripper_close_arm_interlock_anchor_open_cancel_count,
+        )
+        anchor_tensor_evidence = (
+            self._gripper_close_arm_interlock_anchor,
+            self._gripper_close_arm_interlock_max_abs_current_anchor_residual,
+            self._gripper_close_arm_interlock_max_abs_target_anchor_residual,
+        )
+        if any(
+            not isinstance(value, torch.Tensor)
+            or tuple(value.shape) != (self._num_joints,)
+            or value.dtype != torch.float32
+            or value.device != torch.device(self.device)
+            or not bool(torch.isfinite(value).all().item())
+            for value in anchor_tensor_evidence
+        ):
+            raise ValueError("PolaRiS EEF fixed activation-anchor tensor drift")
+        anchor_evidence_is_empty = (
+            not self._gripper_close_arm_interlock_anchor_valid
+            and all(value == 0 for value in anchor_scalar_evidence)
+            and self._gripper_close_arm_interlock_last_activation_apply_index is None
+            and all(
+                not bool(value.any().detach().cpu().item())
+                for value in anchor_tensor_evidence
+            )
+        )
+        if not bound_profile.fixed_activation_anchor and not anchor_evidence_is_empty:
+            raise ValueError("Non-anchor PolaRiS EEF interlock has anchor evidence")
         if not self._gripper_close_arm_interlock_enabled and (
             self._gripper_close_arm_interlock_remaining != 0
             or self._gripper_close_arm_interlock_activation_count != 0
@@ -2638,8 +3104,22 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 .cpu()
                 .item()
             )
+            or not anchor_evidence_is_empty
         ):
             raise ValueError("Disabled PolaRiS EEF close interlock has evidence")
+        anchor_capture_count = self._gripper_close_arm_interlock_anchor_capture_count
+        last_anchor_joint_pos_rad = (
+            self._gripper_close_arm_interlock_anchor.detach().cpu().tolist()
+            if anchor_capture_count > 0
+            else None
+        )
+        last_anchor_sha256 = (
+            _little_endian_float32_vector_sha256(
+                self._gripper_close_arm_interlock_anchor
+            )
+            if anchor_capture_count > 0
+            else None
+        )
         return {
             "arm_slew_headroom": {
                 "enabled": self._arm_slew_headroom_enabled,
@@ -2669,6 +3149,50 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 ),
                 "active_apply_count": (
                     self._gripper_close_arm_interlock_active_apply_count
+                ),
+                "anchor_valid": self._gripper_close_arm_interlock_anchor_valid,
+                "anchor_capture_count": anchor_capture_count,
+                "anchor_target_apply_count": (
+                    self._gripper_close_arm_interlock_anchor_target_apply_count
+                ),
+                "anchor_first_exact_target_count": (
+                    self._gripper_close_arm_interlock_anchor_first_exact_target_count
+                ),
+                "anchor_refresh_count": (
+                    self._gripper_close_arm_interlock_anchor_refresh_count
+                ),
+                "anchor_slew_limit_event_count": (
+                    self._gripper_close_arm_interlock_anchor_slew_limit_event_count
+                ),
+                "anchor_slew_limited_joint_count": (
+                    self._gripper_close_arm_interlock_anchor_slew_limited_joint_count
+                ),
+                "anchor_position_limit_event_count": (
+                    self._gripper_close_arm_interlock_anchor_position_limit_event_count
+                ),
+                "anchor_position_limited_joint_count": (
+                    self._gripper_close_arm_interlock_anchor_position_limited_joint_count
+                ),
+                "anchor_completion_count": (
+                    self._gripper_close_arm_interlock_anchor_completion_count
+                ),
+                "anchor_open_cancel_count": (
+                    self._gripper_close_arm_interlock_anchor_open_cancel_count
+                ),
+                "last_activation_apply_index": (
+                    self._gripper_close_arm_interlock_last_activation_apply_index
+                ),
+                "last_anchor_joint_pos_rad": last_anchor_joint_pos_rad,
+                "last_anchor_little_endian_float32_sha256": last_anchor_sha256,
+                "max_abs_current_anchor_residual_rad": (
+                    self._gripper_close_arm_interlock_max_abs_current_anchor_residual.detach()
+                    .cpu()
+                    .tolist()
+                ),
+                "max_abs_target_anchor_residual_rad": (
+                    self._gripper_close_arm_interlock_max_abs_target_anchor_residual.detach()
+                    .cpu()
+                    .tolist()
                 ),
                 "max_abs_active_delta_joint_pos_rad": (
                     self._gripper_close_arm_interlock_max_abs_active_delta.detach()

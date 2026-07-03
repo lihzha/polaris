@@ -72,6 +72,8 @@ class GripperCloseArmInterlockTransition:
     observed_endpoint_change_count: int
     endpoint_observed_after_successful_apply: bool
     activation_count_delta: int
+    completion_count_delta: int
+    open_cancel_count_delta: int
 
 
 DISABLED_GRIPPER_CLOSE_ARM_INTERLOCK_TRANSITION = GripperCloseArmInterlockTransition(
@@ -80,6 +82,8 @@ DISABLED_GRIPPER_CLOSE_ARM_INTERLOCK_TRANSITION = GripperCloseArmInterlockTransi
     observed_endpoint_change_count=0,
     endpoint_observed_after_successful_apply=False,
     activation_count_delta=0,
+    completion_count_delta=0,
+    open_cancel_count_delta=0,
 )
 
 
@@ -132,10 +136,13 @@ def advance_gripper_close_arm_interlock(
             observed_endpoint_change_count=current_endpoint_change_count,
             endpoint_observed_after_successful_apply=False,
             activation_count_delta=0,
+            completion_count_delta=0,
+            open_cancel_count_delta=0,
         )
 
     remaining = remaining_before_apply
     activation_count_delta = 0
+    open_cancel_count_delta = 0
     if not endpoint_observed_before_apply:
         if current_endpoint_change_count != 0:
             raise ValueError(
@@ -149,6 +156,7 @@ def advance_gripper_close_arm_interlock(
             remaining = configured_substeps
             activation_count_delta = 1
         else:
+            open_cancel_count_delta = int(remaining_before_apply > 0)
             remaining = 0
     active = remaining > 0
     return GripperCloseArmInterlockTransition(
@@ -157,4 +165,6 @@ def advance_gripper_close_arm_interlock(
         observed_endpoint_change_count=current_endpoint_change_count,
         endpoint_observed_after_successful_apply=True,
         activation_count_delta=activation_count_delta,
+        completion_count_delta=int(active and remaining == 1),
+        open_cancel_count_delta=open_cancel_count_delta,
     )

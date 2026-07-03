@@ -189,6 +189,10 @@ def test_rate_0p25_candidate_is_exact_opt_in_and_reaches_close_on_apply_76(
     assert spec.close_limited_applies == 75
     assert spec.close_nextafter_corrections == 41
     assert spec.close_interlock_substeps == 86
+    assert spec.close_interlock_profile == (
+        "eef_gripper_close_fixed_activation_anchor_86_physics_substeps_v2"
+    )
+    assert spec.fixed_activation_anchor is True
 
 
 @pytest.mark.parametrize("flag", [None, 0, 1, 0.25, "true"])
