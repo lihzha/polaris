@@ -15,6 +15,36 @@ from scripts import finalize_eef_pose_boundary_replay as finalizer
 from scripts import smoke_eef_pose_boundary_replay as smoke
 
 
+class _FakeTensor:
+    def __init__(self, values):
+        self._values = values
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def flatten(self):
+        return self
+
+    def tolist(self):
+        return self._values
+
+
+def test_failure_vector_evidence_replaces_nonfinite_values_with_null() -> None:
+    evidence = smoke._finite_vector_evidence(  # noqa: SLF001
+        _FakeTensor([1.0, float("nan"), float("inf"), -2.0])
+    )
+
+    assert evidence == {
+        "values": [1.0, None, None, -2.0],
+        "finite_mask": [True, False, False, True],
+        "finite_count": 2,
+    }
+    assert b"NaN" not in smoke._strict_json_bytes(evidence)  # noqa: SLF001
+
+
 def _diagnostic_vector(values):
     return {
         "values": list(values),

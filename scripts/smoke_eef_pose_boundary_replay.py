@@ -1178,6 +1178,45 @@ def _exception_evidence(error: BaseException) -> dict[str, str]:
     }
 
 
+def _finite_vector_evidence(values: Any) -> dict[str, Any]:
+    """Serialize a tensor-like vector without ever emitting NaN/Infinity."""
+
+    flat_values = values.detach().cpu().flatten().tolist()
+    finite_mask = [math.isfinite(float(value)) for value in flat_values]
+    return {
+        "values": [
+            float(value) if finite else None
+            for value, finite in zip(flat_values, finite_mask, strict=True)
+        ],
+        "finite_mask": finite_mask,
+        "finite_count": sum(finite_mask),
+    }
+
+
+def _capture_failure_runtime_evidence(env: Any, *, policy_step: Any) -> dict[str, Any]:
+    """Capture the live arm state and controller report before failure teardown."""
+
+    from polaris.eef_runtime_contract import eef_episode_safety_report
+
+    arm_term = env.unwrapped.action_manager._terms["arm"]
+    robot = env.unwrapped.scene["robot"]
+    joint_ids = arm_term._joint_ids
+    return {
+        "policy_step": policy_step,
+        "arm_joint_names": list(arm_term._joint_names),
+        "arm_joint_pos_rad": _finite_vector_evidence(
+            robot.data.joint_pos[:, joint_ids][0]
+        ),
+        "arm_joint_vel_rad_s": _finite_vector_evidence(
+            robot.data.joint_vel[:, joint_ids][0]
+        ),
+        "arm_joint_target_rad": _finite_vector_evidence(
+            robot.data.joint_pos_target[:, joint_ids][0]
+        ),
+        "ik_safety": eef_episode_safety_report(env, 0),
+    }
+
+
 def _run_boundary_replay(
     args_cli: argparse.Namespace, state: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1487,6 +1526,8 @@ def main() -> int:
     failure: BaseException | None = None
     close_failures: list[dict[str, str]] = []
     evidence: dict[str, Any] | None = None
+    failure_runtime_evidence: dict[str, Any] | None = None
+    failure_runtime_evidence_error: dict[str, str] | None = None
     try:
         app_launcher = app_launcher_type(args_cli)
         simulation_app = app_launcher.app
@@ -1500,6 +1541,18 @@ def main() -> int:
         sys.stderr.flush()
 
     env = state.get("env")
+    if env is not None and failure is not None:
+        state["stage"] = "capture_failure_runtime_evidence"
+        try:
+            failure_runtime_evidence = _capture_failure_runtime_evidence(
+                env,
+                policy_step=state.get("policy_step"),
+            )
+        except BaseException as error:
+            failure_runtime_evidence_error = _exception_evidence(error)
+            traceback.print_exception(
+                type(error), error, error.__traceback__, file=sys.stderr
+            )
     if env is not None:
         state["stage"] = "close_environment"
         try:
@@ -1576,6 +1629,8 @@ def main() -> int:
         "exit_code": 1,
         "environment": ENVIRONMENT,
         "failure": _exception_evidence(failure) if failure is not None else None,
+        "failure_runtime_evidence": failure_runtime_evidence,
+        "failure_runtime_evidence_error": failure_runtime_evidence_error,
         "close_failures": close_failures,
     }
     try:

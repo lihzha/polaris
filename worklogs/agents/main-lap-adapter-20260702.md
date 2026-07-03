@@ -353,3 +353,24 @@
   This promotes the exact captured limits for EEF IK-safety v3 only; native
   joint-position/pi05 semantics are unchanged. A full-horizon checkpoint
   canary remains mandatory before any standard evaluation.
+
+## 2026-07-02 — v4 boundary replay is non-promotable
+
+- V3 official and reasoning canaries later reached joint-5's upper boundary
+  and failed closed. V4 candidate `e47481458719a0b07637e8c62b5980ea498062e4`
+  therefore inset every commanded joint target by one maximum 120-Hz velocity
+  step and added an exact boundary replay of the 378 official actions plus an
+  adaptive outward dwell.
+- Pinned L40S job `1097984` passed all 23 Isaac-dependent and 45 host/runtime
+  tests. It completed the exact 378-action fixture, but its first adaptive
+  step (`policy_step=378`) found a current joint already outside the live outer
+  soft limit and aborted before DLS/PhysX. Parent/batch/replay failed `1:0`;
+  no ready marker or attestation exists. The immutable mode-0444 failure JSON
+  SHA-256 is
+  `f0e07058bd6d1c6dfdd05cb1039c553582f1d5f658e9ab7f8e26ae0d054103a0`.
+- This disproves the one-physics-substep static target inset as a sufficient
+  implicit-actuator state bound. V4 remains pending and no checkpoint rerun is
+  authorized. The boundary runner now captures finite-or-null live arm q/dq/
+  position-target vectors plus the full controller safety report before
+  failure teardown so the replacement can be based on measured terminal
+  dynamics rather than an assumed margin.
