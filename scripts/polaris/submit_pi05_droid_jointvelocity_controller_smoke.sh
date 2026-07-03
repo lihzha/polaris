@@ -19,18 +19,43 @@ die() {
   exit 2
 }
 
+require_normalized_absolute_path() {
+  local field="$1"
+  local value="$2"
+  local normalized
+  [[ "${value}" == /* && "${value}" != //* ]] \
+    || die "${field} must be an absolute path with one leading slash"
+  normalized="$(realpath -sm -- "${value}")" \
+    || die "Unable to normalize ${field}"
+  [[ "${value}" == "${normalized}" ]] \
+    || die "${field} must use one normalized absolute path spelling"
+}
+
 command -v sbatch >/dev/null || die "sbatch is required; run this on l401/l402/l403"
+require_normalized_absolute_path POLARIS_DIR "${POLARIS_DIR}"
 [[ ! -L "${POLARIS_DIR}" ]] || die "POLARIS_DIR must not be a symlink"
-POLARIS_DIR="$(realpath "${POLARIS_DIR}")"
+POLARIS_DIR_RESOLVED="$(realpath "${POLARIS_DIR}")"
+for path_contract in \
+  "NFS_ROOT=${NFS_ROOT}" \
+  "POLARIS_DATA_DIR=${POLARIS_DATA_DIR}" \
+  "POLARIS_PYXIS_IMAGE=${POLARIS_PYXIS_IMAGE}" \
+  "SBATCH_SCRIPT=${SBATCH_SCRIPT}" \
+  "OUTPUT_ROOT=${OUTPUT_ROOT}" \
+  "LOG_ROOT=${LOG_ROOT}"; do
+  require_normalized_absolute_path \
+    "${path_contract%%=*}" "${path_contract#*=}"
+done
 [[ -d "${POLARIS_DIR}/.git" && ! -L "${POLARIS_DIR}/.git" ]] \
   || die "POLARIS_DIR must be a standalone clone with an in-root .git directory"
 git_dir="$(git -C "${POLARIS_DIR}" rev-parse --absolute-git-dir)"
 git_common_dir="$(git -C "${POLARIS_DIR}" rev-parse --path-format=absolute --git-common-dir)"
-[[ "${git_dir}" == "${POLARIS_DIR}/.git" && "${git_common_dir}" == "${POLARIS_DIR}/.git" ]] \
+[[ "${git_dir}" == "${POLARIS_DIR_RESOLVED}/.git" && \
+  "${git_common_dir}" == "${POLARIS_DIR_RESOLVED}/.git" ]] \
   || die "POLARIS_DIR Git metadata must be wholly contained in its .git directory"
 [[ "$(git -C "${POLARIS_DIR}" rev-parse --abbrev-ref HEAD)" == HEAD ]] \
   || die "POLARIS_DIR must be checked out at a detached HEAD"
-[[ "$(git -C "${POLARIS_DIR}" rev-parse --show-toplevel)" == "${POLARIS_DIR}" ]] \
+[[ "$(git -C "${POLARIS_DIR}" rev-parse --show-toplevel)" == \
+  "${POLARIS_DIR_RESOLVED}" ]] \
   || die "POLARIS_DIR must name the exact Git root"
 POLARIS_COMMIT="$(git -C "${POLARIS_DIR}" rev-parse HEAD)"
 [[ "${POLARIS_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || die "Malformed PolaRiS commit"
@@ -52,6 +77,7 @@ git -C "${POLARIS_DIR}" ls-files --error-unmatch \
 RUN_NAMESPACE="${RUN_NAMESPACE:-$(date -u +%Y%m%dT%H%M%SZ)-${POLARIS_COMMIT:0:12}}"
 [[ "${RUN_NAMESPACE}" =~ ^[A-Za-z0-9._-]+$ ]] || die "Unsafe RUN_NAMESPACE"
 RUN_DIR="${RUN_DIR:-${OUTPUT_ROOT}/${RUN_NAMESPACE}}"
+require_normalized_absolute_path RUN_DIR "${RUN_DIR}"
 [[ ! -e "${RUN_DIR}" && ! -L "${RUN_DIR}" ]] \
   || die "Refusing existing RUN_DIR: ${RUN_DIR}"
 mkdir -p "${LOG_ROOT}"
@@ -77,18 +103,27 @@ from pathlib import Path
 
 path = Path(os.environ["SUBMISSION_RECORD"])
 job_script = Path(os.environ["SBATCH_SCRIPT"])
+polaris_dir = Path(os.environ["POLARIS_DIR"])
+run_dir = Path(os.environ["RUN_DIR"])
+container_image = Path(os.environ["POLARIS_PYXIS_IMAGE"])
+data_dir = Path(os.environ["POLARIS_DATA_DIR"])
 value = {
     "schema_version": 1,
     "scope": "controller_only_no_model_or_checkpoint",
     "promotion": "forbidden_without_separate_checkpoint_canary",
     "job_id": int(os.environ["JOB_ID"]),
     "polaris_commit": os.environ["POLARIS_COMMIT"],
-    "polaris_dir": os.environ["POLARIS_DIR"],
-    "run_dir": os.environ["RUN_DIR"],
-    "sbatch_script": str(job_script.resolve()),
+    "polaris_dir": str(polaris_dir),
+    "polaris_dir_resolved": str(polaris_dir.resolve()),
+    "run_dir": str(run_dir),
+    "run_dir_resolved": str(run_dir.resolve()),
+    "sbatch_script": str(job_script),
+    "sbatch_script_resolved": str(job_script.resolve()),
     "sbatch_script_sha256": hashlib.sha256(job_script.read_bytes()).hexdigest(),
-    "container_image": str(Path(os.environ["POLARIS_PYXIS_IMAGE"]).resolve()),
-    "polaris_data_dir": str(Path(os.environ["POLARIS_DATA_DIR"]).resolve()),
+    "container_image": str(container_image),
+    "container_image_resolved": str(container_image.resolve()),
+    "polaris_data_dir": str(data_dir),
+    "polaris_data_dir_resolved": str(data_dir.resolve()),
 }
 payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
 descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)

@@ -36,19 +36,44 @@ die() {
   exit 2
 }
 
+require_normalized_absolute_path() {
+  local field="$1"
+  local value="$2"
+  local normalized
+  [[ "${value}" == /* && "${value}" != //* ]] \
+    || die "${field} must be an absolute path with one leading slash"
+  normalized="$(realpath -sm -- "${value}")" \
+    || die "Unable to normalize ${field}"
+  [[ "${value}" == "${normalized}" ]] \
+    || die "${field} must use one normalized absolute path spelling"
+}
+
 [[ "${EXPECTED_POLARIS_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
   || die "EXPECTED_POLARIS_COMMIT must be a full lowercase commit"
+require_normalized_absolute_path POLARIS_DIR "${POLARIS_DIR}"
+for path_contract in \
+  "NFS_ROOT=${NFS_ROOT}" \
+  "RUN_DIR=${RUN_DIR}" \
+  "POLARIS_DATA_DIR=${POLARIS_DATA_DIR}" \
+  "POLARIS_PYXIS_IMAGE=${POLARIS_PYXIS_IMAGE}" \
+  "POLARIS_VULKAN_ICD_PATH=${POLARIS_VULKAN_ICD_PATH}" \
+  "POLARIS_CACHE_DIR=${POLARIS_CACHE_DIR}"; do
+  require_normalized_absolute_path \
+    "${path_contract%%=*}" "${path_contract#*=}"
+done
 [[ ! -L "${POLARIS_DIR}" ]] || die "POLARIS_DIR must not be a symlink"
-POLARIS_DIR="$(realpath "${POLARIS_DIR}")"
+POLARIS_DIR_RESOLVED="$(realpath "${POLARIS_DIR}")"
 [[ -d "${POLARIS_DIR}/.git" && ! -L "${POLARIS_DIR}/.git" ]] \
   || die "POLARIS_DIR must be a standalone clone with an in-root .git directory"
 git_dir="$(git -C "${POLARIS_DIR}" rev-parse --absolute-git-dir)"
 git_common_dir="$(git -C "${POLARIS_DIR}" rev-parse --path-format=absolute --git-common-dir)"
-[[ "${git_dir}" == "${POLARIS_DIR}/.git" && "${git_common_dir}" == "${POLARIS_DIR}/.git" ]] \
+[[ "${git_dir}" == "${POLARIS_DIR_RESOLVED}/.git" && \
+  "${git_common_dir}" == "${POLARIS_DIR_RESOLVED}/.git" ]] \
   || die "POLARIS_DIR Git metadata must be wholly contained in its .git directory"
 [[ "$(git -C "${POLARIS_DIR}" rev-parse --abbrev-ref HEAD)" == HEAD ]] \
   || die "POLARIS_DIR must be checked out at a detached HEAD"
-[[ "$(git -C "${POLARIS_DIR}" rev-parse --show-toplevel)" == "$(realpath "${POLARIS_DIR}")" ]] \
+[[ "$(git -C "${POLARIS_DIR}" rev-parse --show-toplevel)" == \
+  "${POLARIS_DIR_RESOLVED}" ]] \
   || die "POLARIS_DIR must name the exact Git root"
 [[ "$(git -C "${POLARIS_DIR}" rev-parse HEAD)" == "${EXPECTED_POLARIS_COMMIT}" ]] \
   || die "PolaRiS commit mismatch"

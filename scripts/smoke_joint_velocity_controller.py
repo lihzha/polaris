@@ -28,6 +28,19 @@ def _canonical_json(payload: dict) -> bytes:
     )
 
 
+def _declared_absolute_path(path: str | Path, field: str) -> Path:
+    rendered = os.fspath(path)
+    if (
+        not isinstance(rendered, str)
+        or not rendered.startswith("/")
+        or rendered.startswith("//")
+        or "\0" in rendered
+        or rendered != os.path.normpath(rendered)
+    ):
+        raise ValueError(f"{field} must use one normalized absolute path spelling")
+    return Path(rendered)
+
+
 def _write_immutable_json(path: Path, payload: dict) -> bytes:
     """Publish one canonical, fsynced, non-overwriting mode-0444 JSON file."""
 
@@ -122,13 +135,14 @@ def _read_immutable_json(path: Path, field: str) -> tuple[dict, bytes, os.stat_r
     return value, rendered, before
 
 
-def _child_ready_payload(raw_path: Path, raw_bytes: bytes) -> dict:
+def _child_ready_payload(raw_path: str | Path, raw_bytes: bytes) -> dict:
+    raw_path = _declared_absolute_path(raw_path, "child raw capture")
     return {
         "schema_version": 1,
         "status": "success",
         "stage": "kit_child_after_env_close_before_simulation_app_close",
         "raw_result": {
-            "path": str(raw_path.resolve()),
+            "path": str(raw_path),
             "size_bytes": len(raw_bytes),
             "sha256": hashlib.sha256(raw_bytes).hexdigest(),
             "mode": "0444",
@@ -253,11 +267,15 @@ def finalize_child_capture(
         "child_capture_sha256": hashlib.sha256(raw_bytes).hexdigest(),
         "child_capture_size": len(raw_bytes),
         "child_capture_mode": "0444",
-        "child_capture_path": str(raw_path.resolve()),
+        "child_capture_path": str(
+            _declared_absolute_path(raw_path, "child raw capture")
+        ),
         "child_ready_marker_sha256": hashlib.sha256(ready_bytes).hexdigest(),
         "child_ready_marker_size": len(ready_bytes),
         "child_ready_marker_mode": "0444",
-        "child_ready_marker_path": str(ready_path.resolve()),
+        "child_ready_marker_path": str(
+            _declared_absolute_path(ready_path, "child ready marker")
+        ),
     }
     return publish_immutable_joint_velocity_smoke(output_path, final_payload)
 
@@ -437,12 +455,13 @@ def _kit_child_main(argv: list[str]) -> int:
 
 def _parent_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-json", type=Path, required=True)
+    parser.add_argument("--output-json", required=True)
     known, _ = parser.parse_known_args(argv)
-    if known.output_json.exists() or known.output_json.is_symlink():
-        raise FileExistsError(f"Refusing to overwrite {known.output_json}")
-    known.output_json.parent.mkdir(parents=True, exist_ok=True)
-    raw_path = known.output_json.with_name(known.output_json.name + ".child-close.json")
+    output_path = _declared_absolute_path(known.output_json, "smoke output")
+    if output_path.exists() or output_path.is_symlink():
+        raise FileExistsError(f"Refusing to overwrite {output_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path = output_path.with_name(output_path.name + ".child-close.json")
     ready_path = raw_path.with_name(raw_path.name + ".ready.json")
     failure_path = raw_path.with_name(raw_path.name + ".failure.json")
     for path, field in (
@@ -469,10 +488,10 @@ def _parent_main(argv: list[str]) -> int:
         raw_path,
         ready_path,
         failure_path,
-        known.output_json,
+        output_path,
         child_exit_code=completed.returncode,
     )
-    print(f"Immutable joint-velocity smoke: {known.output_json}")
+    print(f"Immutable joint-velocity smoke: {output_path}")
     return 0
 
 

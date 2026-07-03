@@ -106,6 +106,96 @@ def _regular_file(path: Path, field: str, *, mode: int | None = None) -> os.stat
     return file_stat
 
 
+def _declared_absolute_path(path: str | Path, field: str) -> Path:
+    """Preserve one normalized absolute spelling without resolving aliases."""
+
+    rendered = os.fspath(path)
+    if (
+        not isinstance(rendered, str)
+        or not rendered.startswith("/")
+        or rendered.startswith("//")
+        or "\0" in rendered
+        or rendered != os.path.normpath(rendered)
+    ):
+        raise ValueError(f"{field} must use one normalized absolute path spelling")
+    return Path(rendered)
+
+
+def _file_identity(file_stat: os.stat_result) -> tuple[int, ...]:
+    return (
+        file_stat.st_dev,
+        file_stat.st_ino,
+        file_stat.st_size,
+        file_stat.st_mode,
+        file_stat.st_nlink,
+        file_stat.st_mtime_ns,
+        file_stat.st_ctime_ns,
+    )
+
+
+def _bind_artifact_path(
+    recorded_path: str,
+    declared_path: Path,
+    file_stat: os.stat_result,
+    field: str,
+) -> dict[str, Any]:
+    """Bind producer and host spellings only when they name the same exact inode."""
+
+    if not isinstance(recorded_path, str):
+        raise ValueError(f"{field} recorded path must be a string")
+    recorded = _declared_absolute_path(recorded_path, f"{field} recorded path")
+    declared = _declared_absolute_path(declared_path, f"{field} declared path")
+    if recorded.name != declared.name:
+        raise ValueError(f"{field} final path component mismatch")
+    try:
+        recorded_before = os.stat(recorded, follow_symlinks=False)
+        declared_before = os.stat(declared, follow_symlinks=False)
+        if stat.S_ISLNK(recorded_before.st_mode) or stat.S_ISLNK(
+            declared_before.st_mode
+        ):
+            raise ValueError(f"{field} final path component must not be a symlink")
+        recorded_resolved = recorded.resolve(strict=True)
+        declared_resolved = declared.resolve(strict=True)
+        recorded_resolved_stat = os.stat(recorded_resolved, follow_symlinks=False)
+        declared_resolved_stat = os.stat(declared_resolved, follow_symlinks=False)
+        recorded_after = os.stat(recorded, follow_symlinks=False)
+        declared_after = os.stat(declared, follow_symlinks=False)
+    except ValueError:
+        raise
+    except OSError as error:
+        raise ValueError(f"{field} path spelling is not readable") from error
+    expected_identity = _file_identity(file_stat)
+    if (
+        any(
+            not stat.S_ISREG(candidate.st_mode)
+            or _file_identity(candidate) != expected_identity
+            for candidate in (
+                recorded_before,
+                declared_before,
+                recorded_resolved_stat,
+                declared_resolved_stat,
+                recorded_after,
+                declared_after,
+            )
+        )
+        or recorded_resolved != declared_resolved
+    ):
+        raise ValueError(f"{field} path spellings do not identify the same exact file")
+    return {
+        "path": str(recorded),
+        "host_declared_path": str(declared),
+        "resolved_path": str(declared_resolved),
+        "path_alias_equivalent": (
+            recorded != declared
+            or recorded != recorded_resolved
+            or declared != declared_resolved
+        ),
+        "producer_host_spelling_match": recorded == declared,
+        "device": format(file_stat.st_dev, "x"),
+        "inode": file_stat.st_ino,
+    }
+
+
 def _read_canonical_json(path: Path, field: str, *, mode: int = 0o444):
     path = Path(path)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -611,10 +701,10 @@ def _validate_smoke(payload: Any) -> dict[str, Any]:
 
 
 def _source_provenance(repository: Path, expected_commit: str) -> dict[str, Any]:
-    repository = Path(repository)
-    if repository.is_symlink():
+    declared_repository = _declared_absolute_path(repository, "PolaRiS repository")
+    if declared_repository.is_symlink():
         raise ValueError("PolaRiS repository path must not be a symlink")
-    repository = repository.resolve()
+    repository = declared_repository.resolve()
     git_metadata = repository / ".git"
     if git_metadata.is_symlink() or not git_metadata.is_dir():
         raise ValueError(
@@ -673,7 +763,8 @@ def _source_provenance(repository: Path, expected_commit: str) -> dict[str, Any]
             "sha256": _sha256_bytes(working),
         }
     return {
-        "repository": str(repository),
+        "repository": str(declared_repository),
+        "resolved_repository": str(repository),
         "git_directory": str(git_directory),
         "git_common_directory": str(common_directory),
         "standalone_git_directory": True,
@@ -686,10 +777,10 @@ def _source_provenance(repository: Path, expected_commit: str) -> dict[str, Any]
 
 
 def _asset_provenance(data_dir: Path) -> dict[str, Any]:
-    data_dir = Path(data_dir)
-    if data_dir.is_symlink() or not data_dir.is_dir():
+    declared_data_dir = _declared_absolute_path(data_dir, "PolaRiS-Hub data root")
+    if declared_data_dir.is_symlink() or not declared_data_dir.is_dir():
         raise ValueError("PolaRiS-Hub data root must be a regular directory")
-    data_dir = data_dir.resolve()
+    data_dir = declared_data_dir.resolve()
     assets = {}
     for relative_path, expected in ASSETS.items():
         path = data_dir / relative_path
@@ -708,15 +799,26 @@ def _asset_provenance(data_dir: Path) -> dict[str, Any]:
         if first_line != HUB_REVISION:
             raise ValueError(f"Asset Hub revision mismatch: {relative_path}")
         assets[relative_path] = {
-            "path": str(path),
+            "path": str(declared_data_dir / relative_path),
+            "resolved_path": str(path),
             "size": file_stat.st_size,
             "sha256": digest,
-            "metadata_path": str(metadata_path),
+            "metadata_path": str(
+                declared_data_dir
+                / ".cache/huggingface/download"
+                / (relative_path + ".metadata")
+            ),
+            "metadata_resolved_path": str(metadata_path),
             "metadata_size": metadata_stat.st_size,
             "metadata_sha256": expected["metadata_sha256"],
             "hub_revision": HUB_REVISION,
         }
-    return {"root": str(data_dir), "hub_revision": HUB_REVISION, "assets": assets}
+    return {
+        "root": str(declared_data_dir),
+        "resolved_root": str(data_dir),
+        "hub_revision": HUB_REVISION,
+        "assets": assets,
+    }
 
 
 def _build_attestation(args: argparse.Namespace) -> dict[str, Any]:
@@ -731,42 +833,56 @@ def _build_attestation(args: argparse.Namespace) -> dict[str, Any]:
     env_job_id = os.environ.get("SLURM_JOB_ID")
     if env_job_id != str(args.job_id) or args.job_id <= 0:
         raise ValueError("SLURM_JOB_ID mismatch")
-    if args.smoke_artifact.name != f"joint-velocity-smoke-{args.job_id}.json":
-        raise ValueError("Smoke artifact filename does not bind job ID")
-    if args.completion.name != f"controller-smoke-{args.job_id}.completion.json":
-        raise ValueError("Completion filename does not bind job ID")
-    smoke, smoke_bytes, smoke_stat = _read_canonical_json(
-        args.smoke_artifact, "smoke artifact"
+    smoke_path = _declared_absolute_path(args.smoke_artifact, "smoke artifact")
+    completion_path = _declared_absolute_path(args.completion, "completion")
+    srun_status_path = _declared_absolute_path(args.srun_status, "srun status")
+    gpu_inventory_path = _declared_absolute_path(args.gpu_inventory, "GPU inventory")
+    saved_job_path = _declared_absolute_path(
+        args.saved_job_script, "saved Slurm script"
     )
+    container_image_path = _declared_absolute_path(
+        args.container_image, "container image"
+    )
+    if smoke_path.name != f"joint-velocity-smoke-{args.job_id}.json":
+        raise ValueError("Smoke artifact filename does not bind job ID")
+    if completion_path.name != f"controller-smoke-{args.job_id}.completion.json":
+        raise ValueError("Completion filename does not bind job ID")
+    smoke, smoke_bytes, smoke_stat = _read_canonical_json(smoke_path, "smoke artifact")
     _validate_smoke(smoke)
-    expected_child_path = args.smoke_artifact.with_name(
-        args.smoke_artifact.name + ".child-close.json"
-    ).resolve()
+    expected_child_path = smoke_path.with_name(smoke_path.name + ".child-close.json")
     expected_ready_path = expected_child_path.with_name(
         expected_child_path.name + ".ready.json"
-    ).resolve()
+    )
     expected_failure_path = expected_child_path.with_name(
         expected_child_path.name + ".failure.json"
     )
     if expected_failure_path.exists() or expected_failure_path.is_symlink():
         raise ValueError("Smoke child failure status exists beside a pass artifact")
     completion_evidence = smoke["completion"]
-    if completion_evidence["child_capture_path"] != str(expected_child_path):
-        raise ValueError("Smoke child-capture path mismatch")
     _, child_bytes, child_stat = _read_canonical_json(
         expected_child_path, "child close capture", mode=0o444
     )
-    if completion_evidence["child_ready_marker_path"] != str(expected_ready_path):
-        raise ValueError("Smoke child-ready-marker path mismatch")
+    child_path_binding = _bind_artifact_path(
+        completion_evidence["child_capture_path"],
+        expected_child_path,
+        child_stat,
+        "smoke child capture",
+    )
     _, ready_bytes, ready_stat = _read_canonical_json(
         expected_ready_path, "child ready marker", mode=0o444
+    )
+    ready_path_binding = _bind_artifact_path(
+        completion_evidence["child_ready_marker_path"],
+        expected_ready_path,
+        ready_stat,
+        "smoke child ready marker",
     )
     expected_ready = {
         "schema_version": 1,
         "status": "success",
         "stage": "kit_child_after_env_close_before_simulation_app_close",
         "raw_result": {
-            "path": str(expected_child_path),
+            "path": child_path_binding["path"],
             "size_bytes": len(child_bytes),
             "sha256": _sha256_bytes(child_bytes),
             "mode": "0444",
@@ -797,15 +913,17 @@ def _build_attestation(args: argparse.Namespace) -> dict[str, Any]:
     ):
         raise ValueError("Smoke completion does not bind exact child ready marker")
 
-    status, status_bytes, _ = _read_canonical_json(args.srun_status, "srun status")
+    status, status_bytes, status_stat = _read_canonical_json(
+        srun_status_path, "srun status"
+    )
     if (
         status != {"job_id": args.job_id, "srun_exit_code": 0}
         or type(status.get("job_id")) is not int
     ):
         raise ValueError("srun status mismatch")
 
-    gpu_stat = _regular_file(args.gpu_inventory, "GPU inventory", mode=0o444)
-    gpu_bytes = args.gpu_inventory.read_bytes()
+    gpu_stat = _regular_file(gpu_inventory_path, "GPU inventory", mode=0o444)
+    gpu_bytes = gpu_inventory_path.read_bytes()
     lines = gpu_bytes.decode("utf-8").splitlines()
     if len(lines) != 1:
         raise ValueError("Exactly one allocated GPU is required")
@@ -821,13 +939,13 @@ def _build_attestation(args: argparse.Namespace) -> dict[str, Any]:
     job_script = source["files"][
         "scripts/polaris/l40s_pi05_droid_jointvelocity_controller_smoke.sbatch"
     ]
-    saved_stat = _regular_file(args.saved_job_script, "saved Slurm script", mode=0o444)
-    saved_sha = _file_sha256(args.saved_job_script)
+    saved_stat = _regular_file(saved_job_path, "saved Slurm script", mode=0o444)
+    saved_sha = _file_sha256(saved_job_path)
     if saved_sha != job_script["sha256"]:
         raise ValueError("Saved Slurm script differs from committed launch script")
 
-    image_stat = _regular_file(args.container_image, "container image")
-    image_sha = _file_sha256(args.container_image)
+    image_stat = _regular_file(container_image_path, "container image")
+    image_sha = _file_sha256(container_image_path)
     if image_sha != IMAGE_SHA256:
         raise ValueError("Container image SHA-256 mismatch")
     data = _asset_provenance(args.data_dir)
@@ -842,13 +960,23 @@ def _build_attestation(args: argparse.Namespace) -> dict[str, Any]:
             "job_id": args.job_id,
             "srun_exit_code": 0,
             "status_artifact": {
-                "path": str(args.srun_status.resolve()),
+                **_bind_artifact_path(
+                    str(srun_status_path),
+                    srun_status_path,
+                    status_stat,
+                    "srun status",
+                ),
                 "size": len(status_bytes),
                 "sha256": _sha256_bytes(status_bytes),
                 "mode": "0444",
             },
             "gpu_inventory": {
-                "path": str(args.gpu_inventory.resolve()),
+                **_bind_artifact_path(
+                    str(gpu_inventory_path),
+                    gpu_inventory_path,
+                    gpu_stat,
+                    "GPU inventory",
+                ),
                 "size": gpu_stat.st_size,
                 "sha256": _sha256_bytes(gpu_bytes),
                 "mode": "0444",
@@ -857,7 +985,12 @@ def _build_attestation(args: argparse.Namespace) -> dict[str, Any]:
                 "driver_version": fields[2],
             },
             "saved_job_script": {
-                "path": str(args.saved_job_script.resolve()),
+                **_bind_artifact_path(
+                    str(saved_job_path),
+                    saved_job_path,
+                    saved_stat,
+                    "saved Slurm script",
+                ),
                 "size": saved_stat.st_size,
                 "sha256": saved_sha,
                 "mode": "0444",
@@ -866,14 +999,21 @@ def _build_attestation(args: argparse.Namespace) -> dict[str, Any]:
         "source": source,
         "runtime": {
             "container_image": {
-                "path": str(args.container_image.resolve()),
+                **_bind_artifact_path(
+                    str(container_image_path),
+                    container_image_path,
+                    image_stat,
+                    "container image",
+                ),
                 "size": image_stat.st_size,
                 "sha256": image_sha,
             },
             "polaris_hub": data,
         },
         "smoke_artifact": {
-            "path": str(args.smoke_artifact.resolve()),
+            **_bind_artifact_path(
+                str(smoke_path), smoke_path, smoke_stat, "smoke artifact"
+            ),
             "size": smoke_stat.st_size,
             "sha256": _sha256_bytes(smoke_bytes),
             "mode": "0444",
@@ -882,14 +1022,14 @@ def _build_attestation(args: argparse.Namespace) -> dict[str, Any]:
             "case_count": 20,
             "runtime_sha256": smoke["runtime_contract"]["runtime_sha256"],
             "child_close_capture": {
-                "path": str(expected_child_path),
+                **child_path_binding,
                 "size": child_stat.st_size,
                 "sha256": _sha256_bytes(child_bytes),
                 "mode": "0444",
                 "status": "close_validated_pending_parent",
             },
             "child_ready_marker": {
-                "path": str(expected_ready_path),
+                **ready_path_binding,
                 "size": ready_stat.st_size,
                 "sha256": _sha256_bytes(ready_bytes),
                 "mode": "0444",
@@ -928,29 +1068,31 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("finalize", "verify"))
     parser.add_argument("--job-id", type=int, required=True)
-    parser.add_argument("--smoke-artifact", type=Path, required=True)
-    parser.add_argument("--completion", type=Path, required=True)
-    parser.add_argument("--srun-status", type=Path, required=True)
-    parser.add_argument("--gpu-inventory", type=Path, required=True)
-    parser.add_argument("--saved-job-script", type=Path, required=True)
-    parser.add_argument("--polaris-repo", type=Path, required=True)
+    parser.add_argument("--smoke-artifact", required=True)
+    parser.add_argument("--completion", required=True)
+    parser.add_argument("--srun-status", required=True)
+    parser.add_argument("--gpu-inventory", required=True)
+    parser.add_argument("--saved-job-script", required=True)
+    parser.add_argument("--polaris-repo", required=True)
     parser.add_argument("--expected-polaris-commit", required=True)
-    parser.add_argument("--container-image", type=Path, required=True)
-    parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument("--container-image", required=True)
+    parser.add_argument("--data-dir", required=True)
     args = parser.parse_args(argv)
 
     expected = _build_attestation(args)
+    completion_path = _declared_absolute_path(args.completion, "completion")
     if args.mode == "finalize":
-        if args.completion.exists() or args.completion.is_symlink():
-            raise FileExistsError(f"Refusing to overwrite {args.completion}")
-        _publish(args.completion, expected)
-    actual, actual_bytes, _ = _read_canonical_json(args.completion, "completion")
+        if completion_path.exists() or completion_path.is_symlink():
+            raise FileExistsError(f"Refusing to overwrite {completion_path}")
+        _publish(completion_path, expected)
+    actual, actual_bytes, _ = _read_canonical_json(completion_path, "completion")
     if actual != expected:
         raise ValueError("Completion attestation does not match live provenance")
     print(
         json.dumps(
             {
-                "completion": str(args.completion.resolve()),
+                "completion": str(completion_path),
+                "completion_resolved": str(completion_path.resolve(strict=True)),
                 "sha256": _sha256_bytes(actual_bytes),
                 "status": "pass",
                 "scope": "controller_only_no_model_or_checkpoint",

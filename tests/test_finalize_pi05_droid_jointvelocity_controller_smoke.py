@@ -319,3 +319,196 @@ def test_submit_and_sbatch_reject_gitfiles_before_git_provenance_queries():
         assert "rev-parse --abbrev-ref HEAD" in source
         assert "standalone clone with an in-root .git directory" in source
         assert "checked out at a detached HEAD" in source
+        lexical_index = source.index(
+            'require_normalized_absolute_path POLARIS_DIR "${POLARIS_DIR}"'
+        )
+        realpath_index = source.index(
+            'POLARIS_DIR_RESOLVED="$(realpath "${POLARIS_DIR}")"'
+        )
+        assert lexical_index < realpath_index < git_query_index
+        assert 'POLARIS_DIR="$(realpath "${POLARIS_DIR}")"' not in source
+
+    submit_source = (
+        repository
+        / "scripts/polaris/submit_pi05_droid_jointvelocity_controller_smoke.sh"
+    ).read_text(encoding="utf-8")
+    submit_index = submit_source.index('job_id="$(sbatch --parsable')
+    assert submit_source.index("require_normalized_absolute_path()") < submit_index
+    assert (
+        submit_source.index('require_normalized_absolute_path RUN_DIR "${RUN_DIR}"')
+        < submit_index
+    )
+    assert 'realpath -sm -- "${value}"' in submit_source
+    for field in (
+        "polaris_dir_resolved",
+        "run_dir_resolved",
+        "sbatch_script_resolved",
+        "container_image_resolved",
+        "polaris_data_dir_resolved",
+    ):
+        assert f'"{field}"' in submit_source
+
+
+def test_submitter_rejects_raw_nonnormalized_polaris_directory_spellings():
+    repository = Path(__file__).parents[1]
+    source = (
+        repository
+        / "scripts/polaris/submit_pi05_droid_jointvelocity_controller_smoke.sh"
+    ).read_text(encoding="utf-8")
+    helper_source = source[source.index("die() {") : source.index("command -v sbatch")]
+    command = helper_source + '\nrequire_normalized_absolute_path POLARIS_DIR "$1"\n'
+    for invalid in (
+        "relative/repository",
+        "/tmp/./repository",
+        "/tmp//repository",
+        "/tmp/other/../repository",
+        "//tmp/repository",
+        "/tmp/repository/",
+    ):
+        completed = subprocess.run(
+            ["bash", "-c", command, "submitter-path-test", invalid],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 2, (invalid, completed)
+        assert "POLARIS_DIR must" in completed.stderr
+
+    accepted = subprocess.run(
+        ["bash", "-c", command, "submitter-path-test", "/tmp/repository"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert accepted.returncode == 0, accepted
+
+
+def test_finalizer_accepts_ancestor_alias_but_rejects_different_or_symlink_file(
+    tmp_path,
+    monkeypatch,
+    valid_joint_velocity_smoke_payload,
+):
+    job_id = 24680
+    repository, commit, image, data_dir = _prepare_provenance(tmp_path, monkeypatch)
+    producer_root = tmp_path / "producer-root"
+    producer_root.symlink_to(tmp_path, target_is_directory=True)
+    producer_repository = producer_root / repository.name
+    producer_image = producer_root / image.name
+    producer_data_dir = producer_root / data_dir.name
+    real_output = tmp_path / "real-results"
+    real_output.mkdir()
+    producer_output = tmp_path / "producer-results"
+    producer_output.symlink_to(real_output, target_is_directory=True)
+
+    smoke_name = f"joint-velocity-smoke-{job_id}.json"
+    producer_smoke = producer_output / smoke_name
+    host_smoke = real_output / smoke_name
+    completion = real_output / f"controller-smoke-{job_id}.completion.json"
+    status = real_output / f"srun-{job_id}.status.json"
+    gpu = real_output / f"gpu-{job_id}.csv"
+    saved = real_output / f"job-{job_id}.sbatch"
+    _publish_transactional_smoke(producer_smoke, valid_joint_velocity_smoke_payload)
+    _immutable(status, _canonical({"job_id": job_id, "srun_exit_code": 0}))
+    _immutable(gpu, b"GPU-test, NVIDIA L40S, 580.105.08\n")
+    _immutable(
+        saved,
+        (
+            repository
+            / "scripts/polaris/l40s_pi05_droid_jointvelocity_controller_smoke.sbatch"
+        ).read_bytes(),
+    )
+    monkeypatch.setenv("SLURM_JOB_ID", str(job_id))
+    assert (
+        finalizer.main(
+            _argv(
+                mode="finalize",
+                job_id=job_id,
+                smoke=host_smoke,
+                completion=completion,
+                status=status,
+                gpu=gpu,
+                saved=saved,
+                repository=producer_repository,
+                commit=commit,
+                image=producer_image,
+                data_dir=producer_data_dir,
+            )
+        )
+        == 0
+    )
+
+    attestation = json.loads(completion.read_bytes())
+    child = attestation["smoke_artifact"]["child_close_capture"]
+    ready = attestation["smoke_artifact"]["child_ready_marker"]
+    producer_child = producer_smoke.with_name(smoke_name + ".child-close.json")
+    host_child = host_smoke.with_name(smoke_name + ".child-close.json")
+    assert child["path"] == str(producer_child)
+    assert child["host_declared_path"] == str(host_child)
+    assert child["resolved_path"] == str(host_child.resolve())
+    assert child["path_alias_equivalent"] is True
+    assert child["producer_host_spelling_match"] is False
+    assert ready["path"] == str(producer_child) + ".ready.json"
+    assert ready["host_declared_path"] == str(host_child) + ".ready.json"
+    assert ready["path_alias_equivalent"] is True
+    assert ready["producer_host_spelling_match"] is False
+    assert attestation["smoke_artifact"]["path"] == str(host_smoke)
+    assert attestation["smoke_artifact"]["resolved_path"] == str(host_smoke.resolve())
+    assert attestation["smoke_artifact"]["path_alias_equivalent"] is False
+    assert attestation["source"]["repository"] == str(producer_repository)
+    assert attestation["source"]["resolved_repository"] == str(repository)
+    hub = attestation["runtime"]["polaris_hub"]
+    assert hub["root"] == str(producer_data_dir)
+    assert hub["resolved_root"] == str(data_dir)
+    for relative_path, asset in hub["assets"].items():
+        assert asset["path"] == str(producer_data_dir / relative_path)
+        assert asset["resolved_path"] == str(data_dir / relative_path)
+    container = attestation["runtime"]["container_image"]
+    assert container["path"] == str(producer_image)
+    assert container["host_declared_path"] == str(producer_image)
+    assert container["resolved_path"] == str(image)
+    assert container["path_alias_equivalent"] is True
+    assert container["producer_host_spelling_match"] is True
+
+    _, _, child_stat = finalizer._read_canonical_json(host_child, "host child")
+    other_dir = tmp_path / "different-results"
+    other_dir.mkdir()
+    different_child = other_dir / host_child.name
+    _immutable(different_child, host_child.read_bytes())
+    with pytest.raises(ValueError, match="same exact file"):
+        finalizer._bind_artifact_path(
+            str(different_child), host_child, child_stat, "different child"
+        )
+
+    symlink_dir = tmp_path / "symlink-results"
+    symlink_dir.mkdir()
+    symlink_child = symlink_dir / host_child.name
+    symlink_child.symlink_to(host_child)
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        finalizer._bind_artifact_path(
+            str(symlink_child), host_child, child_stat, "symlink child"
+        )
+
+    with pytest.raises(ValueError, match="normalized absolute path"):
+        finalizer._bind_artifact_path(
+            host_child.name, host_child, child_stat, "relative child"
+        )
+    with pytest.raises(ValueError, match="normalized absolute path"):
+        finalizer._bind_artifact_path(
+            str(host_child.parent / ".." / host_child.parent.name / host_child.name),
+            host_child,
+            child_stat,
+            "nonnormalized child",
+        )
+    invalid_spellings = (
+        "relative-child.json",
+        f"{host_child.parent}/./{host_child.name}",
+        f"{host_child.parent}//{host_child.name}",
+        f"//{str(host_child).lstrip('/')}",
+    )
+    for invalid_spelling in invalid_spellings:
+        with pytest.raises(ValueError, match="normalized absolute path"):
+            finalizer._bind_artifact_path(
+                invalid_spelling, host_child, child_stat, "raw-spelling child"
+            )
+        with pytest.raises(ValueError, match="normalized absolute path"):
+            controller._child_ready_payload(invalid_spelling, b"payload")
