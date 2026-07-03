@@ -2,6 +2,7 @@ from argparse import Namespace
 import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 import subprocess
 
@@ -21,7 +22,7 @@ def _vector_evidence(values):
 
 def _diagnostic_vector(values):
     return {
-        "values": values,
+        "values": list(values),
         "finite_mask": [True] * 7,
         "finite_count": 7,
     }
@@ -52,6 +53,16 @@ def _safety_report(episode_index, apply_calls, *, adversarial=False):
             "jacobian_max_abs": 1.0,
             "eef_quaternion_norm": None,
         }
+    if adversarial:
+        raw_delta = finalizer.EXPECTED_MAX_DELTA[0] + 0.01
+        maxima["raw_delta_joint_pos_rad"][0] = raw_delta
+        maxima["applied_delta_joint_pos_rad"][0] = finalizer.EXPECTED_MAX_DELTA[0]
+        raw_delta_vector = [raw_delta] + [0.0] * 6
+        raw_target = [q[0] + raw_delta] + q[1:]
+        safe_target = [q[0] + finalizer.EXPECTED_MAX_DELTA[0]] + q[1:]
+        max_raw["raw_delta_joint_pos_rad"] = _diagnostic_vector(raw_delta_vector)
+        max_raw["raw_joint_pos_target_rad"] = _diagnostic_vector(raw_target)
+        max_raw["safe_joint_pos_target_rad"] = _diagnostic_vector(safe_target)
     return {
         "episode_index": episode_index,
         "profile": "panda_velocity_softlimit_v1",
@@ -162,7 +173,7 @@ def _git(repo: Path, *arguments: str) -> str:
     ).strip()
 
 
-def _attestation_args(tmp_path: Path) -> Namespace:
+def _attestation_args(tmp_path: Path, monkeypatch) -> Namespace:
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
     smoke_source = repo / "scripts" / "smoke_eef_pose_controller.py"
@@ -184,6 +195,7 @@ def _attestation_args(tmp_path: Path) -> Namespace:
     runtime_job.write_bytes(saved_job.read_bytes())
 
     job_id = 12345
+    monkeypatch.setenv("SLURM_JOB_ID", str(job_id))
     raw_path = tmp_path / f"smoke-{job_id}.json"
     raw_bytes = _write_immutable_json(raw_path, _valid_raw_result())
     marker_path = raw_path.with_name(raw_path.name + ".ready.json")
@@ -212,6 +224,12 @@ def _attestation_args(tmp_path: Path) -> Namespace:
         expected_smoke_sha256=hashlib.sha256(smoke_source.read_bytes()).hexdigest(),
         container_image=image,
         expected_image_sha256=hashlib.sha256(image.read_bytes()).hexdigest(),
+        expected_finalizer_sha256=hashlib.sha256(
+            Path(finalizer.__file__).resolve().read_bytes()
+        ).hexdigest(),
+        expected_saved_job_script_sha256=hashlib.sha256(
+            saved_job.read_bytes()
+        ).hexdigest(),
     )
 
 
@@ -232,7 +250,7 @@ def test_raw_smoke_gate_requires_pending_full_evidence():
 
     raw = _valid_raw_result()
     raw["raw_ik_safety_capture"]["soft_joint_pos_limits_rad"][0][0] += 0.01
-    with pytest.raises(finalizer.VerificationError, match="soft_joint_pos_limits"):
+    with pytest.raises(finalizer.VerificationError, match="limits"):
         finalizer._verify_raw(raw)
 
     raw = _valid_raw_result()
@@ -257,9 +275,85 @@ def test_raw_smoke_gate_requires_pending_full_evidence():
     with pytest.raises(finalizer.VerificationError, match="dls_fallbacks"):
         finalizer._verify_raw(raw)
 
+    raw = _valid_raw_result()
+    raw["schema_version"] = True
+    with pytest.raises(finalizer.VerificationError, match="schema_version"):
+        finalizer._verify_raw(raw)
 
-def test_attestation_is_bound_verified_and_nonoverwriting(tmp_path):
-    args = _attestation_args(tmp_path)
+    raw = _valid_raw_result()
+    raw["exit_code"] = False
+    with pytest.raises(finalizer.VerificationError, match="exit_code"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["ik_safety_episodes"][0]["counters"]["apply_calls"] = True
+    with pytest.raises(finalizer.VerificationError, match="counters invalid"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    counters = raw["ik_safety_episodes"][0]["counters"]
+    counters["slew_limit_events"] = 1
+    counters["slew_limited_joints"] = 100
+    with pytest.raises(finalizer.VerificationError, match="impossible"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["ik_safety_episodes"][0]["max_raw_delta_diagnostic"]["pose_error_norm"] = None
+    with pytest.raises(finalizer.VerificationError, match="pose_error_norm"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["ik_safety_episodes"][0]["max_raw_delta_diagnostic"]["jacobian_max_abs"] = None
+    with pytest.raises(finalizer.VerificationError, match="jacobian_max_abs"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["ik_safety_episodes"][0]["max_raw_delta_diagnostic"]["eef_quaternion_norm"] = (
+        1.0
+    )
+    with pytest.raises(finalizer.VerificationError, match="eef_quaternion_norm"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["results"][0]["actual_quaternion_wxyz"] = [
+        math.cos(0.1),
+        math.sin(0.1),
+        0.0,
+        0.0,
+    ]
+    with pytest.raises(
+        finalizer.VerificationError, match="rotation error inconsistent"
+    ):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["ik_safety_episodes"][0]["max_raw_delta_diagnostic"][
+        "raw_joint_pos_target_rad"
+    ]["values"][0] += 0.01
+    with pytest.raises(finalizer.VerificationError, match="raw target identity"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    raw["ik_safety_episodes"][0]["max_raw_delta_diagnostic"][
+        "safe_joint_pos_target_rad"
+    ]["values"][0] += 0.1
+    with pytest.raises(finalizer.VerificationError, match="safe slew"):
+        finalizer._verify_raw(raw)
+
+    raw = _valid_raw_result()
+    diagnostic = raw["ik_safety_adversarial"]["ik_safety"]["max_raw_delta_diagnostic"]
+    safety = raw["ik_safety_adversarial"]["ik_safety"]
+    safety["maxima"]["raw_delta_joint_pos_rad"] = [0.0] * 7
+    safety["maxima"]["applied_delta_joint_pos_rad"] = [0.0] * 7
+    diagnostic["raw_delta_joint_pos_rad"] = _diagnostic_vector([0.0] * 7)
+    diagnostic["raw_joint_pos_target_rad"] = copy.deepcopy(diagnostic["joint_pos_rad"])
+    diagnostic["safe_joint_pos_target_rad"] = copy.deepcopy(diagnostic["joint_pos_rad"])
+    with pytest.raises(finalizer.VerificationError, match="never exceed"):
+        finalizer._verify_raw(raw)
+
+
+def test_attestation_is_bound_verified_and_nonoverwriting(tmp_path, monkeypatch):
+    args = _attestation_args(tmp_path, monkeypatch)
     expected = finalizer._build_expected(args)
     finalizer._publish_nonoverwriting(args.attestation, expected)
 
@@ -274,37 +368,64 @@ def test_attestation_is_bound_verified_and_nonoverwriting(tmp_path):
         finalizer._build_expected(args)
 
 
-def test_attestation_rejects_writable_or_mutated_evidence(tmp_path):
-    args = _attestation_args(tmp_path)
+def test_attestation_rejects_writable_or_mutated_evidence(tmp_path, monkeypatch):
+    args = _attestation_args(tmp_path, monkeypatch)
     args.raw_result.chmod(0o644)
     with pytest.raises(finalizer.VerificationError, match="mode"):
         finalizer._build_expected(args)
 
-    args = _attestation_args(tmp_path / "second")
+    args = _attestation_args(tmp_path / "second", monkeypatch)
     marker = args.raw_result.with_name(args.raw_result.name + ".ready.json")
     marker.chmod(0o644)
     with pytest.raises(finalizer.VerificationError, match="ready marker mode"):
         finalizer._build_expected(args)
 
-    args = _attestation_args(tmp_path / "third")
+    args = _attestation_args(tmp_path / "third", monkeypatch)
     args.raw_result.chmod(0o644)
     args.raw_result.write_bytes(args.raw_result.read_bytes() + b" ")
     args.raw_result.chmod(0o444)
     with pytest.raises(finalizer.VerificationError, match="ready marker"):
         finalizer._build_expected(args)
 
-    args = _attestation_args(tmp_path / "fourth")
+    args = _attestation_args(tmp_path / "fourth", monkeypatch)
     args.expected_image_sha256 = "0" * 64
     with pytest.raises(finalizer.VerificationError, match="image digest"):
         finalizer._build_expected(args)
 
-    args = _attestation_args(tmp_path / "fifth")
+    args = _attestation_args(tmp_path / "fifth", monkeypatch)
     args.saved_job_script.write_text("tampered\n")
     with pytest.raises(finalizer.VerificationError, match="job script digest"):
         finalizer._build_expected(args)
 
-    args = _attestation_args(tmp_path / "sixth")
+    args = _attestation_args(tmp_path / "sixth", monkeypatch)
     dirty_path = args.polaris_repo / "dirty.txt"
     dirty_path.write_text("dirty\n")
     with pytest.raises(finalizer.VerificationError, match="repo dirty"):
         finalizer._build_expected(args)
+
+    args = _attestation_args(tmp_path / "seventh", monkeypatch)
+    args.expected_finalizer_sha256 = "0" * 64
+    with pytest.raises(finalizer.VerificationError, match="finalizer expected digest"):
+        finalizer._build_expected(args)
+
+    args = _attestation_args(tmp_path / "eighth", monkeypatch)
+    args.expected_saved_job_script_sha256 = "0" * 64
+    with pytest.raises(finalizer.VerificationError, match="saved job script expected"):
+        finalizer._build_expected(args)
+
+    args = _attestation_args(tmp_path / "ninth", monkeypatch)
+    monkeypatch.setenv("SLURM_JOB_ID", "99999")
+    with pytest.raises(finalizer.VerificationError, match="SLURM_JOB_ID"):
+        finalizer._build_expected(args)
+
+    args = _attestation_args(tmp_path / "tenth", monkeypatch)
+    marker = args.raw_result.with_name(args.raw_result.name + ".ready.json")
+    marker_payload = json.loads(marker.read_text())
+    marker_payload["schema_version"] = True
+    marker.chmod(0o644)
+    marker.write_text(json.dumps(marker_payload, indent=2) + "\n")
+    marker.chmod(0o444)
+    with pytest.raises(finalizer.VerificationError, match="ready marker"):
+        finalizer._build_expected(args)
+
+    assert not finalizer._typed_equal({"schema_version": True}, {"schema_version": 1})

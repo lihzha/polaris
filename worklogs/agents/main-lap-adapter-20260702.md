@@ -305,3 +305,14 @@
   in both `finalize` and `verify` modes. Unit tests cover lifecycle, schema,
   limits, counters, errors, diagnostics, raw/marker mutation, modes, `srun`,
   non-overwrite behavior, and provenance tampering.
+- Follow-up review rejected the first two-phase revision before launch and
+  tightened it further. The ready-marker publish now calls SimulationApp close
+  on the immediately following statement; every diagnostic print/flush occurs
+  before marker publication, every failure log is best-effort, and live-app
+  failure paths end through guaranteed `os._exit(1)` so Isaac teardown cannot
+  mask them. A missing app is never eligible. The finalizer now enforces exact
+  JSON scalar types, event-to-limited-joint bounds, quaternion angular-error
+  reconstruction, max-raw scalar/vector/target/slew/limit identities, and a
+  semantically saturated adversarial slew event. It also binds the actual
+  `SLURM_JOB_ID`, expected finalizer SHA, and externally supplied expected
+  saved-sbatch SHA. Probe-specific mutation tests cover every rejected case.

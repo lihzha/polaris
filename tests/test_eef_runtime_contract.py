@@ -834,11 +834,11 @@ def test_one_step_adversarial_smoke_requires_bounded_active_slew_guard():
     assert '"raw_ik_safety_capture"' in smoke_source
     assert '"stage": state["stage"]' in smoke_source
     assert '"case": state["case"]' in smoke_source
-    assert '"traceback": "".join(' in smoke_source
+    assert 'formatted_traceback = "".join(' in smoke_source
+    assert '"traceback": formatted_traceback' in smoke_source
     assert "except BaseException as run_error:" in smoke_source
     assert "except BaseException as close_error:" in smoke_source
     assert 'close_evidence["component"] = "environment"' in smoke_source
-    assert 'close_evidence["component"] = "simulation_app"' in smoke_source
     assert "_result_payload(state, finalized=False" in smoke_source
     assert "_result_payload(state, finalized=True" not in smoke_source
     assert '"failure": state["failure"]' in smoke_source
@@ -851,22 +851,38 @@ def test_one_step_adversarial_smoke_requires_bounded_active_slew_guard():
         'state["stage"] = "simulation_app_close_pending"'
     )
     raw_write_index = smoke_source.index("_atomic_write_strict_json(", pending_index)
-    ready_index = smoke_source.index("POLARIS_SMOKE_RAW_READY=", raw_write_index)
-    simulation_close_index = smoke_source.index("simulation_app.close()", ready_index)
+    prepared_index = smoke_source.index("POLARIS_SMOKE_RAW_PREPARED=", raw_write_index)
+    marker_publish_index = smoke_source.index(
+        "_atomic_write_strict_json(ready_marker, marker_payload)", prepared_index
+    )
+    simulation_close_index = smoke_source.index(
+        "simulation_app.close()", marker_publish_index
+    )
     assert (
         smoke_source.index("env.close()")
         < pending_index
         < raw_write_index
-        < ready_index
+        < prepared_index
+        < marker_publish_index
         < simulation_close_index
     )
-    assert "it must never rewrite the raw result itself" in smoke_source
-    assert "POLARIS_SMOKE_RAW_READY=" in smoke_source
+    assert (
+        "_atomic_write_strict_json(ready_marker, marker_payload)\n"
+        "            simulation_app.close()"
+    ) in smoke_source
+    assert "POLARIS_SMOKE_RAW_READY=" not in smoke_source
+    assert "POLARIS_SMOKE_RAW_PREPARED=" in smoke_source
     assert "POLARIS_SMOKE_RAW_SHA256=" in smoke_source
-    assert "POLARIS_SMOKE_RAW_READY_MARKER=" in smoke_source
-    assert "POLARIS_SMOKE_RAW_READY_MARKER_SHA256=" in smoke_source
-    assert "if simulation_app is not None and raw_ready:" in smoke_source
+    assert "POLARIS_SMOKE_READY_MARKER_PATH=" in smoke_source
+    assert "POLARIS_SMOKE_READY_MARKER_EXPECTED_SHA256=" in smoke_source
     assert "POLARIS_SIMULATION_APP_CLOSE_SKIPPED=raw_not_ready" in smoke_source
+    assert "os._exit(1)" in smoke_source
+    assert "def _best_effort_failure_log" in smoke_source
+    assert (
+        "else:\n        exit_code = 1\n        _best_effort_failure_log(\n"
+        '            "POLARIS_SMOKE_RAW_FAILURE="'
+    ) in smoke_source
+    assert "finally:\n            os._exit(1)" in smoke_source
     assert "sys.stderr.flush()" in smoke_source
 
 
@@ -877,6 +893,7 @@ def test_smoke_raw_json_publication_is_strict_and_nonoverwriting(tmp_path):
         "_strict_json_value",
         "_strict_json_bytes",
         "_atomic_write_strict_json",
+        "_raw_is_eligible_for_close",
     }
     helper_nodes = [
         node
@@ -890,6 +907,21 @@ def test_smoke_raw_json_publication_is_strict_and_nonoverwriting(tmp_path):
         namespace,
     )
     writer = namespace["_atomic_write_strict_json"]
+    eligible = namespace["_raw_is_eligible_for_close"]
+
+    clean_state = {
+        "stage": "simulation_app_close_pending",
+        "case": None,
+        "failure": None,
+        "close_failures": [],
+        "persistence_failures": [],
+    }
+    assert not eligible(
+        clean_state, exit_code=0, raw_published=True, simulation_app=None
+    )
+    assert eligible(
+        clean_state, exit_code=0, raw_published=True, simulation_app=object()
+    )
 
     output = tmp_path / "raw.json"
     writer(output, {"value": 1.0, "nonfinite": math.inf})

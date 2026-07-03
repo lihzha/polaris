@@ -38,19 +38,39 @@ args_cli.headless = True
 
 
 def _exception_evidence(error: BaseException) -> dict[str, str]:
+    try:
+        message = str(error)
+    except BaseException:
+        message = "<unprintable exception>"
+    try:
+        formatted_traceback = "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        )
+    except BaseException:
+        formatted_traceback = "<traceback unavailable>"
     return {
         "type": f"{type(error).__module__}.{type(error).__qualname__}",
-        "message": str(error),
-        "traceback": "".join(
-            traceback.format_exception(type(error), error, error.__traceback__)
-        ),
+        "message": message,
+        "traceback": formatted_traceback,
     }
 
 
 def _print_exception(error: BaseException) -> None:
-    traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
-    sys.stdout.flush()
-    sys.stderr.flush()
+    try:
+        traceback.print_exception(
+            type(error), error, error.__traceback__, file=sys.stderr
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except BaseException:
+        pass
+
+
+def _best_effort_failure_log(message: str) -> None:
+    try:
+        print(message, flush=True)
+    except BaseException:
+        pass
 
 
 def _strict_json_value(value):
@@ -129,6 +149,25 @@ def _result_payload(
         "close_failures": state["close_failures"],
         "persistence_failures": state["persistence_failures"],
     }
+
+
+def _raw_is_eligible_for_close(
+    state: dict[str, object],
+    *,
+    exit_code: int,
+    raw_published: bool,
+    simulation_app,
+) -> bool:
+    return (
+        raw_published
+        and simulation_app is not None
+        and exit_code == 0
+        and state["stage"] == "simulation_app_close_pending"
+        and state["case"] is None
+        and state["failure"] is None
+        and not state["close_failures"]
+        and not state["persistence_failures"]
+    )
 
 
 def _wxyz_to_xyzw(quaternion):
@@ -446,7 +485,12 @@ if __name__ == "__main__":
             _print_exception(close_error)
             exit_code = 1
 
-    if exit_code == 0 and state["failure"] is None and not state["close_failures"]:
+    if (
+        simulation_app is not None
+        and exit_code == 0
+        and state["failure"] is None
+        and not state["close_failures"]
+    ):
         state["stage"] = "simulation_app_close_pending"
         state["case"] = None
     raw_published = False
@@ -463,14 +507,11 @@ if __name__ == "__main__":
         _print_exception(persistence_error)
         exit_code = 1
 
-    raw_is_eligible = (
-        raw_published
-        and exit_code == 0
-        and state["stage"] == "simulation_app_close_pending"
-        and state["case"] is None
-        and state["failure"] is None
-        and not state["close_failures"]
-        and not state["persistence_failures"]
+    raw_is_eligible = _raw_is_eligible_for_close(
+        state,
+        exit_code=exit_code,
+        raw_published=raw_published,
+        simulation_app=simulation_app,
     )
     raw_ready = False
     if raw_is_eligible:
@@ -496,47 +537,46 @@ if __name__ == "__main__":
             marker_sha256 = hashlib.sha256(
                 _strict_json_bytes(marker_payload)
             ).hexdigest()
-            _atomic_write_strict_json(ready_marker, marker_payload)
-        except BaseException as persistence_error:
-            _print_exception(persistence_error)
-            exit_code = 1
-            print(
-                "POLARIS_SMOKE_RAW_FAILURE=ready_marker_or_hash_failed",
-                flush=True,
-            )
-        else:
-            print(f"POLARIS_SMOKE_RAW_READY={args_cli.output_json}", flush=True)
+            print(f"POLARIS_SMOKE_RAW_PREPARED={args_cli.output_json}", flush=True)
             print(f"POLARIS_SMOKE_RAW_SHA256={raw_sha256}", flush=True)
-            print(f"POLARIS_SMOKE_RAW_READY_MARKER={ready_marker}", flush=True)
+            print(f"POLARIS_SMOKE_READY_MARKER_PATH={ready_marker}", flush=True)
             print(
-                f"POLARIS_SMOKE_RAW_READY_MARKER_SHA256={marker_sha256}",
+                f"POLARIS_SMOKE_READY_MARKER_EXPECTED_SHA256={marker_sha256}",
                 flush=True,
             )
             sys.stdout.flush()
             sys.stderr.flush()
             raw_ready = True
+            _atomic_write_strict_json(ready_marker, marker_payload)
+            simulation_app.close()
+        except BaseException as persistence_error:
+            raw_ready = False
+            _print_exception(persistence_error)
+            exit_code = 1
+            _best_effort_failure_log(
+                "POLARIS_SMOKE_RAW_FAILURE=ready_marker_or_simulation_close_failed",
+            )
     else:
-        print(
+        exit_code = 1
+        _best_effort_failure_log(
             "POLARIS_SMOKE_RAW_FAILURE="
             f"stage={state['stage']},exit_code={exit_code},published={raw_published}",
-            flush=True,
         )
 
-    # SimulationApp.close() terminates the pinned Isaac process before Python
-    # can reliably execute another statement.  The immutable host wrapper must
-    # therefore attest the pending raw JSON only after this process returns 0;
-    # it must never rewrite the raw result itself.
-    if simulation_app is not None and raw_ready:
-        try:
-            simulation_app.close()
-        except BaseException as close_error:
-            close_evidence = _exception_evidence(close_error)
-            close_evidence["component"] = "simulation_app"
-            state["close_failures"].append(close_evidence)
-            _print_exception(close_error)
-            exit_code = 1
-    elif simulation_app is not None:
-        print("POLARIS_SIMULATION_APP_CLOSE_SKIPPED=raw_not_ready", flush=True)
+    # SimulationApp.close() hard-exits the pinned Isaac process.  It is called
+    # immediately after the durable marker publication above, with no fallible
+    # statement in between.  The host attests the untouched raw bytes only
+    # after srun returns zero.
+    if simulation_app is not None and not raw_ready:
+        _best_effort_failure_log("POLARIS_SIMULATION_APP_CLOSE_SKIPPED=raw_not_ready")
         exit_code = 1
 
+    if exit_code != 0 and simulation_app is not None:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except BaseException:
+            pass
+        finally:
+            os._exit(1)
     sys.exit(exit_code)

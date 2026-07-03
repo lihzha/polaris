@@ -183,6 +183,21 @@ def _object(value: Any, field: str) -> dict[str, Any]:
     return value
 
 
+def _typed_equal(actual: Any, expected: Any) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return set(actual) == set(expected) and all(
+            _typed_equal(actual[key], value) for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _typed_equal(actual_item, expected_item)
+            for actual_item, expected_item in zip(actual, expected, strict=True)
+        )
+    return actual == expected
+
+
 def _list(value: Any, field: str, *, length: int | None = None) -> list[Any]:
     _require(isinstance(value, list), f"{field} must be an array")
     if length is not None:
@@ -192,12 +207,23 @@ def _list(value: Any, field: str, *, length: int | None = None) -> list[Any]:
 
 def _finite_number(value: Any, field: str) -> float:
     _require(
-        not isinstance(value, bool)
-        and isinstance(value, (int, float))
-        and math.isfinite(float(value)),
-        f"{field} must be finite",
+        type(value) is float and math.isfinite(value),
+        f"{field} must be a finite JSON float",
     )
-    return float(value)
+    return value
+
+
+def _exact_int(value: Any, expected: int, field: str) -> int:
+    _require(
+        type(value) is int and value == expected, f"{field} must be int {expected}"
+    )
+    return value
+
+
+def _exact_float(value: Any, expected: float, field: str) -> float:
+    actual = _finite_number(value, field)
+    _require(actual == expected, f"{field} mismatch")
+    return actual
 
 
 def _finite_vector_evidence(value: Any, field: str) -> list[float]:
@@ -232,6 +258,12 @@ def _finite_vector(value: Any, field: str, *, length: int) -> list[float]:
     return [
         _finite_number(item, f"{field}[{index}]") for index, item in enumerate(values)
     ]
+
+
+def _exact_float_vector(value: Any, expected: list[float], field: str) -> list[float]:
+    values = _finite_vector(value, field, length=len(expected))
+    _require(values == expected, f"{field} mismatch")
+    return values
 
 
 def _diagnostic_vector(value: Any, field: str) -> list[float | None] | None:
@@ -270,8 +302,11 @@ def _validate_diagnostic(
 ) -> tuple[int, dict[str, Any]]:
     diagnostic = _object(value, field)
     _require(set(diagnostic) == DIAGNOSTIC_FIELDS, f"{field} schema drift")
-    _require(diagnostic.get("kind") in allowed_kinds, f"{field} kind invalid")
-    _require(diagnostic.get("episode_index") == episode_index, f"{field} episode")
+    _require(
+        type(diagnostic.get("kind")) is str and diagnostic["kind"] in allowed_kinds,
+        f"{field} kind invalid",
+    )
+    _exact_int(diagnostic.get("episode_index"), episode_index, f"{field} episode")
     policy_step = diagnostic.get("policy_step")
     physics_substep = diagnostic.get("physics_substep")
     _require(type(policy_step) is int and policy_step >= 0, f"{field} policy_step")
@@ -307,26 +342,54 @@ def _validate_safety_report(
 ) -> tuple[dict[str, int], dict[str, list[float]]]:
     report = _object(value, field)
     _require(set(report) == SAFETY_FIELDS, f"{field} schema drift")
-    expected_static = {
-        "episode_index": episode_index,
-        "profile": "panda_velocity_softlimit_v1",
-        "apply_actions_cadence": "physics_substep",
-        "physics_dt": 1.0 / 120.0,
-        "control_dt": 1.0 / 15.0,
-        "decimation": 8,
-        "current_joint_soft_limit_tolerance_rad": 1e-5,
-        "eef_quaternion_unit_norm_tolerance": 1e-3,
-        "joint_slew_float32_tolerance_rad": 1e-6,
-        "soft_joint_pos_limit_factor": 1.0,
-        "joint_names": EXPECTED_JOINT_NAMES,
-        "joint_velocity_limits_rad_s": EXPECTED_VELOCITY_LIMITS,
-        "joint_effort_limits": EXPECTED_EFFORT_LIMITS,
-        "max_delta_joint_pos_rad": EXPECTED_MAX_DELTA,
-        "soft_joint_pos_limits_rad": EXPECTED_LIMITS,
-        "soft_joint_pos_limits_float32_sha256": EXPECTED_DIGEST,
-    }
-    for name, expected in expected_static.items():
-        _require(report.get(name) == expected, f"{field}.{name} mismatch")
+    if episode_index is None:
+        _require(report.get("episode_index") is None, f"{field}.episode_index")
+    else:
+        _exact_int(report.get("episode_index"), episode_index, f"{field}.episode_index")
+    for name, expected in (
+        ("profile", "panda_velocity_softlimit_v1"),
+        ("apply_actions_cadence", "physics_substep"),
+        ("soft_joint_pos_limits_float32_sha256", EXPECTED_DIGEST),
+    ):
+        _require(
+            type(report.get(name)) is str and report[name] == expected,
+            f"{field}.{name}",
+        )
+    for name, expected in (
+        ("physics_dt", 1.0 / 120.0),
+        ("control_dt", 1.0 / 15.0),
+        ("current_joint_soft_limit_tolerance_rad", 1e-5),
+        ("eef_quaternion_unit_norm_tolerance", 1e-3),
+        ("joint_slew_float32_tolerance_rad", 1e-6),
+        ("soft_joint_pos_limit_factor", 1.0),
+    ):
+        _exact_float(report.get(name), expected, f"{field}.{name}")
+    _exact_int(report.get("decimation"), 8, f"{field}.decimation")
+    _require(
+        report.get("joint_names") == EXPECTED_JOINT_NAMES
+        and all(type(name) is str for name in report["joint_names"]),
+        f"{field}.joint_names",
+    )
+    _exact_float_vector(
+        report.get("joint_velocity_limits_rad_s"),
+        EXPECTED_VELOCITY_LIMITS,
+        f"{field}.joint_velocity_limits_rad_s",
+    )
+    _exact_float_vector(
+        report.get("joint_effort_limits"),
+        EXPECTED_EFFORT_LIMITS,
+        f"{field}.joint_effort_limits",
+    )
+    _exact_float_vector(
+        report.get("max_delta_joint_pos_rad"),
+        EXPECTED_MAX_DELTA,
+        f"{field}.max_delta_joint_pos_rad",
+    )
+    limits = _list(report.get("soft_joint_pos_limits_rad"), f"{field}.limits", length=7)
+    for index, (actual, expected) in enumerate(
+        zip(limits, EXPECTED_LIMITS, strict=True)
+    ):
+        _exact_float_vector(actual, expected, f"{field}.limits[{index}]")
 
     counters = _object(report.get("counters"), f"{field}.counters")
     _require(set(counters) == COUNTER_FIELDS, f"{field}.counter schema drift")
@@ -346,7 +409,7 @@ def _validate_safety_report(
         events = counters[event_name]
         joints = counters[joint_name]
         _require(
-            events <= apply_calls and events <= joints <= 7 * apply_calls,
+            events <= apply_calls and events <= joints <= 7 * events,
             f"{field}.{event_name}/{joint_name} impossible",
         )
     for name in (
@@ -389,6 +452,7 @@ def _validate_safety_report(
 
     diagnostics = _list(report.get("guard_diagnostics"), f"{field}.diagnostics")
     _require(len(diagnostics) <= 32, f"{field}.diagnostics unbounded")
+    _require(diagnostics == [], f"{field}.promotion diagnostics must be empty")
     mapped = {name: 0 for name in (*ABORT_COUNTERS, "dls_fallbacks")}
     indices = []
     for index, diagnostic_value in enumerate(diagnostics):
@@ -441,6 +505,27 @@ def _validate_safety_report(
             max_raw_diagnostic.get("jacobian_finite") is True,
             f"{field}.max-raw jacobian",
         )
+        _require(
+            _finite_number(
+                max_raw_diagnostic.get("pose_error_norm"),
+                f"{field}.max-raw pose_error_norm",
+            )
+            >= 0.0,
+            f"{field}.max-raw pose_error_norm",
+        )
+        _require(
+            _finite_number(
+                max_raw_diagnostic.get("jacobian_max_abs"),
+                f"{field}.max-raw jacobian_max_abs",
+            )
+            >= 0.0,
+            f"{field}.max-raw jacobian_max_abs",
+        )
+        _require(
+            max_raw_diagnostic.get("eef_quaternion_norm") is None,
+            f"{field}.max-raw eef_quaternion_norm must be null",
+        )
+        finite_vectors: dict[str, list[float]] = {}
         for name in (
             "joint_pos_rad",
             "raw_joint_pos_target_rad",
@@ -452,6 +537,34 @@ def _validate_safety_report(
             _require(
                 vector is not None and all(item is not None for item in vector),
                 f"{field}.max-raw {name}",
+            )
+            finite_vectors[name] = [float(item) for item in vector]
+        q_vector = finite_vectors["joint_pos_rad"]
+        raw_target = finite_vectors["raw_joint_pos_target_rad"]
+        safe_target = finite_vectors["safe_joint_pos_target_rad"]
+        raw_delta = [float(item) for item in raw_vector]
+        for index, (q, delta, raw, safe, bound, limits) in enumerate(
+            zip(
+                q_vector,
+                raw_delta,
+                raw_target,
+                safe_target,
+                EXPECTED_MAX_DELTA,
+                EXPECTED_LIMITS,
+                strict=True,
+            )
+        ):
+            _require(
+                math.isclose(raw, q + delta, rel_tol=0.0, abs_tol=1e-6),
+                f"{field}.max-raw joint {index} raw target identity",
+            )
+            _require(
+                abs(safe - q) <= bound + 1e-6,
+                f"{field}.max-raw joint {index} safe slew",
+            )
+            _require(
+                limits[0] - 1e-5 <= safe <= limits[1] + 1e-5,
+                f"{field}.max-raw joint {index} safe limits",
             )
     return counters, maxima
 
@@ -493,12 +606,36 @@ def _validate_ordinary_result(
         ),
         f"{field} position error inconsistent",
     )
+    quaternions = {}
     for name in ("target_quaternion_wxyz", "actual_quaternion_wxyz"):
         quaternion = _finite_vector(result.get(name), f"{field}.{name}", length=4)
         _require(
             abs(math.sqrt(sum(item * item for item in quaternion)) - 1.0) <= 1e-3,
             f"{field}.{name} norm",
         )
+        quaternions[name] = quaternion
+    target_norm = math.sqrt(
+        sum(item * item for item in quaternions["target_quaternion_wxyz"])
+    )
+    actual_norm = math.sqrt(
+        sum(item * item for item in quaternions["actual_quaternion_wxyz"])
+    )
+    dot = abs(
+        sum(
+            target * actual
+            for target, actual in zip(
+                quaternions["target_quaternion_wxyz"],
+                quaternions["actual_quaternion_wxyz"],
+                strict=True,
+            )
+        )
+        / (target_norm * actual_norm)
+    )
+    angular_distance = 2.0 * math.acos(min(1.0, max(0.0, dot)))
+    _require(
+        math.isclose(angular_distance, rotation_error, rel_tol=0.0, abs_tol=1e-7),
+        f"{field} rotation error inconsistent",
+    )
     for name, tolerance in (
         ("reset_frame_position_error_m", frame_position_tolerance),
         ("reset_frame_rotation_error_rad", frame_rotation_tolerance),
@@ -564,7 +701,7 @@ def _file_identity(path: Path, field: str) -> dict[str, Any]:
 
 def _verify_raw(raw: dict[str, Any]) -> dict[str, Any]:
     _require(set(raw) == RAW_FIELDS, "raw top-level schema drift")
-    _require(raw.get("schema_version") == 1, "raw schema_version must be 1")
+    _exact_int(raw.get("schema_version"), 1, "raw schema_version")
     _require(raw.get("finalized") is False, "raw finalized must be false")
     _require(raw.get("passed") is False, "raw passed must be false")
     _require(
@@ -572,28 +709,32 @@ def _verify_raw(raw: dict[str, Any]) -> dict[str, Any]:
         "raw stage must be simulation_app_close_pending",
     )
     _require(raw.get("case") is None, "raw case must be null")
-    _require(raw.get("exit_code") == 0, "raw exit_code must be zero")
+    _exact_int(raw.get("exit_code"), 0, "raw exit_code")
     _require(raw.get("failure") is None, "raw failure must be null")
     _require(raw.get("close_failures") == [], "raw close failures must be empty")
     _require(
         raw.get("persistence_failures") == [],
         "raw persistence failures must be empty",
     )
-    _require(raw.get("environment") == "DROID-FoodBussing", "raw environment")
-    _require(raw.get("eef_frame") == "panda_link8", "raw EEF frame")
-    _require(raw.get("hold_steps") == 45, "raw hold_steps")
-    _require(raw.get("position_delta_m") == 0.04, "raw position delta")
-    _require(raw.get("rotation_delta_deg") == 15.0, "raw rotation delta")
-    _require(raw.get("position_tolerance_m") == 0.01, "raw position tolerance")
-    _require(raw.get("rotation_tolerance_deg") == 5.0, "raw rotation tolerance")
     _require(
-        raw.get("frame_position_tolerance_m") == 1e-5,
-        "raw frame position tolerance",
+        type(raw.get("environment")) is str
+        and raw["environment"] == "DROID-FoodBussing",
+        "raw environment",
     )
     _require(
-        raw.get("frame_rotation_tolerance_deg") == 0.01,
-        "raw frame rotation tolerance",
+        type(raw.get("eef_frame")) is str and raw["eef_frame"] == "panda_link8",
+        "raw EEF frame",
     )
+    _exact_int(raw.get("hold_steps"), 45, "raw hold_steps")
+    for name, expected in (
+        ("position_delta_m", 0.04),
+        ("rotation_delta_deg", 15.0),
+        ("position_tolerance_m", 0.01),
+        ("rotation_tolerance_deg", 5.0),
+        ("frame_position_tolerance_m", 1e-5),
+        ("frame_rotation_tolerance_deg", 0.01),
+    ):
+        _exact_float(raw.get(name), expected, f"raw {name}")
 
     _validate_safety_report(
         raw.get("raw_ik_safety_capture"),
@@ -709,12 +850,13 @@ def _verify_raw(raw: dict[str, Any]) -> dict[str, Any]:
         },
         "guard evidence schema drift",
     )
-    _require(guard.get("apply_calls") == 8, "guard apply_calls")
-    _require(guard.get("abort_count") == 0, "guard abort_count")
-    _require(guard.get("post_clamp_target_violations") == 0, "guard post-clamp")
+    _exact_int(guard.get("apply_calls"), 8, "guard apply_calls")
+    _exact_int(guard.get("abort_count"), 0, "guard abort_count")
+    _exact_int(guard.get("post_clamp_target_violations"), 0, "guard post-clamp")
     _require(guard.get("applied_within_bounds") is True, "guard slew bound")
     _require(
-        guard.get("slew_limit_events") == slew_events,
+        type(guard.get("slew_limit_events")) is int
+        and guard["slew_limit_events"] == slew_events,
         "guard slew event count mismatch",
     )
 
@@ -726,6 +868,19 @@ def _verify_raw(raw: dict[str, Any]) -> dict[str, Any]:
         actual = _finite_number(actual_value, f"applied[{index}]")
         bound = _finite_number(bound_value, f"bound[{index}]")
         _require(actual <= bound + 1e-6, f"joint {index} exceeded slew bound")
+    limited_indices = [
+        index
+        for index, (raw_delta, bound) in enumerate(
+            zip(maxima["raw_delta_joint_pos_rad"], EXPECTED_MAX_DELTA, strict=True)
+        )
+        if raw_delta > bound + 1e-6
+    ]
+    _require(limited_indices, "adversarial raw maxima never exceed a slew bound")
+    for index in limited_indices:
+        _require(
+            applied[index] >= EXPECTED_MAX_DELTA[index] - 1e-6,
+            f"adversarial joint {index} slew event lacks saturated applied maximum",
+        )
 
     return {
         "ordinary_case_count": 13,
@@ -788,8 +943,17 @@ def _publish_nonoverwriting(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _build_expected(args: argparse.Namespace) -> dict[str, Any]:
-    _require(args.srun_rc == 0, f"srun_rc must be zero, got {args.srun_rc}")
-    _require(args.job_id > 0, "job_id must be positive")
+    _exact_int(args.srun_rc, 0, "srun_rc")
+    _require(
+        type(args.job_id) is int and args.job_id > 0, "job_id must be positive int"
+    )
+    slurm_job_id = os.environ.get("SLURM_JOB_ID")
+    _require(
+        slurm_job_id is not None
+        and slurm_job_id.isdecimal()
+        and int(slurm_job_id) == args.job_id,
+        "CLI job_id does not match SLURM_JOB_ID",
+    )
     _require(args.raw_result.resolve() != args.attestation.resolve(), "path collision")
     _require(
         args.raw_result.name == f"smoke-{args.job_id}.json",
@@ -807,6 +971,12 @@ def _build_expected(args: argparse.Namespace) -> dict[str, Any]:
         (args.expected_polaris_commit, "expected PolaRiS commit", 40),
         (args.expected_smoke_sha256, "expected smoke SHA-256", 64),
         (args.expected_image_sha256, "expected image SHA-256", 64),
+        (args.expected_finalizer_sha256, "expected finalizer SHA-256", 64),
+        (
+            args.expected_saved_job_script_sha256,
+            "expected saved job script SHA-256",
+            64,
+        ),
     ):
         _require(
             len(value) == length
@@ -822,17 +992,19 @@ def _build_expected(args: argparse.Namespace) -> dict[str, Any]:
     marker, marker_bytes, marker_sha256 = _read_json_once(marker_path, "ready marker")
     _require(_mode(marker_path) == "0444", "ready marker mode must be 0444")
     _require(
-        marker
-        == {
-            "schema_version": 1,
-            "stage": "simulation_app_close_pending",
-            "raw_result": {
-                "path": str(args.raw_result),
-                "size_bytes": len(raw_bytes),
-                "sha256": raw_sha256,
-                "mode": "0444",
+        _typed_equal(
+            marker,
+            {
+                "schema_version": 1,
+                "stage": "simulation_app_close_pending",
+                "raw_result": {
+                    "path": str(args.raw_result),
+                    "size_bytes": len(raw_bytes),
+                    "sha256": raw_sha256,
+                    "mode": "0444",
+                },
             },
-        },
+        ),
         "ready marker does not bind the exact raw result",
     )
 
@@ -859,6 +1031,14 @@ def _build_expected(args: argparse.Namespace) -> dict[str, Any]:
         "runtime/saved job script digest mismatch",
     )
     finalizer_identity = _file_identity(Path(__file__).resolve(), "finalizer")
+    _require(
+        saved_script["sha256"] == args.expected_saved_job_script_sha256,
+        "saved job script expected digest mismatch",
+    )
+    _require(
+        finalizer_identity["sha256"] == args.expected_finalizer_sha256,
+        "finalizer expected digest mismatch",
+    )
 
     return {
         "schema_version": 1,
@@ -906,6 +1086,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-smoke-sha256", required=True)
     parser.add_argument("--container-image", required=True, type=Path)
     parser.add_argument("--expected-image-sha256", required=True)
+    parser.add_argument("--expected-finalizer-sha256", required=True)
+    parser.add_argument("--expected-saved-job-script-sha256", required=True)
     return parser
 
 
@@ -919,7 +1101,7 @@ def main() -> int:
             args.attestation, "attestation"
         )
         _require(_mode(args.attestation) == "0444", "attestation mode must be 0444")
-        _require(attestation == expected, "attestation content mismatch")
+        _require(_typed_equal(attestation, expected), "attestation content mismatch")
     except (
         OSError,
         subprocess.CalledProcessError,
