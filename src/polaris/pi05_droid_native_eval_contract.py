@@ -484,33 +484,260 @@ def publish_immutable_file_from_temporary(
     return validate_immutable_file(path)
 
 
+_BOUND_FILE_IDENTITY_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_size",
+    "st_mode",
+    "st_nlink",
+    "st_mtime_ns",
+    "st_ctime_ns",
+)
+_BOUND_DIRECTORY_IDENTITY_FIELDS = (
+    "st_dev",
+    "st_ino",
+    "st_size",
+    "st_mode",
+    "st_nlink",
+    "st_mtime_ns",
+    "st_ctime_ns",
+)
+
+
+def _stat_identity(value: os.stat_result, fields: tuple[str, ...]) -> tuple[int, ...]:
+    return tuple(getattr(value, field) for field in fields)
+
+
+def _open_bound_target(path: Path, field: str) -> dict[str, Any]:
+    """Open one lexical filename through a stable resolved parent dirfd."""
+
+    path = Path(path)
+    parent_descriptor = -1
+    file_descriptor = -1
+    try:
+        resolved_parent = path.parent.resolve(strict=True)
+        parent_path_before = os.stat(resolved_parent, follow_symlinks=False)
+        parent_descriptor = os.open(
+            resolved_parent,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        parent_before = os.fstat(parent_descriptor)
+        if not stat.S_ISDIR(parent_before.st_mode) or _stat_identity(
+            parent_before,
+            _BOUND_DIRECTORY_IDENTITY_FIELDS,
+        ) != _stat_identity(
+            parent_path_before,
+            _BOUND_DIRECTORY_IDENTITY_FIELDS,
+        ):
+            raise ValueError(f"{field} artifact parent identity drift")
+        entry_before = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        file_descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+        file_before = os.fstat(file_descriptor)
+        if (
+            not stat.S_ISREG(file_before.st_mode)
+            or file_before.st_nlink != 1
+            or stat.S_IMODE(file_before.st_mode) != 0o444
+            or _stat_identity(file_before, _BOUND_FILE_IDENTITY_FIELDS)
+            != _stat_identity(entry_before, _BOUND_FILE_IDENTITY_FIELDS)
+        ):
+            raise ValueError(f"{field} artifact file identity drift")
+        return {
+            "path": path,
+            "resolved_parent": resolved_parent,
+            "parent_descriptor": parent_descriptor,
+            "file_descriptor": file_descriptor,
+            "parent_before": parent_before,
+            "file_before": file_before,
+        }
+    except ValueError:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+        raise
+    except OSError as error:
+        if file_descriptor >= 0:
+            os.close(file_descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
+        raise ValueError(f"{field} artifact target is not readable") from error
+
+
+def _finish_bound_target(opened: dict[str, Any], field: str) -> os.stat_result:
+    """Recheck the opened file, directory entry, parent fd, and lexical alias."""
+
+    path = opened["path"]
+    resolved_parent = opened["resolved_parent"]
+    parent_descriptor = opened["parent_descriptor"]
+    file_descriptor = opened["file_descriptor"]
+    try:
+        file_after = os.fstat(file_descriptor)
+        entry_after = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        parent_after = os.fstat(parent_descriptor)
+        parent_path_after = os.stat(resolved_parent, follow_symlinks=False)
+        lexical_parent_after = path.parent.resolve(strict=True)
+        lexical_parent_stat = os.stat(
+            lexical_parent_after,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise ValueError(
+            f"{field} artifact target changed during validation"
+        ) from error
+    if (
+        lexical_parent_after != resolved_parent
+        or _stat_identity(opened["file_before"], _BOUND_FILE_IDENTITY_FIELDS)
+        != _stat_identity(file_after, _BOUND_FILE_IDENTITY_FIELDS)
+        or _stat_identity(opened["file_before"], _BOUND_FILE_IDENTITY_FIELDS)
+        != _stat_identity(entry_after, _BOUND_FILE_IDENTITY_FIELDS)
+        or _stat_identity(
+            opened["parent_before"],
+            _BOUND_DIRECTORY_IDENTITY_FIELDS,
+        )
+        != _stat_identity(parent_after, _BOUND_DIRECTORY_IDENTITY_FIELDS)
+        or _stat_identity(
+            opened["parent_before"],
+            _BOUND_DIRECTORY_IDENTITY_FIELDS,
+        )
+        != _stat_identity(parent_path_after, _BOUND_DIRECTORY_IDENTITY_FIELDS)
+        or _stat_identity(
+            opened["parent_before"],
+            _BOUND_DIRECTORY_IDENTITY_FIELDS,
+        )
+        != _stat_identity(lexical_parent_stat, _BOUND_DIRECTORY_IDENTITY_FIELDS)
+    ):
+        raise ValueError(f"{field} artifact target changed during validation")
+    return file_after
+
+
+def _close_bound_target(opened: dict[str, Any]) -> None:
+    os.close(opened["file_descriptor"])
+    os.close(opened["parent_descriptor"])
+
+
 def validate_bound_artifact(
     value: Any, *, expected_path: Path | None, field: str, json_artifact: bool = False
 ) -> dict[str, Any]:
-    """Reopen an artifact identity recorded inside another contract."""
+    """Reopen a bound artifact without a resolve/open alias-retarget gap."""
 
     identity_keys = ("path", "size", "sha256", "mode", "nlink")
     if not isinstance(value, dict) or set(value) != set(identity_keys):
         raise ValueError(f"{field} artifact schema drift")
-    path = Path(value["path"])
-    if expected_path is not None and path.resolve() != Path(expected_path).resolve():
-        raise ValueError(f"{field} artifact path drift")
-    artifact = (
-        validate_immutable_json(path)
-        if json_artifact
-        else validate_immutable_file(path)
-    )
-    # Container publication sees the stable ``/lustre/fsw`` mount as a regular
-    # path, while the login-host finalizer resolves the same inode through its
-    # ``/lustre/fs11`` parent alias.  The resolved target is already bound
-    # above; compare every non-path identity field exactly, then preserve the
-    # recorded lexical path so enclosing immutable contracts rebuild byte-for-
-    # byte.  A different target, digest, size, mode, or link count still fails.
-    if Path(artifact["path"]).resolve() != path.resolve() or any(
-        artifact[key] != value[key] for key in ("size", "sha256", "mode", "nlink")
+    if (
+        type(value["path"]) is not str
+        or not value["path"]
+        or not Path(value["path"]).is_absolute()
+        or ".." in Path(value["path"]).parts
+        or type(value["size"]) is not int
+        or value["size"] <= 0
+        or type(value["sha256"]) is not str
+        or len(value["sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in value["sha256"])
+        or type(value["mode"]) is not str
+        or len(value["mode"]) != 4
+        or any(character not in "01234567" for character in value["mode"])
+        or type(value["nlink"]) is not int
+        or value["nlink"] <= 0
+        or type(json_artifact) is not bool
     ):
-        raise ValueError(f"{field} artifact identity drift")
-    return {key: value[key] for key in identity_keys}
+        raise ValueError(f"{field} artifact identity type drift")
+    path = Path(value["path"])
+    expected_opened = None
+    if expected_path is not None:
+        try:
+            expected_opened = _open_bound_target(Path(expected_path), field)
+        except ValueError as error:
+            raise ValueError(f"{field} artifact path drift") from error
+    try:
+        try:
+            opened = _open_bound_target(path, field)
+        except ValueError as error:
+            if expected_path is not None and "target is not readable" in str(error):
+                raise ValueError(f"{field} artifact path drift") from error
+            raise
+        try:
+            opened_identity_before = _stat_identity(
+                opened["file_before"], _BOUND_FILE_IDENTITY_FIELDS
+            )
+            if expected_opened is not None and opened_identity_before != _stat_identity(
+                expected_opened["file_before"],
+                _BOUND_FILE_IDENTITY_FIELDS,
+            ):
+                raise ValueError(f"{field} artifact path drift")
+            digest = hashlib.sha256()
+            payload_parts = [] if json_artifact else None
+            size = 0
+            try:
+                while block := os.read(
+                    opened["file_descriptor"],
+                    16 * 1024 * 1024,
+                ):
+                    digest.update(block)
+                    size += len(block)
+                    if payload_parts is not None:
+                        payload_parts.append(block)
+            except OSError as error:
+                raise ValueError(
+                    f"{field} artifact changed while being read"
+                ) from error
+            file_after = _finish_bound_target(opened, field)
+            if expected_opened is not None:
+                expected_after = _finish_bound_target(expected_opened, field)
+                file_after = _finish_bound_target(opened, field)
+                if _stat_identity(
+                    file_after,
+                    _BOUND_FILE_IDENTITY_FIELDS,
+                ) != _stat_identity(
+                    expected_after,
+                    _BOUND_FILE_IDENTITY_FIELDS,
+                ):
+                    raise ValueError(f"{field} artifact path drift")
+            artifact = {
+                "size": size,
+                "sha256": digest.hexdigest(),
+                "mode": f"{stat.S_IMODE(file_after.st_mode):04o}",
+                "nlink": file_after.st_nlink,
+            }
+            if size != file_after.st_size or any(
+                artifact[key] != value[key]
+                for key in ("size", "sha256", "mode", "nlink")
+            ):
+                raise ValueError(f"{field} artifact identity drift")
+            if payload_parts is not None:
+                payload = b"".join(payload_parts)
+                try:
+                    json_value = json.loads(
+                        payload,
+                        parse_constant=lambda constant: (_ for _ in ()).throw(
+                            ValueError(
+                                f"Non-finite JSON constant is forbidden: {constant}"
+                            )
+                        ),
+                    )
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise ValueError(f"{field} artifact is not strict JSON") from error
+                if payload != canonical_json_bytes(json_value):
+                    raise ValueError(f"{field} artifact is not canonical JSON")
+            # Preserve only the recorded lexical path in enclosing canonical
+            # bytes after both stable parent handles have been rebound.
+            return {key: value[key] for key in identity_keys}
+        finally:
+            _close_bound_target(opened)
+    finally:
+        if expected_opened is not None:
+            _close_bound_target(expected_opened)
 
 
 def should_render_expensive(

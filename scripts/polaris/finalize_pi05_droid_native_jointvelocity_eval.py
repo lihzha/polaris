@@ -161,6 +161,28 @@ def _seal_file(path: Path, field: str) -> dict[str, Any]:
     }
 
 
+def _validate_sealed_sidecar_artifact(
+    sidecar_artifact: Any,
+    sealed_artifact: dict[str, Any],
+    *,
+    expected_path: Path,
+    field: str,
+) -> dict[str, Any]:
+    """Bind a sidecar's lexical alias to one exact sealed host artifact."""
+
+    bound = validate_bound_artifact(
+        sidecar_artifact,
+        expected_path=expected_path,
+        field=field,
+    )
+    if any(
+        bound[key] != sealed_artifact[key]
+        for key in ("size", "sha256", "mode", "nlink")
+    ):
+        raise ValueError(f"{field} differs from sealed host artifact")
+    return bound
+
+
 def _source_provenance(repository: Path, expected_commit: str) -> dict[str, Any]:
     repository = Path(repository)
     if repository.is_symlink():
@@ -1306,11 +1328,18 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
     if trace_identity["sha256"] != trace_summary["trace_sha256"]:
         raise ValueError("Sealed trace digest differs from trace audit")
     sidecar_artifacts = close_ready["episode_sidecar"]["value"]["artifacts"]
-    if (
-        trace_identity != sidecar_artifacts["trace"]
-        or video_identity != sidecar_artifacts["video"]
-    ):
-        raise ValueError("Sealed trace/video identity differs from episode sidecar")
+    _validate_sealed_sidecar_artifact(
+        sidecar_artifacts["trace"],
+        trace_identity,
+        expected_path=trace_path,
+        field="episode sidecar trace",
+    )
+    _validate_sealed_sidecar_artifact(
+        sidecar_artifacts["video"],
+        video_identity,
+        expected_path=video_path,
+        field="episode sidecar video",
+    )
 
     summary_path = run_dir / "pi05_droid_native_jointvelocity_canary.mp4"
     summary_probe = create_summary_video(

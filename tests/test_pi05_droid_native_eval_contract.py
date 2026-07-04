@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from polaris import pi05_droid_native_eval_contract as native_eval_contract
 from polaris.pi05_droid_jointvelocity_contract import (
     NATIVE_GRIPPER_DRIVE_PROFILE,
     PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE,
@@ -330,6 +331,110 @@ def test_bound_artifact_accepts_parent_alias_but_rejects_target_and_hash_drift(
                 field="native velocity incident",
                 json_artifact=True,
             )
+
+
+@pytest.mark.parametrize("retarget_stage", ["before_open", "during_read"])
+@pytest.mark.parametrize("json_artifact", [False, True])
+def test_bound_artifact_rejects_parent_alias_retarget_during_validation(
+    tmp_path,
+    monkeypatch,
+    json_artifact,
+    retarget_stage,
+):
+    original_root = tmp_path / "original"
+    original_root.mkdir()
+    wrong_root = tmp_path / "wrong"
+    wrong_root.mkdir()
+    alias_root = tmp_path / "alias"
+    alias_root.symlink_to(original_root, target_is_directory=True)
+    filename = "artifact.json" if json_artifact else "artifact.bin"
+    original_path = original_root / filename
+    wrong_path = wrong_root / filename
+    if json_artifact:
+        original = publish_immutable_json(original_path, {"same": "bytes"})
+        publish_immutable_json(wrong_path, {"same": "bytes"})
+    else:
+        for root in (original_root, wrong_root):
+            temporary = root / ".artifact.partial"
+            temporary.write_bytes(b"same bytes")
+            published = publish_immutable_file_from_temporary(
+                temporary,
+                root / filename,
+            )
+            if root == original_root:
+                original = published
+    recorded = {
+        key: original[key] for key in ("path", "size", "sha256", "mode", "nlink")
+    }
+    recorded["path"] = str(alias_root / filename)
+
+    retargeted = False
+
+    def retarget_alias():
+        nonlocal retargeted
+        if not retargeted:
+            alias_root.unlink()
+            alias_root.symlink_to(wrong_root, target_is_directory=True)
+            retargeted = True
+
+    original_read = native_eval_contract.os.read
+
+    def retarget_then_read(descriptor, size):
+        retarget_alias()
+        return original_read(descriptor, size)
+
+    original_open = native_eval_contract.os.open
+    parent_open_count = 0
+
+    def retarget_then_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal parent_open_count
+        if dir_fd is None and flags & os.O_DIRECTORY:
+            parent_open_count += 1
+            if parent_open_count == 2:
+                retarget_alias()
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    if retarget_stage == "before_open":
+        monkeypatch.setattr(native_eval_contract.os, "open", retarget_then_open)
+    else:
+        monkeypatch.setattr(native_eval_contract.os, "read", retarget_then_read)
+    with pytest.raises(ValueError, match="target changed during validation"):
+        validate_bound_artifact(
+            recorded,
+            expected_path=original_path,
+            field="retargeted artifact",
+            json_artifact=json_artifact,
+        )
+    assert retargeted is True
+
+
+@pytest.mark.parametrize(
+    ("key", "invalid"),
+    [
+        ("path", Path("/tmp/not-a-string")),
+        ("path", "relative/artifact.json"),
+        ("size", True),
+        ("size", 1.0),
+        ("sha256", b"0" * 64),
+        ("sha256", "A" * 64),
+        ("mode", 0o444),
+        ("nlink", True),
+    ],
+)
+def test_bound_artifact_requires_exact_identity_types(tmp_path, key, invalid):
+    path = tmp_path / "artifact.json"
+    identity = publish_immutable_json(path, {"strict": True})
+    recorded = {
+        name: identity[name] for name in ("path", "size", "sha256", "mode", "nlink")
+    }
+    recorded[key] = invalid
+    with pytest.raises(ValueError, match="artifact identity type drift"):
+        validate_bound_artifact(
+            recorded,
+            expected_path=path,
+            field="strict artifact",
+            json_artifact=True,
+        )
 
 
 def test_exact_official_model_eval_contract_binds_all_train_eval_semantics():

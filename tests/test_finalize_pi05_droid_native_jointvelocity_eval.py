@@ -597,6 +597,59 @@ def test_finalizer_binds_internal_timeout_terminal_state_and_close_artifact(
         finalizer._validate_runtime_artifact(bad_path)
 
 
+@pytest.mark.parametrize(
+    ("label", "filename"),
+    [
+        ("trace", "policy_traces.jsonl"),
+        ("video", "episode_0.mp4"),
+    ],
+)
+def test_sealed_sidecar_artifacts_accept_fsw_fs11_alias_and_reject_drift(
+    tmp_path,
+    label,
+    filename,
+):
+    fs11 = tmp_path / "lustre" / "fs11" / "attempt"
+    fs11.mkdir(parents=True)
+    fsw = tmp_path / "lustre" / "fsw"
+    fsw.symlink_to(fs11, target_is_directory=True)
+    artifact_path = fs11 / filename
+    artifact_path.write_bytes(f"{label}-artifact\n".encode("ascii"))
+    sealed = finalizer._seal_file(artifact_path, f"sealed {label}")
+    sidecar = {**sealed, "path": str(fsw / filename)}
+
+    assert (
+        finalizer._validate_sealed_sidecar_artifact(
+            sidecar,
+            sealed,
+            expected_path=artifact_path,
+            field=f"episode sidecar {label}",
+        )
+        == sidecar
+    )
+
+    wrong_root = tmp_path / "wrong"
+    wrong_root.mkdir()
+    wrong_path = wrong_root / filename
+    wrong_path.write_bytes(artifact_path.read_bytes())
+    finalizer._seal_file(wrong_path, f"wrong {label}")
+    with pytest.raises(ValueError, match="artifact path drift"):
+        finalizer._validate_sealed_sidecar_artifact(
+            {**sidecar, "path": str(wrong_path)},
+            sealed,
+            expected_path=artifact_path,
+            field=f"episode sidecar {label}",
+        )
+
+    with pytest.raises(ValueError, match="artifact identity drift"):
+        finalizer._validate_sealed_sidecar_artifact(
+            {**sidecar, "sha256": "0" * 64},
+            sealed,
+            expected_path=artifact_path,
+            field=f"episode sidecar {label}",
+        )
+
+
 @pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
     reason="ffmpeg tools are unavailable",
