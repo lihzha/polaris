@@ -8,7 +8,7 @@ Date: 2026-07-03
 
 ## Goal and scope
 
-Implement, but do not launch, one model-free PolaRiS controller replay that
+Implement and target-validate one model-free PolaRiS controller replay that
 feeds the exact 294-action reasoning fixture plus a 64-physics-substep frozen
 tail through the production v4 release-ramp controller. The replay must retain
 the complete 13-DOF causal trace and video while proving that the production
@@ -53,8 +53,8 @@ The four production-core SHA-256 identities remain:
 - `src/polaris/robust_differential_ik.py`: `8add3b6bc3f33e2797a2c4cab2aa2ebf4c67c2ab07c197dd9a0cd004bfde49dc`
 
 The upstream target-runtime gate for `e18b8eb` is job `1098636`, reported by
-the root orchestrator as passing all `84/84` Isaac controller tests. This
-branch does not launch another job.
+the root orchestrator as passing all `84/84` Isaac controller tests. The exact
+full replay was later target-validated by job `1098639`, documented below.
 
 ## Implementation
 
@@ -318,7 +318,7 @@ source roots under `/.venv/lib/python3.11/site-packages/isaaclab/source`.
 That same path is used by both `run_isaac_pytest.py` and the direct replay
 runner.
 
-## Exact launch design (not executed; independent literals required)
+## Exact launch design and target execution
 
 This repository must not derive its own commit, component hashes, or launch ID
 at submission time. The prior dynamic example was removed because a checkout
@@ -345,8 +345,7 @@ the new image-mount child. Older rejected wrappers are SHA-256
 `343f9d2126b5549964985ba794be01c5dfce17b649b5cfb2646ff5abe841edb1`,
 which targets `585ab6f` and omits the gate-I/O literal, and
 `724867f6227ba4100db1c3f7d4e7f946312d9785c860499745e4f4cd519cf504`,
-which targets `2ebfe7d`. A new outer wrapper may be reviewed only after the
-final child commit and component hashes are frozen.
+which targets `2ebfe7d`.
 
 The resource contract remains one ordinary, non-array, non-requeue L40S job:
 account `nvr_lpr_rvp`, partition `batch`, one node/task/GPU, 16 CPUs, 96 GiB,
@@ -364,13 +363,71 @@ the detached source commit is still exact and completely clean, then removes
 the uniquely scoped cache on both success and failure while preserving the
 original exit status unless cleanup or source attestation fails.
 
+## Successful exact target replay
+
+The image-mount child was committed and pushed as
+`5d459b5490e6c921f646f02f57413a6fa4aad3e6` (tree
+`2b5bc3f6018e1f22f7b03b7e2f5870ac3a70f1f0`), a direct child of `d32115d`.
+Two independent code reviews and an exact detached-clone/launcher review found
+no P0, P1, or P2 issue. The immutable outer launcher SHA-256 was
+`5e4512b2a83f20d18e5a38fe6cec481657d2d4d97473f4f15f9a80174580ee3e`.
+
+Slurm job `1098639` ran on one L40S and completed `0:0` in `00:06:36`:
+
+```text
+deliberate Isaac negative probe: exit 5, immutable sidecar content 5
+positive Isaac controller gate: 84 passed, immutable sidecar content 0
+focused in-container replay/sidecar gate: 103 passed
+simulator replay step: completed 0
+post-Kit validator step: completed 0
+wrapper: completed 0; wall time 385 seconds
+```
+
+The successful immutable artifacts are:
+
+- result: `37,857,188` bytes, SHA-256
+  `30d2e8d29aa757956ddc425eae363897c894af83e8eb519ba787eb4e5adfbded`
+- validation manifest: `253,235` bytes, SHA-256
+  `535f3666eadd5cce89b28cde62b89f76217b45d178da0bc9855f60378fea6af1`
+- video: `450,727` bytes, SHA-256
+  `132dc827e9c8464aba2c4766381818f5767b89c5f70a12e53f1422301436a4dd`
+- `SUCCESS`: `335` bytes, SHA-256
+  `ee2be1ede54aa6c573e391dfdbd0ca9d51bb4601925f7cb8a6d0ea55299748d2`
+
+Every authoritative artifact and sidecar is a regular `0444`, single-link
+file. `FAILED` and temporary files are absent, the exact per-job cache was
+removed, the detached source remained clean, and `src/polaris` remained
+byte-identical to production `7fc74d6`.
+
+The result completed all 294 fixture actions plus eight tail policy steps / 64
+tail physics substeps for 2,416 contiguous applies. It has no numerical or
+controller failure. The exact release-ramp result is releases/starts/
+completions `3/3/3`, target applies `48`, limited applies/joints `38/221`, zero
+cancellations, and windows `1600..1615`, `2176..2191`, `2334..2349`. For all
+48 entries, the production-core transaction target, independent helper,
+failure trace, and live setter readback are bit-identical, including matching
+little-endian float32 digests; all observer write counts are zero.
+
+The gripper gate records process/apply/change/repeat/limited/reached counts
+`302/2416/5/296/217/2199`, retains exact applies `2352..2415`, and ends at
+sample `2717` with the closed driver target `0.7853981852531433`. The video is
+H.264 High/yuv420p, external then rotated wrist, `448x224` at 15 FPS, exactly
+303 progressive frames. Independent ffmpeg full decode passed; all 303 frame
+hashes are unique with no consecutive duplicates. Representative first,
+middle, and final frames were visually inspected.
+
+An independent read-only post-run audit returned GO after rechecking Slurm
+steps, strict duplicate-key and non-finite JSON rejection, every frozen count
+and digest, immutable artifact bindings, source/cache hygiene, and a separate
+full video decode.
+
 ## Remaining target-runtime risks
 
 - The observer intentionally reads private failure-trace buffers and core ramp
   fields. Exact parent/production-source hashes make interface drift fail
   closed.
-- CUDA/PhysX replay has not been executed for this child. Host tests validate
-  logic and tamper rejection, not simulator behavior.
+- The exact CUDA/PhysX controller replay passed in job `1098639`; this remains
+  a model-free controller gate, not task-success or checkpoint evidence.
 - Per-substep CUDA-to-CPU trace synchronization changes wall time but not target
   values. The job requests 96 GB and 45 minutes.
 - Cross-run whole-physics bit identity is not the authority. Within-run core
