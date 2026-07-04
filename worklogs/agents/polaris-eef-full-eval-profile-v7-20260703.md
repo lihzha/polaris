@@ -187,3 +187,13 @@ Final reviewed pre-commit source identities:
   `f66af5001f8636333f6db00948a64214909a43b7d6afd1af968397dea33280b0`
 - `src/polaris/eef_runtime_contract.py`:
   `a5f868f58be6850b9b7a4f9f2c1b719d0c867ad969b2fbec26a843e25db90cef`
+
+The reviewed implementation was committed as
+`0611d384f5f26ef9bd8ff114be273e875c3fe719` with tree
+`197858347b9f783a62d282e9edc66a354ec5b424`, exact parent
+`ad19745a97ed7c9b0330325324cc82e23575c896`, and full binary commit-diff
+SHA-256
+`9572152853bfd3e251a88c22c30d0f2887565df8fa99a14e9dfc6a9c24faf67c`.
+The implementation commit is the exact producer identity for Ego-LAP and the
+cluster smoke. This following worklog-only evidence commit is not a substitute
+for that source identity.
