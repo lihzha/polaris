@@ -13,6 +13,7 @@ import struct
 from typing import Any
 
 from polaris.pi05_droid_jointvelocity_contract import (
+    PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE,
     PI05_DROID_JOINTVELOCITY_PROFILE,
 )
 from polaris.pi05_droid_native_eval_contract import (
@@ -175,6 +176,16 @@ def _finite_vector(value: Any, width: int, field: str) -> list[float]:
     return [
         _finite_number(item, f"{field}[{index}]") for index, item in enumerate(value)
     ]
+
+
+def _normalized_gripper_vector(value: Any, field: str) -> list[float]:
+    result = _finite_vector(value, 1, field)
+    tolerance = PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE
+    _require(
+        -tolerance <= result[0] <= 1.0 + tolerance,
+        f"{field} is outside [0, 1] plus {tolerance} audit tolerance",
+    )
+    return result
 
 
 def _finite_matrix(
@@ -571,9 +582,10 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
             )
             query_q = _finite_vector(state["joint_position"], 7, "query joint position")
             active_query_q = query_q
-            gripper = _finite_vector(state["gripper_position"], 1, "query gripper")
+            gripper = _normalized_gripper_vector(
+                state["gripper_position"], "Query normalized gripper"
+            )
             active_query_gripper = gripper
-            _require(0.0 <= gripper[0] <= 1.0, "Query gripper state is outside [0, 1]")
             if previous_q is not None:
                 _require(
                     query_q == previous_q,
@@ -699,14 +711,9 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
         dq_before = _finite_vector(
             action["measured_joint_velocity_before"], 7, "dq before"
         )
-        gripper_before = _finite_vector(
+        gripper_before = _normalized_gripper_vector(
             action["measured_normalized_gripper_position_before"],
-            1,
-            "normalized gripper before",
-        )
-        _require(
-            0.0 <= gripper_before[0] <= 1.0,
-            "Pre-action normalized gripper is outside [0, 1]",
+            "Pre-action normalized gripper",
         )
         normalized_gripper_min = min(normalized_gripper_min, gripper_before[0])
         normalized_gripper_max = max(normalized_gripper_max, gripper_before[0])
@@ -832,14 +839,9 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
         previous_dq = _finite_vector(
             execution["measured_joint_velocity_after"], 7, "dq after"
         )
-        previous_gripper = _finite_vector(
+        previous_gripper = _normalized_gripper_vector(
             execution["measured_normalized_gripper_position_after"],
-            1,
-            "normalized gripper after",
-        )
-        _require(
-            0.0 <= previous_gripper[0] <= 1.0,
-            "Post-action normalized gripper is outside [0, 1]",
+            "Post-action normalized gripper",
         )
         normalized_gripper_min = min(normalized_gripper_min, previous_gripper[0])
         normalized_gripper_max = max(normalized_gripper_max, previous_gripper[0])

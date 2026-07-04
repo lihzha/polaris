@@ -18,6 +18,7 @@ from polaris.pi05_droid_jointvelocity_contract import (
     NATIVE_GRIPPER_DRIVE_PROFILE,
     PI05_DROID_CHECKPOINT_MANIFEST_SHA256,
     PI05_DROID_CHECKPOINT_URI,
+    PI05_DROID_GRIPPER_OBSERVATION_CONTRACT,
     PI05_DROID_NORM_STATS_SHA256,
 )
 
@@ -154,6 +155,7 @@ PI05_DROID_NATIVE_MODEL_EVAL_CONTRACT = {
         "state": "7_panda_joint_positions_radians_plus_closed_positive_gripper",
         "state_width": 8,
         "request_state_dtype": "float32",
+        "gripper_observation": PI05_DROID_GRIPPER_OBSERVATION_CONTRACT,
         "resize": "openpi_image_tools_resize_with_pad_224_v1",
         "resize_semantics": "aspect_preserving_letterbox_with_zero_padding",
         "images": [

@@ -36,6 +36,7 @@ from polaris.pi05_droid_jointvelocity_contract import (
     PANDA_ARM_VELOCITY_DRIVE_DAMPING,
     PANDA_ARM_VELOCITY_DRIVE_STIFFNESS,
     PANDA_ARM_VELOCITY_LIMITS,
+    PI05_DROID_GRIPPER_OBSERVATION_CONTRACT,
     PI05_DROID_ISAACLAB_SOURCE_SHA256,
     PI05_DROID_ISAACLAB_VERSION,
     PI05_DROID_JOINTVELOCITY_PROFILE,
@@ -169,6 +170,7 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
         "policy_frequency_hz",
         "physics_frequency_hz",
         "decimation",
+        "gripper_observation",
         "reset_event_order",
         "joint_names",
         "action_term_class",
@@ -225,6 +227,8 @@ def validate_joint_velocity_runtime_report(report: Any) -> dict[str, Any]:
         != PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256
     ):
         raise ValueError("Joint-velocity runtime PolaRiS source manifest mismatch")
+    if report["gripper_observation"] != PI05_DROID_GRIPPER_OBSERVATION_CONTRACT:
+        raise ValueError("Joint-velocity gripper observation contract mismatch")
     _validate_array_report(
         report["clip"],
         np.broadcast_to(np.asarray([-1.0, 1.0], dtype=np.float32), (1, 7, 2)),
@@ -546,6 +550,26 @@ def _verify_polaris_sources(
     return actual
 
 
+def _validate_gripper_observation_config(root_env: Any) -> dict[str, Any]:
+    """Bind the raw official-DROID closed-fraction observation semantics."""
+
+    policy_cfg = getattr(getattr(root_env.cfg, "observations", None), "policy", None)
+    gripper_cfg = getattr(policy_cfg, "gripper_pos", None)
+    function = getattr(gripper_cfg, "func", None)
+    function_path = (
+        f"{getattr(function, '__module__', '')}.{getattr(function, '__name__', '')}"
+    )
+    if (
+        function_path
+        != PI05_DROID_GRIPPER_OBSERVATION_CONTRACT["polaris_observation_term"]
+        or getattr(gripper_cfg, "clip", object()) is not None
+        or getattr(policy_cfg, "enable_corruption", None) is not False
+        or getattr(policy_cfg, "concatenate_terms", None) is not False
+    ):
+        raise ValueError("Native DROID gripper observation configuration mismatch")
+    return copy.deepcopy(PI05_DROID_GRIPPER_OBSERVATION_CONTRACT)
+
+
 def validate_joint_velocity_runtime(
     env: Any, *, expected_gripper_drive_profile: str
 ) -> dict[str, Any]:
@@ -564,6 +588,7 @@ def validate_joint_velocity_runtime(
         raise ValueError(
             "Native DROID velocity control requires decimation=8 and dt=1/120"
         )
+    gripper_observation = _validate_gripper_observation_config(root_env)
 
     reset_event_order = list(root_env.event_manager.active_terms.get("reset", ()))
     if reset_event_order != ["reset_all", "cap_gripper_followers"]:
@@ -875,6 +900,7 @@ def validate_joint_velocity_runtime(
         "policy_frequency_hz": 15,
         "physics_frequency_hz": 120,
         "decimation": 8,
+        "gripper_observation": gripper_observation,
         "reset_event_order": reset_event_order,
         "joint_names": list(joint_names),
         "action_term_class": _class_path(arm_term),

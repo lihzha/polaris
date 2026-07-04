@@ -18,6 +18,7 @@ from polaris.pi05_droid_jointvelocity_contract import (
     NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
     PANDA_ARM_EFFORT_LIMITS,
     PANDA_ARM_JOINT_NAMES,
+    PI05_DROID_GRIPPER_OBSERVATION_CONTRACT,
     PI05_DROID_JOINTVELOCITY_PROFILE,
     PI05_DROID_ISAACLAB_SOURCE_SHA256,
     PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256,
@@ -38,6 +39,13 @@ ImplicitActuator = _named_class("isaaclab.actuators.actuator_pd", "ImplicitActua
 BinaryGripperAction = _named_class(
     "polaris.environments.droid_cfg", "BinaryJointPositionZeroToOneAction"
 )
+
+
+def gripper_pos():
+    raise AssertionError("configuration identity only")
+
+
+gripper_pos.__module__ = "polaris.environments.droid_cfg"
 
 
 def test_source_resolution_distinguishes_custom_config_from_upstream_base():
@@ -208,7 +216,17 @@ class _Env:
         finger._processed_actions = _DeviceTensor(torch.zeros((1, 1)), device="cuda:0")
         finger.raw_actions = finger._raw_actions
         finger.processed_actions = finger._processed_actions
-        self.cfg = SimpleNamespace(decimation=8, sim=SimpleNamespace(dt=1.0 / 120.0))
+        self.cfg = SimpleNamespace(
+            decimation=8,
+            sim=SimpleNamespace(dt=1.0 / 120.0),
+            observations=SimpleNamespace(
+                policy=SimpleNamespace(
+                    gripper_pos=SimpleNamespace(func=gripper_pos, clip=None),
+                    enable_corruption=False,
+                    concatenate_terms=False,
+                )
+            ),
+        )
         self.action_manager = SimpleNamespace(
             _terms={"arm": arm, "finger_joint": finger}
         )
@@ -262,6 +280,7 @@ def test_runtime_binds_action_class_order_affine_and_direct_physx_drive(monkeypa
     assert report["profile"] == PI05_DROID_JOINTVELOCITY_PROFILE
     assert report["joint_names"] == list(PANDA_ARM_JOINT_NAMES)
     assert report["position_integration"] == "absent_by_exact_action_class"
+    assert report["gripper_observation"] == (PI05_DROID_GRIPPER_OBSERVATION_CONTRACT)
     assert report["action_cfg_class"] == (
         "polaris.environments.droid_cfg.AuditedDroidJointVelocityActionCfg"
     )
@@ -327,6 +346,23 @@ def test_runtime_rejects_reset_event_order_drift(monkeypatch):
     env = _Env()
     env.event_manager.active_terms["reset"].reverse()
     with pytest.raises(ValueError, match="scene reset then all-six cap"):
+        _validate(env)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda cfg: setattr(cfg.gripper_pos, "clip", (0.0, 1.0)),
+        lambda cfg: setattr(cfg, "enable_corruption", True),
+        lambda cfg: setattr(cfg, "concatenate_terms", True),
+        lambda cfg: setattr(cfg.gripper_pos, "func", lambda: None),
+    ],
+)
+def test_runtime_rejects_gripper_observation_semantic_drift(monkeypatch, mutate):
+    _stub_isaaclab(monkeypatch)
+    env = _Env()
+    mutate(env.cfg.observations.policy)
+    with pytest.raises(ValueError, match="gripper observation configuration"):
         _validate(env)
 
 

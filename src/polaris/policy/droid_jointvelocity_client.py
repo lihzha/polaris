@@ -13,6 +13,7 @@ from openpi_client import websocket_client_policy
 
 from polaris.pi05_droid_jointvelocity_contract import (
     PANDA_ARM_JOINT_NAMES,
+    PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE,
     PI05_DROID_JOINTVELOCITY_PROFILE,
     validate_persisted_serving_contract,
     validate_pi05_droid_server_metadata,
@@ -912,6 +913,13 @@ class DroidJointVelocityClient(InferenceClient):
                 raise JointVelocityObservationNumericalError(
                     f"DROID {field} contains non-finite values"
                 )
+        gripper_value = float(gripper_position[0])
+        tolerance = PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE
+        if not -tolerance <= gripper_value <= 1.0 + tolerance:
+            raise JointVelocityObservationNumericalError(
+                "DROID normalized gripper position exceeds the official [0, 1] "
+                f"domain plus {tolerance} audit tolerance: {gripper_value}"
+            )
         return {
             "right_image": right_image,
             "wrist_image": wrist_image,

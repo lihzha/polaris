@@ -10,6 +10,7 @@ from polaris.config import PolicyArgs
 from polaris.pi05_droid_jointvelocity_contract import (
     PI05_DROID_CONTRACT_FILENAME,
     PI05_DROID_CONTRACT_METADATA_KEY,
+    PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE,
     PI05_DROID_JOINTVELOCITY_PROFILE,
     expected_pi05_droid_server_metadata,
     make_openpi_runtime_attestation,
@@ -165,7 +166,7 @@ def _bind_and_begin(client, env):
     return runtime
 
 
-def _observation(q=None, dq=None):
+def _observation(q=None, dq=None, gripper=0.25):
     return {
         "splat": {
             "external_cam": np.full((240, 320, 3), 7, dtype=np.uint8),
@@ -174,7 +175,7 @@ def _observation(q=None, dq=None):
         "policy": {
             "arm_joint_pos": np.asarray([q or [0.0] * 7], dtype=np.float32),
             "arm_joint_vel": np.asarray([dq or [0.0] * 7], dtype=np.float32),
-            "gripper_pos": np.asarray([[0.25]], dtype=np.float32),
+            "gripper_pos": np.asarray([[gripper]], dtype=np.float32),
         },
     }
 
@@ -229,6 +230,58 @@ def test_upstream_processing_binarizes_then_clips_every_dimension():
     raw[-1] = np.nextafter(np.float32(0.5), np.float32(1.0))
     _, clipped = process_native_jointvelocity_action(raw)
     assert clipped[-1] == 1.0
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        -PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE,
+        1.0 + PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE,
+    ],
+)
+def test_gripper_observation_boundary_tolerance_preserves_raw_server_input(
+    tmp_path, value
+):
+    server = _FakePolicyServer(np.zeros((15, 8), dtype=np.float64))
+    with mock.patch(
+        "polaris.policy.droid_jointvelocity_client.websocket_client_policy.WebsocketClientPolicy",
+        return_value=server,
+    ):
+        client = DroidJointVelocityClient(_args(tmp_path))
+
+    client.infer(_observation(gripper=value), "test")
+    np.testing.assert_array_equal(
+        server.requests[0]["observation/gripper_position"],
+        np.asarray([value], dtype=np.float32),
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        np.nextafter(
+            np.float32(-PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE),
+            np.float32(-np.inf),
+        ),
+        np.nextafter(
+            np.float32(1.0 + PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE),
+            np.float32(np.inf),
+        ),
+    ],
+)
+def test_gripper_observation_nextafter_outside_tolerance_fails_closed(tmp_path, value):
+    server = _FakePolicyServer(np.zeros((15, 8), dtype=np.float64))
+    with mock.patch(
+        "polaris.policy.droid_jointvelocity_client.websocket_client_policy.WebsocketClientPolicy",
+        return_value=server,
+    ):
+        client = DroidJointVelocityClient(_args(tmp_path))
+
+    with pytest.raises(
+        JointVelocityObservationNumericalError, match=r"official \[0, 1\] domain"
+    ):
+        client.infer(_observation(gripper=value), "test")
+    assert server.requests == []
 
 
 def test_exact_request_execute8_trace_and_live_target_contract(tmp_path):

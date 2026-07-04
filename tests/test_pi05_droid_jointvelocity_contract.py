@@ -12,6 +12,8 @@ from polaris.pi05_droid_jointvelocity_contract import (
     PI05_DROID_CHECKPOINT_MANIFEST_SHA256,
     PI05_DROID_CONTRACT_FILENAME,
     PI05_DROID_CONTRACT_METADATA_KEY,
+    PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE,
+    PI05_DROID_GRIPPER_OBSERVATION_CONTRACT,
     PI05_DROID_JOINTVELOCITY_PROFILE,
     PI05_DROID_OPENPI_INFERENCE_COMPATIBILITY_COMMIT,
     PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256,
@@ -63,6 +65,18 @@ def test_exact_contract_binds_checkpoint_norm_openpi_action_and_control():
     assert contract["openpi"]["model_action_horizon"] == 15
     assert contract["policy_output"]["response_shape"] == [15, 8]
     assert contract["policy_output"]["execute_first"] == 8
+    assert contract["policy_input"]["gripper_observation"] == (
+        PI05_DROID_GRIPPER_OBSERVATION_CONTRACT
+    )
+    assert PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE == 8 * 2.0**-23
+    assert PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE <= 1e-6
+    assert contract["policy_input"]["gripper_observation"]["raw_value_preserved"]
+    assert (
+        contract["policy_input"]["gripper_observation"][
+            "server_pre_normalization_transform"
+        ]
+        == "none"
+    )
     assert contract["control"]["position_integration"] == "forbidden"
     assert contract["control"]["action_cfg"] == (
         "polaris_AuditedDroidJointVelocityActionCfg"

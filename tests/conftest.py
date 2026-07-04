@@ -18,6 +18,7 @@ from polaris.pi05_droid_jointvelocity_contract import (
     PANDA_ARM_EFFORT_LIMITS,
     PANDA_ARM_JOINT_NAMES,
     PANDA_ARM_VELOCITY_LIMITS,
+    PI05_DROID_GRIPPER_OBSERVATION_CONTRACT,
     PI05_DROID_ISAACLAB_SOURCE_SHA256,
     PI05_DROID_JOINTVELOCITY_PROFILE,
     PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256,
@@ -100,6 +101,7 @@ def make_joint_velocity_runtime_report():
         "policy_frequency_hz": 15,
         "physics_frequency_hz": 120,
         "decimation": 8,
+        "gripper_observation": copy.deepcopy(PI05_DROID_GRIPPER_OBSERVATION_CONTRACT),
         "reset_event_order": ["reset_all", "cap_gripper_followers"],
         "joint_names": list(PANDA_ARM_JOINT_NAMES),
         "action_term_class": (

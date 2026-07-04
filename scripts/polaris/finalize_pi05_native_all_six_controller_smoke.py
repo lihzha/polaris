@@ -71,6 +71,17 @@ POLICY_SEMANTIC_METHODS = {
     "_resize_images",
     "_extract_observation",
 }
+_GRIPPER_OBSERVATION_GUARD = ast.parse(
+    """
+gripper_value = float(gripper_position[0])
+tolerance = PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE
+if not -tolerance <= gripper_value <= 1.0 + tolerance:
+    raise JointVelocityObservationNumericalError(
+        "DROID normalized gripper position exceeds the official [0, 1] "
+        f"domain plus {tolerance} audit tolerance: {gripper_value}"
+    )
+"""
+).body
 
 
 def _require(condition: bool, message: str) -> None:
@@ -121,7 +132,9 @@ def _git(repository: Path, *arguments: str) -> bytes:
     ).stdout
 
 
-def _policy_semantic_symbols(source: bytes) -> dict[str, str]:
+def _policy_semantic_symbols(
+    source: bytes, *, require_gripper_observation_guard: bool
+) -> dict[str, str]:
     tree = ast.parse(source)
     symbols = {}
     for node in tree.body:
@@ -133,6 +146,34 @@ def _policy_semantic_symbols(source: bytes) -> dict[str, str]:
                     isinstance(child, ast.FunctionDef)
                     and child.name in POLICY_SEMANTIC_METHODS
                 ):
+                    if child.name == "_extract_observation":
+                        return_index = next(
+                            (
+                                index
+                                for index, statement in enumerate(child.body)
+                                if isinstance(statement, ast.Return)
+                            ),
+                            -1,
+                        )
+                        guard_start = return_index - len(_GRIPPER_OBSERVATION_GUARD)
+                        guard = child.body[guard_start:return_index]
+                        guard_matches = guard_start >= 0 and ast.dump(
+                            ast.Module(body=guard, type_ignores=[]),
+                            include_attributes=False,
+                        ) == ast.dump(
+                            ast.Module(
+                                body=_GRIPPER_OBSERVATION_GUARD, type_ignores=[]
+                            ),
+                            include_attributes=False,
+                        )
+                        _require(
+                            guard_matches == require_gripper_observation_guard,
+                            "official raw-gripper observation guard drift",
+                        )
+                        if guard_matches:
+                            child.body = (
+                                child.body[:guard_start] + child.body[return_index:]
+                            )
                     symbols[f"{node.name}.{child.name}"] = ast.dump(
                         child, include_attributes=False
                     )
@@ -191,10 +232,12 @@ def _source_provenance(repository: Path, expected_commit: str) -> dict[str, Any]
             "base_commit": BASE_COMMIT,
         }
     current_policy_semantics = _policy_semantic_symbols(
-        _git(repository, "show", f"HEAD:{POLICY_SEMANTIC_PATH}")
+        _git(repository, "show", f"HEAD:{POLICY_SEMANTIC_PATH}"),
+        require_gripper_observation_guard=True,
     )
     base_policy_semantics = _policy_semantic_symbols(
-        _git(repository, "show", f"{BASE_COMMIT}:{POLICY_SEMANTIC_PATH}")
+        _git(repository, "show", f"{BASE_COMMIT}:{POLICY_SEMANTIC_PATH}"),
+        require_gripper_observation_guard=False,
     )
     _require(
         current_policy_semantics == base_policy_semantics,

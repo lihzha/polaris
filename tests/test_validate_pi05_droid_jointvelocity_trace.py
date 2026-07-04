@@ -14,6 +14,7 @@ from scripts.polaris import (
 from scripts.polaris import validate_pi05_droid_jointvelocity_trace as validator
 
 from polaris.pi05_droid_jointvelocity_contract import (
+    PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE,
     PI05_DROID_JOINTVELOCITY_PROFILE,
 )
 from polaris.pi05_droid_native_eval_contract import (
@@ -242,6 +243,17 @@ def _records():
         }
     )
     return records
+
+
+def _set_normalized_gripper(records, value):
+    for record in records:
+        record_type = record["record_type"]
+        if record_type == "openpi_joint_velocity_query":
+            record["state"]["gripper_position"] = [value]
+        elif record_type == "openpi_joint_velocity_action":
+            record["measured_normalized_gripper_position_before"] = [value]
+        elif record_type == "openpi_joint_velocity_execution":
+            record["measured_normalized_gripper_position_after"] = [value]
 
 
 def _failure_records(
@@ -477,6 +489,38 @@ def test_full_450_step_execute8_trace_passes_and_binds_57_queries(tmp_path):
     assert result["environment_runtime_contract"]["live_max_episode_length"] == 451
     assert result["terminal_outcome"]["environment_after"]["episode_length"] == 450
     assert result["measured_normalized_gripper_position_range"] == [0.25, 0.25]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        -PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE,
+        1.0 + PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE,
+    ],
+)
+def test_gripper_trace_exact_tolerance_boundaries_pass_and_remain_raw(tmp_path, value):
+    records = _records()
+    _set_normalized_gripper(records, value)
+    trace, metrics = _write_case(tmp_path, records)
+
+    result = validator.audit_trace(trace, metrics)
+    assert result["measured_normalized_gripper_position_range"] == [value, value]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        math.nextafter(-PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE, -math.inf),
+        math.nextafter(1.0 + PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE, math.inf),
+    ],
+)
+def test_gripper_trace_nextafter_outside_tolerance_fails_closed(tmp_path, value):
+    records = _records()
+    _set_normalized_gripper(records, value)
+    trace, metrics = _write_case(tmp_path, records)
+
+    with pytest.raises(ValueError, match=r"outside \[0, 1\] plus"):
+        validator.audit_trace(trace, metrics)
 
 
 @pytest.mark.parametrize(

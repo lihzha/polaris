@@ -2,6 +2,8 @@ import hashlib
 from pathlib import Path
 import subprocess
 
+import pytest
+
 from scripts.polaris import (
     finalize_pi05_native_all_six_controller_smoke as finalizer,
 )
@@ -45,8 +47,16 @@ def test_recovery_keeps_policy_input_output_semantic_symbols_identical_to_base()
     current = (ROOT / relative).read_bytes()
     base = _git_show(finalizer.BASE_COMMIT, relative)
     assert finalizer._policy_semantic_symbols(
-        current
-    ) == finalizer._policy_semantic_symbols(base)
+        current, require_gripper_observation_guard=True
+    ) == finalizer._policy_semantic_symbols(
+        base, require_gripper_observation_guard=False
+    )
+
+    transformed = current.replace(b"1.0 + tolerance", b"1.0 + 2 * tolerance", 1)
+    with pytest.raises(ValueError, match="raw-gripper observation guard drift"):
+        finalizer._policy_semantic_symbols(
+            transformed, require_gripper_observation_guard=True
+        )
 
 
 def test_controller_smoke_surface_has_no_model_checkpoint_or_network_path():

@@ -51,6 +51,26 @@ PI05_DROID_ISAACLAB_SOURCE_SHA256 = {
     "manager_based_env.py": "a7d694e20e190678410330e24c365381a80d4f538debcced696d2c8e05cb940e",
     "manager_based_rl_env.py": "8ec2759541c8320ed725411d49564f5617b3ab6b9d340c860bededee13d557d4",
 }
+
+# OpenPI documents DROID gripper state as a closed-positive fraction in
+# [0, 1].  The official DROID robot interface computes that observation as
+# ``1 - width / max_width`` without clipping, and ``DroidInputs`` forwards it
+# unchanged into checkpoint normalization.  Preserve those official semantics
+# while allowing only eight float32 epsilons of simulator stop jitter at either
+# mathematical boundary.
+PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE = 8 * 2.0**-23
+PI05_DROID_GRIPPER_OBSERVATION_CONTRACT = {
+    "semantics": "closed_positive_fraction_open0_closed1",
+    "semantic_range": [0.0, 1.0],
+    "official_droid_formula": "1_minus_width_over_max_gripper_width",
+    "polaris_formula": "finger_joint_position_radians_divided_by_pi_over_4",
+    "simulator_observation_clip": None,
+    "server_pre_normalization_transform": "none",
+    "raw_value_preserved": True,
+    "boundary_audit_tolerance": (PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE),
+    "boundary_audit_tolerance_basis": "8_times_ieee754_float32_epsilon",
+    "polaris_observation_term": "polaris.environments.droid_cfg.gripper_pos",
+}
 PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256 = {
     "droid_cfg.py": "2947a19d75d75229462debd0b7faddd4cce75e73ea67e2dbf41eefb3ae90467f",
     "robot_cfg.py": "d514b32e07b54f98deb6d9dbc7a5201fff5337cdc4600d9351ee2a95e5c4c4c5",
@@ -524,6 +544,9 @@ def expected_pi05_droid_jointvelocity_contract(
             "state": "7_panda_joint_positions_radians_plus_closed_positive_gripper",
             "state_width": 8,
             "request_state_dtype": "float32",
+            "gripper_observation": copy.deepcopy(
+                PI05_DROID_GRIPPER_OBSERVATION_CONTRACT
+            ),
             "images": [
                 {
                     "model_slot": "base_0_rgb",

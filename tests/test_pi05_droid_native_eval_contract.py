@@ -6,7 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from polaris.pi05_droid_jointvelocity_contract import NATIVE_GRIPPER_DRIVE_PROFILE
+from polaris.pi05_droid_jointvelocity_contract import (
+    NATIVE_GRIPPER_DRIVE_PROFILE,
+    PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE,
+    PI05_DROID_GRIPPER_OBSERVATION_CONTRACT,
+)
 from polaris.pi05_droid_native_eval_contract import (
     PI05_DROID_GRIPPER_DRIVE_PROFILE,
     PI05_DROID_NATIVE_CONFIGURED_EPISODE_LENGTH_SECONDS,
@@ -386,6 +390,13 @@ def test_exact_official_model_eval_contract_binds_all_train_eval_semantics():
     assert contract["policy_input"]["state"] == (
         "7_panda_joint_positions_radians_plus_closed_positive_gripper"
     )
+    assert contract["policy_input"]["gripper_observation"] == (
+        PI05_DROID_GRIPPER_OBSERVATION_CONTRACT
+    )
+    assert (
+        contract["policy_input"]["gripper_observation"]["boundary_audit_tolerance"]
+        == PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE
+    )
     assert contract["policy_output"]["response_shape"] == [15, 8]
     assert contract["policy_output"]["execute_first"] == 8
     assert contract["policy_output"]["policy_frequency_hz"] == 15
@@ -410,6 +421,9 @@ def test_exact_official_model_eval_contract_binds_all_train_eval_semantics():
             {"shape": [256, 256, 3]}
         ),
         lambda value: value["policy_input"].update({"state_width": 7}),
+        lambda value: value["policy_input"]["gripper_observation"].update(
+            {"boundary_audit_tolerance": 1e-3}
+        ),
         lambda value: value["policy_output"].update({"response_shape": [16, 8]}),
         lambda value: value["policy_output"].update({"execute_first": 15}),
     ],
