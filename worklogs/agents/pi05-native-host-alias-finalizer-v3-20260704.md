@@ -252,3 +252,23 @@ inspection used only login-host read operations.
   deprecation warnings. Ruff 0.15.16 lint/format, Python byte compilation,
   Bash syntax, ShellCheck, and `git diff --check`: pass. Exact-commit read-only
   replay of preserved job `1098704` remains the final gate before freeze.
+
+### Full-trace closure freeze identity and replay
+
+- Final full-trace implementation commit:
+  `c0df3645f21ddfb227213613ee8daef3afbda99f`; tree:
+  `d8abae18bd96d79a1c035ee480abcff02e78e0ec`.
+- The agent-owned `l401` review checkout moved detached and clean to that exact
+  commit. Read-only replay of preserved job `1098704` passed: 199 trace
+  records, episode length 93, trace SHA-256
+  `8d9d893c002953bd10dd6375520196ca5a3f22e2ec0eccb6088b4d662fba49a2`,
+  incident SHA-256
+  `0ba6c6728b1a7fc3a82addd4158b4ba362be3c47df2aad47b5db77305739aacb`,
+  close-ready SHA-256
+  `8772fb1cf40206413ca89d43c7c56c90a375ddeadc9733529f71f9af9ee5d6b6`,
+  and sidecar SHA-256
+  `bdad15d14d12fc44a475861d39fc049b7a950b2f06899f1add25047e2fc63f8d`.
+- No Slurm job/allocation, GPU process, simulator, evaluator, model server,
+  registry operation, or canonical/shared checkout mutation was performed.
+  The subsequent enclosing documentation-only commit records this evidence and
+  does not alter executable source or tests.
