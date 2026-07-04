@@ -53,10 +53,38 @@ SOURCE_PATHS = (
     "src/polaris/pi05_droid_native_lifecycle.py",
     "src/polaris/policy/droid_jointvelocity_client.py",
 )
-UNCHANGED_MODEL_IO_PATHS = (
-    "scripts/polaris/serve_pi05_droid_native_jointvelocity.py",
-    "scripts/polaris/pi05_droid_native_gcs_manifest.tsv",
+UNCHANGED_MODEL_IO_PATHS = ("scripts/polaris/pi05_droid_native_gcs_manifest.tsv",)
+REVIEWED_ADDITIVE_MODEL_VALIDATION_PATH = (
+    "scripts/polaris/serve_pi05_droid_native_jointvelocity.py"
 )
+REVIEWED_ADDITIVE_MODEL_VALIDATION_PROFILE = (
+    "pi05_droid_serve_type_exact_validation_only_ast_v1"
+)
+REVIEWED_ADDITIVE_MODEL_VALIDATION_SOURCE_SHA256 = (
+    "09bfc74c8d751115f0374f9184f28f1e2ca2ef20fb3c92379a325bb206f3e913"
+)
+REVIEWED_ADDITIVE_MODEL_VALIDATION_BASE_SHA256 = (
+    "60e18ef53869784c3bf3435e6cc626cacb43fc52c543659f5e4d0a5bda69d21b"
+)
+SERVE_MODEL_SEMANTIC_ASSIGNMENTS = {
+    "checkout",
+    "openpi_dir",
+    "checkpoint_report",
+    "train_config",
+    "data_config",
+    "transform_contract",
+    "policy",
+    "runtime_attestation",
+    "metadata",
+    "contract_artifact",
+    "server",
+}
+SERVE_MODEL_SEMANTIC_EXPR_CALLS = {
+    "verify_profile_source_files",
+    "_install_controlled_openpi_path",
+    "verify_openpi_git_checkout",
+    "server.serve_forever",
+}
 POLICY_SEMANTIC_PATH = "src/polaris/policy/droid_jointvelocity_client.py"
 POLICY_SEMANTIC_FUNCTIONS = {
     "_image_contract",
@@ -184,6 +212,104 @@ def _policy_semantic_symbols(
     return symbols
 
 
+def _call_path(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _call_path(node.value)
+        return f"{parent}.{node.attr}" if parent else node.attr
+    return ""
+
+
+def _serve_model_semantic_symbols(source: bytes) -> dict[str, str]:
+    """Extract the model/checkpoint/server statements that must match the base."""
+
+    tree = ast.parse(source)
+    main_nodes = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    ]
+    _require(len(main_nodes) == 1, "official serve main function drift")
+    symbols: dict[str, str] = {}
+    expr_counts: dict[str, int] = {}
+    for statement in main_nodes[0].body:
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and statement.targets[0].id in SERVE_MODEL_SEMANTIC_ASSIGNMENTS
+        ):
+            name = statement.targets[0].id
+            _require(
+                name not in symbols, f"duplicate official serve assignment: {name}"
+            )
+            symbols[f"assign:{name}"] = ast.dump(statement, include_attributes=False)
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+            name = _call_path(statement.value.func)
+            if name in SERVE_MODEL_SEMANTIC_EXPR_CALLS:
+                occurrence = expr_counts.get(name, 0)
+                expr_counts[name] = occurrence + 1
+                symbols[f"call:{name}:{occurrence}"] = ast.dump(
+                    statement, include_attributes=False
+                )
+    expected = {f"assign:{name}" for name in SERVE_MODEL_SEMANTIC_ASSIGNMENTS}
+    expected |= {
+        "call:verify_profile_source_files:0",
+        "call:_install_controlled_openpi_path:0",
+        "call:verify_openpi_git_checkout:0",
+        "call:server.serve_forever:0",
+    }
+    _require(set(symbols) == expected, "official serve model semantic symbol set drift")
+    return symbols
+
+
+def _canonical_sha256(value: Any) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _reviewed_serve_validation(current: bytes, base: bytes) -> dict[str, Any]:
+    """Accept only the pinned additive validator refactor with base model semantics."""
+
+    current_ast_sha256 = hashlib.sha256(
+        ast.dump(ast.parse(current), include_attributes=False).encode("utf-8")
+    ).hexdigest()
+    _require(
+        hashlib.sha256(current).hexdigest()
+        == REVIEWED_ADDITIVE_MODEL_VALIDATION_SOURCE_SHA256,
+        "official serve reviewed validation source drift",
+    )
+    _require(
+        hashlib.sha256(base).hexdigest()
+        == REVIEWED_ADDITIVE_MODEL_VALIDATION_BASE_SHA256,
+        "official serve integrated-base source drift",
+    )
+    current_semantics = _serve_model_semantic_symbols(current)
+    base_semantics = _serve_model_semantic_symbols(base)
+    _require(
+        current_semantics == base_semantics,
+        "official serve model/checkpoint/server semantics changed from integrated base",
+    )
+    semantic_sha256 = _canonical_sha256(current_semantics)
+    return {
+        "base_commit": BASE_COMMIT,
+        "base_sha256": REVIEWED_ADDITIVE_MODEL_VALIDATION_BASE_SHA256,
+        "size": len(current),
+        "sha256": hashlib.sha256(current).hexdigest(),
+        "validation_profile": REVIEWED_ADDITIVE_MODEL_VALIDATION_PROFILE,
+        "ast_sha256": current_ast_sha256,
+        "model_semantics_sha256": semantic_sha256,
+        "base_model_semantics_sha256": _canonical_sha256(base_semantics),
+    }
+
+
 def _source_provenance(repository: Path, expected_commit: str) -> dict[str, Any]:
     repository = repository.resolve()
     git_dir = repository / ".git"
@@ -231,6 +357,14 @@ def _source_provenance(repository: Path, expected_commit: str) -> dict[str, Any]
             "sha256": hashlib.sha256(working).hexdigest(),
             "base_commit": BASE_COMMIT,
         }
+    reviewed_validation = _reviewed_serve_validation(
+        _git(repository, "show", f"HEAD:{REVIEWED_ADDITIVE_MODEL_VALIDATION_PATH}"),
+        _git(
+            repository,
+            "show",
+            f"{BASE_COMMIT}:{REVIEWED_ADDITIVE_MODEL_VALIDATION_PATH}",
+        ),
+    )
     current_policy_semantics = _policy_semantic_symbols(
         _git(repository, "show", f"HEAD:{POLICY_SEMANTIC_PATH}"),
         require_gripper_observation_guard=True,
@@ -260,6 +394,9 @@ def _source_provenance(repository: Path, expected_commit: str) -> dict[str, Any]
         "openpi_commit": OPENPI_COMMIT,
         "files": files,
         "official_model_io_unchanged_from_base": unchanged,
+        "official_model_validation_additions": {
+            REVIEWED_ADDITIVE_MODEL_VALIDATION_PATH: reviewed_validation,
+        },
     }
 
 

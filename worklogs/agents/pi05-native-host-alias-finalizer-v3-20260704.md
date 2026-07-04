@@ -334,3 +334,59 @@ inspection used only login-host read operations.
   registry operation, integration, or canonical/shared checkout mutation was
   performed. The subsequent enclosing documentation-only commit records this
   evidence without altering executable source or tests.
+
+## Additive fixed-metadata JSON-type closure
+
+- Parent branch tip:
+  `2ea268e64280c2fa090864832e11a26a20b2fe0d`; parent executable
+  implementation: `4e1aca2b626837c444470a42b013a503a2985073`.
+  Work remains isolated on the same agent branch. No evaluator, simulator,
+  model server, GPU allocation, Slurm job, registry operation, shared document,
+  integration, or canonical checkout is authorized by this closure.
+- The final review found a second class of Python numeric-equality bypasses in
+  fixed metadata. Immutable canonical JSON could carry `1.0`, `450.0`, or
+  `False` where the contract required JSON integers, yet direct Python equality
+  accepted them. Fixed objects and selected envelope fields now compare
+  canonical JSON bytes; open-ended counters require exact `int` types before
+  semantic cadence comparisons.
+- Checkpoint verification now type-exactly binds schema, object count, total
+  bytes, full-MD5 status, and the complete nested global-DROID normalization
+  reference and probes. Model-runtime verification type-exactly binds the
+  checkpoint subset, static `pi05_droid` train config, observed transform
+  runtime, policy metadata/sampler/RNG key, and official model-eval contract.
+  It explicitly calls `validate_native_model_eval_contract` on the artifact
+  subobject and returns the validated artifact values rather than replacing
+  them with expected constants.
+- Trace validation now type-exactly binds the 450-step contract horizon,
+  224x224x3 image shapes, 15x8 response shape, execution horizon 8, wrist
+  rotation 0, every record schema/reset/query/chunk/outer index, and all live
+  environment/sensor counters. Q/dq/action vectors, rubric progress, and CSV
+  cross-format values remain deliberate semantic numeric comparisons.
+- The producer now type-exactly validates the observed transform subset,
+  resize dimensions, model action dimension, static train config and action
+  horizon, and integer JAX RNG key. Runtime, close-ready, GPU, run-record, and
+  submission-record envelopes now require exact integer schema/job/rollout/
+  episode-step fields. GPU inventory job binding is consumed from its first
+  immutable read instead of reopening the artifact.
+- Because the producer source is no longer byte-identical to the integrated
+  base, the all-six bootstrap gate was strengthened rather than removed. The
+  checkpoint manifest remains byte-identical. The serve source must equal one
+  reviewed SHA-256, and an AST comparison requires the checkpoint load,
+  `pi05_droid` config/data construction, policy creation, OpenPI attestation,
+  serving-contract publication, WebSocket server construction, and serve loop
+  statements to remain identical to base commit `3e9df7f`. The completion
+  records both semantic digests and the model-canary consumer independently
+  requires the exact reviewed source/profile and equal current/base semantics.
+- The bootstrap path is intentionally fail-closed: freeze this exact code;
+  separately authorize and run one fresh all-six controller/source smoke;
+  make an evidence-only rebind of its immutable job/commit/completion pins; then
+  run a model canary. The old job `1098682` completion remains rejected by the
+  new closed source schema, and no smoke or canary is launched in this task.
+- Exhaustive type-drift regressions cover every frozen group, including all
+  trace record/envelope variants and nested norm probes. Focused finalizer,
+  all-six bootstrap, producer, and trace suite: `114 passed`. Broad pinned-
+  OpenPI pi0.5/native host suite: `223 passed`, with only three external
+  dependency deprecation warnings. A targeted AST audit found no remaining
+  direct Python equality on the frozen fixed-metadata fields. Ruff lint/format,
+  Python byte compilation, and `git diff --check` pass. Exact-implementation
+  read-only replay of preserved job `1098704` remains the final freeze gate.

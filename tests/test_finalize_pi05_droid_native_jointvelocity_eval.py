@@ -1,3 +1,4 @@
+import argparse
 import copy
 import hashlib
 from pathlib import Path
@@ -17,6 +18,7 @@ from polaris.pi05_droid_jointvelocity_contract import (
 from polaris.pi05_droid_native_eval_contract import (
     PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS,
     PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID,
+    PI05_DROID_ALL_SIX_REVIEWED_MODEL_VALIDATION_PATHS,
     PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS,
     PI05_DROID_CONTROLLER_CRITICAL_PATHS,
     PI05_DROID_NATIVE_CANARY_PROFILE,
@@ -157,6 +159,30 @@ def test_all_six_gate_revalidates_coupling_lifecycle_runtime_and_source(
             "sha256": file_sha256(path),
         }
 
+    reviewed_validation = {}
+    for relative_path in PI05_DROID_ALL_SIX_REVIEWED_MODEL_VALIDATION_PATHS:
+        path = repository / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"reviewed-model-validation:{relative_path}\n", encoding="utf-8"
+        )
+        digest = file_sha256(path)
+        monkeypatch.setattr(
+            finalizer,
+            "PI05_DROID_ALL_SIX_MODEL_VALIDATION_SOURCE_SHA256",
+            digest,
+        )
+        reviewed_validation[relative_path] = {
+            "base_commit": finalizer.PI05_DROID_ALL_SIX_MODEL_VALIDATION_BASE_COMMIT,
+            "base_sha256": finalizer.PI05_DROID_ALL_SIX_MODEL_VALIDATION_BASE_SHA256,
+            "size": path.stat().st_size,
+            "sha256": digest,
+            "validation_profile": finalizer.PI05_DROID_ALL_SIX_MODEL_VALIDATION_PROFILE,
+            "ast_sha256": "e" * 64,
+            "model_semantics_sha256": "f" * 64,
+            "base_model_semantics_sha256": "f" * 64,
+        }
+
     runtime_sha256 = "9" * 64
     smoke = {
         "path": str(
@@ -239,6 +265,7 @@ def test_all_six_gate_revalidates_coupling_lifecycle_runtime_and_source(
                 "openpi_commit": PI05_DROID_OPENPI_INFERENCE_COMPATIBILITY_COMMIT,
                 "files": source_files,
                 "official_model_io_unchanged_from_base": model_io,
+                "official_model_validation_additions": reviewed_validation,
             },
             "smoke": smoke,
             "saved_wrapper": {
@@ -307,6 +334,9 @@ def test_all_six_gate_revalidates_coupling_lifecycle_runtime_and_source(
     assert set(result["unchanged_policy_io_files"]) == set(
         PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS
     )
+    assert set(result["reviewed_model_validation_files"]) == set(
+        PI05_DROID_ALL_SIX_REVIEWED_MODEL_VALIDATION_PATHS
+    )
 
     stale_path = tmp_path / "stale-job1098349.completion.json"
     stale_value = copy.deepcopy(completion["value"])
@@ -327,6 +357,51 @@ def test_all_six_gate_revalidates_coupling_lifecycle_runtime_and_source(
         finalizer.validate_all_six_controller_completion(
             stale_path,
             stale["sha256"],
+            finalizer.PI05_DROID_ALL_SIX_CONTROLLER_PROFILE,
+            repository,
+        )
+
+    monkeypatch.setattr(
+        finalizer, "PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_PATH", str(completion_path)
+    )
+    monkeypatch.setattr(
+        finalizer,
+        "PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SHA256",
+        completion["sha256"],
+    )
+    monkeypatch.setattr(
+        finalizer,
+        "PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SIZE",
+        completion["size"],
+    )
+    drifted_attestation_path = tmp_path / "drifted-model-validation.completion.json"
+    drifted_attestation_value = copy.deepcopy(completion["value"])
+    reviewed_path = PI05_DROID_ALL_SIX_REVIEWED_MODEL_VALIDATION_PATHS[0]
+    drifted_attestation_value["source"]["official_model_validation_additions"][
+        reviewed_path
+    ]["base_model_semantics_sha256"] = "0" * 64
+    drifted_attestation = publish_immutable_json(
+        drifted_attestation_path, drifted_attestation_value
+    )
+    monkeypatch.setattr(
+        finalizer,
+        "PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_PATH",
+        str(drifted_attestation_path),
+    )
+    monkeypatch.setattr(
+        finalizer,
+        "PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SHA256",
+        drifted_attestation["sha256"],
+    )
+    monkeypatch.setattr(
+        finalizer,
+        "PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SIZE",
+        drifted_attestation["size"],
+    )
+    with pytest.raises(ValueError, match="model-validation record mismatch"):
+        finalizer.validate_all_six_controller_completion(
+            drifted_attestation_path,
+            drifted_attestation["sha256"],
             finalizer.PI05_DROID_ALL_SIX_CONTROLLER_PROFILE,
             repository,
         )
@@ -426,7 +501,68 @@ def test_inference_environment_recomputes_lock_and_installed_inventory(
         environment.validate_environment(wrong_jax, openpi_dir, python)
 
 
-def test_model_runtime_artifact_binds_official_config_transforms_and_rng(tmp_path):
+def _checkpoint_verification_value(tmp_path):
+    return {
+        "schema_version": 1,
+        "status": "pass",
+        "checkpoint_uri": finalizer.PI05_DROID_CHECKPOINT_URI,
+        "manifest_path": str(tmp_path / "manifest.tsv"),
+        "sha256": finalizer.PI05_DROID_CHECKPOINT_MANIFEST_SHA256,
+        "object_count": finalizer.PI05_DROID_CHECKPOINT_OBJECT_COUNT,
+        "total_bytes": finalizer.PI05_DROID_CHECKPOINT_BYTES,
+        "checkpoint_dir": str(tmp_path / "pi05_droid"),
+        "norm_stats_sha256": finalizer.PI05_DROID_NORM_STATS_SHA256,
+        "full_md5": True,
+        "norm_reference": {
+            "sha256": finalizer.PI05_DROID_NORM_STATS_SHA256,
+            "path_within_checkpoint": "assets/droid/norm_stats.json",
+            "scope": "checkpoint_global_droid",
+            "asset_id": "droid",
+            "category_override": "forbidden",
+            "probes": copy.deepcopy(finalizer.PI05_DROID_NATIVE_NORM_REFERENCE_PROBES),
+            "action_semantics": "joint_velocity_no_delta_or_absolute_transform",
+            "state_semantics": "panda_joint_position_plus_closed_positive_gripper",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "drifted_value"),
+    [
+        ("schema_version", 1.0),
+        ("object_count", float(finalizer.PI05_DROID_CHECKPOINT_OBJECT_COUNT)),
+        ("total_bytes", float(finalizer.PI05_DROID_CHECKPOINT_BYTES)),
+    ],
+)
+def test_checkpoint_artifact_fixed_scalars_are_type_exact(
+    tmp_path, field, drifted_value
+):
+    value = _checkpoint_verification_value(tmp_path)
+    valid_path = tmp_path / "valid-checkpoint.json"
+    publish_immutable_json(valid_path, value)
+    assert finalizer._validate_checkpoint_artifact(valid_path)["checkpoint"] == value
+
+    value[field] = drifted_value
+    drifted_path = tmp_path / f"drifted-{field}.json"
+    publish_immutable_json(drifted_path, value)
+    with pytest.raises(ValueError, match="Checkpoint-verification identity mismatch"):
+        finalizer._validate_checkpoint_artifact(drifted_path)
+
+
+def test_checkpoint_artifact_norm_reference_probes_are_canonical_type_exact(tmp_path):
+    value = _checkpoint_verification_value(tmp_path)
+    probe = value["norm_reference"]["probes"]["actions_q01_first8"]
+    assert probe[-1] == 0.0
+    probe[-1] = 0
+    path = tmp_path / "drifted-norm-probe.json"
+    publish_immutable_json(path, value)
+    with pytest.raises(ValueError, match="Checkpoint-verification identity mismatch"):
+        finalizer._validate_checkpoint_artifact(path)
+
+
+def test_model_runtime_artifact_binds_official_config_transforms_and_rng(
+    tmp_path, monkeypatch
+):
     checkpoint_value = {
         "sha256": "6f9ccfa5695c669962ad10dbe0dcb7d44bf903918e5fffe33e5d1ff531287922",
         "object_count": 20,
@@ -458,9 +594,25 @@ def test_model_runtime_artifact_binds_official_config_transforms_and_rng(tmp_pat
     }
     path = tmp_path / "model-runtime.json"
     publish_immutable_json(path, value)
+    model_contract_calls = []
+    validate_model_contract = finalizer.validate_native_model_eval_contract
+    monkeypatch.setattr(
+        finalizer,
+        "validate_native_model_eval_contract",
+        lambda contract: (
+            model_contract_calls.append(copy.deepcopy(contract))
+            or validate_model_contract(contract)
+        ),
+    )
     result = finalizer._validate_model_runtime_artifact(path, checkpoint)
     assert result["transform_runtime"]["asset_id"] == "droid"
     assert result["policy"]["rng_key_data"] == [0, 0]
+    assert result["checkpoint"] == checkpoint_value
+    assert result["train_config"] == value["train_config"]
+    assert (
+        result["official_model_eval_contract"] == PI05_DROID_NATIVE_MODEL_EVAL_CONTRACT
+    )
+    assert model_contract_calls == [PI05_DROID_NATIVE_MODEL_EVAL_CONTRACT]
 
     tampered = copy.deepcopy(value)
     tampered["transform_runtime"]["asset_id"] = "single_arm"
@@ -468,6 +620,184 @@ def test_model_runtime_artifact_binds_official_config_transforms_and_rng(tmp_pat
     publish_immutable_json(tampered_path, tampered)
     with pytest.raises(ValueError, match="model-runtime artifact mismatch"):
         finalizer._validate_model_runtime_artifact(tampered_path, checkpoint)
+
+    type_drifts = {
+        "schema_version": lambda payload: payload.update({"schema_version": 1.0}),
+        "checkpoint": lambda payload: payload["checkpoint"].update(
+            {"object_count": 20.0}
+        ),
+        "train_config": lambda payload: payload["train_config"].update(
+            {"action_horizon": 15.0}
+        ),
+        "transform_runtime": lambda payload: payload["transform_runtime"][
+            "resize"
+        ].__setitem__(0, 224.0),
+        "policy": lambda payload: payload["policy"]["rng_key_data"].__setitem__(0, 0.0),
+        "official_model_eval_contract": lambda payload: payload[
+            "official_model_eval_contract"
+        ].update({"schema_version": 1.0}),
+    }
+    for label, mutate in type_drifts.items():
+        drifted = copy.deepcopy(value)
+        mutate(drifted)
+        drifted_path = tmp_path / f"type-drifted-{label}.json"
+        publish_immutable_json(drifted_path, drifted)
+        with pytest.raises(ValueError):
+            finalizer._validate_model_runtime_artifact(drifted_path, checkpoint)
+
+
+def _record_validation_inputs(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    args = argparse.Namespace(
+        job_id=1098704,
+        polaris_repo=tmp_path / "polaris",
+        openpi_dir=tmp_path / "openpi",
+        container_image=tmp_path / "polaris.sqsh",
+        data_dir=tmp_path / "PolaRiS-Hub",
+        controller_completion=tmp_path / "controller.json",
+        expected_controller_completion_sha256="a" * 64,
+        all_six_controller_completion=tmp_path / "all-six.json",
+        expected_all_six_completion_sha256="b" * 64,
+        expected_all_six_profile="all-six-profile",
+        expected_polaris_commit="c" * 40,
+    )
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint = {"checkpoint": {"checkpoint_dir": str(checkpoint_dir)}}
+    sbatch_relative = (
+        "scripts/polaris/l40s_pi05_droid_native_jointvelocity_canary.sbatch"
+    )
+    source = {"files": {sbatch_relative: {"sha256": "d" * 64}}}
+    return args, run_dir, checkpoint, source, sbatch_relative
+
+
+@pytest.mark.parametrize(
+    ("field", "drifted_value"),
+    [("schema_version", 1.0), ("job_id", 1098704.0), ("rollouts", 1.0)],
+)
+def test_run_record_envelope_integer_fields_are_type_exact(
+    tmp_path, field, drifted_value
+):
+    args, run_dir, checkpoint, _, _ = _record_validation_inputs(tmp_path)
+    values = {
+        "RUN_DIR": str(run_dir),
+        "CHECKPOINT_PATH": checkpoint["checkpoint"]["checkpoint_dir"],
+        "POLARIS_DIR": str(args.polaris_repo),
+        "OPENPI_DIR": str(args.openpi_dir),
+        "EXPECTED_POLARIS_COMMIT": args.expected_polaris_commit,
+        "CHECKPOINT_URI": finalizer.PI05_DROID_CHECKPOINT_URI,
+        "CHECKPOINT_MANIFEST": str(
+            args.polaris_repo / "scripts/polaris/pi05_droid_native_gcs_manifest.tsv"
+        ),
+        "POLARIS_PYXIS_IMAGE": str(args.container_image),
+        "POLARIS_DATA_DIR": str(args.data_dir),
+        "CONTROLLER_COMPLETION": str(args.controller_completion),
+        "EXPECTED_CONTROLLER_COMPLETION_SHA256": (
+            args.expected_controller_completion_sha256
+        ),
+        "ALL_SIX_CONTROLLER_COMPLETION": str(args.all_six_controller_completion),
+        "EXPECTED_ALL_SIX_COMPLETION_SHA256": (args.expected_all_six_completion_sha256),
+        "EXPECTED_ALL_SIX_PROFILE": args.expected_all_six_profile,
+        "PORT": "8000",
+        "MODEL_RUNTIME_CONTRACT": str(run_dir / "pi05_droid_native_model_runtime.json"),
+    }
+    value = {
+        "schema_version": 1,
+        "profile": PI05_DROID_NATIVE_CANARY_PROFILE,
+        "job_id": args.job_id,
+        "fresh_attempt_no_resume": True,
+        "task": finalizer.PI05_DROID_NATIVE_TASK,
+        "rollouts": 1,
+        "values": values,
+    }
+    valid_path = run_dir / "valid-run-record.json"
+    publish_immutable_json(valid_path, value)
+    assert (
+        finalizer._validate_run_record(
+            valid_path, args=args, run_dir=run_dir, checkpoint=checkpoint
+        )["port"]
+        == 8000
+    )
+
+    value[field] = drifted_value
+    path = run_dir / f"drifted-run-record-{field}.json"
+    publish_immutable_json(path, value)
+    with pytest.raises(ValueError, match="Run-record schema or identity mismatch"):
+        finalizer._validate_run_record(
+            path, args=args, run_dir=run_dir, checkpoint=checkpoint
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "drifted_value"),
+    [("schema_version", 1.0), ("job_id", 1098704.0), ("rollouts", 1.0)],
+)
+def test_submission_record_envelope_integer_fields_are_type_exact(
+    tmp_path, field, drifted_value
+):
+    args, run_dir, _, source, sbatch_relative = _record_validation_inputs(tmp_path)
+    value = {
+        "schema_version": 1,
+        "profile": PI05_DROID_NATIVE_CANARY_PROFILE,
+        "job_id": args.job_id,
+        "run_dir": str(run_dir),
+        "polaris_dir": str(args.polaris_repo),
+        "polaris_commit": args.expected_polaris_commit,
+        "sbatch_script": str(args.polaris_repo / sbatch_relative),
+        "sbatch_script_sha256": source["files"][sbatch_relative]["sha256"],
+        "container_image": str(args.container_image),
+        "polaris_data_dir": str(args.data_dir),
+        "fresh_attempt_no_resume": True,
+        "task": finalizer.PI05_DROID_NATIVE_TASK,
+        "rollouts": 1,
+    }
+    valid_path = run_dir / "valid-submission-record.json"
+    publish_immutable_json(valid_path, value)
+    finalizer._validate_submission_record(
+        valid_path, args=args, run_dir=run_dir, source=source
+    )
+
+    value[field] = drifted_value
+    path = run_dir / f"drifted-submission-record-{field}.json"
+    publish_immutable_json(path, value)
+    with pytest.raises(
+        ValueError, match="Submission-record schema or identity mismatch"
+    ):
+        finalizer._validate_submission_record(
+            path, args=args, run_dir=run_dir, source=source
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "drifted_value"),
+    [("schema_version", 1.0), ("job_id", 1098704.0)],
+)
+def test_gpu_inventory_envelope_integer_fields_are_type_exact(
+    tmp_path, field, drifted_value
+):
+    value = {
+        "schema_version": 1,
+        "job_id": 1098704,
+        "gpus": [
+            {
+                "uuid": "GPU-8688921b-a641-2ae1-1dc9-494501f1f422",
+                "name": "NVIDIA L40S",
+                "driver_version": "580.95.05",
+            }
+        ],
+    }
+    valid_path = tmp_path / "valid-gpu.json"
+    publish_immutable_json(valid_path, value)
+    assert (
+        finalizer._gpu_inventory(valid_path, expected_job_id=1098704)["job_id"]
+        == 1098704
+    )
+
+    value[field] = drifted_value
+    path = tmp_path / f"drifted-gpu-{field}.json"
+    publish_immutable_json(path, value)
+    with pytest.raises(ValueError, match="GPU inventory mismatch"):
+        finalizer._gpu_inventory(path, expected_job_id=1098704)
 
 
 def test_finalizer_binds_internal_timeout_terminal_state_and_close_artifact(
@@ -597,6 +927,33 @@ def test_finalizer_binds_internal_timeout_terminal_state_and_close_artifact(
     assert close["terminal_outcome"] == terminal
     assert close["episode_sidecar"]["value"]["episode_result"] == result
 
+    for field, drifted_value in (
+        ("schema_version", 1.0),
+        ("rollouts", 1.0),
+        ("episode_steps", 450.0),
+    ):
+        drifted_runtime = make_runtime_artifact(
+            valid_joint_velocity_smoke_payload["runtime_contract"],
+            environment_runtime,
+        )
+        drifted_runtime[field] = drifted_value
+        drifted_runtime_path = task_dir / f"type-drifted-runtime-{field}.json"
+        publish_immutable_json(drifted_runtime_path, drifted_runtime)
+        with pytest.raises(ValueError, match="Runtime-artifact identity mismatch"):
+            finalizer._validate_runtime_artifact(drifted_runtime_path)
+
+    for field, drifted_value in (
+        ("schema_version", 2.0),
+        ("rollouts", 1.0),
+        ("episode_steps", 450.0),
+    ):
+        drifted_close = copy.deepcopy(close_payload)
+        drifted_close[field] = drifted_value
+        drifted_close_path = task_dir / f"type-drifted-close-{field}.json"
+        publish_immutable_json(drifted_close_path, drifted_close)
+        with pytest.raises(ValueError, match="Evaluator close-ready identity mismatch"):
+            finalizer._validate_close_ready(drifted_close_path, runtime, run_dir)
+
     type_drifted_close = copy.deepcopy(close_payload)
     type_drifted_close["terminal_outcome"]["rubric"]["progress"] = 0
     assert type_drifted_close["terminal_outcome"] == terminal
@@ -623,6 +980,19 @@ def test_finalizer_binds_internal_timeout_terminal_state_and_close_artifact(
     publish_immutable_json(bad_path, bad_runtime)
     with pytest.raises(ValueError, match="environment runtime contract mismatch"):
         finalizer._validate_runtime_artifact(bad_path)
+
+    type_drifted_environment_runtime = make_runtime_artifact(
+        valid_joint_velocity_smoke_payload["runtime_contract"], environment_runtime
+    )
+    type_drifted_environment_runtime["environment_runtime_contract"][
+        "outer_episode_steps"
+    ] = 450.0
+    type_drifted_environment_path = task_dir / "type-drifted-environment-runtime.json"
+    publish_immutable_json(
+        type_drifted_environment_path, type_drifted_environment_runtime
+    )
+    with pytest.raises(ValueError, match="environment runtime contract mismatch"):
+        finalizer._validate_runtime_artifact(type_drifted_environment_path)
 
 
 @pytest.mark.parametrize(

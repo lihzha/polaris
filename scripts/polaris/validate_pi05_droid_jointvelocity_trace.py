@@ -152,6 +152,19 @@ def _require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
+def _require_exact_json(value: Any, expected: Any, message: str) -> None:
+    """Require canonical JSON identity so numeric type drift cannot compare equal."""
+
+    _require(
+        canonical_json_bytes(value) == canonical_json_bytes(expected),
+        message,
+    )
+
+
+def _require_exact_int(value: Any, expected: int, message: str) -> None:
+    _require_exact_json(value, expected, message)
+
+
 def _sha256_string(value: Any, field: str) -> str:
     _require(
         isinstance(value, str)
@@ -280,16 +293,21 @@ def _validate_contract_identity(
         identity["environment_runtime_sha256"],
         f"{field} environment runtime digest",
     )
-    _require(
-        identity["outer_episode_steps"] == PI05_DROID_NATIVE_EPISODE_STEPS
-        and identity["internal_max_episode_length"]
-        == PI05_DROID_NATIVE_INTERNAL_MAX_EPISODE_STEPS
-        and identity["sensor_liveness_profile"]
-        == PI05_DROID_NATIVE_SENSOR_LIVENESS_PROFILE,
+    _require_exact_json(
+        {
+            "outer_episode_steps": identity["outer_episode_steps"],
+            "internal_max_episode_length": identity["internal_max_episode_length"],
+            "sensor_liveness_profile": identity["sensor_liveness_profile"],
+        },
+        {
+            "outer_episode_steps": PI05_DROID_NATIVE_EPISODE_STEPS,
+            "internal_max_episode_length": PI05_DROID_NATIVE_INTERNAL_MAX_EPISODE_STEPS,
+            "sensor_liveness_profile": PI05_DROID_NATIVE_SENSOR_LIVENESS_PROFILE,
+        },
         f"{field} environment runtime identity drift",
     )
     if expected is not None:
-        _require(identity == expected, f"{field} contract identity drift")
+        _require_exact_json(identity, expected, f"{field} contract identity drift")
     return identity
 
 
@@ -308,9 +326,9 @@ def _validate_environment_state(value: Any, field: str) -> dict[str, Any]:
             type(value[counter_field]) is int and value[counter_field] >= 0,
             f"{field} {counter_field} is invalid",
         )
-    _require(
-        value["live_max_episode_length"]
-        == PI05_DROID_NATIVE_INTERNAL_MAX_EPISODE_STEPS,
+    _require_exact_int(
+        value["live_max_episode_length"],
+        PI05_DROID_NATIVE_INTERNAL_MAX_EPISODE_STEPS,
         f"{field} live max_episode_length mismatch",
     )
     sensor_frames = value["sensor_frame_counters"]
@@ -328,7 +346,7 @@ def _validate_image(value: Any, field: str, *, blank: bool = False) -> str:
         isinstance(value, dict) and set(value) == {"shape", "dtype", "sha256"},
         f"{field} schema mismatch",
     )
-    _require(value["shape"] == [224, 224, 3], f"{field} shape mismatch")
+    _require_exact_json(value["shape"], [224, 224, 3], f"{field} shape mismatch")
     _require(value["dtype"] == "uint8", f"{field} dtype mismatch")
     digest = _sha256_string(value["sha256"], f"{field} digest")
     if blank:
@@ -383,8 +401,9 @@ def _validate_incident_bound_arm_state(
         incident["sample_kind"] == expected_sample_kind,
         f"{field} incident sample kind mismatch",
     )
-    _require(
-        incident["physics_substep_index"] == expected_physics_substep,
+    _require_exact_int(
+        incident["physics_substep_index"],
+        expected_physics_substep,
         f"{field} incident physics substep mismatch",
     )
     incident_q = _finite_vector(
@@ -447,15 +466,18 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
     rollout_start = records[cursor]
     cursor += 1
     _require(set(rollout_start) == ROLLOUT_START_KEYS, "Rollout start schema mismatch")
-    _require(
-        rollout_start["schema_version"] == PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
+    _require_exact_int(
+        rollout_start["schema_version"],
+        PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
         "Rollout start schema version mismatch",
     )
     _require(
         rollout_start["record_type"] == "openpi_joint_velocity_rollout_start"
-        and rollout_start["profile"] == PI05_DROID_JOINTVELOCITY_PROFILE
-        and rollout_start["reset_index"] == 0,
+        and rollout_start["profile"] == PI05_DROID_JOINTVELOCITY_PROFILE,
         "Rollout start identity mismatch",
+    )
+    _require_exact_int(
+        rollout_start["reset_index"], 0, "Rollout start identity mismatch"
     )
     contract_identity = _validate_contract_identity(
         rollout_start, None, "rollout start"
@@ -503,22 +525,32 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
             set(failure_record) == ROLLOUT_FAILURE_KEYS,
             "Rollout failure schema mismatch",
         )
-        _require(
-            failure_record["schema_version"] == PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION
-            and failure_record["record_type"] == "openpi_joint_velocity_rollout_failure"
-            and failure_record["profile"] == PI05_DROID_JOINTVELOCITY_PROFILE
-            and failure_record["reset_index"] == 0,
+        _require_exact_int(
+            failure_record["schema_version"],
+            PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
             "Rollout failure identity mismatch",
+        )
+        _require(
+            failure_record["record_type"] == "openpi_joint_velocity_rollout_failure"
+            and failure_record["profile"] == PI05_DROID_JOINTVELOCITY_PROFILE,
+            "Rollout failure identity mismatch",
+        )
+        _require_exact_int(
+            failure_record["reset_index"], 0, "Rollout failure identity mismatch"
         )
         _validate_contract_identity(
             failure_record, contract_identity, "rollout failure"
         )
-        _require(
-            failure_record["query_index"] == query_index
-            and failure_record["chunk_action_index"] == action_index
-            and failure_record["outer_step_index"] == step,
-            "Rollout failure action identity mismatch",
-        )
+        for key, expected_index in (
+            ("query_index", query_index),
+            ("chunk_action_index", action_index),
+            ("outer_step_index", step),
+        ):
+            _require_exact_int(
+                failure_record[key],
+                expected_index,
+                "Rollout failure action identity mismatch",
+            )
         terminal = validate_terminal_numerical_failure_evidence(
             failure_record["terminal_failure"], environment_runtime_contract
         )
@@ -544,8 +576,9 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
             query = records[cursor]
             cursor += 1
             _require(set(query) == QUERY_KEYS, f"Query {query_index} schema mismatch")
-            _require(
-                query["schema_version"] == PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
+            _require_exact_int(
+                query["schema_version"],
+                PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
                 "Query schema version mismatch",
             )
             _require(
@@ -559,16 +592,19 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
             contract_identity = _validate_contract_identity(
                 query, contract_identity, f"query {query_index}"
             )
-            _require(query["reset_index"] == 0, "Canary reset index mismatch")
-            _require(query["query_index"] == query_index, "Query index mismatch")
+            _require_exact_int(query["reset_index"], 0, "Canary reset index mismatch")
+            _require_exact_int(
+                query["query_index"], query_index, "Query index mismatch"
+            )
             _require(query["prompt"] == EXPECTED_PROMPT, "Canary prompt mismatch")
-            _require(
-                query["response_action_shape"]
-                == [PI05_DROID_NATIVE_RESPONSE_HORIZON, PI05_DROID_NATIVE_ACTION_WIDTH],
+            _require_exact_json(
+                query["response_action_shape"],
+                [PI05_DROID_NATIVE_RESPONSE_HORIZON, PI05_DROID_NATIVE_ACTION_WIDTH],
                 "Response shape mismatch",
             )
-            _require(
-                query["execution_horizon"] == PI05_DROID_NATIVE_EXECUTION_HORIZON,
+            _require_exact_int(
+                query["execution_horizon"],
+                PI05_DROID_NATIVE_EXECUTION_HORIZON,
                 "Execution horizon mismatch",
             )
             state = query["state"]
@@ -612,7 +648,9 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
                 == ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb_masked"],
                 "Model image order mismatch",
             )
-            _require(images["wrist_rotation_degrees"] == 0, "Wrist image was rotated")
+            _require_exact_int(
+                images["wrist_rotation_degrees"], 0, "Wrist image was rotated"
+            )
             external_hashes.add(_validate_image(images["external"], "external image"))
             wrist_hashes.add(_validate_image(images["wrist"], "wrist image"))
             _validate_image(
@@ -660,8 +698,9 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
         action = records[cursor]
         cursor += 1
         _require(set(action) == ACTION_KEYS, f"Action {step} schema mismatch")
-        _require(
-            action["schema_version"] == PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
+        _require_exact_int(
+            action["schema_version"],
+            PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
             "Action schema version mismatch",
         )
         _require(
@@ -673,10 +712,12 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
             "Action profile mismatch",
         )
         _validate_contract_identity(action, contract_identity, f"action {step}")
-        _require(action["reset_index"] == 0, "Action reset index mismatch")
-        _require(action["query_index"] == query_index, "Action query index mismatch")
-        _require(
-            action["chunk_action_index"] == action_index, "Chunk action index mismatch"
+        _require_exact_int(action["reset_index"], 0, "Action reset index mismatch")
+        _require_exact_int(
+            action["query_index"], query_index, "Action query index mismatch"
+        )
+        _require_exact_int(
+            action["chunk_action_index"], action_index, "Chunk action index mismatch"
         )
         _require(
             _finite_vector(action["raw_action"], 8, "raw action") == raw,
@@ -763,8 +804,9 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
         execution = records[cursor]
         cursor += 1
         _require(set(execution) == EXECUTION_KEYS, f"Execution {step} schema mismatch")
-        _require(
-            execution["schema_version"] == PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
+        _require_exact_int(
+            execution["schema_version"],
+            PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
             "Execution schema version mismatch",
         )
         _require(
@@ -776,16 +818,20 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
             "Execution profile mismatch",
         )
         _validate_contract_identity(execution, contract_identity, f"execution {step}")
-        _require(execution["reset_index"] == 0, "Execution reset index mismatch")
-        _require(
-            execution["query_index"] == query_index, "Execution query index mismatch"
+        _require_exact_int(
+            execution["reset_index"], 0, "Execution reset index mismatch"
         )
-        _require(
-            execution["chunk_action_index"] == action_index,
+        _require_exact_int(
+            execution["query_index"], query_index, "Execution query index mismatch"
+        )
+        _require_exact_int(
+            execution["chunk_action_index"],
+            action_index,
             "Execution action index mismatch",
         )
-        _require(
-            execution["outer_step_index"] == step,
+        _require_exact_int(
+            execution["outer_step_index"],
+            step,
             "Execution outer step index mismatch",
         )
         _require(
@@ -875,15 +921,18 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
         rollout_end = records[cursor]
         cursor += 1
         _require(set(rollout_end) == ROLLOUT_END_KEYS, "Rollout end schema mismatch")
-        _require(
-            rollout_end["schema_version"] == PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
+        _require_exact_int(
+            rollout_end["schema_version"],
+            PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
             "Rollout end schema version mismatch",
         )
         _require(
             rollout_end["record_type"] == "openpi_joint_velocity_rollout_end"
-            and rollout_end["profile"] == PI05_DROID_JOINTVELOCITY_PROFILE
-            and rollout_end["reset_index"] == 0,
+            and rollout_end["profile"] == PI05_DROID_JOINTVELOCITY_PROFILE,
             "Rollout end identity mismatch",
+        )
+        _require_exact_int(
+            rollout_end["reset_index"], 0, "Rollout end identity mismatch"
         )
         _validate_contract_identity(rollout_end, contract_identity, "rollout end")
         terminal_outcome = validate_terminal_rollout_evidence(

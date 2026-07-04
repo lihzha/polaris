@@ -4,6 +4,8 @@ import pytest
 
 from scripts.polaris.serve_pi05_droid_native_jointvelocity import (
     validate_official_pi05_data_config,
+    validate_official_pi05_policy_runtime,
+    validate_official_pi05_train_config,
 )
 
 from openpi import transforms
@@ -30,6 +32,27 @@ def test_official_runtime_transform_pipeline_has_no_action_conversion():
     assert report["output_projection"] == "DroidOutputs_leading8"
 
 
+def test_official_train_config_and_policy_runtime_are_type_exact():
+    train_config = config.get_config("pi05_droid")
+    assert validate_official_pi05_train_config(train_config)["action_horizon"] == 15
+    assert validate_official_pi05_policy_runtime(
+        metadata={}, sample_kwargs={}, rng_key_data=[0, 0]
+    )["rng_key_data"] == [0, 0]
+
+    for field, drifted in (("action_horizon", 15.0), ("action_dim", 32.0)):
+        model = dataclasses.replace(train_config.model, **{field: drifted})
+        with pytest.raises(ValueError, match="config mismatch"):
+            validate_official_pi05_train_config(
+                dataclasses.replace(train_config, model=model)
+            )
+
+    for rng_key_data in ([0.0, 0], [False, 0]):
+        with pytest.raises(ValueError, match="policy runtime mismatch"):
+            validate_official_pi05_policy_runtime(
+                metadata={}, sample_kwargs={}, rng_key_data=rng_key_data
+            )
+
+
 def test_runtime_transform_pipeline_rejects_category_delta_absolute_and_resize():
     data_config = _official_data_config()
     with pytest.raises(ValueError, match="transform pipeline mismatch"):
@@ -52,4 +75,32 @@ def test_runtime_transform_pipeline_rejects_category_delta_absolute_and_resize()
         original_resize, height=256
     )
     with pytest.raises(ValueError, match="transform parameters mismatch"):
+        validate_official_pi05_data_config(data_config)
+
+
+@pytest.mark.parametrize(
+    ("transform_index", "field", "drifted_value"),
+    [
+        (1, "height", 224.0),
+        (1, "width", 224.0),
+        (3, "model_action_dim", 32.0),
+    ],
+)
+def test_runtime_transform_dimensions_are_type_exact(
+    transform_index, field, drifted_value
+):
+    data_config = _official_data_config()
+    transform = data_config.model_transforms.inputs[transform_index]
+    data_config.model_transforms.inputs[transform_index] = dataclasses.replace(
+        transform, **{field: drifted_value}
+    )
+    with pytest.raises(ValueError, match="transform parameters mismatch"):
+        validate_official_pi05_data_config(data_config)
+
+
+def test_runtime_transform_observed_subset_is_canonical_type_exact():
+    data_config = dataclasses.replace(_official_data_config(), use_quantile_norm=1)
+    assert type(data_config.use_quantile_norm) is int
+    assert data_config.use_quantile_norm == 1
+    with pytest.raises(ValueError, match="transform pipeline mismatch"):
         validate_official_pi05_data_config(data_config)

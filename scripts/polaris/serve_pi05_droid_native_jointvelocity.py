@@ -13,6 +13,7 @@ from polaris.pi05_droid_native_eval_contract import (
     PI05_DROID_NATIVE_CANARY_PROFILE,
     PI05_DROID_NATIVE_MODEL_EVAL_CONTRACT,
     PI05_DROID_NATIVE_TRANSFORM_RUNTIME_CONTRACT,
+    canonical_json_bytes,
     publish_immutable_json,
 )
 
@@ -20,6 +21,64 @@ from polaris.pi05_droid_native_eval_contract import (
 def _class_path(value: object) -> str:
     cls = type(value)
     return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def _require_exact_json(value: object, expected: object, message: str) -> None:
+    if canonical_json_bytes(value) != canonical_json_bytes(expected):
+        raise ValueError(message)
+
+
+def validate_official_pi05_train_config(train_config: object) -> dict[str, object]:
+    """Bind the static checkpoint architecture with JSON type identity."""
+
+    try:
+        static_contract = {
+            "name": train_config.name,
+            "model_type": train_config.model.model_type.value,
+            "pi05": train_config.model.pi05,
+            "dtype": train_config.model.dtype,
+            "action_horizon": train_config.model.action_horizon,
+            "action_dim": train_config.model.action_dim,
+            "asset_id": train_config.data.assets.asset_id,
+            "policy_metadata": train_config.policy_metadata,
+        }
+    except AttributeError as error:
+        raise ValueError("Resolved OpenPI pi05_droid config is incomplete") from error
+    expected = {
+        "name": "pi05_droid",
+        "model_type": "pi05",
+        "pi05": True,
+        "dtype": "bfloat16",
+        "action_horizon": 15,
+        "action_dim": 32,
+        "asset_id": "droid",
+        "policy_metadata": None,
+    }
+    _require_exact_json(
+        static_contract,
+        expected,
+        f"Resolved OpenPI pi05_droid config mismatch: expected {expected}, got {static_contract}",
+    )
+    return static_contract
+
+
+def validate_official_pi05_policy_runtime(
+    *, metadata: object, sample_kwargs: object, rng_key_data: object
+) -> dict[str, object]:
+    """Bind empty metadata/default sampler and the exact integer JAX key 0."""
+
+    observed = {
+        "metadata": metadata,
+        "sample_kwargs": sample_kwargs,
+        "rng_key_data": rng_key_data,
+    }
+    expected = {"metadata": {}, "sample_kwargs": {}, "rng_key_data": [0, 0]}
+    _require_exact_json(
+        observed,
+        expected,
+        f"Official pi05_droid policy runtime mismatch: {observed}",
+    )
+    return observed
 
 
 def validate_official_pi05_data_config(data_config: object) -> dict[str, object]:
@@ -58,8 +117,11 @@ def validate_official_pi05_data_config(data_config: object) -> dict[str, object]
     expected = {
         key: PI05_DROID_NATIVE_TRANSFORM_RUNTIME_CONTRACT[key] for key in observed
     }
-    if observed != expected:
-        raise ValueError(f"Official pi05_droid transform pipeline mismatch: {observed}")
+    _require_exact_json(
+        observed,
+        expected,
+        f"Official pi05_droid transform pipeline mismatch: {observed}",
+    )
     data_input = data.inputs[0]
     resize = model.inputs[1]
     tokenizer = model.inputs[2]
@@ -67,14 +129,21 @@ def validate_official_pi05_data_config(data_config: object) -> dict[str, object]
     if (
         getattr(getattr(data_input, "model_type", None), "value", None) != "pi05"
         or getattr(model.inputs[0], "prompt", "missing") is not None
-        or getattr(resize, "height", None) != 224
-        or getattr(resize, "width", None) != 224
         or _class_path(getattr(tokenizer, "tokenizer", None))
         != "openpi.models.tokenizer.PaligemmaTokenizer"
         or getattr(tokenizer, "discrete_state_input", None) is not True
-        or getattr(padding, "model_action_dim", None) != 32
     ):
         raise ValueError("Official pi05_droid transform parameters mismatch")
+    _require_exact_json(
+        [getattr(resize, "height", None), getattr(resize, "width", None)],
+        [224, 224],
+        "Official pi05_droid transform parameters mismatch",
+    )
+    _require_exact_json(
+        getattr(padding, "model_action_dim", None),
+        32,
+        "Official pi05_droid transform parameters mismatch",
+    )
     report = {
         **observed,
         "droid_input_model_type": "pi05",
@@ -88,8 +157,11 @@ def validate_official_pi05_data_config(data_config: object) -> dict[str, object]
         ],
         "output_projection": "DroidOutputs_leading8",
     }
-    if report != PI05_DROID_NATIVE_TRANSFORM_RUNTIME_CONTRACT:
-        raise ValueError("Official pi05_droid full transform contract mismatch")
+    _require_exact_json(
+        report,
+        PI05_DROID_NATIVE_TRANSFORM_RUNTIME_CONTRACT,
+        "Official pi05_droid full transform contract mismatch",
+    )
     return report
 
 
@@ -158,31 +230,7 @@ def main() -> None:
     )
 
     train_config = config.get_config("pi05_droid")
-    static_contract = {
-        "name": train_config.name,
-        "model_type": train_config.model.model_type.value,
-        "pi05": train_config.model.pi05,
-        "dtype": train_config.model.dtype,
-        "action_horizon": train_config.model.action_horizon,
-        "action_dim": train_config.model.action_dim,
-        "asset_id": train_config.data.assets.asset_id,
-        "policy_metadata": train_config.policy_metadata,
-    }
-    expected_static_contract = {
-        "name": "pi05_droid",
-        "model_type": "pi05",
-        "pi05": True,
-        "dtype": "bfloat16",
-        "action_horizon": 15,
-        "action_dim": 32,
-        "asset_id": "droid",
-        "policy_metadata": None,
-    }
-    if static_contract != expected_static_contract:
-        raise ValueError(
-            "Resolved OpenPI pi05_droid config mismatch: "
-            f"expected {expected_static_contract}, got {static_contract}"
-        )
+    static_contract = validate_official_pi05_train_config(train_config)
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     transform_contract = validate_official_pi05_data_config(data_config)
     logging.info("Verified pi05_droid transform contract: %s", transform_contract)
@@ -191,16 +239,11 @@ def main() -> None:
     policy = policy_config.create_trained_policy(
         train_config, args.checkpoint_dir.resolve()
     )
-    if policy.metadata:
-        raise ValueError(
-            f"Official pi05_droid unexpectedly supplied metadata: {policy.metadata}"
-        )
-    if policy._sample_kwargs != {}:
-        raise ValueError(
-            f"Official pi05_droid must use default 10-step sampling: {policy._sample_kwargs}"
-        )
-    if jax.random.key_data(policy._rng).tolist() != [0, 0]:
-        raise ValueError("Official pi05_droid policy RNG did not initialize from key 0")
+    policy_runtime = validate_official_pi05_policy_runtime(
+        metadata=policy.metadata,
+        sample_kwargs=policy._sample_kwargs,
+        rng_key_data=jax.random.key_data(policy._rng).tolist(),
+    )
 
     # Keep explicit references alive and prove these exact modules were imported.
     if openpi_model.__name__ != "openpi.models.model":
@@ -229,11 +272,7 @@ def main() -> None:
             "checkpoint": checkpoint_report,
             "train_config": static_contract,
             "transform_runtime": transform_contract,
-            "policy": {
-                "metadata": policy.metadata,
-                "sample_kwargs": policy._sample_kwargs,
-                "rng_key_data": jax.random.key_data(policy._rng).tolist(),
-            },
+            "policy": policy_runtime,
             "official_model_eval_contract": PI05_DROID_NATIVE_MODEL_EVAL_CONTRACT,
             "openpi_runtime_attestation": runtime_attestation,
         },

@@ -492,6 +492,151 @@ def test_full_450_step_execute8_trace_passes_and_binds_57_queries(tmp_path):
     assert result["measured_normalized_gripper_position_range"] == [0.25, 0.25]
 
 
+def _first_trace_record(records, record_type):
+    return next(record for record in records if record["record_type"] == record_type)
+
+
+def _replace_nested(value, path, replacement):
+    target = value
+    for key in path[:-1]:
+        target = target[key]
+    original = target[path[-1]]
+    target[path[-1]] = replacement
+    return original
+
+
+@pytest.mark.parametrize(
+    ("record_type", "path", "drifted_value"),
+    [
+        ("openpi_joint_velocity_rollout_start", ("schema_version",), 4.0),
+        ("openpi_joint_velocity_rollout_start", ("reset_index",), 0.0),
+        (
+            "openpi_joint_velocity_rollout_start",
+            ("outer_episode_steps",),
+            450.0,
+        ),
+        (
+            "openpi_joint_velocity_rollout_start",
+            ("internal_max_episode_length",),
+            451.0,
+        ),
+        (
+            "openpi_joint_velocity_rollout_start",
+            ("environment_before", "live_max_episode_length"),
+            451.0,
+        ),
+        (
+            "openpi_joint_velocity_rollout_start",
+            ("environment_before", "episode_length"),
+            0.0,
+        ),
+        (
+            "openpi_joint_velocity_rollout_start",
+            ("environment_before", "sim_step_counter"),
+            17.0,
+        ),
+        (
+            "openpi_joint_velocity_rollout_start",
+            ("environment_before", "common_step_counter"),
+            3.0,
+        ),
+        (
+            "openpi_joint_velocity_rollout_start",
+            ("environment_before", "sensor_frame_counters", "external_cam"),
+            1.0,
+        ),
+        ("openpi_joint_velocity_query", ("schema_version",), 4.0),
+        ("openpi_joint_velocity_query", ("reset_index",), 0.0),
+        ("openpi_joint_velocity_query", ("query_index",), 0.0),
+        ("openpi_joint_velocity_query", ("response_action_shape", 0), 15.0),
+        ("openpi_joint_velocity_query", ("response_action_shape", 1), 8.0),
+        ("openpi_joint_velocity_query", ("execution_horizon",), 8.0),
+        (
+            "openpi_joint_velocity_query",
+            ("images", "wrist_rotation_degrees"),
+            0.0,
+        ),
+        (
+            "openpi_joint_velocity_query",
+            ("images", "external", "shape", 0),
+            224.0,
+        ),
+        (
+            "openpi_joint_velocity_query",
+            ("images", "wrist", "shape", 1),
+            224.0,
+        ),
+        (
+            "openpi_joint_velocity_query",
+            ("images", "blank_masked_right_wrist", "shape", 0),
+            224.0,
+        ),
+        ("openpi_joint_velocity_action", ("schema_version",), 4.0),
+        ("openpi_joint_velocity_action", ("reset_index",), 0.0),
+        ("openpi_joint_velocity_action", ("query_index",), 0.0),
+        ("openpi_joint_velocity_action", ("chunk_action_index",), 0.0),
+        ("openpi_joint_velocity_execution", ("schema_version",), 4.0),
+        ("openpi_joint_velocity_execution", ("reset_index",), 0.0),
+        ("openpi_joint_velocity_execution", ("query_index",), 0.0),
+        ("openpi_joint_velocity_execution", ("chunk_action_index",), 0.0),
+        ("openpi_joint_velocity_execution", ("outer_step_index",), 0.0),
+        (
+            "openpi_joint_velocity_execution",
+            ("environment_after", "live_max_episode_length"),
+            451.0,
+        ),
+        (
+            "openpi_joint_velocity_execution",
+            ("environment_after", "episode_length"),
+            1.0,
+        ),
+        (
+            "openpi_joint_velocity_execution",
+            ("environment_after", "sim_step_counter"),
+            25.0,
+        ),
+        (
+            "openpi_joint_velocity_execution",
+            ("environment_after", "common_step_counter"),
+            4.0,
+        ),
+        (
+            "openpi_joint_velocity_execution",
+            ("environment_after", "sensor_frame_counters", "wrist_cam"),
+            2.0,
+        ),
+        ("openpi_joint_velocity_rollout_end", ("schema_version",), 4.0),
+        ("openpi_joint_velocity_rollout_end", ("reset_index",), 0.0),
+        (
+            "openpi_joint_velocity_rollout_end",
+            ("terminal_rollout", "schema_version"),
+            1.0,
+        ),
+        (
+            "openpi_joint_velocity_rollout_end",
+            ("terminal_rollout", "outer_steps_completed"),
+            450.0,
+        ),
+        (
+            "openpi_joint_velocity_rollout_end",
+            ("terminal_rollout", "environment_after", "episode_length"),
+            450.0,
+        ),
+    ],
+)
+def test_trace_fixed_metadata_rejects_python_equal_json_type_drift(
+    tmp_path, record_type, path, drifted_value
+):
+    records = _records()
+    record = _first_trace_record(records, record_type)
+    original = _replace_nested(record, path, drifted_value)
+    assert original == drifted_value
+    assert type(original) is not type(drifted_value)
+    trace, metrics = _write_case(tmp_path, records)
+    with pytest.raises(ValueError):
+        validator.audit_trace(trace, metrics)
+
+
 @pytest.mark.parametrize(
     "value",
     [

@@ -287,12 +287,26 @@ PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS = (
     "src/polaris/policy/droid_jointvelocity_client.py",
 )
 
-# These checkpoint/server inputs remain byte-identical to the integrated
-# official-model base.  Repaired evaluator and client files are instead bound
-# in the exact source manifest above.
+# The checkpoint manifest remains byte-identical to the integrated base.  The
+# server is separately pinned to one reviewed validation-only source digest and
+# must retain AST-identical model/checkpoint/server statements from that base.
 PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS = (
     "scripts/polaris/pi05_droid_native_gcs_manifest.tsv",
+)
+PI05_DROID_ALL_SIX_REVIEWED_MODEL_VALIDATION_PATHS = (
     "scripts/polaris/serve_pi05_droid_native_jointvelocity.py",
+)
+PI05_DROID_ALL_SIX_MODEL_VALIDATION_BASE_COMMIT = (
+    "3e9df7f605baa75848a0ad8edd2783d629d105c5"
+)
+PI05_DROID_ALL_SIX_MODEL_VALIDATION_BASE_SHA256 = (
+    "60e18ef53869784c3bf3435e6cc626cacb43fc52c543659f5e4d0a5bda69d21b"
+)
+PI05_DROID_ALL_SIX_MODEL_VALIDATION_PROFILE = (
+    "pi05_droid_serve_type_exact_validation_only_ast_v1"
+)
+PI05_DROID_ALL_SIX_MODEL_VALIDATION_SOURCE_SHA256 = (
+    "09bfc74c8d751115f0374f9184f28f1e2ca2ef20fb3c92379a325bb206f3e913"
 )
 
 
@@ -865,7 +879,7 @@ def validate_environment_runtime_contract(value: Any) -> dict[str, Any]:
     )
     if (
         not isinstance(value, dict)
-        or value != expected
+        or canonical_json_bytes(value) != canonical_json_bytes(expected)
         or value.get("sha256") != _environment_runtime_sha256(value)
     ):
         raise ValueError("Native environment runtime contract mismatch")
@@ -932,15 +946,18 @@ def validate_terminal_rollout_evidence(
     }
     if not isinstance(value, dict) or set(value) != required:
         raise ValueError("Native terminal rollout evidence schema mismatch")
-    if (
-        value["schema_version"] != 1
-        or value["profile"] != PI05_DROID_NATIVE_ENVIRONMENT_RUNTIME_PROFILE
-        or value["environment_runtime_sha256"] != runtime["sha256"]
-        or value["outer_steps_completed"] != PI05_DROID_NATIVE_EPISODE_STEPS
-        or value["last_outer_step_index"] != PI05_DROID_NATIVE_EPISODE_STEPS - 1
-        or value["terminated_false_count"] != PI05_DROID_NATIVE_EPISODE_STEPS
-        or value["truncated_false_count"] != PI05_DROID_NATIVE_EPISODE_STEPS
-    ):
+    fixed_identity = {
+        "schema_version": 1,
+        "profile": PI05_DROID_NATIVE_ENVIRONMENT_RUNTIME_PROFILE,
+        "environment_runtime_sha256": runtime["sha256"],
+        "outer_steps_completed": PI05_DROID_NATIVE_EPISODE_STEPS,
+        "last_outer_step_index": PI05_DROID_NATIVE_EPISODE_STEPS - 1,
+        "terminated_false_count": PI05_DROID_NATIVE_EPISODE_STEPS,
+        "truncated_false_count": PI05_DROID_NATIVE_EPISODE_STEPS,
+    }
+    if canonical_json_bytes(
+        {key: value[key] for key in fixed_identity}
+    ) != canonical_json_bytes(fixed_identity):
         raise ValueError("Native terminal rollout evidence identity mismatch")
     before = value["environment_before"]
     after = value["environment_after"]
@@ -960,7 +977,8 @@ def validate_terminal_rollout_evidence(
         raise ValueError("Native terminal environment evidence schema mismatch")
     for name, environment in (("before", before), ("after", after)):
         if (
-            environment["live_max_episode_length"]
+            type(environment["live_max_episode_length"]) is not int
+            or environment["live_max_episode_length"]
             != PI05_DROID_NATIVE_INTERNAL_MAX_EPISODE_STEPS
             or type(environment["episode_length"]) is not int
             or type(environment["sim_step_counter"]) is not int
@@ -1018,7 +1036,8 @@ def validate_native_episode_result(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != required:
         raise ValueError("Native episode result schema mismatch")
     if (
-        value["episode"] != 0
+        type(value["episode"]) is not int
+        or value["episode"] != 0
         or type(value["episode_length"]) is not int
         or not 1 <= value["episode_length"] <= PI05_DROID_NATIVE_EPISODE_STEPS
         or type(value["success"]) is not bool
@@ -1082,13 +1101,14 @@ def validate_terminal_numerical_failure_evidence(
         raise ValueError("Native terminal numerical-failure schema mismatch")
     result = validate_native_episode_result(value["episode_result"])
     if (
-        value["schema_version"] != 2
-        or value["profile"] != PI05_DROID_NATIVE_TERMINAL_FAILURE_PROFILE
+        value["profile"] != PI05_DROID_NATIVE_TERMINAL_FAILURE_PROFILE
         or value["terminal_form"] != "native_all_joint_velocity_limit_failure"
         or value["environment_runtime_sha256"] != runtime["sha256"]
         or value["failure_type"] != "NativeAllJointVelocityLimitError"
         or result["numerical_failure"] is not True
     ):
+        raise ValueError("Native terminal numerical-failure identity mismatch")
+    if canonical_json_bytes(value["schema_version"]) != canonical_json_bytes(2):
         raise ValueError("Native terminal numerical-failure identity mismatch")
     incident_artifact = validate_bound_json_artifact(
         value["incident_artifact"],
@@ -1110,14 +1130,17 @@ def validate_terminal_numerical_failure_evidence(
     sample_kind = failure["sample_kind"]
     attempts = result["episode_length"]
     completed = attempts - int(sample_kind == "apply_entry")
-    if (
-        value["failure_sample_kind"] != sample_kind
-        or value["actions_attempted"] != attempts
-        or value["outer_steps_completed"] != completed
-        or value["failed_outer_step_index"] != attempts - 1
-        or value["terminated_false_count"] != completed
-        or value["truncated_false_count"] != completed
-    ):
+    expected_counts = {
+        "failure_sample_kind": sample_kind,
+        "actions_attempted": attempts,
+        "outer_steps_completed": completed,
+        "failed_outer_step_index": attempts - 1,
+        "terminated_false_count": completed,
+        "truncated_false_count": completed,
+    }
+    if canonical_json_bytes(
+        {key: value[key] for key in expected_counts}
+    ) != canonical_json_bytes(expected_counts):
         raise ValueError("Native terminal numerical-failure count mismatch")
     expected_completed_post = attempts - 1
     if (
@@ -1157,6 +1180,7 @@ def validate_terminal_numerical_failure_evidence(
         if (
             not isinstance(environment, dict)
             or set(environment) != environment_fields
+            or type(environment["live_max_episode_length"]) is not int
             or environment["live_max_episode_length"]
             != PI05_DROID_NATIVE_INTERNAL_MAX_EPISODE_STEPS
             or any(
@@ -1269,7 +1293,9 @@ def verify_official_norm_reference_probes(path: Path) -> dict[str, Any]:
         "state_q01_first8": norm_stats["state"]["q01"][:8],
         "state_q99_first8": norm_stats["state"]["q99"][:8],
     }
-    if observed != PI05_DROID_NATIVE_NORM_REFERENCE_PROBES:
+    if canonical_json_bytes(observed) != canonical_json_bytes(
+        PI05_DROID_NATIVE_NORM_REFERENCE_PROBES
+    ):
         raise ValueError("Official DROID norm reference probes mismatch")
     return {
         "sha256": PI05_DROID_NORM_STATS_SHA256,

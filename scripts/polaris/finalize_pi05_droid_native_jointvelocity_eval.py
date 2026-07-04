@@ -41,6 +41,11 @@ from polaris.pi05_droid_native_eval_contract import (
     PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID,
     PI05_DROID_ALL_SIX_CONTROLLER_PROFILE,
     PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT,
+    PI05_DROID_ALL_SIX_MODEL_VALIDATION_BASE_COMMIT,
+    PI05_DROID_ALL_SIX_MODEL_VALIDATION_BASE_SHA256,
+    PI05_DROID_ALL_SIX_MODEL_VALIDATION_PROFILE,
+    PI05_DROID_ALL_SIX_MODEL_VALIDATION_SOURCE_SHA256,
+    PI05_DROID_ALL_SIX_REVIEWED_MODEL_VALIDATION_PATHS,
     PI05_DROID_ALL_SIX_RUNTIME_SHA256,
     PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS,
     PI05_DROID_BASE_CONTROLLER_COMPLETION_PATH,
@@ -55,7 +60,6 @@ from polaris.pi05_droid_native_eval_contract import (
     PI05_DROID_HUB_REVISION,
     PI05_DROID_NATIVE_CANARY_PROFILE,
     PI05_DROID_NATIVE_EPISODE_STEPS,
-    PI05_DROID_NATIVE_MODEL_EVAL_CONTRACT,
     PI05_DROID_NATIVE_NORM_REFERENCE_PROBES,
     PI05_DROID_NATIVE_POLICY_HZ,
     PI05_DROID_NATIVE_TASK,
@@ -100,6 +104,23 @@ SOURCE_PATHS = (
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
+
+
+def _require_exact_json(value: Any, expected: Any, message: str) -> None:
+    """Require JSON identity, including integer/float/bool type identity."""
+
+    if canonical_json_bytes(value) != canonical_json_bytes(expected):
+        raise ValueError(message)
+
+
+def _require_exact_json_subset(
+    value: dict[str, Any], expected: dict[str, Any], message: str
+) -> None:
+    """Require exact JSON identity for selected fields of a closed envelope."""
+
+    if not set(expected).issubset(value):
+        raise ValueError(message)
+    _require_exact_json({key: value[key] for key in expected}, expected, message)
 
 
 def _sha256_string(value: Any, field: str) -> str:
@@ -289,15 +310,24 @@ def validate_base_controller_completion(
     value = artifact["value"]
     if not isinstance(value, dict):
         raise ValueError("Controller completion must be an object")
-    if (
-        value.get("schema_version") != 1
-        or value.get("profile") != CONTROLLER_PROFILE
-        or value.get("status") != "pass"
-        or value.get("scope") != "controller_only_no_model_or_checkpoint"
-        or value.get("slurm", {}).get("job_id") != PI05_DROID_CONTROLLER_JOB_ID
-        or value.get("slurm", {}).get("srun_exit_code") != 0
-    ):
+    slurm = value.get("slurm")
+    if not isinstance(slurm, dict) or set(slurm) != {"job_id", "srun_exit_code"}:
         raise ValueError("Controller completion identity mismatch")
+    _require_exact_json_subset(
+        value,
+        {
+            "schema_version": 1,
+            "profile": CONTROLLER_PROFILE,
+            "status": "pass",
+            "scope": "controller_only_no_model_or_checkpoint",
+        },
+        "Controller completion identity mismatch",
+    )
+    _require_exact_json(
+        slurm,
+        {"job_id": PI05_DROID_CONTROLLER_JOB_ID, "srun_exit_code": 0},
+        "Controller completion identity mismatch",
+    )
     attested_files = value.get("source", {}).get("files")
     source = value.get("source")
     if (
@@ -328,11 +358,17 @@ def validate_base_controller_completion(
         or runtime.get("runtime_sha256") != PI05_DROID_BASE_CONTROLLER_RUNTIME_SHA256
         or runtime.get("status") != "pass"
         or runtime.get("profile") != "openpi_pi05_droid_native_jointvelocity_v1"
-        or runtime.get("policy_frequency_hz") != 15
-        or runtime.get("physics_frequency_hz") != 120
-        or runtime.get("decimation") != 8
     ):
         raise ValueError("job1098174 runtime identity mismatch")
+    _require_exact_json_subset(
+        runtime,
+        {
+            "policy_frequency_hz": 15,
+            "physics_frequency_hz": 120,
+            "decimation": 8,
+        },
+        "job1098174 runtime identity mismatch",
+    )
     if (
         value.get("runtime", {}).get("container_image", {}).get("sha256")
         != PI05_DROID_PYXIS_SHA256
@@ -414,10 +450,8 @@ def validate_all_six_controller_completion(
     if (
         not isinstance(value, dict)
         or set(value) != required
-        or value["schema_version"] != 1
         or value["profile"] != PI05_DROID_ALL_SIX_CONTROLLER_PROFILE
         or value["status"] != "pass"
-        or value["job_id"] != PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID
         or value["scope"] != "controller_only_no_model_no_checkpoint"
         or value["task"] != PI05_DROID_NATIVE_TASK
         or value["official_policy_io_changed"] is not False
@@ -427,6 +461,14 @@ def validate_all_six_controller_completion(
         or value["polaris_hub_revision"] != PI05_DROID_HUB_REVISION
     ):
         raise ValueError("All-six completion schema or identity mismatch")
+    _require_exact_json_subset(
+        value,
+        {
+            "schema_version": 1,
+            "job_id": PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID,
+        },
+        "All-six completion schema or identity mismatch",
+    )
 
     source = value["source"]
     if (
@@ -439,6 +481,7 @@ def validate_all_six_controller_completion(
             "openpi_commit",
             "files",
             "official_model_io_unchanged_from_base",
+            "official_model_validation_additions",
         }
         or not isinstance(source["repository"], str)
         or not source["repository"]
@@ -506,6 +549,62 @@ def validate_all_six_controller_completion(
             )
         policy_io_files[relative_path] = record
 
+    reviewed_validation = source["official_model_validation_additions"]
+    accepted_validation_paths = set(PI05_DROID_ALL_SIX_REVIEWED_MODEL_VALIDATION_PATHS)
+    if (
+        not isinstance(reviewed_validation, dict)
+        or set(reviewed_validation) != accepted_validation_paths
+    ):
+        raise ValueError("All-six reviewed model-validation attestation mismatch")
+    reviewed_validation_files = {}
+    for relative_path in PI05_DROID_ALL_SIX_REVIEWED_MODEL_VALIDATION_PATHS:
+        record = reviewed_validation[relative_path]
+        expected_record = {
+            "base_commit": PI05_DROID_ALL_SIX_MODEL_VALIDATION_BASE_COMMIT,
+            "base_sha256": PI05_DROID_ALL_SIX_MODEL_VALIDATION_BASE_SHA256,
+            "validation_profile": PI05_DROID_ALL_SIX_MODEL_VALIDATION_PROFILE,
+            "sha256": PI05_DROID_ALL_SIX_MODEL_VALIDATION_SOURCE_SHA256,
+        }
+        if (
+            not isinstance(record, dict)
+            or set(record)
+            != {
+                *expected_record,
+                "size",
+                "ast_sha256",
+                "model_semantics_sha256",
+                "base_model_semantics_sha256",
+            }
+            or any(record[key] != expected for key, expected in expected_record.items())
+            or type(record["size"]) is not int
+            or record["size"] <= 0
+            or record["model_semantics_sha256"] != record["base_model_semantics_sha256"]
+        ):
+            raise ValueError(
+                f"All-six reviewed model-validation record mismatch: {relative_path}"
+            )
+        for digest_field in (
+            "base_sha256",
+            "sha256",
+            "ast_sha256",
+            "model_semantics_sha256",
+            "base_model_semantics_sha256",
+        ):
+            _sha256_string(
+                record[digest_field],
+                f"all-six reviewed model validation {relative_path} {digest_field}",
+            )
+        path = repository / relative_path
+        if (
+            path.stat().st_size != record["size"]
+            or file_sha256(path) != record["sha256"]
+        ):
+            raise ValueError(
+                "Reviewed official model validation differs from "
+                f"job{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}: {relative_path}"
+            )
+        reviewed_validation_files[relative_path] = record
+
     smoke_record = value["smoke"]
     if not isinstance(smoke_record, dict) or not isinstance(
         smoke_record.get("path"), str
@@ -543,8 +642,6 @@ def validate_all_six_controller_completion(
     if (
         not isinstance(gpu_value, dict)
         or set(gpu_value) != {"schema_version", "job_id", "gpus"}
-        or gpu_value["schema_version"] != 1
-        or gpu_value["job_id"] != PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID
         or not isinstance(gpu_value["gpus"], list)
         or len(gpu_value["gpus"]) != 1
         or not isinstance(gpu_value["gpus"][0], dict)
@@ -555,15 +652,26 @@ def validate_all_six_controller_completion(
         or not gpu_value["gpus"][0]["driver_version"]
     ):
         raise ValueError("All-six GPU inventory mismatch")
+    _require_exact_json_subset(
+        gpu_value,
+        {
+            "schema_version": 1,
+            "job_id": PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID,
+        },
+        "All-six GPU inventory mismatch",
+    )
     container = value["container"]
     if (
         not isinstance(container, dict)
         or container.get("sha256") != PI05_DROID_PYXIS_SHA256
-        or container.get("size") != 7_183_130_624
         or container.get("mode") != "0644"
-        or container.get("nlink") != 1
     ):
         raise ValueError("All-six container identity mismatch")
+    _require_exact_json_subset(
+        container,
+        {"size": 7_183_130_624, "nlink": 1},
+        "All-six container identity mismatch",
+    )
     assets = value["assets"]
     if not isinstance(assets, dict) or set(assets) != set(PI05_DROID_CANARY_ASSETS):
         raise ValueError("All-six asset set mismatch")
@@ -587,6 +695,7 @@ def validate_all_six_controller_completion(
         "source_commit": PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT,
         "critical_source_files": source_files,
         "unchanged_policy_io_files": policy_io_files,
+        "reviewed_model_validation_files": reviewed_validation_files,
         "smoke": smoke,
         "srun_status": {
             key: srun_status_artifact[key]
@@ -655,26 +764,36 @@ def _validate_checkpoint_artifact(path: Path) -> dict[str, Any]:
     }
     if not isinstance(value, dict) or set(value) != required:
         raise ValueError("Checkpoint-verification schema mismatch")
+    expected_norm_reference = {
+        "sha256": PI05_DROID_NORM_STATS_SHA256,
+        "path_within_checkpoint": "assets/droid/norm_stats.json",
+        "scope": "checkpoint_global_droid",
+        "asset_id": "droid",
+        "category_override": "forbidden",
+        "probes": PI05_DROID_NATIVE_NORM_REFERENCE_PROBES,
+        "action_semantics": "joint_velocity_no_delta_or_absolute_transform",
+        "state_semantics": "panda_joint_position_plus_closed_positive_gripper",
+    }
+    _require_exact_json_subset(
+        value,
+        {
+            "schema_version": 1,
+            "status": "pass",
+            "checkpoint_uri": PI05_DROID_CHECKPOINT_URI,
+            "sha256": PI05_DROID_CHECKPOINT_MANIFEST_SHA256,
+            "object_count": PI05_DROID_CHECKPOINT_OBJECT_COUNT,
+            "total_bytes": PI05_DROID_CHECKPOINT_BYTES,
+            "norm_stats_sha256": PI05_DROID_NORM_STATS_SHA256,
+            "full_md5": True,
+            "norm_reference": expected_norm_reference,
+        },
+        "Checkpoint-verification identity mismatch",
+    )
     if (
-        value["schema_version"] != 1
-        or value["status"] != "pass"
-        or value["checkpoint_uri"] != PI05_DROID_CHECKPOINT_URI
-        or value["sha256"] != PI05_DROID_CHECKPOINT_MANIFEST_SHA256
-        or value["object_count"] != PI05_DROID_CHECKPOINT_OBJECT_COUNT
-        or value["total_bytes"] != PI05_DROID_CHECKPOINT_BYTES
-        or value["norm_stats_sha256"] != PI05_DROID_NORM_STATS_SHA256
-        or value["full_md5"] is not True
-        or value["norm_reference"]
-        != {
-            "sha256": PI05_DROID_NORM_STATS_SHA256,
-            "path_within_checkpoint": "assets/droid/norm_stats.json",
-            "scope": "checkpoint_global_droid",
-            "asset_id": "droid",
-            "category_override": "forbidden",
-            "probes": PI05_DROID_NATIVE_NORM_REFERENCE_PROBES,
-            "action_semantics": "joint_velocity_no_delta_or_absolute_transform",
-            "state_semantics": ("panda_joint_position_plus_closed_positive_gripper"),
-        }
+        type(value["manifest_path"]) is not str
+        or not value["manifest_path"]
+        or type(value["checkpoint_dir"]) is not str
+        or not value["checkpoint_dir"]
     ):
         raise ValueError("Checkpoint-verification identity mismatch")
     return {
@@ -723,24 +842,35 @@ def _validate_model_runtime_artifact(
     if (
         not isinstance(value, dict)
         or set(value) != required
-        or value["schema_version"] != 1
         or value["profile"] != PI05_DROID_NATIVE_CANARY_PROFILE
         or value["status"] != "pass"
-        or value["checkpoint"] != expected_checkpoint
-        or value["train_config"] != expected_train_config
-        or value["transform_runtime"] != PI05_DROID_NATIVE_TRANSFORM_RUNTIME_CONTRACT
-        or value["policy"]
-        != {"metadata": {}, "sample_kwargs": {}, "rng_key_data": [0, 0]}
-        or value["official_model_eval_contract"]
-        != PI05_DROID_NATIVE_MODEL_EVAL_CONTRACT
     ):
         raise ValueError("Native model-runtime artifact mismatch")
-    validate_openpi_runtime_attestation(value["openpi_runtime_attestation"])
+    _require_exact_json_subset(
+        value,
+        {
+            "schema_version": 1,
+            "checkpoint": expected_checkpoint,
+            "train_config": expected_train_config,
+            "transform_runtime": PI05_DROID_NATIVE_TRANSFORM_RUNTIME_CONTRACT,
+            "policy": {"metadata": {}, "sample_kwargs": {}, "rng_key_data": [0, 0]},
+        },
+        "Native model-runtime artifact mismatch",
+    )
+    official_model_eval_contract = validate_native_model_eval_contract(
+        value["official_model_eval_contract"]
+    )
+    openpi_runtime_attestation = validate_openpi_runtime_attestation(
+        value["openpi_runtime_attestation"]
+    )
     return {
         **{key: artifact[key] for key in ("path", "size", "sha256", "mode", "nlink")},
-        "train_config": expected_train_config,
-        "transform_runtime": PI05_DROID_NATIVE_TRANSFORM_RUNTIME_CONTRACT,
+        "checkpoint": value["checkpoint"],
+        "train_config": value["train_config"],
+        "transform_runtime": value["transform_runtime"],
         "policy": value["policy"],
+        "official_model_eval_contract": official_model_eval_contract,
+        "openpi_runtime_attestation": openpi_runtime_attestation,
     }
 
 
@@ -758,13 +888,19 @@ def _validate_runtime_artifact(path: Path) -> dict[str, Any]:
     }:
         raise ValueError("Runtime-artifact schema mismatch")
     if (
-        value["schema_version"] != 1
-        or value["profile"] != PI05_DROID_NATIVE_CANARY_PROFILE
+        value["profile"] != PI05_DROID_NATIVE_CANARY_PROFILE
         or value["environment"] != PI05_DROID_NATIVE_TASK
-        or value["rollouts"] != 1
-        or value["episode_steps"] != PI05_DROID_NATIVE_EPISODE_STEPS
     ):
         raise ValueError("Runtime-artifact identity mismatch")
+    _require_exact_json_subset(
+        value,
+        {
+            "schema_version": 1,
+            "rollouts": 1,
+            "episode_steps": PI05_DROID_NATIVE_EPISODE_STEPS,
+        },
+        "Runtime-artifact identity mismatch",
+    )
     runtime = validate_joint_velocity_runtime_report(value["runtime_contract"])
     environment_runtime = validate_environment_runtime_contract(
         value["environment_runtime_contract"]
@@ -858,12 +994,9 @@ def _validate_close_ready(
     elif incident is not None:
         raise ValueError("Completed native terminal contains an incident")
     if (
-        value["schema_version"] != 2
-        or value["profile"] != PI05_DROID_NATIVE_CANARY_PROFILE
+        value["profile"] != PI05_DROID_NATIVE_CANARY_PROFILE
         or value["status"] != "simulation_app_close_pending"
         or value["environment"] != PI05_DROID_NATIVE_TASK
-        or value["rollouts"] != 1
-        or value["episode_steps"] != PI05_DROID_NATIVE_EPISODE_STEPS
         or value["env_close"] != "complete"
         or value["environment_runtime_contract_sha256"]
         != runtime["environment_runtime_contract"]["sha256"]
@@ -875,6 +1008,15 @@ def _validate_close_ready(
         )
     ):
         raise ValueError("Evaluator close-ready identity mismatch")
+    _require_exact_json_subset(
+        value,
+        {
+            "schema_version": 2,
+            "rollouts": 1,
+            "episode_steps": PI05_DROID_NATIVE_EPISODE_STEPS,
+        },
+        "Evaluator close-ready identity mismatch",
+    )
     return {
         **{key: artifact[key] for key in ("path", "size", "sha256", "mode", "nlink")},
         "environment_runtime_contract_sha256": value[
@@ -1070,22 +1212,33 @@ def create_summary_video(
         raise
 
 
-def _gpu_inventory(path: Path) -> dict[str, Any]:
+def _gpu_inventory(path: Path, *, expected_job_id: int) -> dict[str, Any]:
+    if type(expected_job_id) is not int or expected_job_id <= 0:
+        raise ValueError("GPU inventory expected job ID is invalid")
     artifact = validate_immutable_json(path)
     value = artifact["value"]
     if (
         not isinstance(value, dict)
         or set(value) != {"schema_version", "job_id", "gpus"}
-        or value["schema_version"] != 1
         or not isinstance(value["gpus"], list)
         or len(value["gpus"]) != 1
+        or not isinstance(value["gpus"][0], dict)
         or set(value["gpus"][0]) != {"uuid", "name", "driver_version"}
         or value["gpus"][0]["name"] != "NVIDIA L40S"
+        or type(value["gpus"][0]["uuid"]) is not str
         or not value["gpus"][0]["uuid"].startswith("GPU-")
+        or type(value["gpus"][0]["driver_version"]) is not str
+        or not value["gpus"][0]["driver_version"]
     ):
         raise ValueError("GPU inventory mismatch")
+    _require_exact_json_subset(
+        value,
+        {"schema_version": 1, "job_id": expected_job_id},
+        "GPU inventory mismatch",
+    )
     return {
         **{key: artifact[key] for key in ("path", "size", "sha256", "mode", "nlink")},
+        "job_id": value["job_id"],
         "gpu": value["gpus"][0],
     }
 
@@ -1117,6 +1270,8 @@ def _validate_run_record(
         "PORT",
         "MODEL_RUNTIME_CONTRACT",
     }
+    if type(args.job_id) is not int or args.job_id <= 0:
+        raise ValueError("Run-record expected job ID is invalid")
     if (
         not isinstance(value, dict)
         or set(value)
@@ -1129,12 +1284,9 @@ def _validate_run_record(
             "rollouts",
             "values",
         }
-        or value["schema_version"] != 1
         or value["profile"] != PI05_DROID_NATIVE_CANARY_PROFILE
-        or value["job_id"] != args.job_id
         or value["fresh_attempt_no_resume"] is not True
         or value["task"] != PI05_DROID_NATIVE_TASK
-        or value["rollouts"] != 1
         or not isinstance(value["values"], dict)
         or set(value["values"]) != value_keys
         or any(
@@ -1142,6 +1294,11 @@ def _validate_run_record(
         )
     ):
         raise ValueError("Run-record schema or identity mismatch")
+    _require_exact_json_subset(
+        value,
+        {"schema_version": 1, "job_id": args.job_id, "rollouts": 1},
+        "Run-record schema or identity mismatch",
+    )
     values = value["values"]
     expected_paths = {
         "RUN_DIR": run_dir,
@@ -1211,12 +1368,12 @@ def _validate_submission_record(
     sbatch_relative = (
         "scripts/polaris/l40s_pi05_droid_native_jointvelocity_canary.sbatch"
     )
+    if type(args.job_id) is not int or args.job_id <= 0:
+        raise ValueError("Submission-record expected job ID is invalid")
     if (
         not isinstance(value, dict)
         or set(value) != required
-        or value["schema_version"] != 1
         or value["profile"] != PI05_DROID_NATIVE_CANARY_PROFILE
-        or value["job_id"] != args.job_id
         or Path(value["run_dir"]).resolve() != run_dir
         or Path(value["polaris_dir"]).resolve() != Path(args.polaris_repo).resolve()
         or value["polaris_commit"] != args.expected_polaris_commit
@@ -1228,9 +1385,13 @@ def _validate_submission_record(
         or Path(value["polaris_data_dir"]).resolve() != Path(args.data_dir).resolve()
         or value["fresh_attempt_no_resume"] is not True
         or value["task"] != PI05_DROID_NATIVE_TASK
-        or value["rollouts"] != 1
     ):
         raise ValueError("Submission-record schema or identity mismatch")
+    _require_exact_json_subset(
+        value,
+        {"schema_version": 1, "job_id": args.job_id, "rollouts": 1},
+        "Submission-record schema or identity mismatch",
+    )
     return {key: artifact[key] for key in ("path", "size", "sha256", "mode", "nlink")}
 
 
@@ -1302,10 +1463,9 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         {"job_id": args.job_id, "srun_exit_code": 0}
     ):
         raise ValueError("Evaluator srun status mismatch")
-    gpu = _gpu_inventory(run_dir / f"gpu-{args.job_id}.json")
-    gpu_value = validate_immutable_json(run_dir / f"gpu-{args.job_id}.json")["value"]
-    if gpu_value["job_id"] != args.job_id:
-        raise ValueError("GPU inventory job ID mismatch")
+    gpu = _gpu_inventory(
+        run_dir / f"gpu-{args.job_id}.json", expected_job_id=args.job_id
+    )
     image = Path(args.container_image)
     image_stat = _regular_file(image, "container image")
     image_digest = file_sha256(image)
@@ -1410,9 +1570,7 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         },
         "checkpoint": checkpoint,
         "model_runtime": model_runtime,
-        "official_model_eval_contract": validate_native_model_eval_contract(
-            PI05_DROID_NATIVE_MODEL_EVAL_CONTRACT
-        ),
+        "official_model_eval_contract": model_runtime["official_model_eval_contract"],
         "serving_contract": serving_contract,
         "runtime": runtime,
         "evaluator_close_ready": close_ready,
