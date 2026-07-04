@@ -38,7 +38,7 @@ def test_official_manifest_is_byte_unchanged_and_serve_validation_is_exactly_rev
         PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT, serve_relative
     )
     base_serve = _git_show(finalizer.BASE_COMMIT, serve_relative)
-    assert accepted_serve == base_serve
+    assert accepted_serve == current_serve
     assert current_serve != base_serve
     reviewed = finalizer._reviewed_serve_validation(current_serve, base_serve)
     assert reviewed["sha256"] == (
