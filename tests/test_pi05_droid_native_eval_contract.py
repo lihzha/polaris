@@ -242,6 +242,111 @@ def test_runtime_and_close_artifacts_bind_internal_timeout_and_terminal_state(tm
     assert close["episode_sidecar"] == sidecar_identity
 
 
+def test_close_ready_consumes_sidecar_from_stable_bound_read(tmp_path, monkeypatch):
+    runtime = _environment_runtime()
+    original_terminal = _terminal_rollout(runtime)
+    substituted_terminal = copy.deepcopy(original_terminal)
+    substituted_terminal["rubric"]["progress"] = 0.75
+    original_result = {
+        "episode": 0,
+        "episode_length": 450,
+        "success": False,
+        "progress": 0.25,
+        "numerical_failure": False,
+        "numerical_failure_reason": "",
+    }
+    substituted_result = {**original_result, "progress": 0.75}
+    dynamic = {
+        "schema_version": 3,
+        "profile": NATIVE_GRIPPER_DYNAMIC_PROFILE,
+        "joint_names": list(EXPECTED_DROID_JOINT_NAMES),
+        "joint_indices": list(range(13)),
+        "apply_calls": 3600,
+        "post_policy_step_samples": 450,
+        "sample_count": 4050,
+        "max_abs_joint_velocity_rad_s": [0.0] * 13,
+        "max_abs_joint_acceleration_rad_s2": [0.0] * 13,
+        "terminal_velocity_failure": None,
+        "samples": None,
+    }
+    artifacts = {}
+    for label in ("trace", "video"):
+        temporary = tmp_path / f".{label}.partial"
+        temporary.write_bytes(label.encode("ascii"))
+        artifacts[label] = publish_immutable_file_from_temporary(
+            temporary, tmp_path / f"{label}.bin"
+        )
+    original_root = tmp_path / "original"
+    original_root.mkdir()
+    wrong_root = tmp_path / "wrong"
+    wrong_root.mkdir()
+    alias_root = tmp_path / "alias"
+    alias_root.symlink_to(original_root, target_is_directory=True)
+    filename = "sidecar.json"
+    original_sidecar = publish_immutable_json(
+        original_root / filename,
+        make_episode_sidecar(
+            episode_result=original_result,
+            terminal_outcome=original_terminal,
+            environment_runtime_contract=runtime,
+            dynamic_report=dynamic,
+            trace_artifact=artifacts["trace"],
+            video_artifact=artifacts["video"],
+            incident_artifact=None,
+        ),
+    )
+    substituted_sidecar = publish_immutable_json(
+        wrong_root / filename,
+        make_episode_sidecar(
+            episode_result=substituted_result,
+            terminal_outcome=substituted_terminal,
+            environment_runtime_contract=runtime,
+            dynamic_report=dynamic,
+            trace_artifact=artifacts["trace"],
+            video_artifact=artifacts["video"],
+            incident_artifact=None,
+        ),
+    )
+    assert original_sidecar["sha256"] != substituted_sidecar["sha256"]
+    recorded = {
+        key: original_sidecar[key]
+        for key in ("path", "size", "sha256", "mode", "nlink")
+    }
+    recorded["path"] = str(alias_root / filename)
+    runtime_path = tmp_path / "runtime.json"
+    runtime_artifact = publish_immutable_json(runtime_path, {"runtime": "synthetic"})
+
+    stable_validate = native_eval_contract.validate_bound_json_artifact
+    retargeted = False
+
+    def retarget_after_stable_read(*args, **kwargs):
+        nonlocal retargeted
+        artifact = stable_validate(*args, **kwargs)
+        alias_root.unlink()
+        alias_root.symlink_to(wrong_root, target_is_directory=True)
+        retargeted = True
+        return artifact
+
+    monkeypatch.setattr(
+        native_eval_contract,
+        "validate_bound_json_artifact",
+        retarget_after_stable_read,
+    )
+    with pytest.raises(ValueError, match="Close-ready terminal/sidecar drift"):
+        make_close_ready_artifact(
+            runtime_artifact=runtime_artifact,
+            runtime_path=runtime_path,
+            metrics_path=tmp_path / "metrics.csv",
+            trace_path=tmp_path / "trace.jsonl",
+            video_path=tmp_path / "video.mp4",
+            environment_runtime_contract=runtime,
+            terminal_outcome=substituted_terminal,
+            episode_sidecar=recorded,
+        )
+    assert retargeted is True
+    assert (alias_root / filename).resolve() == wrong_root / filename
+
+
 def test_immutable_json_is_canonical_single_link_mode_0444(tmp_path):
     path = tmp_path / "artifact.json"
     identity = publish_immutable_json(path, {"z": 1, "a": [True, None]})

@@ -68,8 +68,9 @@ from polaris.pi05_droid_native_eval_contract import (
     fsync_directory,
     publish_immutable_json,
     validate_bound_artifact,
+    validate_bound_json_artifact,
     validate_environment_runtime_contract,
-    validate_episode_sidecar,
+    validate_episode_sidecar_value,
     validate_immutable_json,
     validate_native_model_eval_contract,
     validate_native_terminal_outcome,
@@ -804,27 +805,42 @@ def _validate_close_ready(
     terminal_outcome = validate_native_terminal_outcome(
         value.get("terminal_outcome"), runtime["environment_runtime_contract"]
     )
-    sidecar = validate_episode_sidecar(
-        task_dir / "native_runtime" / "episode_000000.json",
-        runtime["environment_runtime_contract"],
-    )
     # The evaluator publishes descriptors from the container-visible fsw
     # namespace, while the host finalizer may reopen the same files through
-    # fs11.  Revalidate the recorded lexical descriptors against the exact
-    # resolved runtime and sidecar targets instead of requiring path strings to
-    # be byte-identical across mount namespaces.
-    validate_bound_artifact(
+    # fs11. Revalidate and consume each recorded JSON through the same stable
+    # descriptor-bound read instead of reopening its lexical path.
+    bound_runtime_artifact = validate_bound_json_artifact(
         value["runtime_artifact"],
         expected_path=Path(runtime["path"]),
         field="close-ready runtime",
-        json_artifact=True,
     )
-    validate_bound_artifact(
+    if any(
+        bound_runtime_artifact[key] != runtime[key]
+        for key in ("size", "sha256", "mode", "nlink")
+    ):
+        raise ValueError("Close-ready runtime changed across validation")
+    sidecar_path = task_dir / "native_runtime" / "episode_000000.json"
+    bound_sidecar_artifact = validate_bound_json_artifact(
         value["episode_sidecar"],
-        expected_path=Path(sidecar["path"]),
+        expected_path=sidecar_path,
         field="close-ready episode sidecar",
-        json_artifact=True,
     )
+    sidecar = {
+        "path": str(sidecar_path),
+        **{
+            key: bound_sidecar_artifact[key]
+            for key in ("size", "sha256", "mode", "nlink")
+        },
+        "value": validate_episode_sidecar_value(
+            bound_sidecar_artifact["value"],
+            runtime["environment_runtime_contract"],
+        ),
+    }
+    if any(
+        sidecar[key] != value["episode_sidecar"][key]
+        for key in ("size", "sha256", "mode", "nlink")
+    ):
+        raise ValueError("Close-ready episode sidecar identity drift")
     incident = sidecar["value"]["artifacts"]["incident"]
     if terminal_outcome.get("terminal_form") == (
         "native_all_joint_velocity_limit_failure"

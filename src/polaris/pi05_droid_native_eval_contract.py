@@ -627,10 +627,10 @@ def _close_bound_target(opened: dict[str, Any]) -> None:
     os.close(opened["parent_descriptor"])
 
 
-def validate_bound_artifact(
+def _validate_bound_artifact(
     value: Any, *, expected_path: Path | None, field: str, json_artifact: bool = False
 ) -> dict[str, Any]:
-    """Reopen a bound artifact without a resolve/open alias-retarget gap."""
+    """Read one bound artifact through stable handles and retain parsed JSON."""
 
     identity_keys = ("path", "size", "sha256", "mode", "nlink")
     if not isinstance(value, dict) or set(value) != set(identity_keys):
@@ -732,12 +732,42 @@ def validate_bound_artifact(
                     raise ValueError(f"{field} artifact is not canonical JSON")
             # Preserve only the recorded lexical path in enclosing canonical
             # bytes after both stable parent handles have been rebound.
-            return {key: value[key] for key in identity_keys}
+            result = {key: value[key] for key in identity_keys}
+            if payload_parts is not None:
+                result["value"] = json_value
+            return result
         finally:
             _close_bound_target(opened)
     finally:
         if expected_opened is not None:
             _close_bound_target(expected_opened)
+
+
+def validate_bound_artifact(
+    value: Any, *, expected_path: Path | None, field: str, json_artifact: bool = False
+) -> dict[str, Any]:
+    """Reopen a bound artifact without a resolve/open alias-retarget gap."""
+
+    artifact = _validate_bound_artifact(
+        value,
+        expected_path=expected_path,
+        field=field,
+        json_artifact=json_artifact,
+    )
+    return {key: artifact[key] for key in ("path", "size", "sha256", "mode", "nlink")}
+
+
+def validate_bound_json_artifact(
+    value: Any, *, expected_path: Path | None, field: str
+) -> dict[str, Any]:
+    """Return canonical JSON parsed from the exact stable descriptor-bound read."""
+
+    return _validate_bound_artifact(
+        value,
+        expected_path=expected_path,
+        field=field,
+        json_artifact=True,
+    )
 
 
 def should_render_expensive(
@@ -1060,14 +1090,16 @@ def validate_terminal_numerical_failure_evidence(
         or result["numerical_failure"] is not True
     ):
         raise ValueError("Native terminal numerical-failure identity mismatch")
-    incident = validate_bound_artifact(
+    incident_artifact = validate_bound_json_artifact(
         value["incident_artifact"],
         expected_path=None,
         field="native velocity incident",
-        json_artifact=True,
     )
-    incident_value = validate_immutable_json(Path(incident["path"]))["value"]
-    failure = validate_native_all_joint_velocity_failure(incident_value)
+    incident = {
+        key: incident_artifact[key]
+        for key in ("path", "size", "sha256", "mode", "nlink")
+    }
+    failure = validate_native_all_joint_velocity_failure(incident_artifact["value"])
     dynamic = validate_native_all_joint_dynamic_report(
         value["dynamic_report"], require_samples=False
     )
@@ -1335,11 +1367,11 @@ def make_episode_sidecar(
     }
 
 
-def validate_episode_sidecar(
-    path: Path, environment_runtime_contract: dict[str, Any]
+def validate_episode_sidecar_value(
+    value: Any, environment_runtime_contract: dict[str, Any]
 ) -> dict[str, Any]:
-    artifact = validate_immutable_json(path)
-    value = artifact["value"]
+    """Validate an episode sidecar value already tied to its source bytes."""
+
     required = {
         "schema_version",
         "profile",
@@ -1371,6 +1403,16 @@ def validate_episode_sidecar(
     )
     if value != rebuilt:
         raise ValueError("Native episode sidecar identity mismatch")
+    return json.loads(canonical_json_bytes(value))
+
+
+def validate_episode_sidecar(
+    path: Path, environment_runtime_contract: dict[str, Any]
+) -> dict[str, Any]:
+    artifact = validate_immutable_json(path)
+    value = validate_episode_sidecar_value(
+        artifact["value"], environment_runtime_contract
+    )
     return {
         **{key: artifact[key] for key in ("path", "size", "sha256", "mode", "nlink")},
         "value": value,
@@ -1399,15 +1441,18 @@ def make_close_ready_artifact(
         environment_runtime_contract
     )
     terminal = validate_native_terminal_outcome(terminal_outcome, environment_runtime)
-    sidecar = validate_bound_artifact(
+    sidecar_artifact = validate_bound_json_artifact(
         episode_sidecar,
         expected_path=None,
         field="episode sidecar",
-        json_artifact=True,
     )
-    sidecar_value = validate_episode_sidecar(
-        Path(sidecar["path"]), environment_runtime
-    )["value"]
+    sidecar = {
+        key: sidecar_artifact[key]
+        for key in ("path", "size", "sha256", "mode", "nlink")
+    }
+    sidecar_value = validate_episode_sidecar_value(
+        sidecar_artifact["value"], environment_runtime
+    )
     if sidecar_value["terminal_outcome"] != terminal:
         raise ValueError("Close-ready terminal/sidecar drift")
     return {

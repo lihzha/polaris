@@ -13,6 +13,7 @@ from scripts.polaris import (
 )
 from scripts.polaris import validate_pi05_droid_jointvelocity_trace as validator
 
+from polaris import pi05_droid_native_eval_contract as native_eval_contract
 from polaris.pi05_droid_jointvelocity_contract import (
     PI05_DROID_GRIPPER_OBSERVATION_BOUND_TOLERANCE,
     PI05_DROID_JOINTVELOCITY_PROFILE,
@@ -679,6 +680,55 @@ def test_typed_partial_failure_trace_passes_and_binds_incident(tmp_path):
     sidecar = validate_episode_sidecar(sidecar_path, ENVIRONMENT_RUNTIME)
     assert sidecar["value"]["episode_result"] == result
     assert sidecar["value"]["artifacts"]["incident"] == terminal["incident_artifact"]
+
+
+def test_terminal_failure_consumes_incident_from_stable_bound_read(
+    tmp_path, monkeypatch
+):
+    original_root = tmp_path / "original"
+    original_root.mkdir()
+    wrong_root = tmp_path / "wrong"
+    wrong_root.mkdir()
+    alias_root = tmp_path / "alias"
+    alias_root.symlink_to(original_root, target_is_directory=True)
+    filename = "incident.json"
+    records, _ = _failure_records(
+        original_root,
+        incident_path=original_root / filename,
+    )
+    terminal = records[-1]["terminal_failure"]
+    terminal["incident_artifact"]["path"] = str(alias_root / filename)
+    original_failure = copy.deepcopy(
+        terminal["dynamic_report"]["terminal_velocity_failure"]
+    )
+    substituted_failure = copy.deepcopy(original_failure)
+    substituted_failure["joint_position"][0] = 0.125
+    substituted = publish_immutable_json(wrong_root / filename, substituted_failure)
+    assert substituted["sha256"] != terminal["incident_artifact"]["sha256"]
+    terminal["dynamic_report"]["terminal_velocity_failure"] = substituted_failure
+
+    stable_validate = native_eval_contract.validate_bound_json_artifact
+    retargeted = False
+
+    def retarget_after_stable_read(*args, **kwargs):
+        nonlocal retargeted
+        artifact = stable_validate(*args, **kwargs)
+        alias_root.unlink()
+        alias_root.symlink_to(wrong_root, target_is_directory=True)
+        retargeted = True
+        return artifact
+
+    monkeypatch.setattr(
+        native_eval_contract,
+        "validate_bound_json_artifact",
+        retarget_after_stable_read,
+    )
+    with pytest.raises(ValueError, match="dynamic report incident drift"):
+        native_eval_contract.validate_terminal_numerical_failure_evidence(
+            terminal, ENVIRONMENT_RUNTIME
+        )
+    assert retargeted is True
+    assert (alias_root / filename).resolve() == wrong_root / filename
 
 
 @pytest.mark.parametrize(

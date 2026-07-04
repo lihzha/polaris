@@ -131,3 +131,75 @@ scope:
 No GPU, Slurm allocation, simulator, evaluation, model server, registry
 publication, or shared-document write was launched. The preserved artifact
 inspection used only login-host read operations.
+
+## Additive descriptor-read JSON consumption closure
+
+- Parent: `9fd25d59aab3e6a1b1eb04bb9c97f446fa0f5eaf`. This work remains on the
+  isolated `codex/pi05-native-bound-artifact-toctou-v4-20260704` branch. GPU,
+  simulator, model-server, evaluation, registry, shared-document, and canonical
+  checkout operations remain frozen.
+- A reviewer reproduced a higher-level incident race after the stable artifact
+  bind: the terminal validator discarded the JSON payload read from the bound
+  descriptor and reopened the recorded lexical path. A parent-alias retarget
+  in that gap could substitute different canonical JSON whose SHA-256 did not
+  match the recorded incident identity.
+- The stable implementation now has one internal descriptor-read operation and
+  two closed public views: `validate_bound_artifact` still returns exactly the
+  five recorded identity fields, while `validate_bound_json_artifact` returns
+  those fields plus the canonical parsed value from those exact bytes. The
+  terminal incident validator consumes that value directly and never reopens
+  its lexical path.
+- The same defect existed at the close-ready episode-sidecar boundary. Sidecar
+  semantic validation is now factored into `validate_episode_sidecar_value`,
+  and `make_close_ready_artifact` applies it directly to the stable bound read.
+  Enclosing terminal, sidecar, and close-ready schemas and stored five-field
+  identities are unchanged.
+- A complete caller audit found no remaining post-bind lexical reopen. Trace,
+  video, and episode-incident callers consume only the returned identity and do
+  not reopen it. The host finalizer was additionally changed to consume the
+  bound sidecar JSON directly and to require the bound runtime's nonpath
+  identity to equal the already validated runtime, closing its earlier-read /
+  later-bind gap without changing host-visible paths or output schemas.
+- Deterministic caller-level regressions retarget an alias immediately after
+  the stable function returns but before caller consumption. The incident case
+  changes `joint_position[0]` and presents matching substituted dynamic
+  evidence; it is rejected because the caller consumes the original bound
+  payload. The sidecar case presents a different valid terminal/progress
+  payload; it is rejected because the original bound sidecar is consumed.
+- Focused contract/trace/finalizer suite: `83 passed`. Broad pinned-OpenPI
+  pi0.5/native host suite: `159 passed`, with only three external dependency
+  deprecation warnings. Ruff 0.15.16 lint/format, Python byte compilation,
+  Bash syntax, ShellCheck, and `git diff --check`: pass.
+- A local replay of the fetched job `1098704` copy correctly could not resolve
+  its immutable `/lustre/...` incident descriptor because this workstation has
+  no Lustre mount. Exact read-only replay therefore remains assigned to the
+  `l401` login host where the original artifact and descriptor target exist;
+  this does not authorize a job or allocation.
+
+### Read-only exact-source replay
+
+- Source commit `f05aeb51cdbb363c50ff44ccbc76c10fa67aa8bb` was checked out
+  detached and clean in the agent-owned login-host checkout
+  `/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-pi05-bound-json-f05aeb5-20260704T160000Z`.
+  No Slurm job, allocation, GPU process, simulator, model server, or evaluator
+  was launched.
+- The current trace audit passed over preserved job `1098704`: 199 records,
+  episode length 93, trace SHA-256
+  `8d9d893c002953bd10dd6375520196ca5a3f22e2ec0eccb6088b4d662fba49a2`,
+  terminal form `native_all_joint_velocity_limit_failure`, incident SHA-256
+  `0ba6c6728b1a7fc3a82addd4158b4ba362be3c47df2aad47b5db77305739aacb`,
+  and raw gripper range
+  `[-1.701161989053901e-9, 8.525632438249886e-6]`.
+- The patched host close-ready validator also passed directly over the
+  preserved fsw-authored descriptors through the fs11 host namespace:
+  close-ready SHA-256
+  `8772fb1cf40206413ca89d43c7c56c90a375ddeadc9733529f71f9af9ee5d6b6`
+  and sidecar SHA-256
+  `bdad15d14d12fc44a475861d39fc049b7a950b2f06899f1add25047e2fc63f8d`.
+- A raw regenerated close-ready object was intentionally not byte-identical on
+  the login host: its five path strings resolve to `/lustre/fs11/...`, while
+  the evaluator authored `/lustre/fsw/...` inside the container. A recursive
+  comparison found only those five expected lexical namespace differences.
+  The alias-aware validator above is the authoritative host check. This remains
+  selective validation of a job produced under `f9c82d7`, not a claim that the
+  old runtime artifact satisfies the exact current runtime schema.
