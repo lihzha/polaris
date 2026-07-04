@@ -120,7 +120,7 @@ def _publish_success_and_close(
     simulation_app.close()
 
 
-def _remove_composed_root_prim(stage, path: str) -> int:
+def _remove_composed_root_prim(stage, path: str, *, remove_spec) -> int:
     prim = stage.GetPrimAtPath(path)
     if not prim.IsValid():
         raise RuntimeError("default viewport camera was absent before forced removal")
@@ -130,7 +130,8 @@ def _remove_composed_root_prim(stage, path: str) -> int:
     for prim_spec in prim_specs:
         if str(prim_spec.path) != path:
             raise RuntimeError("default viewport camera prim stack path mismatch")
-        prim_spec.layer.RemoveRootPrim(prim_spec)
+        if remove_spec(prim_spec) is not True:
+            raise RuntimeError("failed to remove a viewport-camera prim spec")
     if stage.GetPrimAtPath(path).IsValid():
         raise RuntimeError("forced composed viewport-camera removal did not persist")
     return len(prim_specs)
@@ -148,7 +149,7 @@ def main() -> int:
         import omni.usd
         from isaaclab.sim import SimulationContext
         from isaaclab_tasks.utils import parse_env_cfg
-        from pxr import UsdGeom
+        from pxr import Sdf, UsdGeom
 
         import polaris.environments  # noqa: F401
         from polaris.headless_viewport import (
@@ -160,6 +161,11 @@ def main() -> int:
         forced_missing = False
         recovery_messages: list[str] = []
 
+        def remove_spec(prim_spec):
+            edit = Sdf.BatchNamespaceEdit()
+            edit.Add(Sdf.NamespaceEdit.Remove(prim_spec.path))
+            return prim_spec.layer.Apply(edit)
+
         def stage_getter():
             nonlocal forced_missing
             stage = omni.usd.get_context().get_stage()
@@ -167,6 +173,7 @@ def main() -> int:
                 removed_specs = _remove_composed_root_prim(
                     stage,
                     DEFAULT_VIEWPORT_CAMERA_PRIM_PATH,
+                    remove_spec=remove_spec,
                 )
                 forced_missing = True
                 print(
