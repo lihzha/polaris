@@ -8,6 +8,18 @@ from typing import Literal
 
 
 LAP_EEF_FRAME = "panda_link8"
+EEF_CONTROLLER_BASELINE_PROFILE = "baseline"
+EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE = (
+    "arm_slew_0p95_gripper_rate0p25_fixed_anchor86_mimic100_damping1p2_v3"
+)
+EEF_CONTROLLER_PROFILES = (
+    EEF_CONTROLLER_BASELINE_PROFILE,
+    EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE,
+)
+EefControllerProfile = Literal[
+    "baseline",
+    "arm_slew_0p95_gripper_rate0p25_fixed_anchor86_mimic100_damping1p2_v3",
+]
 
 
 @dataclass
@@ -82,11 +94,15 @@ class EvalArgs:
     rollouts: int | None = None  # Number of rollouts to evaluate
     control_mode: Literal["joint-position", "eef-pose"] = "joint-position"
     runtime_contract_output: str | None = None
+    eef_controller_profile: EefControllerProfile = EEF_CONTROLLER_BASELINE_PROFILE
 
 
 def validate_policy_control_mode(eval_args: EvalArgs) -> None:
     """Fail before Isaac launch when a policy and controller are incompatible."""
 
+    profile = eval_args.eef_controller_profile
+    if type(profile) is not str or profile not in EEF_CONTROLLER_PROFILES:
+        raise ValueError(f"Unknown PolaRiS EEF controller profile: {profile!r}")
     if (
         eval_args.policy.client == "EgoLAPEefPose"
         and eval_args.control_mode != "eef-pose"
@@ -97,6 +113,14 @@ def validate_policy_control_mode(eval_args: EvalArgs) -> None:
         and eval_args.control_mode != "joint-position"
     ):
         raise ValueError("DroidJointPos requires --control-mode joint-position")
+    if profile != EEF_CONTROLLER_BASELINE_PROFILE and (
+        eval_args.policy.client != "EgoLAPEefPose"
+        or eval_args.control_mode != "eef-pose"
+    ):
+        raise ValueError(
+            "The PolaRiS EEF mimic-compliance controller profile requires "
+            "EgoLAPEefPose with --control-mode eef-pose"
+        )
 
 
 @dataclass

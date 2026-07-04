@@ -12,6 +12,11 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 from polaris.config import LAP_EEF_FRAME, EvalArgs, validate_policy_control_mode
+from polaris.eef_controller_profile import (
+    capture_eef_controller_repair_candidate_report,
+)
+from polaris.eef_controller_profile import configure_eef_controller_profile
+from polaris.eef_runtime_contract import build_eef_controller_repair_candidate_aggregate
 from polaris.eef_runtime_contract import atomic_write_runtime_contract
 from polaris.eef_runtime_contract import atomic_write_episode_safety
 from polaris.eef_runtime_contract import aggregate_episode_safety
@@ -79,6 +84,14 @@ def main(eval_args: EvalArgs):
             physx_cfg=env_cfg.sim.physx,
             enable_gripper_velocity_limit=is_ego_lap,
         )
+        controller_profile = (
+            configure_eef_controller_profile(
+                env_cfg,
+                profile=eval_args.eef_controller_profile,
+            )
+            if is_ego_lap
+            else None
+        )
         frame_cfg = env_cfg.scene.lap_ee_frame
         target_cfg = frame_cfg.target_frames[0]
         observed_source = frame_cfg.prim_path
@@ -127,12 +140,16 @@ def main(eval_args: EvalArgs):
         )
     elif eval_args.control_mode != "joint-position":
         raise ValueError(f"Unsupported control mode: {eval_args.control_mode}")
+    else:
+        controller_profile = None
     robot_usd_path = Path(env_cfg.scene.robot.spawn.usd_path)
     env: ManagerBasedRLSplatEnv = gym.make(  # type: ignore[assignment]
         eval_args.environment, cfg=env_cfg
     )
     runtime_protocol = None
     if is_ego_lap:
+        if controller_profile is None:
+            raise RuntimeError("Ego-LAP EEF controller profile was not configured")
         runtime_protocol = validate_ego_lap_runtime_protocol(env)
         print(
             "POLARIS_LAP_RUNTIME_PROTOCOL="
@@ -145,6 +162,15 @@ def main(eval_args: EvalArgs):
             f"physics_hz={runtime_protocol['physics_hz']};"
             f"physics_dt={runtime_protocol['physics_dt']};"
             f"decimation={runtime_protocol['decimation']}",
+            flush=True,
+        )
+        print(
+            "POLARIS_LAP_EEF_CONTROLLER="
+            f"profile={controller_profile.profile};"
+            f"target_slew={controller_profile.target_slew_profile};"
+            f"fixed_activation_anchor={controller_profile.fixed_activation_anchor};"
+            "mimic_compliance="
+            f"{controller_profile.mimic_compliance_profile}",
             flush=True,
         )
     evaluation_horizon = (
@@ -225,6 +251,10 @@ def main(eval_args: EvalArgs):
             trace_dir=trace_dir,
             expected_rollouts=rollouts,
             expected_horizon=evaluation_horizon,
+            expected_eef_controller_profile=controller_profile.profile,
+            expected_gripper_target_slew_profile=(
+                controller_profile.target_slew_profile
+            ),
         )
         if recovered_row:
             atomic_write_results(episode_df, csv_path)
@@ -251,6 +281,7 @@ def main(eval_args: EvalArgs):
 
     runtime_frame_evidence = None
     gripper_runtime_contract = None
+    initial_controller_repair_candidate = None
 
     def install_or_validate_gripper_runtime():
         nonlocal gripper_runtime_contract
@@ -262,25 +293,73 @@ def main(eval_args: EvalArgs):
             validate_eef_gripper_post_reset(env, gripper_runtime_contract)
 
     def persist_runtime_contract():
+        nonlocal initial_controller_repair_candidate
         if (
             runtime_protocol is None
             or runtime_frame_evidence is None
             or eval_args.runtime_contract_output is None
         ):
             raise RuntimeError("Ego-LAP runtime contract evidence is incomplete")
-        runtime_safety = validate_eef_runtime_safety(env, require_gripper_runtime=True)
+        runtime_safety = validate_eef_runtime_safety(
+            env,
+            require_gripper_runtime=True,
+            expected_gripper_target_slew_profile=(
+                controller_profile.target_slew_profile
+            ),
+            expected_eef_controller_profile=controller_profile.profile,
+        )
+        if initial_controller_repair_candidate is None:
+            initial_controller_repair_candidate = (
+                capture_eef_controller_repair_candidate_report(
+                    env,
+                    runtime_safety,
+                    expected_profile=controller_profile.profile,
+                    expected_target_slew_profile=(
+                        controller_profile.target_slew_profile
+                    ),
+                    require_initial_state=True,
+                )
+            )
         committed_episode_indices = (
             [int(value) for value in episode_df["episode"].tolist()]
             if "episode" in episode_df
             else []
         )
-        sidecars = load_episode_safety_sidecars(safety_dir, committed_episode_indices)
-        aggregate_safety = aggregate_episode_safety(runtime_safety, sidecars)
+        sidecars = load_episode_safety_sidecars(
+            safety_dir,
+            committed_episode_indices,
+            expected_eef_controller_profile=controller_profile.profile,
+            expected_gripper_target_slew_profile=(
+                controller_profile.target_slew_profile
+            ),
+        )
+        aggregate_safety = aggregate_episode_safety(
+            runtime_safety,
+            sidecars,
+            expected_eef_controller_profile=controller_profile.profile,
+            expected_gripper_target_slew_profile=(
+                controller_profile.target_slew_profile
+            ),
+        )
+        controller_repair_aggregate = build_eef_controller_repair_candidate_aggregate(
+            live_safety=runtime_safety,
+            initial_report=initial_controller_repair_candidate,
+            sidecars=sidecars,
+            expected_eef_controller_profile=controller_profile.profile,
+            expected_gripper_target_slew_profile=(
+                controller_profile.target_slew_profile
+            ),
+        )
         atomic_write_runtime_contract(
             Path(eval_args.runtime_contract_output),
+            eef_controller_profile=controller_profile.profile,
+            controller_repair_candidate=controller_repair_aggregate,
             protocol=runtime_protocol,
             frame=runtime_frame_evidence,
             ik_safety=aggregate_safety,
+            expected_gripper_target_slew_profile=(
+                controller_profile.target_slew_profile
+            ),
         )
         return runtime_safety
 
@@ -365,6 +444,14 @@ def main(eval_args: EvalArgs):
                 video.append(viz)
             try:
                 if is_ego_lap:
+                    if controller_profile.all_six_gripper_trace_enabled:
+                        finger_term = env.unwrapped.action_manager._terms[
+                            "finger_joint"
+                        ]
+                        finger_term.begin_eef_policy_step(
+                            episode_index=episode,
+                            policy_step=bar.n,
+                        )
                     environment_before = capture_eef_environment_state(env)
                 obs, rew, term, trunc, info = env.step(
                     torch.as_tensor(action, device=env.device).reshape(1, -1),
@@ -448,7 +535,37 @@ def main(eval_args: EvalArgs):
                 raise RuntimeError(
                     "Transactional Ego-LAP evaluation did not finalize a trace"
                 )
-            episode_safety = eef_episode_safety_report(env, episode)
+            episode_safety = eef_episode_safety_report(
+                env,
+                episode,
+                expected_gripper_target_slew_profile=(
+                    controller_profile.target_slew_profile
+                ),
+                expected_eef_controller_profile=controller_profile.profile,
+            )
+            controller_repair_candidate = (
+                capture_eef_controller_repair_candidate_report(
+                    env,
+                    episode_safety,
+                    expected_profile=controller_profile.profile,
+                    expected_target_slew_profile=(
+                        controller_profile.target_slew_profile
+                    ),
+                )
+            )
+            arm_failure_substep_trace = None
+            all_six_gripper_trace = None
+            if controller_profile.all_six_gripper_trace_enabled:
+                terms = env.unwrapped.action_manager._terms
+                finger_term = terms["finger_joint"]
+                finger_term.finalize_eef_rollout_trace(
+                    numerical_failure=bool(numerical_failure_reason)
+                )
+                all_six_gripper_trace = finger_term.eef_all_six_gripper_trace()
+                if numerical_failure_reason:
+                    arm_failure_substep_trace = terms["arm"].failure_substep_trace(
+                        episode
+                    )
             artifact_identity = build_episode_artifact_identity(
                 run_folder=run_folder,
                 trace_path=finalized_trace,
@@ -456,11 +573,18 @@ def main(eval_args: EvalArgs):
             )
             atomic_write_episode_safety(
                 safety_dir / f"episode_{episode:06d}.json",
+                eef_controller_profile=controller_profile.profile,
+                controller_repair_candidate=controller_repair_candidate,
+                arm_failure_substep_trace=arm_failure_substep_trace,
+                all_six_gripper_trace=all_six_gripper_trace,
                 episode_index=episode,
                 episode_result=episode_data,
                 safety=episode_safety,
                 artifact_identity=artifact_identity,
                 terminal_rollout=terminal_rollout,
+                expected_gripper_target_slew_profile=(
+                    controller_profile.target_slew_profile
+                ),
             )
         episode_df = pd.concat(
             [episode_df, pd.DataFrame([episode_data])], ignore_index=True

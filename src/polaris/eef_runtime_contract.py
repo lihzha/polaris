@@ -8,13 +8,27 @@ import json
 import math
 import os
 from pathlib import Path
+import struct
 from typing import Any
 
 import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation
 
+from polaris.config import EEF_CONTROLLER_BASELINE_PROFILE
 from polaris.config import LAP_EEF_FRAME
+from polaris.eef_controller_profile import (
+    eef_controller_apply_counts_from_safety,
+)
+from polaris.eef_controller_profile import (
+    eef_controller_profile as resolve_eef_controller_profile,
+)
+from polaris.eef_controller_profile import (
+    validate_eef_controller_repair_candidate_report,
+)
+from polaris.eef_controller_profile import validate_eef_controller_runtime_profile
+from polaris.eef_controller_profile import validate_eef_controller_safety_evidence
+from polaris.eef_gripper_failure_trace import validate_eef_all_six_gripper_trace
 from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
@@ -67,8 +81,8 @@ CANONICAL_IK_METHOD = "dls"
 CANONICAL_DLS_DAMPING = 0.01
 CANONICAL_ARM_SCALE = 1.0
 CANONICAL_ARM_JOINTS = tuple(f"panda_joint{index}" for index in range(1, 8))
-EEF_SAFETY_SIDECAR_SCHEMA_VERSION = 5
-EEF_RUNTIME_CONTRACT_SCHEMA_VERSION = 5
+EEF_SAFETY_SIDECAR_SCHEMA_VERSION = 6
+EEF_RUNTIME_CONTRACT_SCHEMA_VERSION = 6
 EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE = "ego_lap_eef_outer450_internal451_no_autoreset_v1"
 EGO_LAP_ENVIRONMENT_STATE_PROFILE = (
     "isaaclab_single_env_episode_sim_common_camera_counters_v1"
@@ -273,12 +287,37 @@ WRIST_ENERGY_BRAKE_EPISODE_SAFETY_FIELDS = {
 SAFETY_SIDECAR_FIELDS = {
     "schema_version",
     "transaction_state",
+    "eef_controller_profile",
+    "controller_repair_candidate",
+    "arm_failure_substep_trace",
+    "all_six_gripper_trace",
     "episode_index",
     "episode_result",
     "artifact_identity",
     "cadence_evidence",
     "terminal_rollout",
     "safety",
+}
+EEF_CONTROLLER_REPAIR_AGGREGATE_PROFILE = (
+    "polaris_eef_controller_repair_candidate_episode_aggregate_v1"
+)
+EEF_CONTROLLER_REPAIR_AGGREGATE_FIELDS = {
+    "profile",
+    "eef_controller_profile",
+    "initial",
+    "episodes",
+}
+EEF_CONTROLLER_REPAIR_AGGREGATE_EPISODE_FIELDS = {
+    "episode_index",
+    "report",
+}
+EEF_RUNTIME_CONTRACT_FIELDS = {
+    "schema_version",
+    "eef_controller_profile",
+    "controller_repair_candidate",
+    "protocol",
+    "frame",
+    "ik_safety",
 }
 ARTIFACT_IDENTITY_FIELDS = {"video", "terminal_trace"}
 VIDEO_IDENTITY_FIELDS = {
@@ -934,6 +973,326 @@ def _gripper_target_slew_profile_from_safety(safety: Mapping[str, Any]) -> str:
     return profile
 
 
+ARM_FAILURE_SUBSTEP_TRACE_PROFILE = "eef_applied_substep_ring_last64_v1"
+ARM_FAILURE_SUBSTEP_TRACE_EFFORT_SEMANTICS = (
+    "isaaclab_implicit_actuator_approximate_pd_preclip_and_effortlimit_clipped_v1"
+)
+ARM_FAILURE_SUBSTEP_TRACE_PHASE_CONTRACT = {
+    "joint_state": "apply_actions_entry_cached_after_previous_scene_update_v1",
+    "post_joint_state": (
+        "next_apply_actions_entry_cached_after_command_physics_and_scene_update_v1"
+    ),
+    "joint_state_delta": "post_joint_state_minus_pre_joint_state_v1",
+    "current_eef_pose": "apply_actions_entry_before_pose_error_and_dls_v1",
+    "desired_eef_pose": "controller_command_live_at_apply_actions_entry_v1",
+    "pose_error": "position_and_axis_angle_after_pose_error_before_dls_v1",
+    "previous_target": "apply_actions_entry_before_current_target_setters_v1",
+    "raw_dls_target": "after_dls_before_safety_bounding_v1",
+    "new_target": "after_safety_bounding_and_both_target_setters_returned_v1",
+    "new_velocity_target": "zero_target_after_velocity_setter_returned_v1",
+    "new_effort_target": "zero_feedforward_live_at_write_data_to_sim_v1",
+    "effort": (
+        "isaaclab_write_data_to_sim_for_new_target_before_physics_"
+        "observed_at_next_apply_actions_entry_v1"
+    ),
+}
+ARM_FAILURE_SUBSTEP_TRACE_FIELDS = {
+    "schema_version",
+    "profile",
+    "episode_index",
+    "capacity",
+    "policy_step_capacity",
+    "decimation",
+    "joint_names",
+    "joint_drive_stiffness",
+    "joint_drive_damping",
+    "joint_effort_limits",
+    "effort_semantics",
+    "phase_contract",
+    "completed_entry_count",
+    "total_completed_entry_count",
+    "dropped_prefix_entry_count",
+    "pending_entry_count",
+    "pending_apply_index",
+    "entries",
+}
+ARM_FAILURE_SUBSTEP_TRACE_VECTOR_WIDTHS = {
+    "joint_pos_rad": 7,
+    "joint_vel_rad_s": 7,
+    "post_joint_pos_rad": 7,
+    "post_joint_vel_rad_s": 7,
+    "delta_joint_pos_rad": 7,
+    "delta_joint_vel_rad_s": 7,
+    "previous_joint_pos_target_rad": 7,
+    "raw_dls_joint_pos_target_rad": 7,
+    "new_joint_pos_target_rad": 7,
+    "new_joint_vel_target_rad_s": 7,
+    "new_joint_effort_target_nm": 7,
+    "current_eef_position_m": 3,
+    "current_eef_quaternion_wxyz": 4,
+    "desired_eef_position_m": 3,
+    "desired_eef_quaternion_wxyz": 4,
+    "pose_error_position_m_axis_angle_rad": 6,
+    "approximate_pd_effort_preclip_nm": 7,
+    "approximate_pd_effort_postclip_nm": 7,
+}
+ARM_FAILURE_SUBSTEP_TRACE_ENTRY_FIELDS = {
+    "apply_index",
+    "policy_step",
+    "physics_substep",
+    *ARM_FAILURE_SUBSTEP_TRACE_VECTOR_WIDTHS,
+}
+
+
+def _resolve_controller_expectations(
+    *,
+    eef_controller_profile: str,
+    expected_gripper_target_slew_profile: str | None,
+) -> tuple[Any, str]:
+    spec = resolve_eef_controller_profile(eef_controller_profile)
+    target = (
+        spec.target_slew_profile
+        if expected_gripper_target_slew_profile is None
+        else expected_gripper_target_slew_profile
+    )
+    if target != spec.target_slew_profile:
+        raise ValueError(
+            "PolaRiS EEF controller/target-slew contract mismatch: "
+            f"controller={spec.profile!r}, target={target!r}"
+        )
+    return spec, target
+
+
+def _validate_trace_vector(value: Any, *, width: int, field: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "values",
+        "finite_mask",
+        "finite_count",
+    }:
+        raise ValueError(f"{field} schema drift")
+    values = value["values"]
+    mask = value["finite_mask"]
+    if (
+        not isinstance(values, list)
+        or not isinstance(mask, list)
+        or len(values) != width
+        or len(mask) != width
+        or any(type(item) is not bool for item in mask)
+        or value["finite_count"] != sum(mask)
+    ):
+        raise ValueError(f"{field} width/mask drift")
+    for item, finite in zip(values, mask, strict=True):
+        if finite:
+            if (
+                isinstance(item, bool)
+                or not isinstance(item, (int, float))
+                or not math.isfinite(float(item))
+            ):
+                raise ValueError(f"{field} finite value drift")
+        elif item is not None:
+            raise ValueError(f"{field} nonfinite sentinel drift")
+    return dict(value)
+
+
+def _float32_round(value: float) -> float:
+    try:
+        return struct.unpack("<f", struct.pack("<f", value))[0]
+    except (OverflowError, struct.error):
+        return math.nan
+
+
+def _float32_subtract(left: float, right: float) -> float:
+    return _float32_round(_float32_round(left) - _float32_round(right))
+
+
+def _float32_add(left: float, right: float) -> float:
+    return _float32_round(_float32_round(left) + _float32_round(right))
+
+
+def _float32_multiply(left: float, right: float) -> float:
+    return _float32_round(_float32_round(left) * _float32_round(right))
+
+
+def _same_float32(left: float, right: float) -> bool:
+    try:
+        return struct.pack("<f", left) == struct.pack("<f", right)
+    except (OverflowError, struct.error):
+        return False
+
+
+def validate_arm_failure_substep_trace(
+    trace: Any,
+    *,
+    episode_index: int,
+    apply_calls: int,
+) -> dict[str, Any]:
+    """Validate the closed causal arm ring captured on a failed canary."""
+
+    if (
+        type(episode_index) is not int
+        or episode_index < 0
+        or type(apply_calls) is not int
+        or apply_calls < 1
+    ):
+        raise ValueError("Arm failure substep trace validation input drift")
+    if not isinstance(trace, dict) or set(trace) != ARM_FAILURE_SUBSTEP_TRACE_FIELDS:
+        raise ValueError("Arm failure substep trace schema drift")
+    for field in (
+        "schema_version",
+        "episode_index",
+        "capacity",
+        "policy_step_capacity",
+        "decimation",
+    ):
+        if type(trace.get(field)) is not int or trace[field] < 0:
+            raise ValueError(f"Arm failure substep trace {field} type drift")
+    if (
+        trace.get("schema_version") != 1
+        or trace.get("profile") != ARM_FAILURE_SUBSTEP_TRACE_PROFILE
+        or trace.get("episode_index") != episode_index
+        or trace.get("capacity") != 64
+        or trace.get("policy_step_capacity") != 8
+        or trace.get("decimation") != CANONICAL_DECIMATION
+        or trace.get("joint_names") != list(CANONICAL_ARM_JOINTS)
+    ):
+        raise ValueError("Arm failure substep trace identity drift")
+    for field, expected in (
+        ("joint_drive_stiffness", [400.0] * 7),
+        ("joint_drive_damping", [80.0] * 7),
+        ("joint_effort_limits", list(PANDA_EEF_JOINT_EFFORT_LIMITS)),
+    ):
+        values = trace.get(field)
+        if (
+            not isinstance(values, list)
+            or len(values) != 7
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                for value in values
+            )
+            or not np.array_equal(
+                np.asarray(values, dtype=np.float32),
+                np.asarray(expected, dtype=np.float32),
+            )
+        ):
+            raise ValueError(f"Arm failure substep trace {field} drift")
+    if (
+        trace.get("effort_semantics") != ARM_FAILURE_SUBSTEP_TRACE_EFFORT_SEMANTICS
+        or trace.get("phase_contract") != ARM_FAILURE_SUBSTEP_TRACE_PHASE_CONTRACT
+    ):
+        raise ValueError("Arm failure substep trace semantics drift")
+    completed = trace.get("completed_entry_count")
+    total = trace.get("total_completed_entry_count")
+    dropped = trace.get("dropped_prefix_entry_count")
+    pending_count = trace.get("pending_entry_count")
+    pending_index = trace.get("pending_apply_index")
+    if (
+        type(completed) is not int
+        or type(total) is not int
+        or type(dropped) is not int
+        or type(pending_count) is not int
+        or total != apply_calls - 1
+        or pending_count != 0
+        or pending_index is not None
+        or completed != min(total, 64)
+        or dropped != total - completed
+    ):
+        raise ValueError("Arm failure substep trace retention/cadence drift")
+    entries = trace.get("entries")
+    if not isinstance(entries, list) or len(entries) != completed:
+        raise ValueError("Arm failure substep trace entry count drift")
+    first = total - completed
+    validated_entries: list[dict[str, Any]] = []
+    for offset, entry in enumerate(entries):
+        apply_index = first + offset
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != ARM_FAILURE_SUBSTEP_TRACE_ENTRY_FIELDS
+            or type(entry.get("apply_index")) is not int
+            or type(entry.get("policy_step")) is not int
+            or type(entry.get("physics_substep")) is not int
+            or entry.get("apply_index") != apply_index
+            or entry.get("policy_step") != apply_index // CANONICAL_DECIMATION
+            or entry.get("physics_substep") != apply_index % CANONICAL_DECIMATION
+        ):
+            raise ValueError("Arm failure substep trace entry cadence drift")
+        for field, width in ARM_FAILURE_SUBSTEP_TRACE_VECTOR_WIDTHS.items():
+            vector = _validate_trace_vector(
+                entry.get(field),
+                width=width,
+                field=f"arm failure trace {field}",
+            )
+            if vector["finite_count"] != width:
+                raise ValueError(f"Arm failure substep trace {field} is nonfinite")
+        if (
+            entry["new_joint_vel_target_rad_s"]["values"] != [0.0] * 7
+            or entry["new_joint_effort_target_nm"]["values"] != [0.0] * 7
+        ):
+            raise ValueError("Arm failure substep trace zero-target drift")
+        if validated_entries:
+            previous = validated_entries[-1]
+            if (
+                previous["post_joint_pos_rad"] != entry["joint_pos_rad"]
+                or previous["post_joint_vel_rad_s"] != entry["joint_vel_rad_s"]
+                or previous["new_joint_pos_target_rad"]
+                != entry["previous_joint_pos_target_rad"]
+            ):
+                raise ValueError(
+                    "Arm failure substep trace transition continuity drift"
+                )
+
+        for prefix, unit in (("joint_pos", "rad"), ("joint_vel", "rad_s")):
+            pre = entry[f"{prefix}_{unit}"]["values"]
+            post = entry[f"post_{prefix}_{unit}"]["values"]
+            delta = entry[f"delta_{prefix}_{unit}"]["values"]
+            if any(
+                not _same_float32(actual, _float32_subtract(after, before))
+                for before, after, actual in zip(pre, post, delta, strict=True)
+            ):
+                raise ValueError(
+                    f"Arm failure substep trace {prefix} delta semantics drift"
+                )
+
+        joint_pos = entry["joint_pos_rad"]["values"]
+        joint_vel = entry["joint_vel_rad_s"]["values"]
+        joint_pos_target = entry["new_joint_pos_target_rad"]["values"]
+        joint_vel_target = entry["new_joint_vel_target_rad_s"]["values"]
+        joint_effort_target = entry["new_joint_effort_target_nm"]["values"]
+        preclip = entry["approximate_pd_effort_preclip_nm"]["values"]
+        postclip = entry["approximate_pd_effort_postclip_nm"]["values"]
+        for joint_index in range(7):
+            position_error = _float32_subtract(
+                joint_pos_target[joint_index], joint_pos[joint_index]
+            )
+            velocity_error = _float32_subtract(
+                joint_vel_target[joint_index], joint_vel[joint_index]
+            )
+            expected_preclip = _float32_add(
+                _float32_add(
+                    _float32_multiply(
+                        trace["joint_drive_stiffness"][joint_index],
+                        position_error,
+                    ),
+                    _float32_multiply(
+                        trace["joint_drive_damping"][joint_index],
+                        velocity_error,
+                    ),
+                ),
+                joint_effort_target[joint_index],
+            )
+            effort_limit = _float32_round(trace["joint_effort_limits"][joint_index])
+            expected_postclip = min(max(expected_preclip, -effort_limit), effort_limit)
+            if not _same_float32(preclip[joint_index], expected_preclip):
+                raise ValueError("Arm failure substep trace PD preclip semantics drift")
+            if not _same_float32(postclip[joint_index], expected_postclip):
+                raise ValueError(
+                    "Arm failure substep trace PD postclip semantics drift"
+                )
+        validated_entries.append(entry)
+    return dict(trace)
+
+
 def _canonical_wrist_energy_brake_threshold() -> np.ndarray:
     max_delta = np.asarray(
         PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S,
@@ -1487,6 +1846,7 @@ def _validate_eef_runtime_safety_report(
     report: Mapping[str, Any],
     require_gripper_runtime: bool = False,
     expected_gripper_target_slew_profile: str = EEF_GRIPPER_TARGET_SLEW_PROFILE,
+    expected_eef_controller_profile: str | None = None,
 ) -> dict[str, Any]:
     """Validate one exact report already obtained from the live action term."""
 
@@ -1953,6 +2313,13 @@ def _validate_eef_runtime_safety_report(
             max(counters["apply_calls"] - 1, 0),
         }:
             raise ValueError("Gripper target-slew/arm apply counts disagree")
+    if expected_eef_controller_profile is not None:
+        validate_eef_controller_runtime_profile(
+            env,
+            report,
+            expected_profile=expected_eef_controller_profile,
+            expected_target_slew_profile=expected_gripper_target_slew_profile,
+        )
     return report
 
 
@@ -1961,6 +2328,7 @@ def validate_eef_runtime_safety(
     *,
     require_gripper_runtime: bool = False,
     expected_gripper_target_slew_profile: str = EEF_GRIPPER_TARGET_SLEW_PROFILE,
+    expected_eef_controller_profile: str | None = None,
 ) -> dict[str, Any]:
     """Fetch, validate, and return cumulative live EEF IK safety evidence."""
 
@@ -1968,12 +2336,16 @@ def validate_eef_runtime_safety(
     reporter = getattr(arm_term, "safety_report", None)
     if not callable(reporter):
         raise ValueError("Live Ego-LAP EEF action has no IK safety reporter")
-    return _validate_eef_runtime_safety_report(
-        env,
-        report=reporter(),
-        require_gripper_runtime=require_gripper_runtime,
-        expected_gripper_target_slew_profile=(expected_gripper_target_slew_profile),
-    )
+    validation_kwargs = {
+        "report": reporter(),
+        "require_gripper_runtime": require_gripper_runtime,
+        "expected_gripper_target_slew_profile": (expected_gripper_target_slew_profile),
+    }
+    if expected_eef_controller_profile is not None:
+        validation_kwargs["expected_eef_controller_profile"] = (
+            expected_eef_controller_profile
+        )
+    return _validate_eef_runtime_safety_report(env, **validation_kwargs)
 
 
 def validate_eef_runtime_frame(
@@ -2142,6 +2514,7 @@ def eef_episode_safety_report(
     episode_index: int,
     *,
     expected_gripper_target_slew_profile: str = EEF_GRIPPER_TARGET_SLEW_PROFILE,
+    expected_eef_controller_profile: str | None = None,
 ) -> dict[str, Any]:
     """Return one completed rollout's live action-term safety report."""
 
@@ -2150,12 +2523,16 @@ def eef_episode_safety_report(
     if not callable(reporter):
         raise ValueError("Live Ego-LAP EEF action has no episode safety reporter")
     report = reporter(episode_index)
-    return _validate_eef_runtime_safety_report(
-        env,
-        require_gripper_runtime=True,
-        report=report,
-        expected_gripper_target_slew_profile=(expected_gripper_target_slew_profile),
-    )
+    validation_kwargs = {
+        "require_gripper_runtime": True,
+        "report": report,
+        "expected_gripper_target_slew_profile": (expected_gripper_target_slew_profile),
+    }
+    if expected_eef_controller_profile is not None:
+        validation_kwargs["expected_eef_controller_profile"] = (
+            expected_eef_controller_profile
+        )
+    return _validate_eef_runtime_safety_report(env, **validation_kwargs)
 
 
 def _reject_json_constant(value: str) -> None:
@@ -2276,14 +2653,107 @@ def _validate_artifact_identity_schema(identity: Mapping[str, Any]) -> None:
         raise ValueError("Episode trace identity/result terminal binding drift")
 
 
+def _validate_episode_controller_artifacts(
+    *,
+    eef_controller_profile: str,
+    controller_repair_candidate: Any,
+    arm_failure_substep_trace: Any,
+    all_six_gripper_trace: Any,
+    safety: Mapping[str, Any],
+    episode_result: Mapping[str, Any],
+    expected_gripper_target_slew_profile: str | None,
+) -> tuple[Any, str, dict[str, Any]]:
+    spec, target_profile = _resolve_controller_expectations(
+        eef_controller_profile=eef_controller_profile,
+        expected_gripper_target_slew_profile=(expected_gripper_target_slew_profile),
+    )
+    validate_eef_controller_safety_evidence(
+        safety,
+        expected_profile=spec.profile,
+        expected_target_slew_profile=target_profile,
+    )
+    result = canonical_episode_result(episode_result)
+    counters = safety.get("counters")
+    if not isinstance(counters, Mapping):
+        raise ValueError("Episode controller artifacts lack safety counters")
+    apply_calls, committed_apply_calls = eef_controller_apply_counts_from_safety(safety)
+    report = validate_eef_controller_repair_candidate_report(
+        controller_repair_candidate,
+        expected_profile=spec.profile,
+        expected_target_slew_profile=target_profile,
+        expected_physical_max_delta_joint_pos_rad=safety.get("max_delta_joint_pos_rad"),
+        apply_calls=apply_calls,
+        committed_apply_calls=committed_apply_calls,
+    )
+    maxima = safety.get("maxima")
+    if not isinstance(maxima, Mapping):
+        raise ValueError("Episode controller artifacts lack safety maxima")
+    applied_delta = _finite_numeric_vector(
+        maxima.get("applied_delta_joint_pos_rad"),
+        size=7,
+        field="controller-profile applied arm delta",
+    )
+    nominal_delta = np.asarray(
+        report["arm_slew_headroom"]["nominal_max_delta_joint_pos_rad"],
+        dtype=np.float64,
+    )
+    if np.any(applied_delta > nominal_delta + 1e-6):
+        raise ValueError("Episode controller nominal arm-slew bound drift")
+    if spec.all_six_gripper_trace_enabled:
+        raw_dynamic = safety.get("gripper_runtime_dynamic")
+        if not isinstance(raw_dynamic, Mapping):
+            raise ValueError("Candidate episode lacks gripper dynamic evidence")
+        dynamic = validate_eef_gripper_dynamic_evidence(
+            raw_dynamic,
+            expected_target_slew_profile=target_profile,
+        )
+        target_slew = dynamic.get("driver_target_slew")
+        if not isinstance(target_slew, Mapping):
+            raise ValueError("Candidate episode lacks target-slew cadence evidence")
+        arm_endpoint_changes = report["gripper_close_arm_interlock"][
+            "observed_endpoint_change_count"
+        ]
+        finger_endpoint_changes = target_slew.get("endpoint_change_count")
+        endpoint_change_counts_match = (
+            arm_endpoint_changes <= finger_endpoint_changes <= arm_endpoint_changes + 1
+            if result["numerical_failure"]
+            else arm_endpoint_changes == finger_endpoint_changes
+        )
+        if not endpoint_change_counts_match:
+            raise ValueError("Candidate arm/gripper endpoint-change cadence drift")
+        validate_eef_all_six_gripper_trace(
+            all_six_gripper_trace,
+            episode_index=result["episode"],
+            episode_length=result["episode_length"],
+            numerical_failure=result["numerical_failure"],
+            expected_apply_calls=target_slew.get("apply_calls"),
+        )
+        if result["numerical_failure"]:
+            validate_arm_failure_substep_trace(
+                arm_failure_substep_trace,
+                episode_index=result["episode"],
+                apply_calls=counters.get("apply_calls"),
+            )
+        elif arm_failure_substep_trace is not None:
+            raise ValueError("Successful candidate episode has an arm failure trace")
+    elif arm_failure_substep_trace is not None or all_six_gripper_trace is not None:
+        raise ValueError("Baseline EEF controller cannot carry candidate traces")
+    return spec, target_profile, report
+
+
 def atomic_write_episode_safety(
     path: Path,
     *,
+    eef_controller_profile: str,
+    controller_repair_candidate: Mapping[str, Any],
+    arm_failure_substep_trace: Mapping[str, Any] | None,
+    all_six_gripper_trace: Mapping[str, Any] | None,
     episode_index: int,
     episode_result: Mapping[str, Any],
     safety: Mapping[str, Any],
     artifact_identity: Mapping[str, Any],
     terminal_rollout: Mapping[str, Any],
+    expected_gripper_target_slew_profile: str | None = None,
 ) -> dict[str, Any]:
     """Atomically persist an immutable, CSV-recoverable episode transaction."""
 
@@ -2304,14 +2774,34 @@ def atomic_write_episode_safety(
         raise ValueError("Episode sidecar terminal/result binding drift")
     if artifact_identity["terminal_trace"]["terminal_rollout"] != terminal:
         raise ValueError("Episode sidecar terminal/trace binding drift")
+    spec, target_profile, controller_report = _validate_episode_controller_artifacts(
+        eef_controller_profile=eef_controller_profile,
+        controller_repair_candidate=controller_repair_candidate,
+        arm_failure_substep_trace=arm_failure_substep_trace,
+        all_six_gripper_trace=all_six_gripper_trace,
+        safety=safety,
+        episode_result=result,
+        expected_gripper_target_slew_profile=(expected_gripper_target_slew_profile),
+    )
     cadence_evidence = validate_episode_safety_cadence(
         safety=safety,
         episode_result=result,
+        expected_gripper_target_slew_profile=target_profile,
     )
     _validate_terminal_apply_binding(terminal, cadence_evidence)
     payload = {
         "schema_version": EEF_SAFETY_SIDECAR_SCHEMA_VERSION,
         "transaction_state": "prepared",
+        "eef_controller_profile": spec.profile,
+        "controller_repair_candidate": controller_report,
+        "arm_failure_substep_trace": (
+            None
+            if arm_failure_substep_trace is None
+            else dict(arm_failure_substep_trace)
+        ),
+        "all_six_gripper_trace": (
+            None if all_six_gripper_trace is None else dict(all_six_gripper_trace)
+        ),
         "episode_index": episode_index,
         "episode_result": result,
         "artifact_identity": dict(artifact_identity),
@@ -2331,7 +2821,10 @@ def atomic_write_episode_safety(
 
 
 def _validate_episode_safety_evidence_shape(
-    safety: Mapping[str, Any], *, episode_index: int
+    safety: Mapping[str, Any],
+    *,
+    episode_index: int,
+    expected_gripper_target_slew_profile: str | None = None,
 ) -> dict[str, Any] | None:
     """Validate the exact durable per-episode safety schema and counter mapping."""
 
@@ -2353,7 +2846,18 @@ def _validate_episode_safety_evidence_shape(
         raise ValueError("Episode safety environment/apply substeps disagree")
     apply_calls = counters["apply_calls"]
     if gripper_runtime_enabled:
-        gripper_target_slew_profile = _gripper_target_slew_profile_from_safety(safety)
+        actual_target_slew_profile = _gripper_target_slew_profile_from_safety(safety)
+        gripper_target_slew_profile = (
+            actual_target_slew_profile
+            if expected_gripper_target_slew_profile is None
+            else expected_gripper_target_slew_profile
+        )
+        if actual_target_slew_profile != gripper_target_slew_profile:
+            raise ValueError(
+                "Episode gripper target-slew profile mismatch: "
+                f"expected={gripper_target_slew_profile!r}, "
+                f"actual={actual_target_slew_profile!r}"
+            )
         validate_eef_gripper_static_contract(
             safety["gripper_runtime_static"],
             expected_target_slew_profile=gripper_target_slew_profile,
@@ -2532,6 +3036,7 @@ def validate_episode_safety_cadence(
     *,
     safety: Mapping[str, Any],
     episode_result: Mapping[str, Any],
+    expected_gripper_target_slew_profile: str | None = None,
 ) -> dict[str, Any]:
     """Cross-check one rollout result against exact controller substep counts."""
 
@@ -2542,7 +3047,9 @@ def validate_episode_safety_cadence(
             f"safety={safety.get('episode_index')!r}, result={result['episode']!r}"
         )
     velocity_abort = _validate_episode_safety_evidence_shape(
-        safety, episode_index=result["episode"]
+        safety,
+        episode_index=result["episode"],
+        expected_gripper_target_slew_profile=(expected_gripper_target_slew_profile),
     )
     _validate_current_joint_velocity_abort_result_binding(
         evidence=velocity_abort,
@@ -2581,7 +3088,14 @@ def validate_episode_safety_cadence(
     )
     numerical_failure = result["numerical_failure"]
     if "gripper_runtime_dynamic" in safety:
-        gripper_target_slew_profile = _gripper_target_slew_profile_from_safety(safety)
+        actual_target_slew_profile = _gripper_target_slew_profile_from_safety(safety)
+        gripper_target_slew_profile = (
+            actual_target_slew_profile
+            if expected_gripper_target_slew_profile is None
+            else expected_gripper_target_slew_profile
+        )
+        if actual_target_slew_profile != gripper_target_slew_profile:
+            raise ValueError("Episode target-slew expectation drift")
         gripper_dynamic = validate_eef_gripper_dynamic_evidence(
             safety["gripper_runtime_dynamic"],
             expected_target_slew_profile=gripper_target_slew_profile,
@@ -2760,7 +3274,11 @@ def validate_episode_safety_cadence(
 
 
 def load_episode_safety_sidecars(
-    directory: Path, committed_episode_indices: list[int]
+    directory: Path,
+    committed_episode_indices: list[int],
+    *,
+    expected_eef_controller_profile: str = EEF_CONTROLLER_BASELINE_PROFILE,
+    expected_gripper_target_slew_profile: str | None = None,
 ) -> list[dict[str, Any]]:
     """Load the exact sidecar set corresponding to committed CSV episodes."""
 
@@ -2796,9 +3314,21 @@ def load_episode_safety_sidecars(
         result = canonical_episode_result(payload.get("episode_result", {}))
         if result["episode"] != episode_index:
             raise ValueError(f"Drifted episode result identity in sidecar: {path}")
+        if payload.get("eef_controller_profile") != expected_eef_controller_profile:
+            raise ValueError(f"Episode safety sidecar controller profile drift: {path}")
+        _spec, target_profile, _report = _validate_episode_controller_artifacts(
+            eef_controller_profile=expected_eef_controller_profile,
+            controller_repair_candidate=payload.get("controller_repair_candidate"),
+            arm_failure_substep_trace=payload.get("arm_failure_substep_trace"),
+            all_six_gripper_trace=payload.get("all_six_gripper_trace"),
+            safety=payload.get("safety", {}),
+            episode_result=result,
+            expected_gripper_target_slew_profile=(expected_gripper_target_slew_profile),
+        )
         cadence = validate_episode_safety_cadence(
             safety=payload.get("safety", {}),
             episode_result=result,
+            expected_gripper_target_slew_profile=target_profile,
         )
         if payload.get("cadence_evidence") != cadence:
             raise ValueError(f"Drifted cadence evidence in sidecar: {path}")
@@ -2830,6 +3360,8 @@ def reconcile_episode_safety_transactions(
     trace_dir: Path,
     expected_rollouts: int,
     expected_horizon: int,
+    expected_eef_controller_profile: str = EEF_CONTROLLER_BASELINE_PROFILE,
+    expected_gripper_target_slew_profile: str | None = None,
     video_probe_fn: Callable[[Path], Mapping[str, Any]] = probe_episode_video,
 ) -> tuple[pd.DataFrame, bool]:
     """Validate committed sidecars and recover one prepared row after a crash.
@@ -2909,8 +3441,21 @@ def reconcile_episode_safety_transactions(
             raise ValueError(
                 f"Sidecar episode length exceeds horizon {expected_horizon}: {path}"
             )
+        if payload.get("eef_controller_profile") != expected_eef_controller_profile:
+            raise ValueError(f"Sidecar controller profile mismatch: {path}")
+        _spec, target_profile, _report = _validate_episode_controller_artifacts(
+            eef_controller_profile=expected_eef_controller_profile,
+            controller_repair_candidate=payload.get("controller_repair_candidate"),
+            arm_failure_substep_trace=payload.get("arm_failure_substep_trace"),
+            all_six_gripper_trace=payload.get("all_six_gripper_trace"),
+            safety=payload.get("safety", {}),
+            episode_result=result,
+            expected_gripper_target_slew_profile=(expected_gripper_target_slew_profile),
+        )
         cadence = validate_episode_safety_cadence(
-            safety=payload.get("safety", {}), episode_result=result
+            safety=payload.get("safety", {}),
+            episode_result=result,
+            expected_gripper_target_slew_profile=target_profile,
         )
         if payload.get("cadence_evidence") != cadence:
             raise ValueError(f"Sidecar cadence identity mismatch: {path}")
@@ -2954,11 +3499,26 @@ def reconcile_episode_safety_transactions(
 def aggregate_episode_safety(
     live_template: Mapping[str, Any],
     sidecars: list[Mapping[str, Any]],
+    *,
+    expected_eef_controller_profile: str = EEF_CONTROLLER_BASELINE_PROFILE,
+    expected_gripper_target_slew_profile: str | None = None,
 ) -> dict[str, Any]:
     """Merge immutable per-episode reports without losing resume history."""
 
     candidate_enabled = _candidate_enabled_from_safety(live_template)
     gripper_runtime_enabled = _gripper_runtime_enabled_from_safety(live_template)
+    controller_spec = None
+    expected_target_profile = None
+    if gripper_runtime_enabled:
+        controller_spec, expected_target_profile = _resolve_controller_expectations(
+            eef_controller_profile=expected_eef_controller_profile,
+            expected_gripper_target_slew_profile=(expected_gripper_target_slew_profile),
+        )
+        validate_eef_controller_safety_evidence(
+            live_template,
+            expected_profile=controller_spec.profile,
+            expected_target_slew_profile=expected_target_profile,
+        )
     if set(live_template) != _episode_safety_fields(
         candidate_enabled, gripper_runtime_enabled
     ):
@@ -2977,15 +3537,25 @@ def aggregate_episode_safety(
         field: [0.0] * 6 for field in GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS
     }
     gripper_target_slew_profile = (
-        _gripper_target_slew_profile_from_safety(live_template)
-        if gripper_runtime_enabled
-        else None
+        expected_target_profile if gripper_runtime_enabled else None
     )
     episodes = []
     for sidecar in sidecars:
         safety = sidecar.get("safety")
         if not isinstance(safety, Mapping):
             raise ValueError("Episode safety sidecar has no safety object")
+        if gripper_runtime_enabled:
+            if sidecar.get("eef_controller_profile") != controller_spec.profile:
+                raise ValueError("Episode aggregate controller profile drift")
+            _validate_episode_controller_artifacts(
+                eef_controller_profile=controller_spec.profile,
+                controller_repair_candidate=sidecar.get("controller_repair_candidate"),
+                arm_failure_substep_trace=sidecar.get("arm_failure_substep_trace"),
+                all_six_gripper_trace=sidecar.get("all_six_gripper_trace"),
+                safety=safety,
+                episode_result=sidecar.get("episode_result", {}),
+                expected_gripper_target_slew_profile=expected_target_profile,
+            )
         terminal = validate_terminal_rollout_evidence(
             sidecar.get("terminal_rollout", {})
         )
@@ -3071,6 +3641,147 @@ def aggregate_episode_safety(
         gripper_runtime_enabled=gripper_runtime_enabled,
     )
     return aggregate
+
+
+def build_eef_controller_repair_candidate_aggregate(
+    *,
+    live_safety: Mapping[str, Any],
+    initial_report: Mapping[str, Any],
+    sidecars: list[Mapping[str, Any]],
+    expected_eef_controller_profile: str,
+    expected_gripper_target_slew_profile: str | None = None,
+) -> dict[str, Any]:
+    """Build the closed initial-plus-episode controller evidence aggregate."""
+
+    spec, target_profile = _resolve_controller_expectations(
+        eef_controller_profile=expected_eef_controller_profile,
+        expected_gripper_target_slew_profile=(expected_gripper_target_slew_profile),
+    )
+    validate_eef_controller_safety_evidence(
+        live_safety,
+        expected_profile=spec.profile,
+        expected_target_slew_profile=target_profile,
+    )
+    validated_initial = validate_eef_controller_repair_candidate_report(
+        initial_report,
+        expected_profile=spec.profile,
+        expected_target_slew_profile=target_profile,
+        expected_physical_max_delta_joint_pos_rad=live_safety.get(
+            "max_delta_joint_pos_rad"
+        ),
+        apply_calls=0,
+        require_initial_state=True,
+    )
+    episodes = []
+    for expected_index, sidecar in enumerate(sidecars):
+        if (
+            sidecar.get("eef_controller_profile") != spec.profile
+            or sidecar.get("episode_index") != expected_index
+        ):
+            raise ValueError("Controller repair aggregate sidecar identity drift")
+        safety = sidecar.get("safety")
+        if not isinstance(safety, Mapping):
+            raise ValueError("Controller repair aggregate sidecar lacks safety")
+        apply_calls, committed_apply_calls = eef_controller_apply_counts_from_safety(
+            safety
+        )
+        report = validate_eef_controller_repair_candidate_report(
+            sidecar.get("controller_repair_candidate"),
+            expected_profile=spec.profile,
+            expected_target_slew_profile=target_profile,
+            expected_physical_max_delta_joint_pos_rad=safety.get(
+                "max_delta_joint_pos_rad"
+            ),
+            apply_calls=apply_calls,
+            committed_apply_calls=committed_apply_calls,
+        )
+        episodes.append({"episode_index": expected_index, "report": report})
+    aggregate = {
+        "profile": EEF_CONTROLLER_REPAIR_AGGREGATE_PROFILE,
+        "eef_controller_profile": spec.profile,
+        "initial": validated_initial,
+        "episodes": episodes,
+    }
+    return validate_eef_controller_repair_candidate_aggregate(
+        aggregate,
+        ik_safety={
+            "max_delta_joint_pos_rad": live_safety["max_delta_joint_pos_rad"],
+            "episodes": [
+                {
+                    "episode_index": item["episode_index"],
+                    "counters": sidecars[item["episode_index"]]["safety"]["counters"],
+                }
+                for item in episodes
+            ],
+        },
+        expected_eef_controller_profile=spec.profile,
+        expected_gripper_target_slew_profile=target_profile,
+    )
+
+
+def validate_eef_controller_repair_candidate_aggregate(
+    value: Any,
+    *,
+    ik_safety: Mapping[str, Any],
+    expected_eef_controller_profile: str,
+    expected_gripper_target_slew_profile: str | None = None,
+) -> dict[str, Any]:
+    """Validate a runtime aggregate without trusting its requested profile."""
+
+    spec, target_profile = _resolve_controller_expectations(
+        eef_controller_profile=expected_eef_controller_profile,
+        expected_gripper_target_slew_profile=(expected_gripper_target_slew_profile),
+    )
+    if (
+        not isinstance(value, dict)
+        or set(value) != EEF_CONTROLLER_REPAIR_AGGREGATE_FIELDS
+        or value.get("profile") != EEF_CONTROLLER_REPAIR_AGGREGATE_PROFILE
+        or value.get("eef_controller_profile") != spec.profile
+    ):
+        raise ValueError("Controller repair runtime aggregate schema/identity drift")
+    physical = ik_safety.get("max_delta_joint_pos_rad")
+    validate_eef_controller_repair_candidate_report(
+        value.get("initial"),
+        expected_profile=spec.profile,
+        expected_target_slew_profile=target_profile,
+        expected_physical_max_delta_joint_pos_rad=physical,
+        apply_calls=0,
+        require_initial_state=True,
+    )
+    episodes = value.get("episodes")
+    safety_episodes = ik_safety.get("episodes")
+    if (
+        not isinstance(episodes, list)
+        or not isinstance(safety_episodes, list)
+        or len(episodes) != len(safety_episodes)
+    ):
+        raise ValueError("Controller repair runtime aggregate episode count drift")
+    for expected_index, (episode, safety_episode) in enumerate(
+        zip(episodes, safety_episodes, strict=True)
+    ):
+        if (
+            not isinstance(episode, dict)
+            or set(episode) != EEF_CONTROLLER_REPAIR_AGGREGATE_EPISODE_FIELDS
+            or episode.get("episode_index") != expected_index
+            or not isinstance(safety_episode, Mapping)
+            or safety_episode.get("episode_index") != expected_index
+        ):
+            raise ValueError("Controller repair runtime aggregate episode drift")
+        counters = safety_episode.get("counters")
+        if not isinstance(counters, Mapping):
+            raise ValueError("Controller repair runtime aggregate counters drift")
+        apply_calls, committed_apply_calls = eef_controller_apply_counts_from_safety(
+            {"counters": counters}
+        )
+        validate_eef_controller_repair_candidate_report(
+            episode.get("report"),
+            expected_profile=spec.profile,
+            expected_target_slew_profile=target_profile,
+            expected_physical_max_delta_joint_pos_rad=physical,
+            apply_calls=apply_calls,
+            committed_apply_calls=committed_apply_calls,
+        )
+    return dict(value)
 
 
 def _validate_runtime_aggregate_consistency(
@@ -3200,12 +3911,19 @@ def _validate_runtime_aggregate_consistency(
 def atomic_write_runtime_contract(
     path: Path,
     *,
+    eef_controller_profile: str,
+    controller_repair_candidate: Mapping[str, Any],
     protocol: Mapping[str, Any],
     frame: Mapping[str, Any],
     ik_safety: Mapping[str, Any],
+    expected_gripper_target_slew_profile: str | None = None,
 ) -> None:
     """Atomically persist the live simulator/controller contract for this attempt."""
 
+    controller_spec, target_profile = _resolve_controller_expectations(
+        eef_controller_profile=eef_controller_profile,
+        expected_gripper_target_slew_profile=(expected_gripper_target_slew_profile),
+    )
     validated_protocol = validate_ego_lap_protocol_evidence(protocol)
     candidate_enabled = _candidate_enabled_from_safety(ik_safety)
     gripper_runtime_enabled = _gripper_runtime_enabled_from_safety(ik_safety)
@@ -3222,16 +3940,33 @@ def atomic_write_runtime_contract(
         gripper_target_slew_profile = _gripper_target_slew_profile_from_safety(
             ik_safety
         )
+        if gripper_target_slew_profile != target_profile:
+            raise ValueError("Runtime controller/gripper target-slew profile drift")
         validate_eef_gripper_static_contract(
             ik_safety["gripper_runtime_static"],
             expected_target_slew_profile=gripper_target_slew_profile,
         )
+        validate_eef_controller_safety_evidence(
+            ik_safety,
+            expected_profile=controller_spec.profile,
+            expected_target_slew_profile=target_profile,
+        )
+    validated_controller_repair = validate_eef_controller_repair_candidate_aggregate(
+        controller_repair_candidate,
+        ik_safety=ik_safety,
+        expected_eef_controller_profile=controller_spec.profile,
+        expected_gripper_target_slew_profile=target_profile,
+    )
     if frame.get("ik_safety_profile") != ik_safety.get("profile"):
         raise ValueError("Runtime frame and aggregate EEF IK safety profiles disagree")
     payload = {
         "schema_version": EEF_RUNTIME_CONTRACT_SCHEMA_VERSION,
+        "eef_controller_profile": controller_spec.profile,
+        "controller_repair_candidate": validated_controller_repair,
         "protocol": validated_protocol,
         "frame": dict(frame),
         "ik_safety": dict(ik_safety),
     }
+    if set(payload) != EEF_RUNTIME_CONTRACT_FIELDS:
+        raise ValueError("Runtime contract top-level schema drift")
     _atomic_write_json(path, payload)

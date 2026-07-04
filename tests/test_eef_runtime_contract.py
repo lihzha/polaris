@@ -18,6 +18,7 @@ from polaris.eef_runtime_contract import atomic_write_runtime_contract
 from polaris.eef_runtime_contract import atomic_write_episode_safety
 from polaris.eef_runtime_contract import _validate_wrist_energy_brake_history
 from polaris.eef_runtime_contract import aggregate_episode_safety
+from polaris.eef_runtime_contract import build_eef_controller_repair_candidate_aggregate
 from polaris.eef_runtime_contract import build_terminal_rollout_evidence
 from polaris.eef_runtime_contract import EEF_RUNTIME_CONTRACT_SCHEMA_VERSION
 from polaris.eef_runtime_contract import EEF_SAFETY_SIDECAR_SCHEMA_VERSION
@@ -29,6 +30,13 @@ from polaris.eef_runtime_contract import validate_eef_runtime_frame
 from polaris.eef_runtime_contract import validate_eef_runtime_safety
 from polaris.eef_runtime_contract import validate_ego_lap_runtime_protocol
 from polaris import eef_runtime_contract as runtime_contract_module
+from polaris.config import EEF_CONTROLLER_BASELINE_PROFILE
+from polaris.config import EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
+from polaris.eef_controller_profile import eef_controller_profile
+from polaris.eef_gripper_failure_trace import EEF_ALL_SIX_GRIPPER_TRACE_PROFILE
+from polaris.eef_gripper_runtime import (
+    EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE,
+)
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
@@ -331,6 +339,190 @@ def _episode_safety(
             }
         ]
     return report
+
+
+def _baseline_controller_report(safety: dict) -> dict:
+    spec = eef_controller_profile(EEF_CONTROLLER_BASELINE_PROFILE)
+    physical = list(safety["max_delta_joint_pos_rad"])
+    return {
+        "arm_slew_headroom": {
+            "enabled": False,
+            "profile": "panda_nominal_target_slew_0p95_physical_limit_v1",
+            "ratio": 0.95,
+            "physical_max_delta_joint_pos_rad": physical,
+            "nominal_max_delta_joint_pos_rad": physical,
+        },
+        "gripper_close_arm_interlock": {
+            "enabled": False,
+            "profile": spec.close_interlock_profile,
+            "configured_substeps": spec.close_interlock_substeps,
+            "remaining_substeps": 0,
+            "observed_endpoint_change_count": 0,
+            "endpoint_observed": False,
+            "activation_count": 0,
+            "active_apply_count": 0,
+            "anchor_valid": False,
+            "anchor_capture_count": 0,
+            "anchor_target_apply_count": 0,
+            "anchor_first_exact_target_count": 0,
+            "anchor_refresh_count": 0,
+            "anchor_slew_limit_event_count": 0,
+            "anchor_slew_limited_joint_count": 0,
+            "anchor_position_limit_event_count": 0,
+            "anchor_position_limited_joint_count": 0,
+            "anchor_completion_count": 0,
+            "anchor_open_cancel_count": 0,
+            "last_activation_apply_index": None,
+            "last_anchor_joint_pos_rad": None,
+            "last_anchor_little_endian_float32_sha256": None,
+            "max_abs_current_anchor_residual_rad": [0.0] * 7,
+            "max_abs_target_anchor_residual_rad": [0.0] * 7,
+            "max_abs_active_delta_joint_pos_rad": [0.0] * 7,
+            "released_apply_count": 0,
+            "max_abs_released_delta_joint_pos_rad": [0.0] * 7,
+        },
+    }
+
+
+def _controller_aggregate(ik_safety: dict) -> dict:
+    return {
+        "profile": "polaris_eef_controller_repair_candidate_episode_aggregate_v1",
+        "eef_controller_profile": EEF_CONTROLLER_BASELINE_PROFILE,
+        "initial": _baseline_controller_report(ik_safety),
+        "episodes": [
+            {
+                "episode_index": episode["episode_index"],
+                "report": _baseline_controller_report(ik_safety),
+            }
+            for episode in ik_safety.get("episodes", [])
+        ],
+    }
+
+
+def _candidate_controller_report(safety: dict, *, initial: bool) -> dict:
+    spec = eef_controller_profile(EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE)
+    physical = np.asarray(safety["max_delta_joint_pos_rad"], dtype=np.float32).tolist()
+    nominal = np.multiply(
+        np.asarray(physical, dtype=np.float32),
+        np.float32(0.95),
+        dtype=np.float32,
+    ).tolist()
+    return {
+        "arm_slew_headroom": {
+            "enabled": True,
+            "profile": "panda_nominal_target_slew_0p95_physical_limit_v1",
+            "ratio": 0.95,
+            "physical_max_delta_joint_pos_rad": physical,
+            "nominal_max_delta_joint_pos_rad": nominal,
+        },
+        "gripper_close_arm_interlock": {
+            "enabled": True,
+            "profile": spec.close_interlock_profile,
+            "configured_substeps": spec.close_interlock_substeps,
+            "remaining_substeps": 0,
+            "observed_endpoint_change_count": 0,
+            "endpoint_observed": not initial,
+            "activation_count": 0,
+            "active_apply_count": 0,
+            "anchor_valid": False,
+            "anchor_capture_count": 0,
+            "anchor_target_apply_count": 0,
+            "anchor_first_exact_target_count": 0,
+            "anchor_refresh_count": 0,
+            "anchor_slew_limit_event_count": 0,
+            "anchor_slew_limited_joint_count": 0,
+            "anchor_position_limit_event_count": 0,
+            "anchor_position_limited_joint_count": 0,
+            "anchor_completion_count": 0,
+            "anchor_open_cancel_count": 0,
+            "last_activation_apply_index": None,
+            "last_anchor_joint_pos_rad": None,
+            "last_anchor_little_endian_float32_sha256": None,
+            "max_abs_current_anchor_residual_rad": [0.0] * 7,
+            "max_abs_target_anchor_residual_rad": [0.0] * 7,
+            "max_abs_active_delta_joint_pos_rad": [0.0] * 7,
+            "released_apply_count": 0,
+            "max_abs_released_delta_joint_pos_rad": [0.0] * 7,
+        },
+    }
+
+
+def _all_six_trace(*, episode: int, length: int, apply_calls: int) -> dict:
+    snapshot = {
+        "joint_pos_rad": [0.0] * 6,
+        "joint_vel_rad_s": [0.0] * 6,
+        "joint_acc_rad_s2": [0.0] * 6,
+        "joint_pos_target_rad": [0.0] * 6,
+        "joint_vel_target_rad_s": [0.0] * 6,
+        "joint_effort_target_nm": [0.0] * 6,
+    }
+    first = max(apply_calls - 64, 0)
+    entries = [
+        {
+            "apply_index": apply_index,
+            "policy_step": apply_index // 8,
+            "physics_substep": apply_index % 8,
+            "raw_action": 0.0,
+            "requested_endpoint_rad": 0.0,
+            "pre": copy.deepcopy(snapshot),
+            "target_after_setter_rad": 0.0,
+            "post": copy.deepcopy(snapshot),
+        }
+        for apply_index in range(first, apply_calls)
+    ]
+    return {
+        "schema_version": 1,
+        "profile": EEF_ALL_SIX_GRIPPER_TRACE_PROFILE,
+        "episode_index": episode,
+        "capacity": 64,
+        "decimation": 8,
+        "joint_names": [
+            "finger_joint",
+            "right_outer_knuckle_joint",
+            "left_inner_finger_joint",
+            "right_inner_finger_joint",
+            "left_inner_finger_knuckle_joint",
+            "right_inner_finger_knuckle_joint",
+        ],
+        "joint_indices": [7, 8, 9, 10, 11, 12],
+        "process_action_calls": length,
+        "total_apply_entries": apply_calls,
+        "dropped_entries": first,
+        "initial_snapshot": copy.deepcopy(snapshot),
+        "entries": entries,
+        "terminal_snapshot": copy.deepcopy(snapshot),
+        "numerical_failure": False,
+    }
+
+
+def _attach_candidate_stub_gripper(safety: dict, *, length: int) -> dict:
+    apply_calls = safety["counters"]["apply_calls"]
+    safety["gripper_runtime_static"] = {
+        "profile": "candidate-static-stub",
+        "driver_target_slew": {
+            "profile": EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+        },
+        "mimic_compliance": {
+            "profile": (
+                "robotiq_2f85_live_physx_mimic_frequency100_damping1p2_candidate_v1"
+            ),
+            "enabled": True,
+        },
+    }
+    safety["gripper_runtime_dynamic"] = {
+        "apply_entry_samples": apply_calls,
+        "post_policy_step_samples": length,
+        "max_abs_joint_velocity_rad_s": [0.0] * 6,
+        "max_abs_joint_acceleration_rad_s2": [0.0] * 6,
+        "nonfinite_samples": 0,
+        "driver_target_slew": {
+            "profile": EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE,
+            "process_action_calls": length,
+            "apply_calls": apply_calls,
+            "endpoint_change_count": 0,
+        },
+    }
+    return safety
 
 
 def _attach_stub_gripper_runtime(
@@ -683,6 +875,10 @@ def _prepare_episode_transaction(tmp_path: Path, *, episode: int):
     sidecar_path = tmp_path / "ik_safety" / f"episode_{episode:06d}.json"
     payload = atomic_write_episode_safety(
         sidecar_path,
+        eef_controller_profile=EEF_CONTROLLER_BASELINE_PROFILE,
+        controller_repair_candidate=_baseline_controller_report(safety),
+        arm_failure_substep_trace=None,
+        all_six_gripper_trace=None,
         episode_index=episode,
         episode_result=result,
         safety=safety,
@@ -789,6 +985,8 @@ def test_runtime_candidate_selects_exact_profile_schema_and_diagnostics(tmp_path
     ]
     atomic_write_runtime_contract(
         tmp_path / "candidate-runtime.json",
+        eef_controller_profile=EEF_CONTROLLER_BASELINE_PROFILE,
+        controller_repair_candidate=_controller_aggregate(aggregate),
         protocol=validate_ego_lap_runtime_protocol(env),
         frame=frame,
         ik_safety=aggregate,
@@ -796,6 +994,8 @@ def test_runtime_candidate_selects_exact_profile_schema_and_diagnostics(tmp_path
     with pytest.raises(ValueError, match="profiles disagree"):
         atomic_write_runtime_contract(
             tmp_path / "candidate-runtime-mismatch.json",
+            eef_controller_profile=EEF_CONTROLLER_BASELINE_PROFILE,
+            controller_repair_candidate=_controller_aggregate(aggregate),
             protocol=validate_ego_lap_runtime_protocol(env),
             frame={**frame, "ik_safety_profile": EEF_IK_SAFETY_PROFILE},
             ik_safety=aggregate,
@@ -1026,12 +1226,19 @@ def test_runtime_contract_is_atomic_and_has_exact_evidence_schema():
         path.parent.mkdir(parents=True)
         path.write_text('{"stale": true}\n', encoding="utf-8")
         atomic_write_runtime_contract(
-            path, protocol=protocol, frame=frame, ik_safety=aggregate_safety
+            path,
+            eef_controller_profile=EEF_CONTROLLER_BASELINE_PROFILE,
+            controller_repair_candidate=_controller_aggregate(aggregate_safety),
+            protocol=protocol,
+            frame=frame,
+            ik_safety=aggregate_safety,
         )
         payload = json.loads(path.read_text(encoding="utf-8"))
 
         assert payload == {
             "schema_version": EEF_RUNTIME_CONTRACT_SCHEMA_VERSION,
+            "eef_controller_profile": EEF_CONTROLLER_BASELINE_PROFILE,
+            "controller_repair_candidate": _controller_aggregate(aggregate_safety),
             "protocol": {
                 "profile": "ego_lap_eef_outer450_internal451_no_autoreset_v1",
                 "episode_steps": 450,
@@ -1048,6 +1255,186 @@ def test_runtime_contract_is_atomic_and_has_exact_evidence_schema():
             "ik_safety": aggregate_safety,
         }
         assert not list(path.parent.glob(".*.tmp"))
+
+
+def test_candidate_schema6_sidecar_resume_and_runtime_profile_propagation(
+    tmp_path: Path,
+    monkeypatch,
+):
+    result = _episode_result(length=450)
+    safety = _attach_candidate_stub_gripper(
+        _episode_safety(length=450),
+        length=450,
+    )
+    controller_report = _candidate_controller_report(safety, initial=False)
+    initial_report = _candidate_controller_report(safety, initial=True)
+    all_six_trace = _all_six_trace(episode=0, length=450, apply_calls=3600)
+    terminal = _terminal_rollout(result)
+    sidecar_path = tmp_path / "ik_safety" / "episode_000000.json"
+
+    def static_contract(value, *, expected_target_slew_profile):
+        assert expected_target_slew_profile == (
+            EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+        )
+        return dict(value)
+
+    def dynamic_contract(value, *, expected_target_slew_profile):
+        assert expected_target_slew_profile == (
+            EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+        )
+        return dict(value)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            runtime_contract_module,
+            "validate_eef_gripper_static_contract",
+            static_contract,
+        )
+        patch.setattr(
+            runtime_contract_module,
+            "validate_eef_gripper_dynamic_evidence",
+            dynamic_contract,
+        )
+        patch.setattr(
+            runtime_contract_module,
+            "validate_eef_controller_safety_evidence",
+            lambda *_args, expected_profile, **_kwargs: eef_controller_profile(
+                expected_profile
+            ),
+        )
+        payload = atomic_write_episode_safety(
+            sidecar_path,
+            eef_controller_profile=(EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE),
+            controller_repair_candidate=controller_report,
+            arm_failure_substep_trace=None,
+            all_six_gripper_trace=all_six_trace,
+            episode_index=0,
+            episode_result=result,
+            safety=safety,
+            artifact_identity=_artifact_identity_for_terminal(result, terminal),
+            terminal_rollout=terminal,
+            expected_gripper_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+        )
+        assert payload["schema_version"] == 6
+        assert payload["eef_controller_profile"] == (
+            EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
+        )
+        assert payload["controller_repair_candidate"] == controller_report
+        assert payload["all_six_gripper_trace"] == all_six_trace
+        assert payload["arm_failure_substep_trace"] is None
+
+        unsafe_nominal = copy.deepcopy(safety)
+        unsafe_nominal["maxima"]["applied_delta_joint_pos_rad"][0] = (
+            controller_report["arm_slew_headroom"]["nominal_max_delta_joint_pos_rad"][0]
+            + 2e-6
+        )
+        with pytest.raises(ValueError, match="nominal arm-slew bound"):
+            atomic_write_episode_safety(
+                tmp_path / "unsafe_nominal.json",
+                eef_controller_profile=(
+                    EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
+                ),
+                controller_repair_candidate=controller_report,
+                arm_failure_substep_trace=None,
+                all_six_gripper_trace=all_six_trace,
+                episode_index=0,
+                episode_result=result,
+                safety=unsafe_nominal,
+                artifact_identity=_artifact_identity_for_terminal(result, terminal),
+                terminal_rollout=terminal,
+                expected_gripper_target_slew_profile=(
+                    EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+                ),
+            )
+
+        unsafe_endpoint_count = copy.deepcopy(safety)
+        unsafe_endpoint_count["gripper_runtime_dynamic"]["driver_target_slew"][
+            "endpoint_change_count"
+        ] = 1
+        with pytest.raises(ValueError, match="endpoint-change cadence"):
+            atomic_write_episode_safety(
+                tmp_path / "unsafe_endpoint.json",
+                eef_controller_profile=(
+                    EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
+                ),
+                controller_repair_candidate=controller_report,
+                arm_failure_substep_trace=None,
+                all_six_gripper_trace=all_six_trace,
+                episode_index=0,
+                episode_result=result,
+                safety=unsafe_endpoint_count,
+                artifact_identity=_artifact_identity_for_terminal(result, terminal),
+                terminal_rollout=terminal,
+                expected_gripper_target_slew_profile=(
+                    EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+                ),
+            )
+
+        with pytest.raises(ValueError, match="controller profile drift"):
+            load_episode_safety_sidecars(sidecar_path.parent, [0])
+        sidecars = load_episode_safety_sidecars(
+            sidecar_path.parent,
+            [0],
+            expected_eef_controller_profile=(
+                EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
+            ),
+            expected_gripper_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+        )
+        aggregate = aggregate_episode_safety(
+            safety,
+            sidecars,
+            expected_eef_controller_profile=(
+                EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
+            ),
+            expected_gripper_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+        )
+        controller_aggregate = build_eef_controller_repair_candidate_aggregate(
+            live_safety=safety,
+            initial_report=initial_report,
+            sidecars=sidecars,
+            expected_eef_controller_profile=(
+                EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
+            ),
+            expected_gripper_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+        )
+        env, observation = _runtime_fixture()
+        runtime_path = tmp_path / "polaris_runtime_contract.json"
+        atomic_write_runtime_contract(
+            runtime_path,
+            eef_controller_profile=(EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE),
+            controller_repair_candidate=controller_aggregate,
+            protocol=validate_ego_lap_runtime_protocol(env),
+            frame=validate_eef_runtime_frame(env, observation),
+            ik_safety=aggregate,
+            expected_gripper_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+        )
+        runtime = json.loads(runtime_path.read_text())
+        assert set(runtime) == {
+            "schema_version",
+            "eef_controller_profile",
+            "controller_repair_candidate",
+            "protocol",
+            "frame",
+            "ik_safety",
+        }
+        assert runtime["schema_version"] == 6
+        assert runtime["eef_controller_profile"] == (
+            EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
+        )
+        assert runtime["controller_repair_candidate"]["initial"] == initial_report
+        assert runtime["controller_repair_candidate"]["episodes"] == [
+            {"episode_index": 0, "report": controller_report}
+        ]
 
 
 def test_prepared_sidecar_recovers_exact_missing_csv_row(tmp_path: Path):
@@ -1067,6 +1454,10 @@ def test_prepared_sidecar_recovers_exact_missing_csv_row(tmp_path: Path):
     sidecar_path = tmp_path / "ik_safety" / "episode_000000.json"
     atomic_write_episode_safety(
         sidecar_path,
+        eef_controller_profile=EEF_CONTROLLER_BASELINE_PROFILE,
+        controller_repair_candidate=_baseline_controller_report(safety),
+        arm_failure_substep_trace=None,
+        all_six_gripper_trace=None,
         episode_index=0,
         episode_result=result,
         safety=safety,
@@ -1110,6 +1501,10 @@ def test_transaction_recovery_is_idempotent_after_csv_commit(tmp_path: Path):
     with pytest.raises(ValueError, match="Refusing to overwrite drifted"):
         atomic_write_episode_safety(
             sidecar_path,
+            eef_controller_profile=EEF_CONTROLLER_BASELINE_PROFILE,
+            controller_repair_candidate=_baseline_controller_report(drifted_safety),
+            arm_failure_substep_trace=None,
+            all_six_gripper_trace=None,
             episode_index=0,
             episode_result=result,
             safety=drifted_safety,
@@ -1118,10 +1513,10 @@ def test_transaction_recovery_is_idempotent_after_csv_commit(tmp_path: Path):
         )
 
 
-def test_sidecar_loader_and_reconciler_reject_previous_v4_schema(tmp_path: Path):
+def test_sidecar_loader_and_reconciler_reject_previous_v5_schema(tmp_path: Path):
     _result, sidecar_path, payload = _prepare_episode_transaction(tmp_path, episode=0)
-    assert payload["schema_version"] == EEF_SAFETY_SIDECAR_SCHEMA_VERSION == 5
-    payload["schema_version"] = 4
+    assert payload["schema_version"] == EEF_SAFETY_SIDECAR_SCHEMA_VERSION == 6
+    payload["schema_version"] = 5
     sidecar_path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 
     with pytest.raises(ValueError, match="Invalid episode safety sidecar identity"):
@@ -1258,6 +1653,8 @@ def test_runtime_writer_recomputes_aggregate_from_episode_entries(
     with pytest.raises(ValueError, match=match):
         atomic_write_runtime_contract(
             tmp_path / "runtime-mutated.json",
+            eef_controller_profile=EEF_CONTROLLER_BASELINE_PROFILE,
+            controller_repair_candidate=_controller_aggregate(aggregate),
             protocol=validate_ego_lap_runtime_protocol(env),
             frame=validate_eef_runtime_frame(env, observation),
             ik_safety=aggregate,
@@ -1280,6 +1677,10 @@ def test_prepared_sidecar_recovery_rejects_csv_and_trace_drift(tmp_path: Path):
     sidecar_path = tmp_path / "ik_safety" / "episode_000000.json"
     atomic_write_episode_safety(
         sidecar_path,
+        eef_controller_profile=EEF_CONTROLLER_BASELINE_PROFILE,
+        controller_repair_candidate=_baseline_controller_report(safety),
+        arm_failure_substep_trace=None,
+        all_six_gripper_trace=None,
         episode_index=0,
         episode_result=result,
         safety=safety,
@@ -1379,13 +1780,17 @@ def test_current_velocity_abort_preserves_sidecar_and_runtime_evidence(
     sidecar_path = tmp_path / "ik_safety" / "episode_000000.json"
     payload = atomic_write_episode_safety(
         sidecar_path,
+        eef_controller_profile=EEF_CONTROLLER_BASELINE_PROFILE,
+        controller_repair_candidate=_baseline_controller_report(safety),
+        arm_failure_substep_trace=None,
+        all_six_gripper_trace=None,
         episode_index=0,
         episode_result=result,
         safety=safety,
         artifact_identity=_artifact_identity_for_terminal(result, terminal),
         terminal_rollout=terminal,
     )
-    assert payload["schema_version"] == EEF_SAFETY_SIDECAR_SCHEMA_VERSION == 5
+    assert payload["schema_version"] == EEF_SAFETY_SIDECAR_SCHEMA_VERSION == 6
     assert payload["safety"]["current_joint_velocity_abort"] == evidence
     aggregate = aggregate_episode_safety(
         safety,
@@ -1401,12 +1806,14 @@ def test_current_velocity_abort_preserves_sidecar_and_runtime_evidence(
     runtime_path = tmp_path / "polaris_runtime_contract.json"
     atomic_write_runtime_contract(
         runtime_path,
+        eef_controller_profile=EEF_CONTROLLER_BASELINE_PROFILE,
+        controller_repair_candidate=_controller_aggregate(aggregate),
         protocol=validate_ego_lap_runtime_protocol(env),
         frame=validate_eef_runtime_frame(env, observation),
         ik_safety=aggregate,
     )
     runtime_payload = json.loads(runtime_path.read_text(encoding="utf-8"))
-    assert runtime_payload["schema_version"] == EEF_RUNTIME_CONTRACT_SCHEMA_VERSION == 5
+    assert runtime_payload["schema_version"] == EEF_RUNTIME_CONTRACT_SCHEMA_VERSION == 6
 
     runtime_sign_drift = copy.deepcopy(aggregate)
     runtime_abort = runtime_sign_drift["episodes"][0]["current_joint_velocity_abort"]
@@ -1414,6 +1821,8 @@ def test_current_velocity_abort_preserves_sidecar_and_runtime_evidence(
     with pytest.raises(ValueError, match="result/reason digest binding drift"):
         atomic_write_runtime_contract(
             tmp_path / "runtime-sign-drift.json",
+            eef_controller_profile=EEF_CONTROLLER_BASELINE_PROFILE,
+            controller_repair_candidate=_controller_aggregate(runtime_sign_drift),
             protocol=validate_ego_lap_runtime_protocol(env),
             frame=validate_eef_runtime_frame(env, observation),
             ik_safety=runtime_sign_drift,
@@ -1819,6 +2228,10 @@ def test_episode_sidecar_strict_json_rejects_nan(tmp_path: Path):
     with pytest.raises(ValueError, match="maximum raw_delta_joint_pos_rad is invalid"):
         atomic_write_episode_safety(
             tmp_path / "episode_000000.json",
+            eef_controller_profile=EEF_CONTROLLER_BASELINE_PROFILE,
+            controller_repair_candidate=_baseline_controller_report(safety),
+            arm_failure_substep_trace=None,
+            all_six_gripper_trace=None,
             episode_index=0,
             episode_result=result,
             safety=safety,
@@ -1871,6 +2284,10 @@ def test_episode_sidecar_binds_failure_sim_tail_to_apply_calls(tmp_path: Path):
     }
     atomic_write_episode_safety(
         tmp_path / "valid.json",
+        eef_controller_profile=EEF_CONTROLLER_BASELINE_PROFILE,
+        controller_repair_candidate=_baseline_controller_report(safety),
+        arm_failure_substep_trace=None,
+        all_six_gripper_trace=None,
         episode_index=0,
         episode_result=result,
         safety=safety,
@@ -1887,6 +2304,10 @@ def test_episode_sidecar_binds_failure_sim_tail_to_apply_calls(tmp_path: Path):
     with pytest.raises(ValueError, match="sim-counter/apply-call binding"):
         atomic_write_episode_safety(
             tmp_path / "mismatch.json",
+            eef_controller_profile=EEF_CONTROLLER_BASELINE_PROFILE,
+            controller_repair_candidate=_baseline_controller_report(safety),
+            arm_failure_substep_trace=None,
+            all_six_gripper_trace=None,
             episode_index=0,
             episode_result=result,
             safety=safety,
