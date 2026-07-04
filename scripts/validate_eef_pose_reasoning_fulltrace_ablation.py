@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and finalize one post-Kit reasoning full-trace ablation."""
+"""Validate and finalize one post-Kit cap/release full-trace follow-up."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import build_reasoning_fulltrace_replay_fixture as fixture_contract
 import smoke_eef_pose_reasoning_fulltrace_ablation as diagnostic
 
 
-PROFILE = "reasoning_43075_fulltrace_ablation_post_kit_validation_v3"
+PROFILE = "reasoning_43075_fulltrace_cap_release_followup_post_kit_v1"
 RESULT_FIELDS = {
     "schema_version",
     "profile",
@@ -40,7 +40,11 @@ RESULT_FIELDS = {
     "intervention",
     "action_count",
     "actions_completed",
+    "tail_contract",
+    "tail_policy_steps_completed",
+    "tail_physics_substeps_completed",
     "numerical_failure",
+    "controller_failure_evidence",
     "outcome",
     "full_substep_trace_profile",
     "full_substep_trace_cadence",
@@ -149,6 +153,142 @@ def float32_equal(left: float, right: float) -> bool:
     return struct.pack("<f", left) == struct.pack("<f", right)
 
 
+def expected_release_ramp_static(*, enabled: bool) -> dict[str, Any]:
+    return {
+        "profile": "arm_post_interlock_linear_slew_cap_release_ramp16_v2",
+        "enabled": enabled,
+        "scope": "arm_position_target_slew_cap_after_interlock_release_v2",
+        "substeps": diagnostic.RELEASE_RAMP_SUBSTEPS,
+        "fraction_profile": ("inclusive_linear_float32_0_over_15_to_15_over_15_v2"),
+        "fractions_float32": [
+            diagnostic.float32(item) for item in diagnostic.RELEASE_RAMP_FRACTIONS
+        ],
+        "nominal_arm_slew_ratio": diagnostic.NOMINAL_ARM_SLEW_RATIO,
+        "effective_physical_limit_ratios": [
+            diagnostic.float32_multiply(diagnostic.NOMINAL_ARM_SLEW_RATIO, fraction)
+            for fraction in diagnostic.RELEASE_RAMP_FRACTIONS
+        ],
+        "arm_joint_ids": diagnostic.ARM_JOINT_IDS,
+        "arm_joint_names": diagnostic.ARM_JOINT_NAMES,
+        "nominal_max_delta_joint_pos_rad": diagnostic.ARM_NOMINAL_MAX_DELTA_RAD,
+        "formula_profile": (
+            "endpoint_exact_else_float32_clamp_nominal_delta_by_scaled_slew_v1"
+        ),
+        "transaction_profile": (
+            "diagnostic_post_super_overlay_commit_after_setter_and_trace_v1"
+        ),
+        "reset_profile": "clear_all_diagnostic_ramp_state_after_base_reset_v1",
+        "target_setter": "Articulation.set_joint_position_target_arm_ids_v1",
+        "gripper_target_or_state_write_count": 0,
+    }
+
+
+def validate_release_ramp_runtime(value: Any, *, enabled: bool) -> dict[str, Any]:
+    fields = {
+        "profile",
+        "enabled",
+        "release_observed_count",
+        "ramp_started_count",
+        "ramp_completed_count",
+        "ramp_cancelled_by_reactivation_count",
+        "ramp_target_apply_count",
+        "ramp_limited_target_apply_count",
+        "applied_indices",
+        "pending_at_report",
+        "next_index_at_report",
+        "max_abs_nominal_to_ramped_target_change_rad",
+        "overlay_entries",
+        "gripper_target_or_state_write_count",
+    }
+    require(
+        isinstance(value, dict)
+        and set(value) == fields
+        and value.get("profile")
+        == "arm_post_interlock_linear_slew_cap_release_ramp16_runtime_v2"
+        and value.get("enabled") is enabled
+        and value.get("gripper_target_or_state_write_count") == 0,
+        "release-ramp runtime schema/profile",
+    )
+    count_fields = fields - {
+        "profile",
+        "enabled",
+        "applied_indices",
+        "pending_at_report",
+        "next_index_at_report",
+        "max_abs_nominal_to_ramped_target_change_rad",
+        "overlay_entries",
+        "gripper_target_or_state_write_count",
+    }
+    require(
+        all(type(value[field]) is int and value[field] >= 0 for field in count_fields),
+        "release-ramp runtime counters",
+    )
+    applied = value["applied_indices"]
+    require(
+        isinstance(applied, list)
+        and all(
+            type(index) is int and 0 <= index < diagnostic.RELEASE_RAMP_SUBSTEPS
+            for index in applied
+        )
+        and value["ramp_target_apply_count"] == len(applied)
+        and value["ramp_started_count"] == applied.count(0)
+        and value["ramp_completed_count"]
+        == applied.count(diagnostic.RELEASE_RAMP_SUBSTEPS - 1)
+        and value["ramp_limited_target_apply_count"] <= len(applied),
+        "release-ramp applied-index/counter binding",
+    )
+    for previous, current in zip(applied, applied[1:]):
+        require(
+            current == previous + 1 or current == 0,
+            "release-ramp applied-index sequence",
+        )
+    pending = value["pending_at_report"]
+    next_index = value["next_index_at_report"]
+    require(
+        type(pending) is bool
+        and (
+            next_index is None
+            or (
+                type(next_index) is int
+                and 0 <= next_index < diagnostic.RELEASE_RAMP_SUBSTEPS
+            )
+        )
+        and (not pending or next_index == 0),
+        "release-ramp terminal state",
+    )
+    maximum = value["max_abs_nominal_to_ramped_target_change_rad"]
+    overlays = value["overlay_entries"]
+    require(
+        isinstance(maximum, (int, float))
+        and not isinstance(maximum, bool)
+        and math.isfinite(float(maximum))
+        and float(maximum) >= 0.0,
+        "release-ramp maximum target change",
+    )
+    require(
+        isinstance(overlays, list)
+        and len(overlays) == value["ramp_target_apply_count"],
+        "release-ramp overlay count",
+    )
+    if not enabled:
+        require(
+            all(value[field] == 0 for field in count_fields)
+            and applied == []
+            and pending is False
+            and next_index is None
+            and float(maximum) == 0.0
+            and overlays == [],
+            "disabled release-ramp retained runtime state",
+        )
+    else:
+        require(
+            value["release_observed_count"] >= value["ramp_started_count"]
+            and value["ramp_started_count"] >= value["ramp_completed_count"],
+            "enabled release-ramp lifecycle counts",
+        )
+    return dict(value)
+
+
 def validate_intervention(value: Any, *, variant: str) -> dict[str, Any]:
     require(
         isinstance(value, dict)
@@ -157,14 +297,16 @@ def validate_intervention(value: Any, *, variant: str) -> dict[str, Any]:
             "profile",
             "variant",
             "production_contract_acceptance",
-            "force_gripper_open",
+            "passive_follower_velocity_cap_rad_s",
             "passive_follower_velocity_limit_setter_call_count",
             "velocity_limits_before_intervention",
             "velocity_limits_after_intervention",
             "configured_close_anchor_substeps",
+            "arm_release_mode",
+            "arm_release_ramp_static",
+            "arm_release_ramp_runtime",
         }
-        and value.get("profile")
-        == "post_production_installer_single_variable_diagnostic_only_v1"
+        and value.get("profile") == "post_production_installer_cap_release_followup_v1"
         and value.get("variant") == variant
         and value.get("production_contract_acceptance") is False,
         "intervention schema/profile",
@@ -185,8 +327,8 @@ def validate_intervention(value: Any, *, variant: str) -> dict[str, Any]:
         "production follower-cap input",
     )
     expected_after = list(EXPECTED_LIMITS_WITH_FOLLOWER_CAP)
-    if variant == "follower_default_limit":
-        expected_after[8:] = [diagnostic.FOLLOWER_DEFAULT_LIMIT] * 5
+    requested_cap = diagnostic.FOLLOWER_CAP_BY_VARIANT[variant]
+    expected_after[8:] = [requested_cap] * 5
     require(
         all(
             float32_equal(actual, expected)
@@ -194,19 +336,112 @@ def validate_intervention(value: Any, *, variant: str) -> dict[str, Any]:
         ),
         "variant follower-limit output",
     )
+    ramp_enabled = variant == diagnostic.RELEASE_RAMP_VARIANT
+    recorded_cap = value.get("passive_follower_velocity_cap_rad_s")
     require(
-        value.get("force_gripper_open") is (variant == "force_open")
+        isinstance(recorded_cap, (int, float))
+        and not isinstance(recorded_cap, bool)
+        and math.isfinite(float(recorded_cap))
+        and float32_equal(float(recorded_cap), requested_cap)
         and value.get("passive_follower_velocity_limit_setter_call_count")
-        == int(variant == "follower_default_limit")
-        and value.get("configured_close_anchor_substeps")
-        == (
-            diagnostic.HOLD_CLOSE_ANCHOR_SUBSTEPS
-            if variant == "hold_close_anchor"
-            else 86
-        ),
-        "single-variable intervention identity",
+        == int(requested_cap != diagnostic.PRODUCTION_FOLLOWER_LIMIT)
+        and value.get("configured_close_anchor_substeps") == 86
+        and value.get("arm_release_mode")
+        == ("linear_slew_cap_ramp16" if ramp_enabled else "abrupt")
+        and value.get("arm_release_ramp_static")
+        == expected_release_ramp_static(enabled=ramp_enabled),
+        "pre-registered intervention identity",
+    )
+    validate_release_ramp_runtime(
+        value.get("arm_release_ramp_runtime"), enabled=ramp_enabled
     )
     return dict(value)
+
+
+def validate_source_scene_controller_provenance(payload: dict[str, Any]) -> None:
+    """Close the immutable fixture, scene, and production controller inputs."""
+
+    require(
+        payload.get("fixture") == diagnostic.file_identity(diagnostic.FIXTURE_PATH),
+        "fixture live/recorded identity",
+    )
+    production = payload.get("production_eval")
+    gate0 = diagnostic.gate0
+    require(
+        isinstance(production, dict)
+        and production.get("size_bytes") == gate0.EXPECTED_PRODUCTION_EVAL_SIZE_BYTES
+        and production.get("sha256") == gate0.EXPECTED_PRODUCTION_EVAL_SHA256
+        and production.get("reset_profile") == gate0.PRODUCTION_RESET_PROFILE
+        and production.get("reset_call") == gate0.PRODUCTION_RESET_CALL
+        and production.get("environment_seed") is None
+        and production.get("initial_condition_index") == 0
+        and production.get("step_render_profile")
+        == gate0.PRODUCTION_STEP_RENDER_PROFILE
+        and production.get("effective_step_expensive") is True
+        and production.get("policy_config_source", {}).get("sha256")
+        == gate0.EXPECTED_PRODUCTION_POLICY_CONFIG_SHA256
+        and production.get("lap_client_source", {}).get("sha256")
+        == gate0.EXPECTED_PRODUCTION_LAP_CLIENT_SHA256,
+        "production reset/render/client provenance",
+    )
+    boundary = payload.get("boundary_helper")
+    require(
+        isinstance(boundary, dict)
+        and boundary.get("size_bytes") == gate0.EXPECTED_BOUNDARY_HELPER_SIZE_BYTES
+        and boundary.get("sha256") == gate0.EXPECTED_BOUNDARY_HELPER_SHA256,
+        "boundary helper provenance",
+    )
+    assets = payload.get("assets")
+    require(
+        isinstance(assets, dict)
+        and assets.get("contract") == gate0.EXPECTED_ASSET_CONTRACT
+        and assets.get("robot_usd", {}).get("sha256") == gate0.EXPECTED_ROBOT_USD_SHA256
+        and assets.get("scene", {}).get("scene", {}).get("sha256")
+        == gate0.EXPECTED_ASSET_CONTRACT["scene_sha256"]
+        and assets.get("scene", {}).get("initial_conditions", {}).get("sha256")
+        == gate0.EXPECTED_ASSET_CONTRACT["initial_conditions_sha256"],
+        "scene/robot asset provenance",
+    )
+    runtime_protocol = payload.get("runtime_protocol")
+    require(
+        isinstance(runtime_protocol, dict)
+        and runtime_protocol.get("physics_hz") == 120.0
+        and runtime_protocol.get("physics_dt") == 1.0 / 120.0
+        and runtime_protocol.get("decimation") == diagnostic.DECIMATION
+        and runtime_protocol.get("policy_hz") == 15.0,
+        "runtime physics/policy cadence provenance",
+    )
+    runtime_frame = payload.get("runtime_frame")
+    require(
+        isinstance(runtime_frame, dict)
+        and runtime_frame.get("action_dim") == 7
+        and runtime_frame.get("command_type") == "pose"
+        and runtime_frame.get("controlled_body") == "panda_link8"
+        and runtime_frame.get("eef_frame") == "panda_link8"
+        and runtime_frame.get("reference_frame") == "panda_link0"
+        and runtime_frame.get("ik_method") == "dls"
+        and runtime_frame.get("dls_damping") == 0.01
+        and runtime_frame.get("ik_safety_profile")
+        == "panda_velocity_physxlimit_solveriter1_v4"
+        and runtime_frame.get("use_relative_mode") is False,
+        "runtime EEF controller-frame provenance",
+    )
+    gripper = payload.get("production_gripper_contract_before_ablation")
+    require(
+        isinstance(gripper, dict)
+        and gripper.get("joint_names") == diagnostic.JOINT_NAMES
+        and gripper.get("driver_joint_index") == 7
+        and gripper.get("follower_joint_indices") == diagnostic.FOLLOWER_INDICES
+        and gripper.get("driver_target_slew", {}).get("profile")
+        == (
+            "eef_binary_driver_target_slew_rate1p25_from_live_limit5_"
+            "per_120hz_substep_candidate_v1"
+        )
+        and gripper.get("mimic_compliance", {}).get("profile")
+        == "robotiq_2f85_live_physx_mimic_frequency100_damping1p2_candidate_v1"
+        and gripper.get("measured_velocity_is_hard_bounded_by_limit") is False,
+        "production gripper/controller provenance",
+    )
 
 
 def probe_video(path: Path, *, ffprobe: str, ffmpeg: str) -> dict[str, Any]:
@@ -378,9 +613,12 @@ def validate_result(
         isinstance(repository, dict)
         and repository.get("commit") == expected_commit
         and repository.get("clean_tracked") is True
+        and repository.get("diagnostic_base_commit")
+        == diagnostic.DIAGNOSTIC_BASE_COMMIT
+        and repository.get("diagnostic_base_relation") == "exact_first_parent_v1"
         and repository.get("production_base_commit")
         == diagnostic.PRODUCTION_BASE_COMMIT
-        and repository.get("production_base_relation") == "exact_first_parent_v1",
+        and repository.get("production_base_relation") == "exact_first_grandparent_v1",
         "repository provenance",
     )
     lifecycle = payload.get("lifecycle")
@@ -407,36 +645,105 @@ def validate_result(
         and payload.get("action_count") == diagnostic.ACTION_COUNT,
         "source trace/action identity",
     )
+    validate_source_scene_controller_provenance(payload)
+    _, source_actions = diagnostic.load_actions()
+    expected_tail = diagnostic.frozen_tail_contract(source_actions)
+    require(payload.get("tail_contract") == expected_tail, "frozen tail contract")
     validate_intervention(payload.get("intervention"), variant=variant)
+    entries = payload.get("full_substep_trace")
+    require(
+        isinstance(entries, list)
+        and payload.get("full_substep_trace_profile")
+        == (
+            "all13_after_arm_before_gripper_post_setters_post_physics_"
+            "before_next_arm_v2"
+        ),
+        "full 13-DOF three-phase substep trace profile",
+    )
+    numerical_failure = payload.get("numerical_failure")
+    require(
+        numerical_failure is None or isinstance(numerical_failure, dict),
+        "numerical failure schema",
+    )
     outcome = payload.get("outcome")
+    expected_outcome = diagnostic.classify_outcome(
+        variant,
+        numerical_failure,
+        payload.get("actions_completed"),
+        payload.get("tail_policy_steps_completed"),
+        len(entries),
+    )
     require(
         isinstance(outcome, dict)
+        and outcome == expected_outcome
         and outcome.get("diagnostic_completed") is True
         and outcome.get("controller_completed_actions")
-        == payload.get("actions_completed"),
+        == payload.get("actions_completed")
+        and outcome.get("source_actions_completed") == payload.get("actions_completed")
+        and outcome.get("tail_policy_steps_completed")
+        == payload.get("tail_policy_steps_completed")
+        and outcome.get("tail_physics_substeps_completed")
+        == payload.get("tail_physics_substeps_completed"),
         "diagnostic outcome",
     )
-    if variant == "baseline":
+    classification = outcome.get("classification")
+    controller_failure_evidence = payload.get("controller_failure_evidence")
+    if classification == "followup_completed_source_and_tail":
         require(
-            outcome.get("classification") == "baseline_exact_source_abort_reproduced"
-            and outcome.get("parsed_numerical_failure")
-            == fixture_contract.EXPECTED_FAILURE
-            and payload.get("actions_completed") == 293,
-            "baseline reproduction outcome",
+            numerical_failure is None
+            and controller_failure_evidence is None
+            and payload.get("actions_completed") == diagnostic.ACTION_COUNT
+            and payload.get("tail_policy_steps_completed")
+            == diagnostic.TAIL_POLICY_STEPS
+            and payload.get("tail_physics_substeps_completed")
+            == diagnostic.TAIL_PHYSICS_SUBSTEPS
+            and outcome.get("failure_segment") is None
+            and outcome.get("parsed_numerical_failure") is None
+            and outcome.get("numerical_failure_parse_error") is None,
+            "complete follow-up outcome",
         )
+        if variant == diagnostic.RELEASE_RAMP_VARIANT:
+            ramp_runtime = payload["intervention"]["arm_release_ramp_runtime"]
+            require(
+                ramp_runtime["release_observed_count"] == 3
+                and ramp_runtime["ramp_started_count"] == 3
+                and ramp_runtime["ramp_completed_count"] == 3
+                and ramp_runtime["ramp_cancelled_by_reactivation_count"] == 0
+                and ramp_runtime["ramp_target_apply_count"]
+                == 3 * diagnostic.RELEASE_RAMP_SUBSTEPS
+                and len(ramp_runtime["overlay_entries"])
+                == 3 * diagnostic.RELEASE_RAMP_SUBSTEPS
+                and ramp_runtime["applied_indices"]
+                == list(range(diagnostic.RELEASE_RAMP_SUBSTEPS)) * 3
+                and ramp_runtime["pending_at_report"] is False
+                and ramp_runtime["next_index_at_report"] is None,
+                "complete cap-5 release-ramp lifecycle",
+            )
     else:
         require(
-            outcome.get("classification")
-            in {
-                "ablation_completed_all_recorded_actions",
-                "ablation_numerical_failure_observed",
-            },
-            "novel ablation outcome classification",
+            classification == "followup_numerical_failure_observed"
+            and isinstance(numerical_failure, dict)
+            and isinstance(outcome.get("parsed_numerical_failure"), dict)
+            and outcome.get("numerical_failure_parse_error") is None
+            and outcome.get("failure_segment")
+            in {"source_actions", "frozen_final_command_tail"},
+            "follow-up numerical-failure outcome",
         )
-    entries = payload.get("full_substep_trace")
-    require(isinstance(entries, list), "full substep trace")
+        diagnostic.validate_controller_failure_evidence(
+            controller_failure_evidence,
+            failure=numerical_failure,
+            entries=entries,
+        )
+    require(
+        payload.get("tail_physics_substeps_completed")
+        == expected_outcome["tail_physics_substeps_completed"],
+        "tail physics-substep count recomputation",
+    )
     expected_cadence = diagnostic.validate_trace_cadence(
-        entries, variant=variant, outcome=outcome
+        entries,
+        variant=variant,
+        outcome=outcome,
+        release_ramp_runtime=payload["intervention"]["arm_release_ramp_runtime"],
     )
     require(
         payload.get("full_substep_trace_cadence") == expected_cadence,
@@ -476,8 +783,11 @@ def validate_result(
         "video recorded/live identity",
     )
     decoded = probe_video(video_path, ffprobe=ffprobe, ffmpeg=ffmpeg)
-    failure = payload.get("numerical_failure")
-    expected_frames = payload["actions_completed"] + (2 if failure is not None else 1)
+    expected_frames = (
+        payload["actions_completed"]
+        + payload["tail_policy_steps_completed"]
+        + (2 if numerical_failure is not None else 1)
+    )
     require(
         recorded_video.get("frame_count") == expected_frames
         and decoded["frame_count"] == expected_frames,
@@ -495,7 +805,10 @@ def validate_result(
         "video": video_identity,
         "video_decode": decoded,
         "outcome": outcome,
+        "controller_failure_evidence": controller_failure_evidence,
         "full_substep_summary": expected_summary,
+        "full_substep_trace_cadence": expected_cadence,
+        "tail_contract": expected_tail,
         "intervention": payload["intervention"],
         "runtime_close": close,
         "runtime_exit": {
@@ -573,7 +886,7 @@ def main() -> int:
     )
     identity = atomic_write(args.output_manifest, manifest)
     print(
-        f"POLARIS_FULLTRACE_VALIDATED={identity['path']};"
+        f"POLARIS_FULLTRACE_CAP_RELEASE_VALIDATED={identity['path']};"
         f"size={identity['size_bytes']};sha256={identity['sha256']}",
         flush=True,
     )

@@ -24,7 +24,7 @@ for name in "${required[@]}"; do
 done
 
 case "${FULLTRACE_VARIANT}" in
-  baseline|force_open|follower_default_limit|hold_close_anchor) ;;
+  cap8_abrupt_release|cap24_abrupt_release|cap5_release_ramp16) ;;
   *)
     printf 'invalid FULLTRACE_VARIANT=%s\n' "${FULLTRACE_VARIANT}" >&2
     exit 2
@@ -37,13 +37,15 @@ esac
 [[ "${SLURM_LOCALID:-0}" == 0 ]]
 
 base_commit=0611d384f5f26ef9bd8ff114be273e875c3fe719
+diagnostic_base_commit=26f75a1aeb2e6342d45f96d746ee101be02764f5
 runner=${FULLTRACE_POLARIS_REPO}/scripts/smoke_eef_pose_reasoning_fulltrace_ablation.py
 validator=${FULLTRACE_POLARIS_REPO}/scripts/validate_eef_pose_reasoning_fulltrace_ablation.py
 fixture=${FULLTRACE_POLARIS_REPO}/scripts/fixtures/reasoning_43075_job1098523_fulltrace_actions.json
 wrapper=$(readlink -f "$0")
 
 [[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD)" == "${FULLTRACE_DIAGNOSTIC_COMMIT}" ]]
-[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^)" == "${base_commit}" ]]
+[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^)" == "${diagnostic_base_commit}" ]]
+[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^^)" == "${base_commit}" ]]
 [[ -z "$(git -C "${FULLTRACE_POLARIS_REPO}" branch --show-current)" ]]
 [[ -z "$(git -C "${FULLTRACE_POLARIS_REPO}" status --porcelain --untracked-files=all)" ]]
 [[ "$(sha256sum "${FULLTRACE_CONTAINER_IMAGE}" | awk '{print $1}')" == "${FULLTRACE_CONTAINER_SHA256}" ]]
@@ -73,7 +75,7 @@ write_failure_marker() {
     rm -f "${success_marker}"
   fi
   if [[ "${status}" != 0 && ! -e "${failure_marker}" ]]; then
-    printf 'profile=reasoning_fulltrace_ablation_wrapper_failure_v1\njob_id=%s\nvariant=%s\nstatus=%s\n' \
+    printf 'profile=reasoning_fulltrace_cap_release_followup_wrapper_failure_v1\njob_id=%s\nvariant=%s\nstatus=%s\n' \
       "${SLURM_JOB_ID}" "${FULLTRACE_VARIANT}" "${status}" >"${failure_marker}"
     chmod 0444 "${failure_marker}"
   fi
@@ -81,10 +83,10 @@ write_failure_marker() {
 trap write_failure_marker EXIT
 
 record=${attempt}/run_record.env
-printf 'PROFILE=%s\nSLURM_JOB_ID=%s\nSLURM_RESTART_COUNT=%s\nVARIANT=%s\nLAUNCH_ID=%s\nDIAGNOSTIC_COMMIT=%s\nPRODUCTION_BASE_COMMIT=%s\nCONTAINER_IMAGE=%s\nCONTAINER_SHA256=%s\nRESULT_JSON=%s\nVIDEO=%s\nMANIFEST=%s\n' \
-  reasoning_fulltrace_ablation_srun_v1 \
+printf 'PROFILE=%s\nSLURM_JOB_ID=%s\nSLURM_RESTART_COUNT=%s\nVARIANT=%s\nLAUNCH_ID=%s\nDIAGNOSTIC_COMMIT=%s\nDIAGNOSTIC_BASE_COMMIT=%s\nPRODUCTION_BASE_COMMIT=%s\nCONTAINER_IMAGE=%s\nCONTAINER_SHA256=%s\nRESULT_JSON=%s\nVIDEO=%s\nMANIFEST=%s\n' \
+  reasoning_fulltrace_cap_release_followup_srun_v1 \
   "${SLURM_JOB_ID}" "${SLURM_RESTART_COUNT:-0}" "${FULLTRACE_VARIANT}" \
-  "${FULLTRACE_LAUNCH_ID}" "${FULLTRACE_DIAGNOSTIC_COMMIT}" "${base_commit}" \
+  "${FULLTRACE_LAUNCH_ID}" "${FULLTRACE_DIAGNOSTIC_COMMIT}" "${diagnostic_base_commit}" "${base_commit}" \
   "${FULLTRACE_CONTAINER_IMAGE}" "${FULLTRACE_CONTAINER_SHA256}" \
   "${result_json}" "${video}" "${manifest}" >"${record}"
 chmod 0444 "${record}"
@@ -166,7 +168,7 @@ result_sha=$(sha256sum "${result_json}" | awk '{print $1}')
 video_sha=$(sha256sum "${video}" | awk '{print $1}')
 success_temporary=${attempt}/.SUCCESS.${SLURM_JOB_ID}.tmp
 [[ ! -e "${success_temporary}" && ! -e "${success_marker}" ]]
-printf 'profile=reasoning_fulltrace_ablation_success_v1\njob_id=%s\nvariant=%s\nresult_sha256=%s\nvideo_sha256=%s\nmanifest_sha256=%s\n' \
+printf 'profile=reasoning_fulltrace_cap_release_followup_success_v1\njob_id=%s\nvariant=%s\nresult_sha256=%s\nvideo_sha256=%s\nmanifest_sha256=%s\n' \
   "${SLURM_JOB_ID}" "${FULLTRACE_VARIANT}" "${result_sha}" "${video_sha}" \
   "${manifest_sha}" >"${success_temporary}"
 chmod 0444 "${success_temporary}"
