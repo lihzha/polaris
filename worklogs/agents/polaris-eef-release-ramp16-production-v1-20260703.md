@@ -60,10 +60,19 @@ Current result: `867 passed`, `30 subtests passed`, Ruff clean, source compilati
 
 Independent review initially found two P1s: disabled-path device synchronizations/readbacks that changed the durable baseline/v3 hot path, and insufficiently closed ramp report equations. Both were fixed. The non-ramp transaction now executes only the parent velocity and position setters and retains the parent failure-trace ordering. The v4 validator requires exact integer-zero gripper writes, one non-limited endpoint per completed ramp, phase-consistent last index/apply evidence, and positive target-change maxima if and only if a target was limited. Re-review on code diff SHA `56c864fa2bfdac1ea8b86909230fecfe698b177c7977eca158916f83280813b4` returned GO with no P0/P1; independent validation reproduced `867 passed`, `30 subtests passed`, 184 focused passes, Ruff, compilation, and diff checks.
 
+## L40S target-runtime gate
+
+Fail-closed job `1098635` ran the pinned CUDA 13/Isaac image on one L40S against commit `7fc74d648328432a7f9f06d13c0e82a03f73a0c1`. Its deliberate no-tests-selected probe correctly produced immutable `5\n` evidence. The authoritative test run then reported `83 passed, 1 failed` and immutable `1\n`, so the wrapper and Slurm job failed as intended.
+
+The sole failure was in `test_standard_action_reset_clears_selected_candidate_state`: the test constructs an object with `object.__new__` and bypasses `__init__`, but did not provide `_max_delta_joint_pos`, which real construction installs before the interlock and release-ramp lifecycle resets. The production lifecycle and controller math were unchanged. The test now supplies that initialized dependency explicitly and verifies that standard reset clears both the inherited interlock anchor and the new release-ramp phase/evidence/transaction latch. A fresh host validation and L40S gate are required before promotion.
+
+The repair is test-only. The Isaac test uses the exact float32 Panda velocity-limit vector divided by 120 Hz, matching real construction, and the host stub now invokes the same reset lifecycle with a faithful parent raw-action reset plus an initialization-order assertion. Ruff, Python compilation, `git diff --check`, the focused host stub, and the full host-safe suite pass: `867 passed`, `30 subtests passed`. Production source hashes remain identical to commit `7fc74d6`.
+
 ## Next gate
 
-1. Resolve independent P0/P1 review.
-2. Commit and push the exact production revision.
-3. Build a pinned replay-only child revision that traces the production v4 path without a post-setter overlay.
-4. Run target-runtime controller smoke and exact 294-action reasoning replay on L40S; inspect traces and video.
-5. Run fresh full-horizon official LAP-3B and reasoning-checkpoint canaries in parallel before any standard-suite promotion.
+1. Preserve the independent GO and commit/push the test-only child revision without changing production source.
+2. Deploy that exact child commit and rerun the fail-closed L40S gate.
+3. Build and review a pinned replay-only child revision that observes the production v4 path without a post-setter overlay.
+4. Run and inspect the exact 2,416-apply production-core replay on L40S, including traces and video.
+5. Run fresh full-horizon official LAP-3B and reasoning-checkpoint canaries in parallel.
+6. Promote to the standard suite only after every preceding target-runtime gate passes.

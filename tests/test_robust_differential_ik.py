@@ -1448,6 +1448,13 @@ def test_standard_action_reset_clears_selected_candidate_state():
 
     action = _bare_robust_action()
     action._raw_actions = torch.ones((1, 7), dtype=torch.float32)
+    # Real construction installs the per-joint slew tensor before either
+    # candidate lifecycle reset. This bare object intentionally skips
+    # ``__init__``, so provide that required initialized dependency explicitly.
+    action._max_delta_joint_pos = torch.tensor(
+        [PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S],
+        dtype=torch.float32,
+    ) * (1.0 / 120.0)
     action._wrist_energy_brake_enabled = True
     action._wrist_energy_brake_latch_remaining = torch.ones(1, dtype=torch.int64)
     action._wrist_energy_brake_previous_applied_target = torch.ones((1, 7))
@@ -1463,6 +1470,21 @@ def test_standard_action_reset_clears_selected_candidate_state():
     assert not action._wrist_energy_brake_previous_applied_target.any()
     assert not action._wrist_energy_brake_previous_target_valid.any()
     assert not action._wrist_energy_brake_reversal_detection_armed.any()
+    assert not action._gripper_close_arm_interlock_anchor.any()
+    assert not action._gripper_close_arm_interlock_anchor_valid
+    assert action._gripper_close_arm_interlock_last_activation_apply_index is None
+    assert not action._gripper_close_arm_interlock_max_abs_active_delta.any()
+    assert not action._gripper_close_arm_interlock_max_abs_released_delta.any()
+    assert action._arm_release_ramp_phase == "release"
+    assert action._arm_release_ramp_next_index is None
+    assert action._arm_release_observed_count == 0
+    assert action._arm_release_ramp_started_count == 0
+    assert action._arm_release_ramp_completed_count == 0
+    assert action._arm_release_ramp_target_apply_count == 0
+    assert action._arm_release_ramp_last_target_apply_index is None
+    assert action._arm_release_ramp_last_index is None
+    assert not action._arm_release_ramp_max_abs_nominal_to_ramped_target_change.any()
+    assert action._arm_target_transaction_failed is False
     action.__del__()
 
 

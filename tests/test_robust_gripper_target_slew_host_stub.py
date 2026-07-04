@@ -8,6 +8,10 @@ import sys
 
 def test_robust_action_binds_finger_target_slew_report_in_isolated_host_stub():
     root = Path(__file__).parents[1]
+    source = (root / "src" / "polaris" / "robust_differential_ik.py").read_text()
+    assert source.index("self._max_delta_joint_pos =") < source.index(
+        "self._reset_episode_safety_state(episode_index=None)"
+    )
     code = r"""
 import sys
 import types
@@ -68,7 +72,8 @@ class DifferentialInverseKinematicsAction:
         return self._env.device
 
     def reset(self, *_args, **_kwargs):
-        pass
+        env_ids = _args[0] if _args else slice(None)
+        self._raw_actions[env_ids] = 0.0
 
 
 actions_cfg.DifferentialInverseKinematicsActionCfg = (
@@ -84,6 +89,7 @@ pxr.PhysxSchema = types.SimpleNamespace()
 pxr.UsdPhysics = types.SimpleNamespace()
 
 import polaris.robust_differential_ik as robust
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.eef_gripper_runtime import EEF_GRIPPER_TARGET_SLEW_PROFILE
 from polaris.eef_gripper_runtime import (
     EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE,
@@ -152,6 +158,37 @@ def bare_action(*, apply_calls=0):
     action._apply_call_count = apply_calls
     return action
 
+
+# Exercise the ordinary reset lifecycle without Isaac imports. The real
+# constructor creates this exact per-joint tensor before the first lifecycle
+# reset; a test object made with ``object.__new__`` must supply it explicitly.
+reset_action = bare_action()
+reset_action._raw_actions = torch.ones((1, 7), dtype=torch.float32)
+reset_action._max_delta_joint_pos = torch.tensor(
+    [PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S],
+    dtype=torch.float32,
+) * (1.0 / 120.0)
+reset_action._wrist_energy_brake_enabled = False
+reset_action._gripper_close_arm_interlock_anchor = torch.ones(7)
+reset_action._gripper_close_arm_interlock_anchor_valid = True
+reset_action._arm_release_ramp_phase = "ramp"
+reset_action._arm_release_ramp_next_index = 7
+reset_action._arm_release_ramp_started_count = 3
+reset_action._arm_target_transaction_failed = True
+reset_action.reset([0])
+assert not reset_action._raw_actions.any()
+assert not reset_action._gripper_close_arm_interlock_anchor.any()
+assert reset_action._gripper_close_arm_interlock_anchor.shape == (7,)
+assert reset_action._gripper_close_arm_interlock_anchor.dtype == torch.float32
+assert reset_action._gripper_close_arm_interlock_anchor_valid is False
+assert reset_action._gripper_close_arm_interlock_last_activation_apply_index is None
+assert reset_action._arm_release_ramp_phase == "release"
+assert reset_action._arm_release_ramp_next_index is None
+assert reset_action._arm_release_ramp_started_count == 0
+assert reset_action._arm_release_ramp_last_target_apply_index is None
+assert reset_action._arm_release_ramp_last_index is None
+assert not reset_action._arm_release_ramp_max_abs_nominal_to_ramped_target_change.any()
+assert reset_action._arm_target_transaction_failed is False
 
 finger = Finger()
 action = bare_action()
