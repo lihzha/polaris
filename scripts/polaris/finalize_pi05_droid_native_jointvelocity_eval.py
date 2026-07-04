@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import struct
 import subprocess
 from typing import Any
 
@@ -85,12 +86,15 @@ from polaris.pi05_droid_native_eval_contract import (
 
 
 CONTROLLER_PROFILE = "pi05_droid_native_jointvelocity_l40s_controller_smoke_v1"
+HOST_MEDIA_TOOLS_MANIFEST = "scripts/polaris/pi05_droid_native_host_media_tools.json"
+HOST_MEDIA_TOOLS_PROFILE = "pi05_droid_native_host_media_tools_v1"
 SOURCE_PATHS = (
     "scripts/eval.py",
     "scripts/polaris/capture_pi05_droid_native_environment.py",
     "scripts/polaris/eval_pi05_droid_native_jointvelocity.sh",
     "scripts/polaris/finalize_pi05_droid_native_jointvelocity_eval.py",
     "scripts/polaris/l40s_pi05_droid_native_jointvelocity_canary.sbatch",
+    HOST_MEDIA_TOOLS_MANIFEST,
     "scripts/polaris/pi05_droid_native_runtime_overlay_requirements.txt",
     "scripts/polaris/serve_pi05_droid_native_jointvelocity.py",
     "scripts/polaris/submit_pi05_droid_native_jointvelocity_canary.sh",
@@ -115,7 +119,7 @@ ATOMIC_PORT_SERVER_SOURCE_SHA256 = (
 )
 ATOMIC_PORT_RUNTIME_SOURCE_SHA256 = {
     "scripts/polaris/eval_pi05_droid_native_jointvelocity.sh": (
-        "dde53327f23cd7772c6219ccb74d14eeecdbc38a48805d133b6b401e83572e39"
+        "39bd11a8afa72a776ac0da6db13a3fdd7950aca0792fa2d8598855ed94f5db80"
     ),
     "scripts/polaris/serve_pi05_droid_native_jointvelocity.py": (
         ATOMIC_PORT_SERVER_SOURCE_SHA256
@@ -214,6 +218,290 @@ def _seal_file(path: Path, field: str) -> dict[str, Any]:
         "mode": "0444",
         "nlink": 1,
     }
+
+
+def _static_elf64_amd64_identity(path: Path) -> dict[str, Any]:
+    """Require one native amd64 ELF with no dynamic or interpreter segment."""
+
+    path = Path(path)
+    file_size = path.stat().st_size
+    with path.open("rb") as source:
+        header = source.read(64)
+        if len(header) != 64:
+            raise ValueError("Host media tool ELF header is truncated")
+        try:
+            (
+                identifier,
+                elf_type,
+                machine,
+                elf_version,
+                _entry,
+                program_header_offset,
+                _section_header_offset,
+                _flags,
+                header_size,
+                program_header_size,
+                program_header_count,
+                _section_header_size,
+                _section_header_count,
+                _section_name_index,
+            ) = struct.unpack("<16sHHIQQQIHHHHHH", header)
+        except struct.error as error:
+            raise ValueError("Host media tool ELF header is invalid") from error
+        if (
+            identifier[:4] != b"\x7fELF"
+            or identifier[4] != 2
+            or identifier[5] != 1
+            or identifier[6] != 1
+            or elf_type != 2
+            or machine != 62
+            or elf_version != 1
+            or header_size != 64
+            or program_header_size != 56
+            or not 1 <= program_header_count <= 128
+            or program_header_offset < header_size
+            or program_header_offset + program_header_size * program_header_count
+            > file_size
+        ):
+            raise ValueError(
+                "Host media tool must be one static ELF64 amd64 executable"
+            )
+        source.seek(program_header_offset)
+        program_types = []
+        for _ in range(program_header_count):
+            program_header = source.read(program_header_size)
+            if len(program_header) != program_header_size:
+                raise ValueError("Host media tool program headers are truncated")
+            program_types.append(struct.unpack_from("<I", program_header)[0])
+    if 1 not in program_types or 2 in program_types or 3 in program_types:
+        raise ValueError("Host media tool must not use PT_DYNAMIC or PT_INTERP")
+    return {
+        "class": "ELF64",
+        "endianness": "little",
+        "machine": "x86_64",
+        "linkage": "static_no_pt_dynamic_or_interp",
+        "program_header_count": program_header_count,
+    }
+
+
+def _directory_chain_identity(path: Path, field: str) -> dict[str, Any]:
+    """Bind every absolute directory component without following symlinks."""
+
+    path = Path(path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"{field} must be one normalized absolute path")
+    current = Path(path.anchor)
+    components = []
+    for part in (path.anchor, *path.parts[1:]):
+        if part != path.anchor:
+            current /= part
+        try:
+            component_stat = os.lstat(current)
+        except OSError as error:
+            raise ValueError(f"{field} component is unavailable: {current}") from error
+        if stat.S_ISLNK(component_stat.st_mode) or not stat.S_ISDIR(
+            component_stat.st_mode
+        ):
+            raise ValueError(f"{field} component must be a real directory: {current}")
+        components.append(
+            {
+                "path": str(current),
+                "device": component_stat.st_dev,
+                "inode": component_stat.st_ino,
+                "mode": format(stat.S_IMODE(component_stat.st_mode), "04o"),
+                "nlink": component_stat.st_nlink,
+            }
+        )
+    if path.resolve(strict=True) != path:
+        raise ValueError(f"{field} must use its canonical no-symlink spelling")
+    return {
+        "path": str(path),
+        "resolved_path": str(path.resolve(strict=True)),
+        "components": components,
+        "leaf": components[-1],
+    }
+
+
+def _load_host_media_tools_manifest(repository: Path) -> dict[str, Any]:
+    repository = Path(repository)
+    path = repository / HOST_MEDIA_TOOLS_MANIFEST
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("Host media tools manifest is unreadable") from error
+    source_archive = value.get("source_archive") if isinstance(value, dict) else None
+    tools = value.get("tools") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "schema_version",
+            "profile",
+            "architecture",
+            "package_root",
+            "source_archive",
+            "tools",
+        }
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or value["profile"] != HOST_MEDIA_TOOLS_PROFILE
+        or value["architecture"] != "amd64"
+        or not isinstance(value["package_root"], str)
+        or not Path(value["package_root"]).is_absolute()
+        or not isinstance(source_archive, dict)
+        or set(source_archive) != {"url", "version", "size", "sha256", "upstream_md5"}
+        or source_archive["url"]
+        != "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+        or source_archive["version"] != "7.0.2-static"
+        or type(source_archive["size"]) is not int
+        or source_archive["size"] <= 0
+        or _LOWER_SHA256.fullmatch(source_archive["sha256"]) is None
+        or re.fullmatch(r"[0-9a-f]{32}", source_archive["upstream_md5"]) is None
+        or not isinstance(tools, dict)
+        or set(tools) != {"ffprobe", "ffmpeg"}
+    ):
+        raise ValueError("Host media tools manifest schema or identity mismatch")
+    package_root = Path(value["package_root"])
+    for name in ("ffprobe", "ffmpeg"):
+        record = tools[name]
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"path", "size", "sha256", "version_line"}
+            or not isinstance(record["path"], str)
+            or not Path(record["path"]).is_absolute()
+            or Path(record["path"]).parent != package_root
+            or Path(record["path"]).name != name
+            or type(record["size"]) is not int
+            or record["size"] <= 0
+            or _LOWER_SHA256.fullmatch(record["sha256"]) is None
+            or not isinstance(record["version_line"], str)
+            or not record["version_line"].startswith(f"{name} version 7.0.2-static ")
+        ):
+            raise ValueError("Host media tools manifest schema or identity mismatch")
+    return {
+        "artifact": {
+            "path": str(path.resolve()),
+            "size": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        },
+        "value": value,
+    }
+
+
+def validate_host_media_tools(
+    repository: Path,
+    *,
+    expected_manifest_sha256: str,
+    ffprobe_path: Path,
+    expected_ffprobe_sha256: str,
+    ffmpeg_path: Path,
+    expected_ffmpeg_sha256: str,
+) -> dict[str, Any]:
+    """Validate and provenance-bind the host-only post-srun video toolchain."""
+
+    manifest = _load_host_media_tools_manifest(repository)
+    manifest_value = manifest["value"]
+    if (
+        _sha256_string(expected_manifest_sha256, "host media tools manifest SHA-256")
+        != manifest["artifact"]["sha256"]
+    ):
+        raise ValueError("Host media tools manifest SHA-256 mismatch")
+    package_root = Path(manifest_value["package_root"])
+    package_root_identity = _directory_chain_identity(
+        package_root, "host media tools package root"
+    )
+    if package_root_identity["leaf"]["mode"] != "0555":
+        raise ValueError("Host media tools package root must have mode 0555")
+    provided = {
+        "ffprobe": (Path(ffprobe_path), expected_ffprobe_sha256),
+        "ffmpeg": (Path(ffmpeg_path), expected_ffmpeg_sha256),
+    }
+    tools = {}
+    for name in ("ffprobe", "ffmpeg"):
+        path, expected_sha256 = provided[name]
+        expected = manifest_value["tools"][name]
+        if (
+            not path.is_absolute()
+            or str(path) != expected["path"]
+            or _sha256_string(expected_sha256, f"host {name} SHA-256")
+            != expected["sha256"]
+        ):
+            raise ValueError(f"Host {name} path or SHA-256 differs from manifest")
+        file_stat = _regular_file(path, f"host {name}", mode=0o555)
+        if file_stat.st_size != expected["size"] or not os.access(path, os.X_OK):
+            raise ValueError(f"Host {name} size or executable mode mismatch")
+        digest = file_sha256(path)
+        if digest != expected["sha256"]:
+            raise ValueError(f"Host {name} SHA-256 mismatch")
+        elf = _static_elf64_amd64_identity(path)
+        try:
+            version = subprocess.run(
+                [str(path), "-version"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env={"LANG": "C", "LC_ALL": "C"},
+            ).stdout.splitlines()[0]
+        except (
+            OSError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as error:
+            raise ValueError(f"Host {name} executable preflight failed") from error
+        if version != expected["version_line"]:
+            raise ValueError(f"Host {name} version identity mismatch")
+        second_digest = file_sha256(path)
+        second_stat = _regular_file(path, f"host {name}", mode=0o555)
+        if (
+            second_digest != digest
+            or second_stat.st_dev != file_stat.st_dev
+            or second_stat.st_ino != file_stat.st_ino
+            or second_stat.st_size != file_stat.st_size
+            or second_stat.st_mode != file_stat.st_mode
+            or second_stat.st_mtime_ns != file_stat.st_mtime_ns
+            or second_stat.st_ctime_ns != file_stat.st_ctime_ns
+        ):
+            raise ValueError(f"Host {name} changed during validation")
+        tools[name] = {
+            "path": str(path),
+            "resolved_path": str(path.resolve()),
+            "size": second_stat.st_size,
+            "sha256": second_digest,
+            "mode": "0555",
+            "nlink": 1,
+            "device": second_stat.st_dev,
+            "inode": second_stat.st_ino,
+            "mtime_ns": second_stat.st_mtime_ns,
+            "ctime_ns": second_stat.st_ctime_ns,
+            "version_line": version,
+            "elf": elf,
+        }
+    package_root_after = _directory_chain_identity(
+        package_root, "host media tools package root"
+    )
+    if canonical_json_bytes(package_root_after) != canonical_json_bytes(
+        package_root_identity
+    ):
+        raise ValueError("Host media tools package root changed during validation")
+    return {
+        "schema_version": 1,
+        "profile": HOST_MEDIA_TOOLS_PROFILE,
+        "architecture": manifest_value["architecture"],
+        "package_root": manifest_value["package_root"],
+        "package_root_identity": package_root_after,
+        "source_archive": manifest_value["source_archive"],
+        "manifest": manifest["artifact"],
+        "tools": tools,
+    }
+
+
+def _require_host_media_tools_unchanged(
+    before: dict[str, Any], after: dict[str, Any]
+) -> None:
+    if canonical_json_bytes(after) != canonical_json_bytes(before):
+        raise ValueError("Host media tools changed across video finalization")
 
 
 def _validate_sealed_sidecar_artifact(
@@ -1409,12 +1697,17 @@ def _top_level_mp4_boxes(path: Path) -> list[str]:
 
 
 def probe_video(
-    path: Path, *, require_faststart: bool, expected_frame_count: int
+    path: Path,
+    *,
+    require_faststart: bool,
+    expected_frame_count: int,
+    ffprobe_path: Path,
+    ffmpeg_path: Path,
 ) -> dict[str, Any]:
     path = Path(path)
     _regular_file(path, "video")
     command = [
-        "ffprobe",
+        str(ffprobe_path),
         "-v",
         "error",
         "-count_frames",
@@ -1465,7 +1758,7 @@ def probe_video(
     try:
         subprocess.run(
             [
-                "ffmpeg",
+                str(ffmpeg_path),
                 "-v",
                 "error",
                 "-threads",
@@ -1506,7 +1799,12 @@ def probe_video(
 
 
 def create_summary_video(
-    source: Path, output: Path, *, source_frame_count: int
+    source: Path,
+    output: Path,
+    *,
+    source_frame_count: int,
+    ffprobe_path: Path,
+    ffmpeg_path: Path,
 ) -> dict[str, Any]:
     output = Path(output)
     if output.exists() or output.is_symlink():
@@ -1518,7 +1816,7 @@ def create_summary_video(
         summary_frame_count = max(source_frame_count, 45)
         subprocess.run(
             [
-                "ffmpeg",
+                str(ffmpeg_path),
                 "-v",
                 "error",
                 "-threads",
@@ -1546,6 +1844,8 @@ def create_summary_video(
             temporary,
             require_faststart=True,
             expected_frame_count=summary_frame_count,
+            ffprobe_path=ffprobe_path,
+            ffmpeg_path=ffmpeg_path,
         )
         temporary.chmod(0o444)
         with temporary.open("rb") as source_file:
@@ -1611,6 +1911,11 @@ def _validate_run_record(
         "CHECKPOINT_MANIFEST",
         "POLARIS_PYXIS_IMAGE",
         "POLARIS_DATA_DIR",
+        "EXPECTED_HOST_MEDIA_TOOLS_MANIFEST_SHA256",
+        "HOST_FFPROBE_PATH",
+        "EXPECTED_HOST_FFPROBE_SHA256",
+        "HOST_FFMPEG_PATH",
+        "EXPECTED_HOST_FFMPEG_SHA256",
         "CONTROLLER_COMPLETION",
         "EXPECTED_CONTROLLER_COMPLETION_SHA256",
         "ALL_SIX_CONTROLLER_COMPLETION",
@@ -1665,6 +1970,8 @@ def _validate_run_record(
         / "scripts/polaris/pi05_droid_native_gcs_manifest.tsv",
         "POLARIS_PYXIS_IMAGE": Path(args.container_image),
         "POLARIS_DATA_DIR": Path(args.data_dir),
+        "HOST_FFPROBE_PATH": Path(args.host_ffprobe_path),
+        "HOST_FFMPEG_PATH": Path(args.host_ffmpeg_path),
         "CONTROLLER_COMPLETION": Path(args.controller_completion),
         "ALL_SIX_CONTROLLER_COMPLETION": Path(args.all_six_controller_completion),
         "BOUND_PORT_FILE": run_dir / "policy_bound_port.json",
@@ -1684,6 +1991,11 @@ def _validate_run_record(
         ),
         "EXPECTED_ALL_SIX_COMPLETION_SHA256": (args.expected_all_six_completion_sha256),
         "EXPECTED_ALL_SIX_PROFILE": args.expected_all_six_profile,
+        "EXPECTED_HOST_MEDIA_TOOLS_MANIFEST_SHA256": (
+            args.expected_host_media_tools_manifest_sha256
+        ),
+        "EXPECTED_HOST_FFPROBE_SHA256": args.expected_host_ffprobe_sha256,
+        "EXPECTED_HOST_FFMPEG_SHA256": args.expected_host_ffmpeg_sha256,
     }
     if any(values[key] != expected for key, expected in expected_scalars.items()):
         raise ValueError("Run-record scalar binding mismatch")
@@ -1812,6 +2124,11 @@ def _validate_submission_record(
         "sbatch_script_sha256",
         "container_image",
         "polaris_data_dir",
+        "expected_host_media_tools_manifest_sha256",
+        "host_ffprobe_path",
+        "expected_host_ffprobe_sha256",
+        "host_ffmpeg_path",
+        "expected_host_ffmpeg_sha256",
         "fresh_attempt_no_resume",
         "task",
         "rollouts",
@@ -1834,6 +2151,12 @@ def _validate_submission_record(
         or Path(value["container_image"]).resolve()
         != Path(args.container_image).resolve()
         or Path(value["polaris_data_dir"]).resolve() != Path(args.data_dir).resolve()
+        or value["expected_host_media_tools_manifest_sha256"]
+        != args.expected_host_media_tools_manifest_sha256
+        or value["host_ffprobe_path"] != str(args.host_ffprobe_path)
+        or value["expected_host_ffprobe_sha256"] != args.expected_host_ffprobe_sha256
+        or value["host_ffmpeg_path"] != str(args.host_ffmpeg_path)
+        or value["expected_host_ffmpeg_sha256"] != args.expected_host_ffmpeg_sha256
         or value["fresh_attempt_no_resume"] is not True
         or value["task"] != PI05_DROID_NATIVE_TASK
     ):
@@ -1855,6 +2178,14 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Run directory is invalid")
     task_dir = run_dir / PI05_DROID_NATIVE_TASK
     source = _source_provenance(args.polaris_repo, args.expected_polaris_commit)
+    host_media_tools_pre = validate_host_media_tools(
+        args.polaris_repo,
+        expected_manifest_sha256=args.expected_host_media_tools_manifest_sha256,
+        ffprobe_path=args.host_ffprobe_path,
+        expected_ffprobe_sha256=args.expected_host_ffprobe_sha256,
+        ffmpeg_path=args.host_ffmpeg_path,
+        expected_ffmpeg_sha256=args.expected_host_ffmpeg_sha256,
+    )
     atomic_port_sources = validate_atomic_port_runtime_sources(args.polaris_repo)
     openpi = _openpi_provenance(args.openpi_dir)
     base_controller = validate_base_controller_completion(
@@ -1966,6 +2297,8 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         video_path,
         require_faststart=False,
         expected_frame_count=trace_summary["metrics"]["episode_length"],
+        ffprobe_path=Path(host_media_tools_pre["tools"]["ffprobe"]["path"]),
+        ffmpeg_path=Path(host_media_tools_pre["tools"]["ffmpeg"]["path"]),
     )
     trace_identity = _seal_file(trace_path, "policy trace")
     metrics_identity = _seal_file(metrics_path, "metrics CSV")
@@ -1991,7 +2324,18 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         video_path,
         summary_path,
         source_frame_count=trace_summary["metrics"]["episode_length"],
+        ffprobe_path=Path(host_media_tools_pre["tools"]["ffprobe"]["path"]),
+        ffmpeg_path=Path(host_media_tools_pre["tools"]["ffmpeg"]["path"]),
     )
+    host_media_tools_post = validate_host_media_tools(
+        args.polaris_repo,
+        expected_manifest_sha256=args.expected_host_media_tools_manifest_sha256,
+        ffprobe_path=args.host_ffprobe_path,
+        expected_ffprobe_sha256=args.expected_host_ffprobe_sha256,
+        ffmpeg_path=args.host_ffmpeg_path,
+        expected_ffmpeg_sha256=args.expected_host_ffmpeg_sha256,
+    )
+    _require_host_media_tools_unchanged(host_media_tools_pre, host_media_tools_post)
     summary_identity = _seal_file(summary_path, "summary video")
     summary_manifest = {
         "schema_version": 1,
@@ -2042,6 +2386,12 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         "evaluator_close_ready": close_ready,
         "sensor_liveness": trace_summary["sensor_liveness"],
         "inference_environment": environment,
+        "host_finalization": {
+            "profile": "pi05_droid_native_separate_post_srun_finalizer_v1",
+            "media_tools_pre": host_media_tools_pre,
+            "media_tools_post": host_media_tools_post,
+            "identity_match": True,
+        },
         "slurm": {
             "submission_record": submission_record,
             "run_record": run_record,
@@ -2104,15 +2454,25 @@ def _add_controller_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--expected-all-six-profile", required=True)
 
 
+def _add_host_media_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--expected-host-media-tools-manifest-sha256", required=True)
+    parser.add_argument("--host-ffprobe-path", type=Path, required=True)
+    parser.add_argument("--expected-host-ffprobe-sha256", required=True)
+    parser.add_argument("--host-ffmpeg-path", type=Path, required=True)
+    parser.add_argument("--expected-host-ffmpeg-sha256", required=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     preflight = subparsers.add_parser("preflight")
     _add_controller_arguments(preflight)
+    _add_host_media_arguments(preflight)
     finalize_parser = subparsers.add_parser("finalize")
     finalize_parser.add_argument("--job-id", type=int, required=True)
     finalize_parser.add_argument("--run-dir", type=Path, required=True)
     _add_controller_arguments(finalize_parser)
+    _add_host_media_arguments(finalize_parser)
     finalize_parser.add_argument("--expected-polaris-commit", required=True)
     finalize_parser.add_argument("--openpi-dir", type=Path, required=True)
     finalize_parser.add_argument("--container-image", type=Path, required=True)
@@ -2123,6 +2483,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.command == "preflight":
+        host_media_tools = validate_host_media_tools(
+            args.polaris_repo,
+            expected_manifest_sha256=args.expected_host_media_tools_manifest_sha256,
+            ffprobe_path=args.host_ffprobe_path,
+            expected_ffprobe_sha256=args.expected_host_ffprobe_sha256,
+            ffmpeg_path=args.host_ffmpeg_path,
+            expected_ffmpeg_sha256=args.expected_host_ffmpeg_sha256,
+        )
         atomic_port = validate_atomic_port_runtime_sources(args.polaris_repo)
         base = validate_base_controller_completion(
             args.controller_completion,
@@ -2137,7 +2505,12 @@ def main() -> None:
         )
         print(
             canonical_json_bytes(
-                {"atomic_port": atomic_port, "base": base, "all_six": all_six}
+                {
+                    "host_media_tools": host_media_tools,
+                    "atomic_port": atomic_port,
+                    "base": base,
+                    "all_six": all_six,
+                }
             ).decode("ascii"),
             end="",
         )

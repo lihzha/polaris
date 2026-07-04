@@ -1,0 +1,27 @@
+{
+  "architecture": "amd64",
+  "package_root": "/lustre/fs11/portfolios/nvr/projects/nvr_lpr_rvp/users/lzha/cache/polaris/host-media-tools/ffmpeg-7.0.2-static-amd64-abda8d77ce830914",
+  "profile": "pi05_droid_native_host_media_tools_v1",
+  "schema_version": 1,
+  "source_archive": {
+    "sha256": "abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67",
+    "size": 41888096,
+    "upstream_md5": "7fa72b652e19bf84c9461e332ea1cdf3",
+    "url": "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
+    "version": "7.0.2-static"
+  },
+  "tools": {
+    "ffmpeg": {
+      "path": "/lustre/fs11/portfolios/nvr/projects/nvr_lpr_rvp/users/lzha/cache/polaris/host-media-tools/ffmpeg-7.0.2-static-amd64-abda8d77ce830914/ffmpeg",
+      "sha256": "e7e7fb30477f717e6f55f9180a70386c62677ef8a4d4d1a5d948f4098aa3eb99",
+      "size": 79826272,
+      "version_line": "ffmpeg version 7.0.2-static https://johnvansickle.com/ffmpeg/  Copyright (c) 2000-2024 the FFmpeg developers"
+    },
+    "ffprobe": {
+      "path": "/lustre/fs11/portfolios/nvr/projects/nvr_lpr_rvp/users/lzha/cache/polaris/host-media-tools/ffmpeg-7.0.2-static-amd64-abda8d77ce830914/ffprobe",
+      "sha256": "4f231a1960d83e403d08f7971e271707bec278a9ae18e21b8b5b03186668450d",
+      "size": 79665792,
+      "version_line": "ffprobe version 7.0.2-static https://johnvansickle.com/ffmpeg/  Copyright (c) 2007-2024 the FFmpeg developers"
+    }
+  }
+}

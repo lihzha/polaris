@@ -25,6 +25,9 @@ NFS_ROOT="${NFS_ROOT:-/lustre/fsw/portfolios/nvr/users/lzha}"
 
 POLARIS_PYXIS_IMAGE="${POLARIS_PYXIS_IMAGE:-${NFS_ROOT}/cache/polaris/polaris-eval-cuda13-fd00a51.sqsh}"
 POLARIS_DATA_DIR="${POLARIS_DATA_DIR:-${NFS_ROOT}/data/PolaRiS-Hub}"
+HOST_MEDIA_TOOLS_ROOT=/lustre/fs11/portfolios/nvr/projects/nvr_lpr_rvp/users/lzha/cache/polaris/host-media-tools/ffmpeg-7.0.2-static-amd64-abda8d77ce830914
+HOST_FFPROBE_PATH="${HOST_FFPROBE_PATH:-${HOST_MEDIA_TOOLS_ROOT}/ffprobe}"
+HOST_FFMPEG_PATH="${HOST_FFMPEG_PATH:-${HOST_MEDIA_TOOLS_ROOT}/ffmpeg}"
 JOB_SCRIPT="${POLARIS_DIR}/scripts/polaris/l40s_pi05_droid_native_jointvelocity_canary.sbatch"
 SAVED_JOB_SCRIPT="${RUN_DIR}/job-${SLURM_JOB_ID}.sbatch"
 GPU_INVENTORY="${RUN_DIR}/gpu-${SLURM_JOB_ID}.json"
@@ -84,6 +87,7 @@ export NVIDIA_VISIBLE_DEVICES="${gpu_uuid}"
 export NVIDIA_DRIVER_CAPABILITIES=all
 export PYTHONUNBUFFERED=1
 export SLURM_EXPORT_ENV=ALL
+export HOST_FFPROBE_PATH HOST_FFMPEG_PATH
 
 echo "[$(date -Iseconds)] job=${SLURM_JOB_ID} host=$(hostname) profile=official-pi05-droid-native-canary"
 exec "${POLARIS_DIR}/scripts/polaris/eval_pi05_droid_native_jointvelocity.sh"

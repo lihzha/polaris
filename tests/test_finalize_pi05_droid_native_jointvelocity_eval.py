@@ -4,6 +4,7 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -50,6 +51,8 @@ from polaris.native_gripper_runtime import (
 
 
 ROOT = Path(__file__).parents[1]
+LOCAL_FFMPEG = shutil.which("ffmpeg")
+LOCAL_FFPROBE = shutil.which("ffprobe")
 
 
 def _legacy_slurm_artifact(path: Path, **extra):
@@ -848,6 +851,11 @@ def _record_validation_inputs(tmp_path):
         expected_all_six_completion_sha256="b" * 64,
         expected_all_six_profile="all-six-profile",
         expected_polaris_commit="c" * 40,
+        expected_host_media_tools_manifest_sha256="1" * 64,
+        host_ffprobe_path=tmp_path / "host-tools/ffprobe",
+        expected_host_ffprobe_sha256="e" * 64,
+        host_ffmpeg_path=tmp_path / "host-tools/ffmpeg",
+        expected_host_ffmpeg_sha256="f" * 64,
     )
     checkpoint_dir = tmp_path / "checkpoint"
     checkpoint = {"checkpoint": {"checkpoint_dir": str(checkpoint_dir)}}
@@ -878,6 +886,13 @@ def test_run_record_envelope_integer_fields_are_type_exact(
         ),
         "POLARIS_PYXIS_IMAGE": str(args.container_image),
         "POLARIS_DATA_DIR": str(args.data_dir),
+        "EXPECTED_HOST_MEDIA_TOOLS_MANIFEST_SHA256": (
+            args.expected_host_media_tools_manifest_sha256
+        ),
+        "HOST_FFPROBE_PATH": str(args.host_ffprobe_path),
+        "EXPECTED_HOST_FFPROBE_SHA256": args.expected_host_ffprobe_sha256,
+        "HOST_FFMPEG_PATH": str(args.host_ffmpeg_path),
+        "EXPECTED_HOST_FFMPEG_SHA256": args.expected_host_ffmpeg_sha256,
         "CONTROLLER_COMPLETION": str(args.controller_completion),
         "EXPECTED_CONTROLLER_COMPLETION_SHA256": (
             args.expected_controller_completion_sha256
@@ -1012,6 +1027,13 @@ def test_submission_record_envelope_integer_fields_are_type_exact(
         "sbatch_script_sha256": source["files"][sbatch_relative]["sha256"],
         "container_image": str(args.container_image),
         "polaris_data_dir": str(args.data_dir),
+        "expected_host_media_tools_manifest_sha256": (
+            args.expected_host_media_tools_manifest_sha256
+        ),
+        "host_ffprobe_path": str(args.host_ffprobe_path),
+        "expected_host_ffprobe_sha256": args.expected_host_ffprobe_sha256,
+        "host_ffmpeg_path": str(args.host_ffmpeg_path),
+        "expected_host_ffmpeg_sha256": args.expected_host_ffmpeg_sha256,
         "fresh_attempt_no_resume": True,
         "task": finalizer.PI05_DROID_NATIVE_TASK,
         "rollouts": 1,
@@ -1313,8 +1335,205 @@ def test_sealed_sidecar_artifacts_accept_fsw_fs11_alias_and_reject_drift(
         )
 
 
+def _write_synthetic_static_elf(path: Path, *, marker: bytes) -> None:
+    identifier = b"\x7fELF" + bytes([2, 1, 1, 3]) + bytes(8)
+    header = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        identifier,
+        2,
+        62,
+        1,
+        0x401000,
+        64,
+        0,
+        0,
+        64,
+        56,
+        1,
+        64,
+        0,
+        0,
+    )
+    load_segment = struct.pack("<IIQQQQQQ", 1, 5, 0, 0x400000, 0, 0, 0, 0x1000)
+    path.write_bytes(header + load_segment + marker)
+    path.chmod(0o555)
+
+
+def test_host_media_manifest_pins_upstream_archive_and_static_tools():
+    manifest = finalizer._load_host_media_tools_manifest(ROOT)
+    value = manifest["value"]
+    assert manifest["artifact"]["sha256"] == (
+        "09d95a1f28e9e9af1e172439806ca9c2d6b19dd661f9f5f4ee7f51185cb99be5"
+    )
+    assert value["profile"] == finalizer.HOST_MEDIA_TOOLS_PROFILE
+    assert value["source_archive"] == {
+        "url": "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz",
+        "version": "7.0.2-static",
+        "size": 41_888_096,
+        "sha256": "abda8d77ce8309141f83ab8edf0596834087c52467f6badf376a6a2a4c87cf67",
+        "upstream_md5": "7fa72b652e19bf84c9461e332ea1cdf3",
+    }
+    assert value["tools"]["ffprobe"]["sha256"] == (
+        "4f231a1960d83e403d08f7971e271707bec278a9ae18e21b8b5b03186668450d"
+    )
+    assert value["tools"]["ffmpeg"]["sha256"] == (
+        "e7e7fb30477f717e6f55f9180a70386c62677ef8a4d4d1a5d948f4098aa3eb99"
+    )
+    assert value["package_root"].startswith("/lustre/fs11/")
+    assert finalizer.HOST_MEDIA_TOOLS_MANIFEST in finalizer.SOURCE_PATHS
+
+
+def test_host_media_tools_require_exact_paths_hashes_static_elf_and_versions(
+    tmp_path, monkeypatch
+):
+    package_root = tmp_path / "host-media-tools"
+    package_root.mkdir()
+    tools = {}
+    for name in ("ffprobe", "ffmpeg"):
+        path = package_root / name
+        _write_synthetic_static_elf(path, marker=name.encode("ascii"))
+        tools[name] = {
+            "path": str(path),
+            "size": path.stat().st_size,
+            "sha256": file_sha256(path),
+            "version_line": f"{name} version 7.0.2-static test build",
+        }
+    package_root.chmod(0o555)
+    manifest_value = {
+        "schema_version": 1,
+        "profile": finalizer.HOST_MEDIA_TOOLS_PROFILE,
+        "architecture": "amd64",
+        "package_root": str(package_root),
+        "source_archive": {
+            "url": "https://example.invalid/ffmpeg.tar.xz",
+            "version": "7.0.2-static",
+            "size": 123,
+            "sha256": "a" * 64,
+            "upstream_md5": "b" * 32,
+        },
+        "tools": tools,
+    }
+    monkeypatch.setattr(
+        finalizer,
+        "_load_host_media_tools_manifest",
+        lambda _: {
+            "artifact": {
+                "path": str(tmp_path / "manifest.json"),
+                "size": 1,
+                "sha256": "c" * 64,
+            },
+            "value": manifest_value,
+        },
+    )
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append((command, kwargs))
+        name = Path(command[0]).name
+        return SimpleNamespace(stdout=f"{tools[name]['version_line']}\n")
+
+    monkeypatch.setattr(finalizer.subprocess, "run", fake_run)
+    result = finalizer.validate_host_media_tools(
+        tmp_path,
+        expected_manifest_sha256="c" * 64,
+        ffprobe_path=tools["ffprobe"]["path"],
+        expected_ffprobe_sha256=tools["ffprobe"]["sha256"],
+        ffmpeg_path=tools["ffmpeg"]["path"],
+        expected_ffmpeg_sha256=tools["ffmpeg"]["sha256"],
+    )
+    assert result["profile"] == finalizer.HOST_MEDIA_TOOLS_PROFILE
+    assert result["tools"]["ffprobe"]["elf"]["linkage"] == (
+        "static_no_pt_dynamic_or_interp"
+    )
+    assert result["tools"]["ffmpeg"]["mode"] == "0555"
+    assert [command[0][0] for command in commands] == [
+        tools["ffprobe"]["path"],
+        tools["ffmpeg"]["path"],
+    ]
+    assert all(command[0][1:] == ["-version"] for command in commands)
+
+    with pytest.raises(ValueError, match="manifest SHA-256 mismatch"):
+        finalizer.validate_host_media_tools(
+            tmp_path,
+            expected_manifest_sha256="d" * 64,
+            ffprobe_path=tools["ffprobe"]["path"],
+            expected_ffprobe_sha256=tools["ffprobe"]["sha256"],
+            ffmpeg_path=tools["ffmpeg"]["path"],
+            expected_ffmpeg_sha256=tools["ffmpeg"]["sha256"],
+        )
+
+    with pytest.raises(ValueError, match="differs from manifest"):
+        finalizer.validate_host_media_tools(
+            tmp_path,
+            expected_manifest_sha256="c" * 64,
+            ffprobe_path=tools["ffprobe"]["path"],
+            expected_ffprobe_sha256="0" * 64,
+            ffmpeg_path=tools["ffmpeg"]["path"],
+            expected_ffmpeg_sha256=tools["ffmpeg"]["sha256"],
+        )
+
+    original_ffprobe = Path(tools["ffprobe"]["path"])
+    replacement_ffprobe = tmp_path / "replacement-ffprobe"
+    replacement_ffprobe.write_bytes(original_ffprobe.read_bytes())
+    replacement_ffprobe.chmod(0o555)
+    package_root.chmod(0o755)
+    os.replace(replacement_ffprobe, original_ffprobe)
+    package_root.chmod(0o555)
+    replaced = finalizer.validate_host_media_tools(
+        tmp_path,
+        expected_manifest_sha256="c" * 64,
+        ffprobe_path=tools["ffprobe"]["path"],
+        expected_ffprobe_sha256=tools["ffprobe"]["sha256"],
+        ffmpeg_path=tools["ffmpeg"]["path"],
+        expected_ffmpeg_sha256=tools["ffmpeg"]["sha256"],
+    )
+    assert (
+        replaced["tools"]["ffprobe"]["sha256"] == result["tools"]["ffprobe"]["sha256"]
+    )
+    assert replaced["tools"]["ffprobe"]["inode"] != result["tools"]["ffprobe"]["inode"]
+    with pytest.raises(ValueError, match="changed across video finalization"):
+        finalizer._require_host_media_tools_unchanged(result, replaced)
+
+    Path(tools["ffprobe"]["path"]).chmod(0o755)
+    with pytest.raises(ValueError, match="mode 0555"):
+        finalizer.validate_host_media_tools(
+            tmp_path,
+            expected_manifest_sha256="c" * 64,
+            ffprobe_path=tools["ffprobe"]["path"],
+            expected_ffprobe_sha256=tools["ffprobe"]["sha256"],
+            ffmpeg_path=tools["ffmpeg"]["path"],
+            expected_ffmpeg_sha256=tools["ffmpeg"]["sha256"],
+        )
+
+
+def test_host_media_static_elf_rejects_dynamic_or_interpreted_binary(tmp_path):
+    path = tmp_path / "dynamic-ffprobe"
+    _write_synthetic_static_elf(path, marker=b"dynamic")
+    payload = bytearray(path.read_bytes())
+    struct.pack_into("<I", payload, 64, 3)
+    path.chmod(0o644)
+    path.write_bytes(payload)
+    path.chmod(0o555)
+    with pytest.raises(ValueError, match="PT_DYNAMIC or PT_INTERP"):
+        finalizer._static_elf64_amd64_identity(path)
+
+
+def test_host_media_package_root_rejects_intermediate_symlink(tmp_path):
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    package_root = real_parent / "package"
+    package_root.mkdir()
+    package_root.chmod(0o555)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(ValueError, match="component must be a real directory"):
+        finalizer._directory_chain_identity(
+            alias / "package", "host media tools package root"
+        )
+
+
 @pytest.mark.skipif(
-    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    LOCAL_FFMPEG is None or LOCAL_FFPROBE is None,
     reason="ffmpeg tools are unavailable",
 )
 def test_summary_video_is_exact_h264_yuv420p_faststart_and_fully_decodable(tmp_path):
@@ -1339,14 +1558,22 @@ def test_summary_video_is_exact_h264_yuv420p_faststart_and_fully_decodable(tmp_p
         check=True,
     )
     source_probe = finalizer.probe_video(
-        source, require_faststart=False, expected_frame_count=450
+        source,
+        require_faststart=False,
+        expected_frame_count=450,
+        ffprobe_path=Path(LOCAL_FFPROBE),
+        ffmpeg_path=Path(LOCAL_FFMPEG),
     )
     assert source_probe["frame_count"] == 450
     assert source_probe["full_decode"] == "pass"
 
     summary = tmp_path / "summary.mp4"
     summary_probe = finalizer.create_summary_video(
-        source, summary, source_frame_count=450
+        source,
+        summary,
+        source_frame_count=450,
+        ffprobe_path=Path(LOCAL_FFPROBE),
+        ffmpeg_path=Path(LOCAL_FFMPEG),
     )
     assert summary_probe["codec"] == "h264"
     assert summary_probe["pixel_format"] == "yuv420p"
@@ -1360,7 +1587,7 @@ def test_summary_video_is_exact_h264_yuv420p_faststart_and_fully_decodable(tmp_p
 
 
 @pytest.mark.skipif(
-    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    LOCAL_FFMPEG is None or LOCAL_FFPROBE is None,
     reason="ffmpeg tools are unavailable",
 )
 def test_short_numerical_failure_summary_is_padded_to_three_seconds(tmp_path):
@@ -1384,11 +1611,21 @@ def test_short_numerical_failure_summary_is_padded_to_three_seconds(tmp_path):
         ],
         check=True,
     )
-    raw = finalizer.probe_video(source, require_faststart=False, expected_frame_count=8)
+    raw = finalizer.probe_video(
+        source,
+        require_faststart=False,
+        expected_frame_count=8,
+        ffprobe_path=Path(LOCAL_FFPROBE),
+        ffmpeg_path=Path(LOCAL_FFMPEG),
+    )
     assert raw["frame_count"] == 8
     summary = tmp_path / "failure-summary.mp4"
     summary_probe = finalizer.create_summary_video(
-        source, summary, source_frame_count=8
+        source,
+        summary,
+        source_frame_count=8,
+        ffprobe_path=Path(LOCAL_FFPROBE),
+        ffmpeg_path=Path(LOCAL_FFMPEG),
     )
     assert summary_probe["frame_count"] == 45
     assert summary_probe["duration_seconds"] == 3.0
@@ -1409,6 +1646,9 @@ def test_launchers_block_before_download_or_sbatch_and_forbid_resume():
     lifecycle_source = (ROOT / "src/polaris/pi05_droid_native_lifecycle.py").read_text(
         encoding="utf-8"
     )
+    finalizer_source = (
+        ROOT / "scripts/polaris/finalize_pi05_droid_native_jointvelocity_eval.py"
+    ).read_text(encoding="utf-8")
 
     assert eval_source.index("finalize_pi05_droid_native_jointvelocity_eval.py") < (
         eval_source.index("maybe_download")
@@ -1424,6 +1664,13 @@ def test_launchers_block_before_download_or_sbatch_and_forbid_resume():
         assert "1098204" not in source
         assert "RESUME_FROM_TASK_DIR" in source
         assert "Ambient PORT is forbidden" in source
+        assert "HOST_FFPROBE_PATH" in source
+        assert "EXPECTED_HOST_MEDIA_TOOLS_MANIFEST_SHA256" in source
+        assert "EXPECTED_HOST_FFPROBE_SHA256" in source
+        assert "HOST_FFMPEG_PATH" in source
+        assert "EXPECTED_HOST_FFMPEG_SHA256" in source
+        assert "--host-ffprobe-path" in source
+        assert "--host-ffmpeg-path" in source
     assert "/dev/tcp" not in eval_source
     assert "20000 +" not in eval_source
     assert "REQUESTED_PORT=0" in eval_source
@@ -1436,8 +1683,21 @@ def test_launchers_block_before_download_or_sbatch_and_forbid_resume():
     assert "BOUND_PORT_VALIDATION_AFTER_EVAL" in eval_source
     assert "attempt_failed.json" in eval_source
     assert "failed_not_ready_for_promotion" in eval_source
+    assert "printf '%q ' \"${finalizer_command[@]}\"" in eval_source
+    assert '"${finalizer_command[@]}"' in eval_source
     assert "Ambient PORT is forbidden" in sbatch_source
+    assert "HOST_FFPROBE_PATH" in sbatch_source
+    assert "HOST_FFMPEG_PATH" in sbatch_source
     assert sbatch_source.count("#SBATCH --no-requeue") == 1
+    summary_encode = finalizer_source.index("summary_probe = create_summary_video")
+    post_media_validation = finalizer_source.index(
+        "host_media_tools_post = validate_host_media_tools", summary_encode
+    )
+    summary_seal = finalizer_source.index(
+        'summary_identity = _seal_file(summary_path, "summary video")',
+        post_media_validation,
+    )
+    assert summary_encode < post_media_validation < summary_seal
     timeout_configuration = evaluator_source.index(
         "configured_episode_length_seconds = configure_native_environment_timeout"
     )

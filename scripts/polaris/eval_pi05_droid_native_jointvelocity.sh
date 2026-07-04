@@ -10,6 +10,12 @@ NFS_ROOT="${NFS_ROOT:-/lustre/fsw/portfolios/nvr/users/lzha}"
 OPENPI_DIR="${OPENPI_DIR:-${POLARIS_DIR}/third_party/openpi}"
 POLARIS_DATA_DIR="${POLARIS_DATA_DIR:-${NFS_ROOT}/data/PolaRiS-Hub}"
 POLARIS_PYXIS_IMAGE="${POLARIS_PYXIS_IMAGE:-${NFS_ROOT}/cache/polaris/polaris-eval-cuda13-fd00a51.sqsh}"
+HOST_MEDIA_TOOLS_ROOT=/lustre/fs11/portfolios/nvr/projects/nvr_lpr_rvp/users/lzha/cache/polaris/host-media-tools/ffmpeg-7.0.2-static-amd64-abda8d77ce830914
+HOST_FFPROBE_PATH="${HOST_FFPROBE_PATH:-${HOST_MEDIA_TOOLS_ROOT}/ffprobe}"
+HOST_FFMPEG_PATH="${HOST_FFMPEG_PATH:-${HOST_MEDIA_TOOLS_ROOT}/ffmpeg}"
+EXPECTED_HOST_MEDIA_TOOLS_MANIFEST_SHA256=09d95a1f28e9e9af1e172439806ca9c2d6b19dd661f9f5f4ee7f51185cb99be5
+EXPECTED_HOST_FFPROBE_SHA256=4f231a1960d83e403d08f7971e271707bec278a9ae18e21b8b5b03186668450d
+EXPECTED_HOST_FFMPEG_SHA256=e7e7fb30477f717e6f55f9180a70386c62677ef8a4d4d1a5d948f4098aa3eb99
 POLARIS_VULKAN_ICD_PATH="${POLARIS_VULKAN_ICD_PATH:-/usr/share/vulkan/icd.d/nvidia_icd.json}"
 OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-${NFS_ROOT}/cache/openpi-pi05-droid-native-v1}"
 POLARIS_CACHE_DIR="${POLARIS_CACHE_DIR:-${NFS_ROOT}/cache/polaris/runtime/pi05-native-${SLURM_JOB_ID:-manual}}"
@@ -42,6 +48,10 @@ die() {
   || die "Malformed job1098174 completion digest"
 [[ "${EXPECTED_ALL_SIX_COMPLETION_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
   || die "Malformed all-six completion digest"
+[[ "${EXPECTED_HOST_MEDIA_TOOLS_MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ \
+  && "${EXPECTED_HOST_FFPROBE_SHA256}" =~ ^[0-9a-f]{64}$ \
+  && "${EXPECTED_HOST_FFMPEG_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+  || die "Malformed host media tool digest"
 [[ -z "${PORT+x}" ]] \
   || die "Ambient PORT is forbidden; the WebSocket server must bind port 0"
 [[ "${SERVER_START_TIMEOUT_SECS}" =~ ^[1-9][0-9]*$ ]] \
@@ -93,7 +103,12 @@ PYTHONPATH="${POLARIS_DIR}/src:${SCRIPT_DIR}" "${OPENPI_DIR}/.venv/bin/python" \
   --expected-controller-completion-sha256 "${EXPECTED_CONTROLLER_COMPLETION_SHA256}" \
   --all-six-controller-completion "${ALL_SIX_CONTROLLER_COMPLETION}" \
   --expected-all-six-completion-sha256 "${EXPECTED_ALL_SIX_COMPLETION_SHA256}" \
-  --expected-all-six-profile "${EXPECTED_ALL_SIX_PROFILE}"
+  --expected-all-six-profile "${EXPECTED_ALL_SIX_PROFILE}" \
+  --expected-host-media-tools-manifest-sha256 "${EXPECTED_HOST_MEDIA_TOOLS_MANIFEST_SHA256}" \
+  --host-ffprobe-path "${HOST_FFPROBE_PATH}" \
+  --expected-host-ffprobe-sha256 "${EXPECTED_HOST_FFPROBE_SHA256}" \
+  --host-ffmpeg-path "${HOST_FFMPEG_PATH}" \
+  --expected-host-ffmpeg-sha256 "${EXPECTED_HOST_FFMPEG_SHA256}"
 
 TASK_DIR="${RUN_DIR}/${POLARIS_ENVIRONMENT}"
 SERVER_LOG="${RUN_DIR}/policy_server.log"
@@ -358,12 +373,37 @@ eval_command=(
   XDG_CACHE_HOME=/cache HF_HOME=/cache/huggingface HOME=/cache/home
   /.venv/bin/python "${eval_args[@]}"
 )
+finalizer_command=(
+  "${OPENPI_DIR}/.venv/bin/python"
+  "${SCRIPT_DIR}/finalize_pi05_droid_native_jointvelocity_eval.py"
+  finalize
+  --job-id "${SLURM_JOB_ID}"
+  --run-dir "${RUN_DIR}"
+  --polaris-repo "${POLARIS_DIR}"
+  --expected-polaris-commit "${EXPECTED_POLARIS_COMMIT}"
+  --openpi-dir "${OPENPI_DIR}"
+  --container-image "${POLARIS_PYXIS_IMAGE}"
+  --data-dir "${POLARIS_DATA_DIR}"
+  --controller-completion "${CONTROLLER_COMPLETION}"
+  --expected-controller-completion-sha256 "${EXPECTED_CONTROLLER_COMPLETION_SHA256}"
+  --all-six-controller-completion "${ALL_SIX_CONTROLLER_COMPLETION}"
+  --expected-all-six-completion-sha256 "${EXPECTED_ALL_SIX_COMPLETION_SHA256}"
+  --expected-all-six-profile "${EXPECTED_ALL_SIX_PROFILE}"
+  --expected-host-media-tools-manifest-sha256 "${EXPECTED_HOST_MEDIA_TOOLS_MANIFEST_SHA256}"
+  --host-ffprobe-path "${HOST_FFPROBE_PATH}"
+  --expected-host-ffprobe-sha256 "${EXPECTED_HOST_FFPROBE_SHA256}"
+  --host-ffmpeg-path "${HOST_FFMPEG_PATH}"
+  --expected-host-ffmpeg-sha256 "${EXPECTED_HOST_FFMPEG_SHA256}"
+)
 
 export RUN_RECORD RUN_DIR CHECKPOINT_PATH="${checkpoint_path}" POLARIS_DIR OPENPI_DIR
 export EXPECTED_POLARIS_COMMIT CHECKPOINT_URI CHECKPOINT_MANIFEST POLARIS_PYXIS_IMAGE
 export POLARIS_DATA_DIR CONTROLLER_COMPLETION EXPECTED_CONTROLLER_COMPLETION_SHA256
 export ALL_SIX_CONTROLLER_COMPLETION EXPECTED_ALL_SIX_COMPLETION_SHA256
 export EXPECTED_ALL_SIX_PROFILE MODEL_RUNTIME_CONTRACT
+export HOST_FFPROBE_PATH EXPECTED_HOST_FFPROBE_SHA256
+export HOST_FFMPEG_PATH EXPECTED_HOST_FFMPEG_SHA256
+export EXPECTED_HOST_MEDIA_TOOLS_MANIFEST_SHA256
 export PORT_REQUESTED="${REQUESTED_PORT}" PORT_ACTUAL="${ACTUAL_PORT}" SERVER_PID
 export BOUND_PORT_FILE BOUND_PORT_TOKEN BOUND_PORT_FILE_SHA256 BOUND_PORT_FILE_IDENTITY
 export HANDSHAKE_PATH
@@ -376,6 +416,9 @@ keys = (
     "RUN_DIR", "CHECKPOINT_PATH", "POLARIS_DIR", "OPENPI_DIR",
     "EXPECTED_POLARIS_COMMIT", "CHECKPOINT_URI", "CHECKPOINT_MANIFEST",
     "POLARIS_PYXIS_IMAGE", "POLARIS_DATA_DIR", "CONTROLLER_COMPLETION",
+    "EXPECTED_HOST_MEDIA_TOOLS_MANIFEST_SHA256",
+    "HOST_FFPROBE_PATH", "EXPECTED_HOST_FFPROBE_SHA256",
+    "HOST_FFMPEG_PATH", "EXPECTED_HOST_FFMPEG_SHA256",
     "EXPECTED_CONTROLLER_COMPLETION_SHA256", "ALL_SIX_CONTROLLER_COMPLETION",
     "EXPECTED_ALL_SIX_COMPLETION_SHA256", "EXPECTED_ALL_SIX_PROFILE",
     "PORT_REQUESTED", "PORT_ACTUAL", "SERVER_PID", "BOUND_PORT_FILE",
@@ -407,6 +450,9 @@ PY
   printf '%q ' "${handshake_command[@]}"
   printf '\n'
   printf '%q ' "${eval_command[@]}"
+  printf '\n'
+  printf 'PYTHONPATH=%q ' "${POLARIS_DIR}/src:${SCRIPT_DIR}"
+  printf '%q ' "${finalizer_command[@]}"
   printf '\n'
 } > "${COMMANDS_FILE}"
 chmod 0444 "${COMMANDS_FILE}"
@@ -445,19 +491,6 @@ PY
 (( tee_code == 0 )) || exit "${tee_code}"
 
 FAILURE_STAGE=host_finalization
-PYTHONPATH="${POLARIS_DIR}/src:${SCRIPT_DIR}" "${OPENPI_DIR}/.venv/bin/python" \
-  "${SCRIPT_DIR}/finalize_pi05_droid_native_jointvelocity_eval.py" finalize \
-  --job-id "${SLURM_JOB_ID}" \
-  --run-dir "${RUN_DIR}" \
-  --polaris-repo "${POLARIS_DIR}" \
-  --expected-polaris-commit "${EXPECTED_POLARIS_COMMIT}" \
-  --openpi-dir "${OPENPI_DIR}" \
-  --container-image "${POLARIS_PYXIS_IMAGE}" \
-  --data-dir "${POLARIS_DATA_DIR}" \
-  --controller-completion "${CONTROLLER_COMPLETION}" \
-  --expected-controller-completion-sha256 "${EXPECTED_CONTROLLER_COMPLETION_SHA256}" \
-  --all-six-controller-completion "${ALL_SIX_CONTROLLER_COMPLETION}" \
-  --expected-all-six-completion-sha256 "${EXPECTED_ALL_SIX_COMPLETION_SHA256}" \
-  --expected-all-six-profile "${EXPECTED_ALL_SIX_PROFILE}"
+PYTHONPATH="${POLARIS_DIR}/src:${SCRIPT_DIR}" "${finalizer_command[@]}"
 
 echo "Official pi0.5-DROID native canary complete: ${RUN_DIR}"
