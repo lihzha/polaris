@@ -738,6 +738,177 @@ def _post_recovery_lower_endpoint_terminal_velocity_recovery_report() -> dict:
     return report
 
 
+def _hard_limit_terminal_snapshot(
+    report: dict,
+    *,
+    kind: str,
+    apply_index: int,
+    committed: bool,
+) -> dict:
+    limits = np.asarray(report["contract"]["velocity_limits_rad_s"], dtype=np.float32)
+    hard_limits = np.asarray(
+        report["contract"]["hard_joint_position_limits_rad"],
+        dtype=np.float32,
+    )
+    position = np.asarray(
+        [0.0, 0.0, 0.0, -1.5, 0.0, 1.8, 0.0],
+        dtype=np.float32,
+    )
+    velocity = np.zeros(7, dtype=np.float32)
+    if kind == "current":
+        position[0] = np.nextafter(hard_limits[0, 1], np.float32(np.inf))
+    elif kind == "predicted":
+        velocity[0] = np.float32(2.0)
+        delta = np.float32(velocity[0] * np.float32(PANDA_EEF_PHYSICS_DT_FLOAT32))
+        position[0] = np.float32(hard_limits[0, 1] - np.float32(delta / 2.0))
+    else:
+        raise AssertionError(f"unknown hard-limit fixture kind: {kind!r}")
+    predicted = (position + velocity * np.float32(PANDA_EEF_PHYSICS_DT_FLOAT32)).astype(
+        np.float32
+    )
+    clearance = np.minimum(
+        predicted - hard_limits[:, 0],
+        hard_limits[:, 1] - predicted,
+    ).astype(np.float32)
+    hold_target = position.tolist() if committed else None
+    return {
+        "apply_index": apply_index,
+        "policy_step": apply_index // 8,
+        "physics_substep": apply_index % 8,
+        "joint_pos_rad": position.tolist(),
+        "joint_velocity_rad_s": velocity.tolist(),
+        "joint_velocity_limit_rad_s": limits.tolist(),
+        "joint_velocity_envelope_rad_s": report["contract"]["velocity_envelopes_rad_s"],
+        "joint_velocity_limit_excess_rad_s": np.maximum(
+            np.abs(velocity) - limits,
+            np.float32(0.0),
+        )
+        .astype(np.float32)
+        .tolist(),
+        "velocity_to_limit_ratio": (np.abs(velocity) / limits)
+        .astype(np.float32)
+        .tolist(),
+        "predicted_joint_pos_rad": predicted.tolist(),
+        "predicted_hard_limit_clearance_rad": clearance.tolist(),
+        "hold_target_rad": hold_target,
+        "hold_position_target_readback_rad": hold_target,
+        "hold_velocity_target_readback_rad_s": [0.0] * 7 if committed else None,
+        "hold_effort_target_readback_nm": [0.0] * 7 if committed else None,
+    }
+
+
+def _hard_limit_collision_velocity_recovery_report(
+    *,
+    kind: str,
+    post_recovery: bool,
+) -> dict:
+    report = _active_velocity_recovery_report(apply_index=0 if post_recovery else 9)
+    end_reason = {
+        "current": "current_hard_limit_abort",
+        "predicted": "predicted_hard_limit_abort",
+    }[kind]
+    terminal_apply = 18 if post_recovery else 10
+    terminal = _hard_limit_terminal_snapshot(
+        report,
+        kind=kind,
+        apply_index=terminal_apply,
+        committed=False,
+    )
+    report["state"] = {
+        "phase": "inactive",
+        "active": False,
+        "consecutive_active_substeps": 0,
+        "consecutive_clean_samples": 0,
+        "release_ramp_next_index": None,
+    }
+    abort_counter = (
+        "current_hard_limit_aborts" if kind == "current" else "predicted_limit_aborts"
+    )
+    report["counters"][abort_counter] = 1
+    if not post_recovery:
+        report["events"][0].update(
+            {
+                "end_apply_index": terminal_apply,
+                "end_reason": end_reason,
+                "deferred_lower_endpoint_transition_count": 2,
+                "lower_endpoint_transition_overflow_context": "active_recovery",
+                "last": terminal,
+            }
+        )
+        return report
+
+    clean = _hard_limit_terminal_snapshot(
+        report,
+        kind="predicted",
+        apply_index=17,
+        committed=True,
+    )
+    # The clean completion owns a neutral state, not the predicted fixture's
+    # near-boundary position/velocity.
+    clean_position = np.asarray(
+        [0.0, 0.0, 0.0, -1.5, 0.0, 1.8, 0.0],
+        dtype=np.float32,
+    )
+    hard_limits = np.asarray(
+        report["contract"]["hard_joint_position_limits_rad"],
+        dtype=np.float32,
+    )
+    clean.update(
+        {
+            "joint_pos_rad": clean_position.tolist(),
+            "joint_velocity_rad_s": [0.0] * 7,
+            "joint_velocity_limit_excess_rad_s": [0.0] * 7,
+            "velocity_to_limit_ratio": [0.0] * 7,
+            "predicted_joint_pos_rad": clean_position.tolist(),
+            "predicted_hard_limit_clearance_rad": np.minimum(
+                clean_position - hard_limits[:, 0],
+                hard_limits[:, 1] - clean_position,
+            )
+            .astype(np.float32)
+            .tolist(),
+            "hold_target_rad": clean_position.tolist(),
+            "hold_position_target_readback_rad": clean_position.tolist(),
+        }
+    )
+    report["events"][0].update(
+        {
+            "end_apply_index": 17,
+            "end_reason": "clean2_release_ramp_complete",
+            "recovery_completed_apply_index": 17,
+            "last": clean,
+        }
+    )
+    report["counters"].update(
+        {
+            "recovery_events": 2,
+            "recovery_active_substeps": 3,
+            "recovered_events": 1,
+            "hold_target_applies": 3,
+            "release_ramp_target_applies": 16,
+        }
+    )
+    report["maxima"]["consecutive_recovery_substeps"] = 3
+    owner_start_reason = {
+        "current": "current_hard_limit_violation",
+        "predicted": "predicted_hard_limit_crossing",
+    }[kind]
+    report["events"].append(
+        {
+            "event_index": 1,
+            "start_apply_index": 18,
+            "end_apply_index": 18,
+            "start_reason": owner_start_reason,
+            "end_reason": end_reason,
+            "deferred_lower_endpoint_transition_count": 2,
+            "lower_endpoint_transition_overflow_context": "post_recovery_resume",
+            "recovery_completed_apply_index": 17,
+            "start": copy.deepcopy(terminal),
+            "last": copy.deepcopy(terminal),
+        }
+    )
+    return report
+
+
 def _candidate_controller_report(
     safety: dict,
     *,
@@ -2491,6 +2662,197 @@ def test_v5_lower_endpoint_overflow_survives_result_sidecar_and_runtime(
         assert runtime_recovery["events"][0][
             "lower_endpoint_transition_overflow_context"
         ] == ("post_recovery_resume" if post_recovery else "active_recovery")
+
+        drifted_safety = copy.deepcopy(safety)
+        drifted_safety["gripper_runtime_dynamic"]["driver_target_slew"][
+            "endpoint_change_count"
+        ] = 1
+        with pytest.raises(ValueError, match="endpoint-change cadence drift"):
+            atomic_write_episode_safety(
+                tmp_path / "endpoint-count-drift.json",
+                eef_controller_profile=(
+                    EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+                ),
+                controller_repair_candidate=controller_report,
+                arm_failure_substep_trace={},
+                all_six_gripper_trace=all_six_trace,
+                episode_index=0,
+                episode_result=result,
+                safety=drifted_safety,
+                artifact_identity=_artifact_identity_for_terminal(result, terminal),
+                terminal_rollout=terminal,
+                expected_gripper_target_slew_profile=(
+                    EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+                ),
+            )
+
+
+@pytest.mark.parametrize("kind", ["current", "predicted"])
+@pytest.mark.parametrize("post_recovery", [False, True])
+def test_v5_hard_limit_collision_survives_result_sidecar_and_runtime(
+    tmp_path: Path,
+    monkeypatch,
+    kind: str,
+    post_recovery: bool,
+) -> None:
+    length = 3 if post_recovery else 2
+    result = _episode_result(length=length, numerical_failure=True)
+    safety = _episode_safety(
+        length=length,
+        numerical_failure=True,
+        failure_substeps=3,
+    )
+    recovery = _hard_limit_collision_velocity_recovery_report(
+        kind=kind,
+        post_recovery=post_recovery,
+    )
+    terminal_event = recovery["events"][-1]
+    safety["profile"] = EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+    safety["current_joint_velocity_abort"] = None
+    safety["current_joint_velocity_recovery"] = recovery
+    safety["maxima"]["abs_joint_vel_rad_s"] = [
+        max(
+            abs(event[snapshot_name]["joint_velocity_rad_s"][joint_index])
+            for event in recovery["events"]
+            for snapshot_name in ("start", "last")
+        )
+        for joint_index in range(7)
+    ]
+    safety["counters"]["nonfinite_aborts"] = 0
+    safety["counters"]["current_joint_limit_aborts"] = int(kind == "current")
+    safety["counters"]["invariant_aborts"] = int(kind == "predicted")
+    safety["guard_diagnostics"][0]["kind"] = {
+        "current": "current_joint_hard_position_limit_abort",
+        "predicted": "predicted_joint_hard_position_limit_abort",
+    }[kind]
+    encoded = json.dumps(
+        terminal_event,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    end_reason = terminal_event["end_reason"]
+    result["numerical_failure_reason"] = (
+        "DifferentialIKInvariantError: "
+        f"{CURRENT_JOINT_VELOCITY_RECOVERY_ABORT_MESSAGES[end_reason]} "
+        f"(evidence_sha256={digest})"
+    )
+    assert (
+        validate_episode_safety_cadence(
+            safety=safety,
+            episode_result=result,
+        )["abort_count"]
+        == 1
+    )
+
+    safety = _attach_candidate_stub_gripper(safety, length=length)
+    dynamic = safety["gripper_runtime_dynamic"]
+    dynamic["post_policy_step_samples"] = length - 1
+    committed_apply_calls = safety["counters"]["apply_calls"] - 1
+    dynamic["driver_target_slew"]["apply_calls"] = committed_apply_calls
+    dynamic["driver_target_slew"]["endpoint_change_count"] = 2
+    controller_report = _candidate_controller_report(
+        safety,
+        initial=False,
+        profile=EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+    )
+    controller_report["current_joint_velocity_recovery"] = copy.deepcopy(recovery)
+    all_six_trace = _all_six_trace(
+        episode=0,
+        length=length,
+        apply_calls=committed_apply_calls,
+    )
+    all_six_trace["numerical_failure"] = True
+    terminal = _terminal_rollout(result)
+    sidecar_path = tmp_path / "ik_safety" / "episode_000000.json"
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            runtime_contract_module,
+            "validate_eef_gripper_static_contract",
+            lambda value, **_kwargs: dict(value),
+        )
+        patch.setattr(
+            runtime_contract_module,
+            "validate_eef_gripper_dynamic_evidence",
+            lambda value, **_kwargs: dict(value),
+        )
+        patch.setattr(
+            runtime_contract_module,
+            "validate_eef_controller_safety_evidence",
+            lambda *_args, expected_profile, **_kwargs: eef_controller_profile(
+                expected_profile
+            ),
+        )
+        patch.setattr(
+            runtime_contract_module,
+            "validate_arm_failure_substep_trace",
+            lambda value, **_kwargs: dict(value),
+        )
+        payload = atomic_write_episode_safety(
+            sidecar_path,
+            eef_controller_profile=(EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE),
+            controller_repair_candidate=controller_report,
+            arm_failure_substep_trace={},
+            all_six_gripper_trace=all_six_trace,
+            episode_index=0,
+            episode_result=result,
+            safety=safety,
+            artifact_identity=_artifact_identity_for_terminal(result, terminal),
+            terminal_rollout=terminal,
+            expected_gripper_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+        )
+        assert payload["schema_version"] == 7
+        assert payload["safety"]["current_joint_velocity_recovery"] == recovery
+
+        aggregate = aggregate_episode_safety(
+            safety,
+            [{**payload, "path": str(sidecar_path), "sha256": "9" * 64}],
+            expected_eef_controller_profile=(
+                EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+            ),
+        )
+        initial_report = _candidate_controller_report(
+            safety,
+            initial=True,
+            profile=EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+        )
+        controller_aggregate = {
+            "profile": "polaris_eef_controller_repair_candidate_episode_aggregate_v1",
+            "eef_controller_profile": (
+                EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+            ),
+            "initial": initial_report,
+            "episodes": [{"episode_index": 0, "report": controller_report}],
+        }
+        env, observation = _runtime_fixture()
+        frame = validate_eef_runtime_frame(env, observation)
+        frame["ik_safety_profile"] = EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+        runtime_path = tmp_path / "polaris-runtime.json"
+        atomic_write_runtime_contract(
+            runtime_path,
+            eef_controller_profile=(EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE),
+            controller_repair_candidate=controller_aggregate,
+            protocol=validate_ego_lap_runtime_protocol(env),
+            frame=frame,
+            ik_safety=aggregate,
+        )
+        runtime_payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+        runtime_event = runtime_payload["ik_safety"]["episodes"][0][
+            "current_joint_velocity_recovery"
+        ]["events"][-1]
+        assert runtime_event["end_reason"] == end_reason
+        assert runtime_event["deferred_lower_endpoint_transition_count"] == 2
+        assert runtime_event["lower_endpoint_transition_overflow_context"] == (
+            "post_recovery_resume" if post_recovery else "active_recovery"
+        )
+        assert runtime_event["recovery_completed_apply_index"] == (
+            17 if post_recovery else None
+        )
 
         drifted_safety = copy.deepcopy(safety)
         drifted_safety["gripper_runtime_dynamic"]["driver_target_slew"][

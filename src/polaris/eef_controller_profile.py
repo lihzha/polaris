@@ -1014,9 +1014,7 @@ def validate_current_joint_velocity_recovery_report(
                 recovery_completed_apply_index is not None
                 and (
                     type(recovery_completed_apply_index) is not int
-                    or not event["start_apply_index"]
-                    <= recovery_completed_apply_index
-                    < apply_calls
+                    or not 0 <= recovery_completed_apply_index < apply_calls
                 )
             )
         ):
@@ -1248,23 +1246,36 @@ def validate_current_joint_velocity_recovery_report(
                 "PolaRiS EEF surviving measured recovery lacks committed start"
             )
 
-        if end_reason == "lower_endpoint_transition_overflow_abort":
+        collision_end_reason = end_reason in (
+            "lower_endpoint_transition_overflow_abort",
+            "current_hard_limit_abort",
+            "predicted_hard_limit_abort",
+        )
+        has_collision_evidence = (
+            deferred_endpoint_count is not None or lower_endpoint_context is not None
+        )
+        if end_reason == "lower_endpoint_transition_overflow_abort" and not (
+            deferred_endpoint_count is not None
+            and lower_endpoint_context
+            in CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXTS
+        ):
+            raise ValueError("PolaRiS EEF lower-endpoint overflow evidence is absent")
+        if has_collision_evidence:
             if (
-                deferred_endpoint_count is None
+                not collision_end_reason
+                or deferred_endpoint_count is None
                 or lower_endpoint_context
                 not in CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXTS
             ):
-                raise ValueError(
-                    "PolaRiS EEF lower-endpoint overflow evidence is absent"
-                )
+                raise ValueError("PolaRiS EEF terminal collision evidence drift")
             if lower_endpoint_context == (
                 CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXT_ACTIVE
             ):
                 if recovery_completed_apply_index is not None:
                     raise ValueError(
-                        "PolaRiS EEF active lower overflow retained completion"
+                        "PolaRiS EEF active terminal collision retained completion"
                     )
-            else:
+            elif end_reason == "lower_endpoint_transition_overflow_abort":
                 if (
                     recovery_completed_apply_index != end_index - 1
                     or duration is None
@@ -1274,21 +1285,41 @@ def validate_current_joint_velocity_recovery_report(
                         "PolaRiS EEF post-recovery lower overflow chronology drift"
                     )
                 post_recovery_lower_endpoint_abort_count += 1
-        elif deferred_endpoint_count is not None or lower_endpoint_context is not None:
-            raise ValueError("PolaRiS EEF non-lower event retained endpoint evidence")
+            else:
+                previous_event = events[event_index - 1] if event_index > 0 else None
+                if (
+                    duration != 0
+                    or recovery_completed_apply_index != event["start_apply_index"] - 1
+                    or not isinstance(previous_event, dict)
+                    or previous_event.get("end_reason")
+                    != "clean2_release_ramp_complete"
+                    or previous_event.get("end_apply_index")
+                    != recovery_completed_apply_index
+                    or previous_event.get("recovery_completed_apply_index")
+                    != recovery_completed_apply_index
+                ):
+                    raise ValueError(
+                        "PolaRiS EEF post-recovery hard-limit collision chronology drift"
+                    )
 
         if end_reason == "clean2_release_ramp_complete":
             if recovery_completed_apply_index != end_index:
                 raise ValueError("PolaRiS EEF clean recovery completion cadence drift")
-        elif (
-            not (
+        else:
+            retains_prior_completion = (
                 end_reason == "lower_endpoint_transition_overflow_abort"
                 and lower_endpoint_context
                 == CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXT_POST_RECOVERY
+            ) or (
+                end_reason in ("current_hard_limit_abort", "predicted_hard_limit_abort")
+                and has_collision_evidence
+                and lower_endpoint_context
+                == CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXT_POST_RECOVERY
             )
-            and recovery_completed_apply_index is not None
-        ):
-            raise ValueError("PolaRiS EEF non-recovered event retained completion")
+            if recovery_completed_apply_index is not None and not (
+                retains_prior_completion
+            ):
+                raise ValueError("PolaRiS EEF non-recovered event retained completion")
 
         if start_reason == "measured_velocity_above_float32_envelope":
             if end_reason == "clean2_release_ramp_complete" or (

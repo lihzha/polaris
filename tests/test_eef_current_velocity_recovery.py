@@ -669,6 +669,49 @@ def _measured_later_terminal_report(end_reason: str) -> dict:
     return report
 
 
+def _hard_limit_collision_report(*, kind: str, post_recovery: bool) -> dict:
+    end_reason = {
+        "current": "current_hard_limit_abort",
+        "predicted": "predicted_hard_limit_abort",
+    }[kind]
+    if not post_recovery:
+        report = _measured_later_terminal_report(end_reason)
+        report["events"][0].update(
+            {
+                "deferred_lower_endpoint_transition_count": 2,
+                "lower_endpoint_transition_overflow_context": "active_recovery",
+            }
+        )
+        return report
+
+    report = _clean_completed_recovery_report()
+    owner = (
+        _immediate_current_hard_terminal_report()
+        if kind == "current"
+        else _immediate_predicted_terminal_report()
+    )["events"][0]
+    start = copy.deepcopy(owner["start"])
+    start.update({"apply_index": 18, "policy_step": 2, "physics_substep": 2})
+    terminal_event = {
+        "event_index": 1,
+        "start_apply_index": 18,
+        "end_apply_index": 18,
+        "start_reason": owner["start_reason"],
+        "end_reason": end_reason,
+        "deferred_lower_endpoint_transition_count": 2,
+        "lower_endpoint_transition_overflow_context": "post_recovery_resume",
+        "recovery_completed_apply_index": 17,
+        "start": copy.deepcopy(start),
+        "last": copy.deepcopy(start),
+    }
+    report["events"].append(terminal_event)
+    report["counters"]["recovery_events"] = 2
+    report["counters"][
+        "current_hard_limit_aborts" if kind == "current" else "predicted_limit_aborts"
+    ] = 1
+    return report
+
+
 def test_recovery_report_schema_and_open_event_are_closed() -> None:
     report = _active_recovery_report()
     assert (
@@ -978,6 +1021,49 @@ def test_measured_start_accepts_each_legal_later_terminal(end_reason: str) -> No
     report = _measured_later_terminal_report(end_reason)
     validated = validate_current_joint_velocity_recovery_report(report, apply_calls=2)
     assert validated["events"][0]["end_reason"] == end_reason
+
+
+@pytest.mark.parametrize("kind", ["current", "predicted"])
+@pytest.mark.parametrize("post_recovery", [False, True])
+def test_hard_limit_collision_binds_deferred_endpoint_context(
+    kind: str,
+    post_recovery: bool,
+) -> None:
+    report = _hard_limit_collision_report(kind=kind, post_recovery=post_recovery)
+    apply_calls = 19 if post_recovery else 2
+    validated = validate_current_joint_velocity_recovery_report(
+        report,
+        apply_calls=apply_calls,
+    )
+    event = validated["events"][-1]
+    assert event["deferred_lower_endpoint_transition_count"] == 2
+    assert event["lower_endpoint_transition_overflow_context"] == (
+        "post_recovery_resume" if post_recovery else "active_recovery"
+    )
+
+    mutations = [
+        lambda value: value["events"][-1].__setitem__(
+            "deferred_lower_endpoint_transition_count", 1
+        ),
+        lambda value: value["events"][-1].__setitem__(
+            "lower_endpoint_transition_overflow_context",
+            "active_recovery" if post_recovery else "post_recovery_resume",
+        ),
+    ]
+    if post_recovery:
+        mutations.append(
+            lambda value: value["events"][-1].__setitem__(
+                "recovery_completed_apply_index", 16
+            )
+        )
+    for mutation in mutations:
+        drifted = copy.deepcopy(report)
+        mutation(drifted)
+        with pytest.raises(ValueError):
+            validate_current_joint_velocity_recovery_report(
+                drifted,
+                apply_calls=apply_calls,
+            )
 
 
 @pytest.mark.parametrize(

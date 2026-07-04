@@ -2952,8 +2952,7 @@ def _validate_episode_controller_artifacts(
         apply_calls=apply_calls,
         committed_apply_calls=committed_apply_calls,
     )
-    lower_endpoint_transition_overflow = False
-    deferred_lower_endpoint_transition_count = None
+    terminal_deferred_endpoint_transition_count = None
     if spec.current_joint_velocity_recovery_enabled:
         recovery = validate_current_joint_velocity_recovery_report(
             safety.get("current_joint_velocity_recovery"),
@@ -2963,13 +2962,8 @@ def _validate_episode_controller_artifacts(
             raise ValueError(
                 "Episode safety/controller velocity-recovery evidence drift"
             )
-        lower_endpoint_transition_overflow = bool(
-            recovery["events"]
-            and recovery["events"][-1]["end_reason"]
-            == "lower_endpoint_transition_overflow_abort"
-        )
-        if lower_endpoint_transition_overflow:
-            deferred_lower_endpoint_transition_count = recovery["events"][-1][
+        if recovery["events"]:
+            terminal_deferred_endpoint_transition_count = recovery["events"][-1][
                 "deferred_lower_endpoint_transition_count"
             ]
     maxima = safety.get("maxima")
@@ -3001,15 +2995,15 @@ def _validate_episode_controller_artifacts(
             "observed_endpoint_change_count"
         ]
         finger_endpoint_changes = target_slew.get("endpoint_change_count")
-        if lower_endpoint_transition_overflow:
+        if terminal_deferred_endpoint_transition_count is not None:
             # Recovery freezes the lower interlock's consumed count.  The first
             # deferred endpoint is tolerated; the next observed count is the
             # terminal condition, so bind the exact recorded uncommitted lead.
             endpoint_change_counts_match = (
                 result["numerical_failure"]
-                and type(deferred_lower_endpoint_transition_count) is int
+                and type(terminal_deferred_endpoint_transition_count) is int
                 and finger_endpoint_changes
-                == arm_endpoint_changes + deferred_lower_endpoint_transition_count
+                == arm_endpoint_changes + terminal_deferred_endpoint_transition_count
             )
         elif result["numerical_failure"]:
             endpoint_change_counts_match = (

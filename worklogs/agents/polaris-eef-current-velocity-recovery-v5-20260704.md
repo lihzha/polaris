@@ -249,3 +249,70 @@ The final focused suite passed `237` tests. The broad host-safe suite passed
 `926` tests plus `30` subtests. Only the existing Torch `pynvml` deprecation
 warning was emitted. No local GPU, simulator, Slurm, evaluation, or checkpoint
 job was launched, and no canonical worktree was modified.
+
+## Terminal-guard/deferred-endpoint collision closure
+
+Final review of pushed revision
+`99fb191f4fe0238f8f9950cfd8887d3a2ba35c43` found one remaining artifact
+finalization mismatch. During active recovery or the first post-recovery resume
+apply, a current-hard or predicted-hard guard correctly precedes the deferred
+lower endpoint-overflow guard. When both conditions occurred together, the
+hard-limit guard therefore won, but its terminal event did not record the
+unconsumed lower endpoint count. The sidecar then applied the ordinary
+numerical-failure allowance and rejected the truthful two-count finger/arm
+difference.
+
+The additive repair preserves safety precedence and schema 3 while making the
+collision evidence guard-agnostic:
+
+- Before any current-hard, predicted-hard, lower-overflow, DLS, or setter path,
+  the producer observes the exact deferred endpoint count. Counts zero or one
+  retain the prior behavior. A count greater than one is attached to whichever
+  current-hard or predicted-hard event wins, together with
+  `active_recovery` or `post_recovery_resume` context.
+- Post-recovery hard-limit events are separate same-apply terminal events and
+  bind the immediately preceding clean completion exactly at
+  `completion == start - 1`. Active collisions retain no completion index.
+  The three existing schema-3 fields are included in the canonical event JSON
+  before its exception SHA-256 is computed.
+- The nested validator accepts collision metadata only on lower-overflow,
+  current-hard, or predicted-hard terminal events, enforces the exact active or
+  post chronology, and preserves ordinary hard-limit events without metadata.
+- Sidecar validation now binds the exact recorded deferred count to
+  `finger_endpoint_changes - arm_endpoint_changes` for all three terminal
+  collision reasons. Lower-only active/post behavior and the legacy one-count
+  numerical-failure allowance are unchanged.
+- Producer and consumer tests cover active/post x current/predicted through
+  guard ordering, event digest generation, nested validation, cadence/result
+  binding, atomic sidecar publication, aggregate reconstruction, and runtime
+  publication. Count, context, completion, and endpoint-difference mutations
+  fail closed.
+
+The first focused run exposed a compatibility regression in the no-overflow
+path: zero/one deferred transitions were unnecessarily required to carry a
+terminal snapshot apply index. The cadence check is now delayed until an actual
+count-greater-than-one collision, preserving the prior zero/one resume path.
+
+Final host validation from the dedicated PolaRiS worktree used:
+
+```bash
+PYTHONPATH=$PWD/src /home/lzha/code/ego-lap/.venv/bin/python -m pytest -q \
+  tests/test_eef_current_velocity_recovery.py \
+  tests/test_eef_runtime_contract.py \
+  tests/test_eef_controller_repair.py \
+  tests/test_eef_controller_profile.py \
+  tests/test_robust_gripper_target_slew_host_stub.py
+PYTHONPATH=$PWD/src /home/lzha/code/ego-lap/.venv/bin/python -m pytest -q \
+  tests --ignore=tests/test_robust_differential_ik.py
+ruff check <six changed Python files>
+ruff format --check <six changed Python files>
+python -m py_compile <six changed Python files>
+git diff --check
+```
+
+The focused suite passed `245` tests. The broad host-safe suite passed `934`
+tests plus `30` subtests. Static checks were clean; the only warning was the
+existing Torch `pynvml` deprecation warning. This work remained local and
+model-free: no GPU process, simulator, Slurm job, evaluation, watcher, or
+checkpoint job was launched. The canonical Ego-LAP primary checkout remained
+on `main`, and registry doctor passed before development.

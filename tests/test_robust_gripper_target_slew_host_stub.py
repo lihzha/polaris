@@ -962,8 +962,191 @@ assert stale_event["lower_endpoint_transition_overflow_context"] == (
 assert stale_resume._guard_diagnostics[-1]["kind"] == (
     "measured_velocity_recovery_lower_endpoint_transition_abort"
 )
+
+# Current-hard and predicted-hard guards retain precedence over the lower
+# overflow guard, but the winning event must still carry the exact collision
+# evidence. Exercise the producer for both active-recovery and first-resume
+# contexts rather than relying only on constructed consumer fixtures.
+hard_limit_specs = (
+    (
+        "current_hard_limit_abort",
+        "current_joint_hard_position_limit_abort",
+        "current_hard_limit_violation",
+        False,
+    ),
+    (
+        "predicted_hard_limit_abort",
+        "predicted_joint_hard_position_limit_abort",
+        "predicted_hard_limit_crossing",
+        True,
+    ),
+)
+
+
+def hard_limit_snapshot(owner, *, end_reason, apply_index):
+    owner._apply_call_count = apply_index + 1
+    position = joint_position.clone()
+    velocity = torch.zeros_like(joint_velocity)
+    if end_reason == "current_hard_limit_abort":
+        position[0, 0] = torch.nextafter(
+            hard_limits[0, 0, 1],
+            torch.tensor(float("inf"), dtype=torch.float32),
+        )
+    else:
+        velocity[0, 0] = 2.0
+        delta = velocity * torch.tensor(
+            robust.PANDA_EEF_PHYSICS_DT_FLOAT32,
+            dtype=torch.float32,
+        )
+        position[0, 0] = hard_limits[0, 0, 1] - delta[0, 0] / 2.0
+    predicted = position + velocity * torch.tensor(
+        robust.PANDA_EEF_PHYSICS_DT_FLOAT32,
+        dtype=torch.float32,
+    )
+    clearance = torch.minimum(
+        predicted - hard_limits[..., 0],
+        hard_limits[..., 1] - predicted,
+    )
+    return owner._current_joint_velocity_recovery_snapshot(
+        joint_pos=position,
+        joint_vel=velocity,
+        predicted_joint_pos=predicted,
+        predicted_hard_limit_clearance=clearance,
+    )
+
+
+for post_recovery in (False, True):
+    for end_reason, diagnostic_kind, start_reason, increment_invariant in (
+        hard_limit_specs
+    ):
+        collision = recovery_transaction_action()
+        collision._gripper_close_arm_interlock_observed_endpoint_change_count = 0
+        collision._gripper_target_slew_term = types.SimpleNamespace(
+            _gripper_target_slew_endpoint_change_count=2
+        )
+        terminal_apply_index = 18 if post_recovery else 1
+        terminal_snapshot = hard_limit_snapshot(
+            collision,
+            end_reason=end_reason,
+            apply_index=terminal_apply_index,
+        )
+        if post_recovery:
+            collision._current_joint_velocity_recovery_phase = "inactive"
+            collision._current_joint_velocity_recovery_recovered_events = 1
+            committed_start = copy.deepcopy(overflow_snapshot)
+            committed_start["hold_target_rad"] = list(
+                committed_start["joint_pos_rad"]
+            )
+            committed_start["hold_position_target_readback_rad"] = list(
+                committed_start["joint_pos_rad"]
+            )
+            committed_start["hold_velocity_target_readback_rad_s"] = [0.0] * 7
+            committed_start["hold_effort_target_readback_nm"] = [0.0] * 7
+            collision._apply_call_count = 18
+            clean_snapshot = collision._current_joint_velocity_recovery_snapshot(
+                joint_pos=joint_position,
+                joint_vel=torch.zeros_like(joint_velocity),
+                predicted_joint_pos=joint_position,
+                predicted_hard_limit_clearance=torch.minimum(
+                    joint_position - hard_limits[..., 0],
+                    hard_limits[..., 1] - joint_position,
+                ),
+                hold_target=joint_position,
+                hold_position_readback=joint_position,
+                hold_velocity_readback=torch.zeros_like(joint_velocity),
+                hold_effort_readback=torch.zeros_like(joint_velocity),
+            )
+            collision._current_joint_velocity_recovery_events = [{
+                "event_index": 0,
+                "start_apply_index": 0,
+                "end_apply_index": 17,
+                "start_reason": "measured_velocity_above_float32_envelope",
+                "end_reason": "clean2_release_ramp_complete",
+                "deferred_lower_endpoint_transition_count": None,
+                "lower_endpoint_transition_overflow_context": None,
+                "recovery_completed_apply_index": 17,
+                "start": committed_start,
+                "last": clean_snapshot,
+            }]
+            collision._current_joint_velocity_recovery_events_count = 1
+            assert (
+                collision._current_joint_velocity_recovery_completed_previous_apply()
+                is True
+            )
+            collision._apply_call_count = 19
+            collision_evidence = (
+                collision._deferred_gripper_endpoint_transition_collision_evidence(
+                    lower_controller_suspended=False,
+                    recovery_completed_previous_apply=True,
+                    snapshot_apply_index=18,
+                )
+            )
+        else:
+            collision._current_joint_velocity_recovery_phase = "hold"
+            collision._start_current_joint_velocity_recovery_event(
+                reason="measured_velocity_above_float32_envelope",
+                snapshot=overflow_snapshot,
+            )
+            collision_evidence = (
+                collision._deferred_gripper_endpoint_transition_collision_evidence(
+                    lower_controller_suspended=True,
+                    recovery_completed_previous_apply=False,
+                    snapshot_apply_index=1,
+                )
+            )
+        expected_context = (
+            "post_recovery_resume" if post_recovery else "active_recovery"
+        )
+        assert collision_evidence == (
+            2,
+            expected_context,
+            17 if post_recovery else None,
+        )
+        try:
+            collision._raise_current_joint_velocity_recovery_abort(
+                kind=diagnostic_kind,
+                start_reason=start_reason,
+                end_reason=end_reason,
+                message=robust.CURRENT_JOINT_VELOCITY_RECOVERY_ABORT_MESSAGES[
+                    end_reason
+                ],
+                snapshot=terminal_snapshot,
+                increment_invariant=increment_invariant,
+                deferred_lower_endpoint_transition_count=collision_evidence[0],
+                lower_endpoint_transition_overflow_context=collision_evidence[1],
+                recovery_completed_apply_index=collision_evidence[2],
+            )
+        except robust.DifferentialIKInvariantError as error:
+            winning_event = collision._current_joint_velocity_recovery_events[-1]
+            digest = collision._canonical_json_sha256(winning_event)
+            assert str(error).endswith(f"(evidence_sha256={digest})")
+        else:
+            raise AssertionError(f"{expected_context} {end_reason} did not abort")
+        winning_event = collision._current_joint_velocity_recovery_events[-1]
+        assert winning_event["end_reason"] == end_reason
+        assert winning_event["deferred_lower_endpoint_transition_count"] == 2
+        assert winning_event["lower_endpoint_transition_overflow_context"] == (
+            expected_context
+        )
+        assert winning_event["recovery_completed_apply_index"] == (
+            17 if post_recovery else None
+        )
+        if post_recovery:
+            assert collision._current_joint_velocity_recovery_events[-2][
+                "end_reason"
+            ] == "clean2_release_ramp_complete"
+            assert winning_event["start_apply_index"] == 18
+            assert winning_event["end_apply_index"] == 18
+
 apply_source = inspect.getsource(
     robust.RobustDifferentialInverseKinematicsAction.apply_actions
+)
+collision_evidence_guard = apply_source.index(
+    "self._deferred_gripper_endpoint_transition_collision_evidence("
+)
+current_hard_guard = apply_source.index("if current_hard_invalid:")
+predicted_hard_guard = apply_source.index(
+    "if bool(predicted_hard_limit_crossing.any().detach().cpu().item()):"
 )
 overflow_guard = apply_source.index(
     "self._abort_on_deferred_gripper_endpoint_transition_overflow("
@@ -973,6 +1156,12 @@ dls_dispatch = apply_source.index(
 )
 target_setter = apply_source.index(
     "self._set_targets_and_commit_gripper_close_arm_interlock("
+)
+assert (
+    collision_evidence_guard
+    < current_hard_guard
+    < predicted_hard_guard
+    < overflow_guard
 )
 assert overflow_guard < dls_dispatch < target_setter
 v5_next_gripper = apply_source.index(
