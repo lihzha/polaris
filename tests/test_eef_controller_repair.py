@@ -721,6 +721,7 @@ def test_controller_candidates_are_explicit_default_off_config_and_wired():
     assert source.count("enable_arm_slew_headroom: bool = False") == 1
     assert source.count("enable_gripper_close_arm_interlock: bool = False") == 1
     assert source.count("enable_arm_release_ramp: bool = False") == 1
+    assert source.count("enable_current_joint_velocity_recovery: bool = False") == 1
     assert "self._nominal_max_delta_joint_pos" in source
     assert "ARM_SLEW_HEADROOM_RATIO if self._arm_slew_headroom_enabled" in source
     assert source.count("self._nominal_max_delta_joint_pos,") >= 2
@@ -763,9 +764,8 @@ def test_controller_candidates_are_explicit_default_off_config_and_wired():
         in source
     )
     assert '"required before another apply"' in source
+    assert "if recovery_owns_target" in source
+    assert "else self._asset.data.joint_effort_target[:, self._joint_ids]" in source
     assert "self._gripper_close_arm_interlock_anchor_valid = False" in source
     assert "self._gripper_close_arm_interlock_anchor_refresh_count = 0" in source
-    assert (
-        "if self._gripper_close_arm_interlock_enabled\n"
-        "            else DISABLED_GRIPPER_CLOSE_ARM_INTERLOCK_TRANSITION"
-    ) in source
+    assert "DISABLED_GRIPPER_CLOSE_ARM_INTERLOCK_TRANSITION" in source

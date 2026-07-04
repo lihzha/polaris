@@ -7,6 +7,16 @@ from dataclasses import dataclass
 import torch
 
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_CLEAN_SAMPLES_REQUIRED,
+)
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS,
+)
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_RELEASE_RAMP
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_PHASES
 
 
 ARM_RELEASE_RAMP_SUBSTEPS = 16
@@ -29,6 +39,198 @@ ARM_RELEASE_PHASES = (
     ARM_RELEASE_PHASE_RAMP,
     ARM_RELEASE_PHASE_RELEASE,
 )
+
+
+@dataclass(frozen=True)
+class CurrentJointVelocityRecoveryTransition:
+    """One mutation-free v5 recovery transition at a physics substep."""
+
+    phase_after_successful_apply: str
+    consecutive_active_substeps_after_successful_apply: int
+    consecutive_clean_samples_after_successful_apply: int
+    release_ramp_index_to_apply: int | None
+    next_release_ramp_index_after_successful_apply: int | None
+    skip_dls: bool
+    hold_current_position: bool
+    recovery_event_delta: int
+    active_substep_delta: int
+    recovered_event_delta: int
+    release_ramp_completed_delta: int
+    sustained_abort: bool
+
+
+def advance_current_joint_velocity_recovery(
+    *,
+    enabled: bool,
+    phase_before_apply: str,
+    consecutive_active_substeps_before_apply: int,
+    consecutive_clean_samples_before_apply: int,
+    next_release_ramp_index_before_apply: int | None,
+    measured_velocity_over_envelope: bool,
+) -> CurrentJointVelocityRecoveryTransition:
+    """Stage one bounded HOLD/clean-2/release-ramp transition.
+
+    The exact envelope is DLS-eligible.  A value above it starts or restarts a
+    fail-closed current-position hold.  Two consecutive in-envelope samples
+    hand off through the existing inclusive 16-substep arm release target.
+    More than eight consecutive hold/recovery substeps is a terminal abort.
+    """
+
+    if type(enabled) is not bool or type(measured_velocity_over_envelope) is not bool:
+        raise ValueError("PolaRiS EEF velocity-recovery flags must be bool")
+    if phase_before_apply not in CURRENT_JOINT_VELOCITY_RECOVERY_PHASES:
+        raise ValueError("PolaRiS EEF velocity-recovery phase drift")
+    for field, value in (
+        ("active substeps", consecutive_active_substeps_before_apply),
+        ("clean samples", consecutive_clean_samples_before_apply),
+    ):
+        if type(value) is not int or value < 0:
+            raise ValueError(f"PolaRiS EEF velocity-recovery {field} drift")
+    if next_release_ramp_index_before_apply is not None and (
+        type(next_release_ramp_index_before_apply) is not int
+        or not 0 <= next_release_ramp_index_before_apply < ARM_RELEASE_RAMP_SUBSTEPS
+    ):
+        raise ValueError("PolaRiS EEF velocity-recovery ramp index drift")
+    if (phase_before_apply == CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_RELEASE_RAMP) is (
+        next_release_ramp_index_before_apply is None
+    ):
+        raise ValueError("PolaRiS EEF velocity-recovery phase/index binding drift")
+    if phase_before_apply != CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD and (
+        consecutive_active_substeps_before_apply != 0
+        or consecutive_clean_samples_before_apply != 0
+    ):
+        raise ValueError("PolaRiS EEF velocity-recovery inactive counters drift")
+    if phase_before_apply == CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD and not (
+        1
+        <= consecutive_active_substeps_before_apply
+        <= CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS
+    ):
+        raise ValueError("PolaRiS EEF velocity-recovery active counter drift")
+    if consecutive_clean_samples_before_apply >= (
+        CURRENT_JOINT_VELOCITY_RECOVERY_CLEAN_SAMPLES_REQUIRED
+    ):
+        raise ValueError("PolaRiS EEF velocity-recovery clean counter drift")
+    if not enabled:
+        if (
+            phase_before_apply != CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE
+            or next_release_ramp_index_before_apply is not None
+            or measured_velocity_over_envelope
+        ):
+            raise ValueError("Disabled PolaRiS EEF velocity recovery retained state")
+        return CurrentJointVelocityRecoveryTransition(
+            phase_after_successful_apply=phase_before_apply,
+            consecutive_active_substeps_after_successful_apply=0,
+            consecutive_clean_samples_after_successful_apply=0,
+            release_ramp_index_to_apply=None,
+            next_release_ramp_index_after_successful_apply=None,
+            skip_dls=False,
+            hold_current_position=False,
+            recovery_event_delta=0,
+            active_substep_delta=0,
+            recovered_event_delta=0,
+            release_ramp_completed_delta=0,
+            sustained_abort=False,
+        )
+
+    if measured_velocity_over_envelope:
+        continuing_hold = (
+            phase_before_apply == CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD
+        )
+        continuing_open_event = phase_before_apply in (
+            CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD,
+            CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_RELEASE_RAMP,
+        )
+        active = consecutive_active_substeps_before_apply + 1 if continuing_hold else 1
+        return CurrentJointVelocityRecoveryTransition(
+            phase_after_successful_apply=CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD,
+            consecutive_active_substeps_after_successful_apply=active,
+            consecutive_clean_samples_after_successful_apply=0,
+            release_ramp_index_to_apply=None,
+            next_release_ramp_index_after_successful_apply=None,
+            skip_dls=True,
+            hold_current_position=True,
+            recovery_event_delta=int(not continuing_open_event),
+            active_substep_delta=1,
+            recovered_event_delta=0,
+            release_ramp_completed_delta=0,
+            sustained_abort=(
+                active > CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS
+            ),
+        )
+
+    if phase_before_apply == CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD:
+        active = consecutive_active_substeps_before_apply + 1
+        clean = consecutive_clean_samples_before_apply + 1
+        sustained_abort = (
+            active > CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS
+        )
+        recovered = (
+            clean >= CURRENT_JOINT_VELOCITY_RECOVERY_CLEAN_SAMPLES_REQUIRED
+            and not sustained_abort
+        )
+        return CurrentJointVelocityRecoveryTransition(
+            phase_after_successful_apply=(
+                CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_RELEASE_RAMP
+                if recovered
+                else CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD
+            ),
+            consecutive_active_substeps_after_successful_apply=(
+                0 if recovered else active
+            ),
+            consecutive_clean_samples_after_successful_apply=(
+                0 if recovered else clean
+            ),
+            release_ramp_index_to_apply=(0 if recovered else None),
+            next_release_ramp_index_after_successful_apply=(1 if recovered else None),
+            skip_dls=not recovered,
+            hold_current_position=not recovered,
+            recovery_event_delta=0,
+            active_substep_delta=1,
+            recovered_event_delta=0,
+            release_ramp_completed_delta=0,
+            sustained_abort=sustained_abort,
+        )
+
+    if phase_before_apply == CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_RELEASE_RAMP:
+        index = next_release_ramp_index_before_apply
+        if index is None:
+            raise ValueError("PolaRiS EEF velocity-recovery ramp index is absent")
+        completed = index == ARM_RELEASE_RAMP_SUBSTEPS - 1
+        return CurrentJointVelocityRecoveryTransition(
+            phase_after_successful_apply=(
+                CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE
+                if completed
+                else CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_RELEASE_RAMP
+            ),
+            consecutive_active_substeps_after_successful_apply=0,
+            consecutive_clean_samples_after_successful_apply=0,
+            release_ramp_index_to_apply=index,
+            next_release_ramp_index_after_successful_apply=(
+                None if completed else index + 1
+            ),
+            skip_dls=False,
+            hold_current_position=False,
+            recovery_event_delta=0,
+            active_substep_delta=0,
+            recovered_event_delta=int(completed),
+            release_ramp_completed_delta=int(completed),
+            sustained_abort=False,
+        )
+
+    return CurrentJointVelocityRecoveryTransition(
+        phase_after_successful_apply=CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE,
+        consecutive_active_substeps_after_successful_apply=0,
+        consecutive_clean_samples_after_successful_apply=0,
+        release_ramp_index_to_apply=None,
+        next_release_ramp_index_after_successful_apply=None,
+        skip_dls=False,
+        hold_current_position=False,
+        recovery_event_delta=0,
+        active_substep_delta=0,
+        recovered_event_delta=0,
+        release_ramp_completed_delta=0,
+        sustained_abort=False,
+    )
 
 
 def arm_release_ramp_fraction(index: int) -> float:
@@ -207,6 +409,62 @@ DISABLED_ARM_RELEASE_RAMP_TRANSITION = ArmReleaseRampTransition(
     ramp_completed_delta=0,
     ramp_cancelled_by_reactivation_delta=0,
 )
+
+
+def suspend_gripper_close_arm_interlock(
+    *,
+    remaining_before_apply: int,
+    observed_endpoint_change_count: int,
+    endpoint_observed_before_apply: bool,
+) -> GripperCloseArmInterlockTransition:
+    """Freeze the lower interlock while the v5 recovery owns the arm target."""
+
+    if (
+        type(remaining_before_apply) is not int
+        or remaining_before_apply < 0
+        or type(observed_endpoint_change_count) is not int
+        or observed_endpoint_change_count < 0
+        or type(endpoint_observed_before_apply) is not bool
+    ):
+        raise ValueError("PolaRiS EEF suspended interlock state drift")
+    return GripperCloseArmInterlockTransition(
+        active=False,
+        remaining_after_successful_apply=remaining_before_apply,
+        observed_endpoint_change_count=observed_endpoint_change_count,
+        endpoint_observed_after_successful_apply=endpoint_observed_before_apply,
+        activation_count_delta=0,
+        completion_count_delta=0,
+        open_cancel_count_delta=0,
+    )
+
+
+def suspend_arm_release_ramp(
+    *,
+    phase_before_apply: str,
+    next_ramp_index_before_apply: int | None,
+) -> ArmReleaseRampTransition:
+    """Freeze the lower release ramp without double-counting a target apply."""
+
+    if phase_before_apply not in ARM_RELEASE_PHASES:
+        raise ValueError("PolaRiS EEF suspended arm release-ramp phase drift")
+    if (phase_before_apply == ARM_RELEASE_PHASE_RAMP) is (
+        next_ramp_index_before_apply is None
+    ):
+        raise ValueError("PolaRiS EEF suspended arm release-ramp index drift")
+    if next_ramp_index_before_apply is not None and (
+        type(next_ramp_index_before_apply) is not int
+        or not 0 <= next_ramp_index_before_apply < ARM_RELEASE_RAMP_SUBSTEPS
+    ):
+        raise ValueError("PolaRiS EEF suspended arm release-ramp index drift")
+    return ArmReleaseRampTransition(
+        phase_after_successful_apply=phase_before_apply,
+        ramp_index_to_apply=None,
+        next_ramp_index_after_successful_apply=next_ramp_index_before_apply,
+        release_observed_delta=0,
+        ramp_started_delta=0,
+        ramp_completed_delta=0,
+        ramp_cancelled_by_reactivation_delta=0,
+    )
 
 
 def advance_arm_release_ramp(

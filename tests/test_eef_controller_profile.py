@@ -11,6 +11,7 @@ import pytest
 from polaris.config import EEF_CONTROLLER_BASELINE_PROFILE
 from polaris.config import EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
 from polaris.config import EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE
+from polaris.config import EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE
 from polaris.eef_controller_profile import configure_eef_controller_profile
 from polaris.eef_controller_profile import eef_controller_apply_counts_from_safety
 from polaris.eef_controller_profile import eef_controller_profile
@@ -79,6 +80,7 @@ def _env_cfg() -> SimpleNamespace:
         enable_arm_slew_headroom=False,
         enable_gripper_close_arm_interlock=False,
         enable_arm_release_ramp=False,
+        enable_current_joint_velocity_recovery=False,
     )
     finger = SimpleNamespace(
         enable_target_slew_rate_0p25_candidate=False,
@@ -149,6 +151,7 @@ def test_candidate_configures_exact_accepted_stack_before_spawn(monkeypatch) -> 
     assert cfg.actions.arm.enable_arm_slew_headroom is True
     assert cfg.actions.arm.enable_gripper_close_arm_interlock is True
     assert cfg.actions.arm.enable_arm_release_ramp is False
+    assert cfg.actions.arm.enable_current_joint_velocity_recovery is False
     assert cfg.actions.finger_joint.enable_target_slew_rate_0p25_candidate is True
     assert (
         cfg.actions.finger_joint.class_type.eef_all_six_gripper_trace_profile
@@ -185,12 +188,40 @@ def test_release_ramp_profile_adds_only_the_versioned_v4_flag(monkeypatch) -> No
     )
     assert spec.arm_release_ramp_enabled is True
     assert cfg.actions.arm.enable_arm_release_ramp is True
+    assert spec.current_joint_velocity_recovery_enabled is False
+    assert cfg.actions.arm.enable_current_joint_velocity_recovery is False
     assert cfg.actions.arm.enable_failure_substep_trace is True
     assert cfg.actions.arm.enable_arm_slew_headroom is True
     assert cfg.actions.arm.enable_gripper_close_arm_interlock is True
     validate_eef_controller_profile_config(
         cfg,
         expected_profile=EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+    )
+
+
+def test_velocity_recovery_profile_adds_only_the_versioned_v5_flag(
+    monkeypatch,
+) -> None:
+    cfg = _env_cfg()
+    monkeypatch.setattr(
+        "polaris.eef_gripper_runtime._expected_original_spawn_func",
+        lambda: _original_spawn,
+    )
+    spec = configure_eef_controller_profile(
+        cfg,
+        profile=EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+    )
+    assert spec.profile == (
+        "arm_slew_0p95_gripper_rate0p25_fixed_anchor86_release_ramp16_"
+        "velocity_recovery8_clean2_mimic100_damping1p2_v5"
+    )
+    assert spec.arm_release_ramp_enabled is True
+    assert spec.current_joint_velocity_recovery_enabled is True
+    assert cfg.actions.arm.enable_arm_release_ramp is True
+    assert cfg.actions.arm.enable_current_joint_velocity_recovery is True
+    validate_eef_controller_profile_config(
+        cfg,
+        expected_profile=EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
     )
 
 
@@ -242,6 +273,7 @@ def test_candidate_fails_closed_on_pre_enabled_or_tampered_components(
         EEF_CONTROLLER_BASELINE_PROFILE,
         EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE,
         EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+        EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
     ],
 )
 def test_profiles_reject_modified_action_classes_and_spawn_before_writes(

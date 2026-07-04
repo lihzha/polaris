@@ -28,14 +28,21 @@ from polaris.eef_controller_profile import (
 )
 from polaris.eef_controller_profile import validate_eef_controller_runtime_profile
 from polaris.eef_controller_profile import validate_eef_controller_safety_evidence
+from polaris.eef_controller_profile import (
+    validate_current_joint_velocity_recovery_report,
+)
 from polaris.eef_gripper_failure_trace import validate_eef_all_six_gripper_trace
 from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_ABORT_MESSAGES
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
+from polaris.eef_ik_safety import (
+    EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+)
 from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import format_current_joint_velocity_abort_message
@@ -83,6 +90,8 @@ CANONICAL_ARM_SCALE = 1.0
 CANONICAL_ARM_JOINTS = tuple(f"panda_joint{index}" for index in range(1, 8))
 EEF_SAFETY_SIDECAR_SCHEMA_VERSION = 6
 EEF_RUNTIME_CONTRACT_SCHEMA_VERSION = 6
+EEF_SAFETY_SIDECAR_VELOCITY_RECOVERY_SCHEMA_VERSION = 7
+EEF_RUNTIME_CONTRACT_VELOCITY_RECOVERY_SCHEMA_VERSION = 7
 EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE = "ego_lap_eef_outer450_internal451_no_autoreset_v1"
 EGO_LAP_ENVIRONMENT_STATE_PROFILE = (
     "isaaclab_single_env_episode_sim_common_camera_counters_v1"
@@ -234,6 +243,13 @@ WRIST_ENERGY_BRAKE_SAFETY_DIAGNOSTIC_COUNTERS = {
     **SAFETY_DIAGNOSTIC_COUNTERS,
     "wrist_energy_brake_target_state_abort": "invariant_aborts",
 }
+VELOCITY_RECOVERY_SAFETY_DIAGNOSTIC_COUNTERS = {
+    **SAFETY_DIAGNOSTIC_COUNTERS,
+    "current_joint_hard_position_limit_abort": "current_joint_limit_aborts",
+    "predicted_joint_hard_position_limit_abort": "invariant_aborts",
+    "measured_velocity_recovery_sustained_abort": "invariant_aborts",
+    "measured_velocity_recovery_transaction_abort": "invariant_aborts",
+}
 SAFETY_STATIC_FIELDS = (
     "profile",
     "apply_actions_cadence",
@@ -350,6 +366,9 @@ RUNTIME_EPISODE_FIELDS = {
     "current_joint_velocity_abort",
     "sidecar_path",
     "sidecar_sha256",
+}
+CURRENT_JOINT_VELOCITY_RECOVERY_RUNTIME_EPISODE_FIELD = {
+    "current_joint_velocity_recovery"
 }
 WRIST_ENERGY_BRAKE_RUNTIME_EPISODE_FIELDS = {
     *RUNTIME_EPISODE_FIELDS,
@@ -874,7 +893,26 @@ def _wrist_energy_brake_enabled(arm_term: Any) -> bool:
     return enabled
 
 
-def _selected_safety_profile(candidate_enabled: bool) -> str:
+def _current_joint_velocity_recovery_enabled(arm_term: Any) -> bool:
+    """Return the exact additive v5 opt-in flag without truthy widening."""
+
+    arm_cfg = getattr(arm_term, "cfg", None)
+    enabled = getattr(arm_cfg, "enable_current_joint_velocity_recovery", False)
+    if type(enabled) is not bool:
+        raise ValueError(
+            "Live EEF IK current-velocity recovery enable flag must be exactly bool"
+        )
+    return enabled
+
+
+def _selected_safety_profile(
+    candidate_enabled: bool,
+    velocity_recovery_enabled: bool = False,
+) -> str:
+    if candidate_enabled and velocity_recovery_enabled:
+        raise ValueError("EEF IK wrist brake and velocity recovery cannot be combined")
+    if velocity_recovery_enabled:
+        return EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE
     return (
         EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
         if candidate_enabled
@@ -883,15 +921,23 @@ def _selected_safety_profile(candidate_enabled: bool) -> str:
 
 
 def _episode_safety_fields(
-    candidate_enabled: bool, gripper_runtime_enabled: bool = False
+    candidate_enabled: bool,
+    gripper_runtime_enabled: bool = False,
+    velocity_recovery_enabled: bool = False,
 ) -> set[str]:
     fields = (
         WRIST_ENERGY_BRAKE_EPISODE_SAFETY_FIELDS
         if candidate_enabled
         else EPISODE_SAFETY_FIELDS
     )
-    return fields | (
-        GRIPPER_RUNTIME_EPISODE_FIELDS if gripper_runtime_enabled else set()
+    return (
+        fields
+        | (GRIPPER_RUNTIME_EPISODE_FIELDS if gripper_runtime_enabled else set())
+        | (
+            CURRENT_JOINT_VELOCITY_RECOVERY_RUNTIME_EPISODE_FIELD
+            if velocity_recovery_enabled
+            else set()
+        )
     )
 
 
@@ -928,23 +974,48 @@ def _aggregate_safety_fields(
 
 
 def _runtime_episode_fields(
-    candidate_enabled: bool, gripper_runtime_enabled: bool = False
+    candidate_enabled: bool,
+    gripper_runtime_enabled: bool = False,
+    velocity_recovery_enabled: bool = False,
 ) -> set[str]:
     fields = (
         WRIST_ENERGY_BRAKE_RUNTIME_EPISODE_FIELDS
         if candidate_enabled
         else RUNTIME_EPISODE_FIELDS
     )
-    return fields | ({"gripper_runtime_dynamic"} if gripper_runtime_enabled else set())
+    return (
+        fields
+        | ({"gripper_runtime_dynamic"} if gripper_runtime_enabled else set())
+        | (
+            CURRENT_JOINT_VELOCITY_RECOVERY_RUNTIME_EPISODE_FIELD
+            if velocity_recovery_enabled
+            else set()
+        )
+    )
 
 
 def _candidate_enabled_from_safety(safety: Mapping[str, Any]) -> bool:
     profile = safety.get("profile")
     if profile == EEF_IK_SAFETY_PROFILE:
         return False
+    if profile == EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE:
+        return False
     if profile == EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE:
         return True
     raise ValueError(f"Unknown EEF IK safety profile: {profile!r}")
+
+
+def _velocity_recovery_enabled_from_safety(safety: Mapping[str, Any]) -> bool:
+    profile = safety.get("profile")
+    present = "current_joint_velocity_recovery" in safety
+    if profile == EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE:
+        aggregate_present = "episodes" in safety
+        if not present and not aggregate_present:
+            raise ValueError("Velocity-recovery safety profile lacks its report")
+        return True
+    if present:
+        raise ValueError("Non-v5 EEF IK safety report has velocity-recovery evidence")
+    return False
 
 
 def _gripper_runtime_enabled_from_safety(safety: Mapping[str, Any]) -> bool:
@@ -1694,6 +1765,7 @@ def _validate_current_joint_velocity_abort_binding(
     guard_diagnostics: Any,
     counters: Mapping[str, Any],
     field: str,
+    allow_v5_velocity_residual: bool = False,
 ) -> dict[str, Any] | None:
     """Bind one measured-velocity abort to its limit, maxima, and guard."""
 
@@ -1733,8 +1805,12 @@ def _validate_current_joint_velocity_abort_binding(
         and diagnostic.get("kind") == "current_joint_velocity_limit_abort"
     ]
 
+    if type(allow_v5_velocity_residual) is not bool:
+        raise ValueError(f"{field} current-velocity validation mode drift")
     if evidence is None:
-        if velocity_guards or np.any(maxima_exceeded_mask):
+        if velocity_guards or (
+            np.any(maxima_exceeded_mask) and not allow_v5_velocity_residual
+        ):
             raise ValueError(f"{field} current-velocity abort evidence is missing")
         return None
     if not isinstance(evidence, Mapping) or set(evidence) != (
@@ -1840,6 +1916,153 @@ def _validate_current_joint_velocity_abort_result_binding(
         )
 
 
+_VELOCITY_RECOVERY_TERMINAL_BINDINGS = {
+    "current_hard_limit_abort": (
+        "current_joint_hard_position_limit_abort",
+        "current_joint_limit_aborts",
+    ),
+    "predicted_hard_limit_abort": (
+        "predicted_joint_hard_position_limit_abort",
+        "invariant_aborts",
+    ),
+    "sustained_recovery_abort": (
+        "measured_velocity_recovery_sustained_abort",
+        "invariant_aborts",
+    ),
+    "transaction_abort": (
+        "measured_velocity_recovery_transaction_abort",
+        "invariant_aborts",
+    ),
+}
+
+
+def _validate_current_joint_velocity_recovery_result_binding(
+    *,
+    recovery: Any,
+    episode_result: Mapping[str, Any],
+    apply_calls: int,
+    counters: Mapping[str, Any],
+    guard_diagnostics: Any,
+    field: str,
+) -> None:
+    """Bind a named terminal v5 event to its exact guard and exception SHA."""
+
+    validated = validate_current_joint_velocity_recovery_report(
+        recovery,
+        apply_calls=apply_calls,
+    )
+    result = canonical_episode_result(episode_result)
+    terminal_events = [
+        event
+        for event in validated["events"]
+        if event["end_reason"] in _VELOCITY_RECOVERY_TERMINAL_BINDINGS
+    ]
+    named_recovery_reason = any(
+        result["numerical_failure_reason"].startswith(
+            "DifferentialIKInvariantError: "
+            f"{CURRENT_JOINT_VELOCITY_RECOVERY_ABORT_MESSAGES[end_reason]} "
+            "(evidence_sha256="
+        )
+        for end_reason in _VELOCITY_RECOVERY_TERMINAL_BINDINGS
+    )
+    if not terminal_events:
+        if named_recovery_reason:
+            raise ValueError(f"{field} recovery exception lacks a terminal event")
+        return
+    if len(terminal_events) != 1:
+        raise ValueError(f"{field} has multiple terminal recovery events")
+    event = terminal_events[0]
+    end_reason = event["end_reason"]
+    diagnostic_kind, counter_field = _VELOCITY_RECOVERY_TERMINAL_BINDINGS[end_reason]
+    if (
+        event is not validated["events"][-1]
+        or event["end_apply_index"] != apply_calls - 1
+        or validated["state"]
+        != {
+            "phase": "inactive",
+            "active": False,
+            "consecutive_active_substeps": 0,
+            "consecutive_clean_samples": 0,
+            "release_ramp_next_index": None,
+        }
+        or counters.get(counter_field) != 1
+        or not isinstance(guard_diagnostics, list)
+    ):
+        raise ValueError(f"{field} terminal recovery lifecycle/counter drift")
+    matching_diagnostics = [
+        diagnostic
+        for diagnostic in guard_diagnostics
+        if isinstance(diagnostic, Mapping) and diagnostic.get("kind") == diagnostic_kind
+    ]
+    if len(matching_diagnostics) != 1:
+        raise ValueError(f"{field} terminal recovery diagnostic drift")
+    diagnostic = matching_diagnostics[0]
+    if (
+        diagnostic.get("policy_step") != (apply_calls - 1) // CANONICAL_DECIMATION
+        or diagnostic.get("physics_substep") != (apply_calls - 1) % CANONICAL_DECIMATION
+    ):
+        raise ValueError(f"{field} terminal recovery diagnostic cadence drift")
+    encoded = json.dumps(
+        event,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    expected_reason = (
+        "DifferentialIKInvariantError: "
+        f"{CURRENT_JOINT_VELOCITY_RECOVERY_ABORT_MESSAGES[end_reason]} "
+        f"(evidence_sha256={digest})"
+    )
+    if (
+        not result["numerical_failure"]
+        or result["numerical_failure_reason"] != expected_reason
+    ):
+        raise ValueError(f"{field} recovery result/reason digest binding drift")
+
+
+def _validate_current_joint_velocity_recovery_maxima_binding(
+    *,
+    recovery: Mapping[str, Any],
+    velocity_limits: Any,
+    max_abs_velocity: Any,
+    field: str,
+) -> None:
+    """Bind nested v5 maxima to the independently accumulated safety maxima."""
+
+    limits = _finite_numeric_vector(
+        velocity_limits,
+        size=7,
+        field=f"{field} velocity limits",
+    ).astype(np.float32)
+    maximum_velocity = _finite_numeric_vector(
+        max_abs_velocity,
+        size=7,
+        field=f"{field} absolute velocity maxima",
+    ).astype(np.float32)
+    if np.any(limits <= 0.0) or np.any(maximum_velocity < 0.0):
+        raise ValueError(f"{field} velocity maxima inputs drift")
+    expected_excess = np.maximum(
+        maximum_velocity - limits,
+        np.float32(0.0),
+    )
+    expected_ratio = float(np.max((maximum_velocity / limits).astype(np.float32)))
+    maxima = recovery.get("maxima")
+    if not isinstance(maxima, Mapping):
+        raise ValueError(f"{field} nested recovery maxima are absent")
+    recorded_excess = np.asarray(
+        maxima.get("abs_velocity_residual_excess_rad_s"),
+        dtype=np.float32,
+    )
+    if (
+        recorded_excess.shape != (7,)
+        or not np.array_equal(recorded_excess, expected_excess)
+        or maxima.get("abs_velocity_to_limit_ratio") != expected_ratio
+    ):
+        raise ValueError(f"{field} nested/top-level velocity maxima drift")
+
+
 def _validate_eef_runtime_safety_report(
     env: Any,
     *,
@@ -1853,13 +2076,16 @@ def _validate_eef_runtime_safety_report(
     runtime = _unwrapped(env)
     arm_term = _arm_action_term(runtime)
     candidate_enabled = _wrist_energy_brake_enabled(arm_term)
+    velocity_recovery_enabled = _current_joint_velocity_recovery_enabled(arm_term)
     if not isinstance(report, dict):
         raise ValueError("Live Ego-LAP EEF IK safety reporter returned no object")
     gripper_runtime_enabled = _gripper_runtime_enabled_from_safety(report)
     if require_gripper_runtime and not gripper_runtime_enabled:
         raise ValueError("Production EEF evaluation lacks all-six gripper evidence")
     expected_report_fields = _episode_safety_fields(
-        candidate_enabled, gripper_runtime_enabled
+        candidate_enabled,
+        gripper_runtime_enabled,
+        velocity_recovery_enabled,
     )
     if set(report) != expected_report_fields:
         raise ValueError(
@@ -1868,7 +2094,9 @@ def _validate_eef_runtime_safety_report(
             f"actual={sorted(report)!r}"
         )
     exact_fields = {
-        "profile": _selected_safety_profile(candidate_enabled),
+        "profile": _selected_safety_profile(
+            candidate_enabled, velocity_recovery_enabled
+        ),
         "apply_actions_cadence": EEF_IK_APPLY_CADENCE,
         "target_soft_limit_guard_band_profile": TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE,
         "physx_hard_limit_profile": PHYSX_HARD_LIMIT_PROFILE,
@@ -2255,9 +2483,13 @@ def _validate_eef_runtime_safety_report(
         "dls_fallbacks": 0,
     }
     diagnostic_counter_mapping = (
-        WRIST_ENERGY_BRAKE_SAFETY_DIAGNOSTIC_COUNTERS
-        if candidate_enabled
-        else SAFETY_DIAGNOSTIC_COUNTERS
+        VELOCITY_RECOVERY_SAFETY_DIAGNOSTIC_COUNTERS
+        if velocity_recovery_enabled
+        else (
+            WRIST_ENERGY_BRAKE_SAFETY_DIAGNOSTIC_COUNTERS
+            if candidate_enabled
+            else SAFETY_DIAGNOSTIC_COUNTERS
+        )
     )
     for diagnostic in guard_diagnostics:
         _validate_guard_diagnostic(
@@ -2285,7 +2517,34 @@ def _validate_eef_runtime_safety_report(
         guard_diagnostics=guard_diagnostics,
         counters=counters,
         field="Live EEF IK",
+        allow_v5_velocity_residual=velocity_recovery_enabled,
     )
+    if velocity_recovery_enabled:
+        if report.get("current_joint_velocity_abort") is not None:
+            raise ValueError("Live v5 EEF IK retained a legacy velocity abort")
+        validated_recovery = validate_current_joint_velocity_recovery_report(
+            report.get("current_joint_velocity_recovery"),
+            apply_calls=counters["apply_calls"],
+        )
+        _validate_current_joint_velocity_recovery_maxima_binding(
+            recovery=validated_recovery,
+            velocity_limits=report["joint_velocity_limits_rad_s"],
+            max_abs_velocity=maxima["abs_joint_vel_rad_s"],
+            field="Live EEF IK",
+        )
+        if expected_eef_controller_profile is not None:
+            controller_reporter = getattr(
+                arm_term, "controller_repair_candidate_report", None
+            )
+            if not callable(controller_reporter):
+                raise ValueError("Live v5 EEF IK controller reporter is absent")
+            controller_report = controller_reporter()
+            if controller_report.get("current_joint_velocity_recovery") != (
+                validated_recovery
+            ):
+                raise ValueError(
+                    "Live v5 EEF IK safety/controller recovery evidence drift"
+                )
     max_raw_diagnostic = report.get("max_raw_delta_diagnostic")
     if max_raw_diagnostic is not None and not isinstance(max_raw_diagnostic, dict):
         raise ValueError("Live EEF IK safety max-raw-delta diagnostic is invalid")
@@ -2421,6 +2680,7 @@ def validate_eef_runtime_frame(
             f"{getattr(arm_cfg, 'body_name', None)!r}"
         )
     candidate_enabled = _wrist_energy_brake_enabled(arm_term)
+    velocity_recovery_enabled = _current_joint_velocity_recovery_enabled(arm_term)
     if not _identity_offset(getattr(arm_cfg, "body_offset", None)):
         raise ValueError("Live Ego-LAP controller body offset is not identity")
     controller_cfg = getattr(arm_cfg, "controller", None)
@@ -2494,7 +2754,9 @@ def validate_eef_runtime_frame(
         "arm_scale": CANONICAL_ARM_SCALE,
         "arm_joint_names": list(CANONICAL_ARM_JOINTS),
         "gripper_threshold_profile": GRIPPER_THRESHOLD_PROFILE,
-        "ik_safety_profile": _selected_safety_profile(candidate_enabled),
+        "ik_safety_profile": _selected_safety_profile(
+            candidate_enabled, velocity_recovery_enabled
+        ),
         "action_dim": 7,
     }
 
@@ -2685,6 +2947,15 @@ def _validate_episode_controller_artifacts(
         apply_calls=apply_calls,
         committed_apply_calls=committed_apply_calls,
     )
+    if spec.current_joint_velocity_recovery_enabled:
+        recovery = validate_current_joint_velocity_recovery_report(
+            safety.get("current_joint_velocity_recovery"),
+            apply_calls=apply_calls,
+        )
+        if report.get("current_joint_velocity_recovery") != recovery:
+            raise ValueError(
+                "Episode safety/controller velocity-recovery evidence drift"
+            )
     maxima = safety.get("maxima")
     if not isinstance(maxima, Mapping):
         raise ValueError("Episode controller artifacts lack safety maxima")
@@ -2790,7 +3061,11 @@ def atomic_write_episode_safety(
     )
     _validate_terminal_apply_binding(terminal, cadence_evidence)
     payload = {
-        "schema_version": EEF_SAFETY_SIDECAR_SCHEMA_VERSION,
+        "schema_version": (
+            EEF_SAFETY_SIDECAR_VELOCITY_RECOVERY_SCHEMA_VERSION
+            if spec.current_joint_velocity_recovery_enabled
+            else EEF_SAFETY_SIDECAR_SCHEMA_VERSION
+        ),
         "transaction_state": "prepared",
         "eef_controller_profile": spec.profile,
         "controller_repair_candidate": controller_report,
@@ -2829,9 +3104,12 @@ def _validate_episode_safety_evidence_shape(
     """Validate the exact durable per-episode safety schema and counter mapping."""
 
     candidate_enabled = _candidate_enabled_from_safety(safety)
+    velocity_recovery_enabled = _velocity_recovery_enabled_from_safety(safety)
     gripper_runtime_enabled = _gripper_runtime_enabled_from_safety(safety)
     if set(safety) != _episode_safety_fields(
-        candidate_enabled, gripper_runtime_enabled
+        candidate_enabled,
+        gripper_runtime_enabled,
+        velocity_recovery_enabled,
     ):
         raise ValueError("Episode safety report schema drift")
     counters = safety.get("counters")
@@ -2845,6 +3123,19 @@ def _validate_episode_safety_evidence_shape(
     if counters["environment_substeps"] != counters["apply_calls"]:
         raise ValueError("Episode safety environment/apply substeps disagree")
     apply_calls = counters["apply_calls"]
+    if velocity_recovery_enabled:
+        if safety.get("current_joint_velocity_abort") is not None:
+            raise ValueError("Episode v5 EEF IK retained a legacy velocity abort")
+        validated_recovery = validate_current_joint_velocity_recovery_report(
+            safety.get("current_joint_velocity_recovery"),
+            apply_calls=apply_calls,
+        )
+        _validate_current_joint_velocity_recovery_maxima_binding(
+            recovery=validated_recovery,
+            velocity_limits=safety["joint_velocity_limits_rad_s"],
+            max_abs_velocity=maxima["abs_joint_vel_rad_s"],
+            field="Episode EEF IK",
+        )
     if gripper_runtime_enabled:
         actual_target_slew_profile = _gripper_target_slew_profile_from_safety(safety)
         gripper_target_slew_profile = (
@@ -2982,9 +3273,13 @@ def _validate_episode_safety_evidence_shape(
     }
     diagnostic_indices = []
     diagnostic_counter_mapping = (
-        WRIST_ENERGY_BRAKE_SAFETY_DIAGNOSTIC_COUNTERS
-        if candidate_enabled
-        else SAFETY_DIAGNOSTIC_COUNTERS
+        VELOCITY_RECOVERY_SAFETY_DIAGNOSTIC_COUNTERS
+        if velocity_recovery_enabled
+        else (
+            WRIST_ENERGY_BRAKE_SAFETY_DIAGNOSTIC_COUNTERS
+            if candidate_enabled
+            else SAFETY_DIAGNOSTIC_COUNTERS
+        )
     )
     for diagnostic in diagnostics:
         _validate_guard_diagnostic(
@@ -3020,6 +3315,7 @@ def _validate_episode_safety_evidence_shape(
         guard_diagnostics=diagnostics,
         counters=counters,
         field="Episode EEF IK",
+        allow_v5_velocity_residual=velocity_recovery_enabled,
     )
     max_raw = safety.get("max_raw_delta_diagnostic")
     if max_raw is not None:
@@ -3072,6 +3368,15 @@ def validate_episode_safety_cadence(
     ):
         raise ValueError(f"Episode safety cadence counters are invalid: {counters!r}")
     apply_calls = counters["apply_calls"]
+    if "current_joint_velocity_recovery" in safety:
+        _validate_current_joint_velocity_recovery_result_binding(
+            recovery=safety["current_joint_velocity_recovery"],
+            episode_result=result,
+            apply_calls=apply_calls,
+            counters=counters,
+            guard_diagnostics=safety.get("guard_diagnostics"),
+            field="Episode EEF IK",
+        )
     if counters["environment_substeps"] != apply_calls:
         raise ValueError(
             "Single-environment episode substeps must equal controller apply calls"
@@ -3282,6 +3587,14 @@ def load_episode_safety_sidecars(
 ) -> list[dict[str, Any]]:
     """Load the exact sidecar set corresponding to committed CSV episodes."""
 
+    expected_controller_spec = resolve_eef_controller_profile(
+        expected_eef_controller_profile
+    )
+    expected_sidecar_schema = (
+        EEF_SAFETY_SIDECAR_VELOCITY_RECOVERY_SCHEMA_VERSION
+        if expected_controller_spec.current_joint_velocity_recovery_enabled
+        else EEF_SAFETY_SIDECAR_SCHEMA_VERSION
+    )
     if committed_episode_indices != list(range(len(committed_episode_indices))):
         raise ValueError(
             "Committed safety episode indices must be a contiguous ordered prefix: "
@@ -3306,7 +3619,7 @@ def load_episode_safety_sidecars(
         if set(payload) != SAFETY_SIDECAR_FIELDS:
             raise ValueError(f"Episode safety sidecar schema drift: {path}")
         if (
-            payload.get("schema_version") != EEF_SAFETY_SIDECAR_SCHEMA_VERSION
+            payload.get("schema_version") != expected_sidecar_schema
             or payload.get("transaction_state") != "prepared"
             or payload.get("episode_index") != episode_index
         ):
@@ -3372,6 +3685,15 @@ def reconcile_episode_safety_transactions(
     into the CSV; no evidence is deleted or overwritten.
     """
 
+    expected_controller_spec = resolve_eef_controller_profile(
+        expected_eef_controller_profile
+    )
+    expected_sidecar_schema = (
+        EEF_SAFETY_SIDECAR_VELOCITY_RECOVERY_SCHEMA_VERSION
+        if expected_controller_spec.current_joint_velocity_recovery_enabled
+        else EEF_SAFETY_SIDECAR_SCHEMA_VERSION
+    )
+
     rows = [
         canonical_episode_result(row)
         for row in frame.loc[:, list(EVAL_RESULT_COLUMNS)].to_dict(orient="records")
@@ -3429,7 +3751,7 @@ def reconcile_episode_safety_transactions(
         if set(payload) != SAFETY_SIDECAR_FIELDS:
             raise ValueError(f"Prepared safety sidecar schema drift: {path}")
         if (
-            payload.get("schema_version") != EEF_SAFETY_SIDECAR_SCHEMA_VERSION
+            payload.get("schema_version") != expected_sidecar_schema
             or payload.get("transaction_state") != "prepared"
             or payload.get("episode_index") != episode_index
         ):
@@ -3506,6 +3828,7 @@ def aggregate_episode_safety(
     """Merge immutable per-episode reports without losing resume history."""
 
     candidate_enabled = _candidate_enabled_from_safety(live_template)
+    velocity_recovery_enabled = _velocity_recovery_enabled_from_safety(live_template)
     gripper_runtime_enabled = _gripper_runtime_enabled_from_safety(live_template)
     controller_spec = None
     expected_target_profile = None
@@ -3520,7 +3843,9 @@ def aggregate_episode_safety(
             expected_target_slew_profile=expected_target_profile,
         )
     if set(live_template) != _episode_safety_fields(
-        candidate_enabled, gripper_runtime_enabled
+        candidate_enabled,
+        gripper_runtime_enabled,
+        velocity_recovery_enabled,
     ):
         raise ValueError("Live safety template schema drift")
     static = {
@@ -3571,6 +3896,11 @@ def aggregate_episode_safety(
                     f"Episode safety static field drift for {field}: "
                     f"expected={expected!r}, actual={safety.get(field)!r}"
                 )
+        if velocity_recovery_enabled:
+            validate_current_joint_velocity_recovery_report(
+                safety.get("current_joint_velocity_recovery"),
+                apply_calls=int(safety["counters"]["apply_calls"]),
+            )
         if (
             set(safety.get("counters", {})) != counter_names
             or set(safety.get("maxima", {})) != maxima_names
@@ -3617,6 +3947,10 @@ def aggregate_episode_safety(
             )
         if gripper_runtime_enabled:
             episode["gripper_runtime_dynamic"] = safety["gripper_runtime_dynamic"]
+        if velocity_recovery_enabled:
+            episode["current_joint_velocity_recovery"] = safety[
+                "current_joint_velocity_recovery"
+            ]
         episodes.append(episode)
     aggregate = {
         **static,
@@ -3631,7 +3965,11 @@ def aggregate_episode_safety(
         candidate_enabled, gripper_runtime_enabled
     ) or any(
         set(episode)
-        != _runtime_episode_fields(candidate_enabled, gripper_runtime_enabled)
+        != _runtime_episode_fields(
+            candidate_enabled,
+            gripper_runtime_enabled,
+            velocity_recovery_enabled,
+        )
         for episode in episodes
     ):
         raise ValueError("Aggregate EEF IK safety schema drift")
@@ -3639,6 +3977,7 @@ def aggregate_episode_safety(
         aggregate,
         candidate_enabled=candidate_enabled,
         gripper_runtime_enabled=gripper_runtime_enabled,
+        velocity_recovery_enabled=velocity_recovery_enabled,
     )
     return aggregate
 
@@ -3710,6 +4049,15 @@ def build_eef_controller_repair_candidate_aggregate(
                 {
                     "episode_index": item["episode_index"],
                     "counters": sidecars[item["episode_index"]]["safety"]["counters"],
+                    **(
+                        {
+                            "current_joint_velocity_recovery": sidecars[
+                                item["episode_index"]
+                            ]["safety"]["current_joint_velocity_recovery"]
+                        }
+                        if spec.current_joint_velocity_recovery_enabled
+                        else {}
+                    ),
                 }
                 for item in episodes
             ],
@@ -3773,7 +4121,7 @@ def validate_eef_controller_repair_candidate_aggregate(
         apply_calls, committed_apply_calls = eef_controller_apply_counts_from_safety(
             {"counters": counters}
         )
-        validate_eef_controller_repair_candidate_report(
+        validated_report = validate_eef_controller_repair_candidate_report(
             episode.get("report"),
             expected_profile=spec.profile,
             expected_target_slew_profile=target_profile,
@@ -3781,6 +4129,13 @@ def validate_eef_controller_repair_candidate_aggregate(
             apply_calls=apply_calls,
             committed_apply_calls=committed_apply_calls,
         )
+        if spec.current_joint_velocity_recovery_enabled and (
+            validated_report.get("current_joint_velocity_recovery")
+            != safety_episode.get("current_joint_velocity_recovery")
+        ):
+            raise ValueError(
+                "Controller/safety velocity-recovery aggregate evidence drift"
+            )
     return dict(value)
 
 
@@ -3789,6 +4144,7 @@ def _validate_runtime_aggregate_consistency(
     *,
     candidate_enabled: bool,
     gripper_runtime_enabled: bool,
+    velocity_recovery_enabled: bool = False,
 ) -> None:
     """Recompute every aggregate value from its immutable episode entries."""
 
@@ -3796,7 +4152,11 @@ def _validate_runtime_aggregate_consistency(
     if not isinstance(episodes, list) or any(
         not isinstance(episode, Mapping)
         or set(episode)
-        != _runtime_episode_fields(candidate_enabled, gripper_runtime_enabled)
+        != _runtime_episode_fields(
+            candidate_enabled,
+            gripper_runtime_enabled,
+            velocity_recovery_enabled,
+        )
         for episode in episodes
     ):
         raise ValueError("Runtime aggregate episode safety schema drift")
@@ -3872,6 +4232,7 @@ def _validate_runtime_aggregate_consistency(
             guard_diagnostics=episode["guard_diagnostics"],
             counters=counters,
             field="Runtime aggregate episode EEF IK",
+            allow_v5_velocity_residual=velocity_recovery_enabled,
         )
         if velocity_abort is not None and not result["numerical_failure"]:
             raise ValueError(
@@ -3882,6 +4243,25 @@ def _validate_runtime_aggregate_consistency(
             episode_result=result,
             field="Runtime aggregate episode EEF IK",
         )
+        if velocity_recovery_enabled:
+            if velocity_abort is not None:
+                raise ValueError(
+                    "Runtime aggregate v5 episode retained legacy velocity abort"
+                )
+            _validate_current_joint_velocity_recovery_maxima_binding(
+                recovery=episode["current_joint_velocity_recovery"],
+                velocity_limits=ik_safety["joint_velocity_limits_rad_s"],
+                max_abs_velocity=maxima["abs_joint_vel_rad_s"],
+                field="Runtime aggregate episode EEF IK",
+            )
+            _validate_current_joint_velocity_recovery_result_binding(
+                recovery=episode.get("current_joint_velocity_recovery"),
+                episode_result=result,
+                apply_calls=counters["apply_calls"],
+                counters=counters,
+                guard_diagnostics=episode.get("guard_diagnostics"),
+                field="Runtime aggregate episode EEF IK",
+            )
 
         if gripper_runtime_enabled:
             dynamic = validate_eef_gripper_dynamic_evidence(
@@ -3926,6 +4306,7 @@ def atomic_write_runtime_contract(
     )
     validated_protocol = validate_ego_lap_protocol_evidence(protocol)
     candidate_enabled = _candidate_enabled_from_safety(ik_safety)
+    velocity_recovery_enabled = _velocity_recovery_enabled_from_safety(ik_safety)
     gripper_runtime_enabled = _gripper_runtime_enabled_from_safety(ik_safety)
     if set(ik_safety) != _aggregate_safety_fields(
         candidate_enabled, gripper_runtime_enabled
@@ -3935,6 +4316,7 @@ def atomic_write_runtime_contract(
         ik_safety,
         candidate_enabled=candidate_enabled,
         gripper_runtime_enabled=gripper_runtime_enabled,
+        velocity_recovery_enabled=velocity_recovery_enabled,
     )
     if gripper_runtime_enabled:
         gripper_target_slew_profile = _gripper_target_slew_profile_from_safety(
@@ -3960,7 +4342,11 @@ def atomic_write_runtime_contract(
     if frame.get("ik_safety_profile") != ik_safety.get("profile"):
         raise ValueError("Runtime frame and aggregate EEF IK safety profiles disagree")
     payload = {
-        "schema_version": EEF_RUNTIME_CONTRACT_SCHEMA_VERSION,
+        "schema_version": (
+            EEF_RUNTIME_CONTRACT_VELOCITY_RECOVERY_SCHEMA_VERSION
+            if controller_spec.current_joint_velocity_recovery_enabled
+            else EEF_RUNTIME_CONTRACT_SCHEMA_VERSION
+        ),
         "eef_controller_profile": controller_spec.profile,
         "controller_repair_candidate": validated_controller_repair,
         "protocol": validated_protocol,

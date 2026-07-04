@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 import hashlib
 import json
 import math
+import struct
 from typing import Any
 
 from polaris.eef_gripper_runtime import EEF_GRIPPER_TARGET_SLEW_PROFILE
 from polaris.eef_gripper_runtime import eef_gripper_target_slew_profile
 
 EEF_IK_SAFETY_PROFILE = "panda_velocity_physxlimit_solveriter1_v4"
+EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE = (
+    "panda_velocity_physxlimit_solveriter1_residual_recovery8_clean2_v5"
+)
 EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE = (
     "panda_velocity_physxlimit_solveriter1_wristenergybrake_candidate_v1"
 )
@@ -51,6 +56,169 @@ EEF_QUATERNION_UNIT_NORM_TOLERANCE = 1e-3
 CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE = (
     "current_joint_velocity_limit_abort_signed_dq_limit_excess_v1"
 )
+CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION = 1
+CURRENT_JOINT_VELOCITY_RECOVERY_PROFILE = (
+    "current_joint_velocity_residual_hold_recovery_v1"
+)
+CURRENT_JOINT_VELOCITY_RECOVERY_ENVELOPE_FORMULA_PROFILE = (
+    "float32_limit_plus_float32_limit_times_float32_1e_4_v1"
+)
+CURRENT_JOINT_VELOCITY_RECOVERY_RELATIVE_ENVELOPE_FLOAT32 = struct.unpack(
+    "<f", struct.pack("<f", 1e-4)
+)[0]
+CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS = 8
+CURRENT_JOINT_VELOCITY_RECOVERY_CLEAN_SAMPLES_REQUIRED = 2
+CURRENT_JOINT_VELOCITY_RECOVERY_HOLD_PROFILE = (
+    "all_arm_hold_current_q_zero_velocity_zero_effort_v1"
+)
+CURRENT_JOINT_VELOCITY_RECOVERY_PREDICTED_POSITION_PROFILE = (
+    "float32_q_plus_float32_dq_times_physics_dt_v1"
+)
+CURRENT_JOINT_VELOCITY_RECOVERY_TRANSACTION_PROFILE = (
+    "position_velocity_effort_setter_readback_trace_then_state_commit_v1"
+)
+CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE = "inactive"
+CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD = "hold"
+CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_RELEASE_RAMP = "release_ramp"
+CURRENT_JOINT_VELOCITY_RECOVERY_PHASES = (
+    CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE,
+    CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD,
+    CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_RELEASE_RAMP,
+)
+CURRENT_JOINT_VELOCITY_RECOVERY_START_REASONS = (
+    "measured_velocity_above_float32_envelope",
+    "current_hard_limit_violation",
+    "predicted_hard_limit_crossing",
+    "target_transaction_failure",
+)
+CURRENT_JOINT_VELOCITY_RECOVERY_END_REASONS = (
+    "clean2_release_ramp_complete",
+    "sustained_recovery_abort",
+    "current_hard_limit_abort",
+    "predicted_hard_limit_abort",
+    "transaction_abort",
+)
+CURRENT_JOINT_VELOCITY_RECOVERY_ABORT_MESSAGES = {
+    "sustained_recovery_abort": (
+        "PolaRiS EEF measured-velocity recovery exceeded eight consecutive "
+        "physics substeps; aborting before DLS and PhysX"
+    ),
+    "current_hard_limit_abort": (
+        "PolaRiS EEF current joint position crossed the installed PhysX hard "
+        "envelope; aborting before DLS and PhysX"
+    ),
+    "predicted_hard_limit_abort": (
+        "PolaRiS EEF measured velocity predicts a one-substep crossing of the "
+        "installed PhysX hard envelope; aborting before DLS and PhysX"
+    ),
+    "transaction_abort": (
+        "PolaRiS EEF measured-velocity recovery target transaction failed; "
+        "reset is required before another apply"
+    ),
+}
+
+
+def _float32(value: float) -> float:
+    """Return one IEEE-754 binary32 round, rejecting non-finite inputs."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("PolaRiS EEF float32 helper requires one numeric scalar")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError("PolaRiS EEF float32 helper requires a finite scalar")
+    try:
+        rounded = struct.unpack("<f", struct.pack("<f", value))[0]
+    except (OverflowError, struct.error) as error:
+        raise ValueError("PolaRiS EEF float32 helper overflowed") from error
+    if not math.isfinite(rounded):
+        raise ValueError("PolaRiS EEF float32 helper produced a non-finite scalar")
+    return rounded
+
+
+def current_joint_velocity_recovery_envelope(limit_rad_s: float) -> float:
+    """Compute ``float32(L + float32(L * float32(1e-4)))`` exactly."""
+
+    limit = _float32(limit_rad_s)
+    if limit <= 0.0:
+        raise ValueError("PolaRiS EEF velocity limit must be positive")
+    residual = _float32(
+        limit * CURRENT_JOINT_VELOCITY_RECOVERY_RELATIVE_ENVELOPE_FLOAT32
+    )
+    return _float32(limit + residual)
+
+
+@dataclass(frozen=True)
+class CurrentJointVelocityRecoveryClassification:
+    """Pure scalar classification at the v5 measured-velocity boundary."""
+
+    measured_velocity_rad_s: float
+    absolute_velocity_rad_s: float
+    limit_rad_s: float
+    envelope_rad_s: float
+    limit_excess_rad_s: float
+    velocity_to_limit_ratio: float
+    residual: bool
+    recovery_required: bool
+
+
+def classify_current_joint_velocity_for_recovery(
+    measured_velocity_rad_s: float,
+    limit_rad_s: float,
+) -> CurrentJointVelocityRecoveryClassification:
+    """Classify one signed float32 velocity without weakening the live limit."""
+
+    measured = _float32(measured_velocity_rad_s)
+    limit = _float32(limit_rad_s)
+    envelope = current_joint_velocity_recovery_envelope(limit)
+    absolute = abs(measured)
+    return CurrentJointVelocityRecoveryClassification(
+        measured_velocity_rad_s=measured,
+        absolute_velocity_rad_s=absolute,
+        limit_rad_s=limit,
+        envelope_rad_s=envelope,
+        limit_excess_rad_s=max(_float32(absolute - limit), 0.0),
+        velocity_to_limit_ratio=_float32(absolute / limit),
+        residual=absolute > limit,
+        recovery_required=absolute > envelope,
+    )
+
+
+@dataclass(frozen=True)
+class PredictedJointPositionHardLimit:
+    """Pure float32 one-substep hard-position prediction."""
+
+    predicted_joint_pos_rad: float
+    signed_lower_clearance_rad: float
+    signed_upper_clearance_rad: float
+    within_hard_limits: bool
+
+
+def predict_joint_position_against_hard_limits(
+    joint_pos_rad: float,
+    joint_velocity_rad_s: float,
+    physics_dt: float,
+    hard_lower_rad: float,
+    hard_upper_rad: float,
+) -> PredictedJointPositionHardLimit:
+    """Evaluate the exact float32 ``q + float32(dq * dt)`` hard-limit guard."""
+
+    position = _float32(joint_pos_rad)
+    velocity = _float32(joint_velocity_rad_s)
+    timestep = _float32(physics_dt)
+    lower = _float32(hard_lower_rad)
+    upper = _float32(hard_upper_rad)
+    if timestep <= 0.0 or not lower < upper:
+        raise ValueError("PolaRiS EEF predicted hard-limit inputs are invalid")
+    predicted = _float32(position + _float32(velocity * timestep))
+    lower_clearance = _float32(predicted - lower)
+    upper_clearance = _float32(upper - predicted)
+    return PredictedJointPositionHardLimit(
+        predicted_joint_pos_rad=predicted,
+        signed_lower_clearance_rad=lower_clearance,
+        signed_upper_clearance_rad=upper_clearance,
+        within_hard_limits=lower_clearance >= 0.0 and upper_clearance >= 0.0,
+    )
+
 
 # Opt-in diagnostic candidate for the deterministic coupled wrist transient.
 # This is deliberately not part of EEF_IK_SAFETY_PROFILE until the target-

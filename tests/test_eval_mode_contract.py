@@ -8,6 +8,7 @@ import pytest
 from polaris.config import EEF_CONTROLLER_BASELINE_PROFILE
 from polaris.config import EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
 from polaris.config import EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE
+from polaris.config import EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE
 from polaris.config import EvalArgs, PolicyArgs, validate_policy_control_mode
 
 
@@ -57,6 +58,7 @@ def test_candidate_profile_requires_exact_ego_lap_eef_pairing() -> None:
     for profile in (
         EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE,
         EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+        EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
     ):
         validate_policy_control_mode(
             _eval_args(

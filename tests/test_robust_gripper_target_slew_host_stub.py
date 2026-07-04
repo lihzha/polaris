@@ -222,6 +222,7 @@ class SetterAsset:
         self.data = types.SimpleNamespace(
             joint_vel_target=torch.full((1, 7), -1.0, dtype=torch.float32),
             joint_pos_target=torch.full((1, 7), -1.0, dtype=torch.float32),
+            joint_effort_target=torch.zeros((1, 7), dtype=torch.float32),
         )
 
     def set_joint_velocity_target(self, target, joint_ids):
@@ -236,6 +237,14 @@ class SetterAsset:
             raise RuntimeError("forced position setter failure")
         self.data.joint_pos_target[:, joint_ids] = (
             target + 1.0 if self.failure == "readback" else target
+        )
+
+    def set_joint_effort_target(self, target, joint_ids):
+        self.calls.append(("effort", target.clone(), list(joint_ids)))
+        if self.failure == "effort":
+            raise RuntimeError("forced effort setter failure")
+        self.data.joint_effort_target[:, joint_ids] = (
+            target + 1.0 if self.failure == "effort_readback" else target
         )
 
 
@@ -394,6 +403,152 @@ assert transactional._arm_release_ramp_phase == "hold"
 assert transactional._arm_release_ramp_next_index is None
 assert transactional._arm_release_observed_count == 0
 assert transactional._arm_target_transaction_failed is False
+
+
+def recovery_transaction_action(failure=None):
+    value = object.__new__(robust.RobustDifferentialInverseKinematicsAction)
+    value._env = types.SimpleNamespace(num_envs=1, device="cpu")
+    value._asset = SetterAsset(failure)
+    value._zero_joint_velocity_target = zero.unsqueeze(0)
+    value._zero_joint_effort_target = zero.unsqueeze(0)
+    value._joint_ids = list(range(7))
+    value._num_joints = 7
+    value._joint_names = tuple(f"panda_joint{index}" for index in range(1, 8))
+    value._joint_velocity_limits = torch.tensor(
+        [[2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61]],
+        dtype=torch.float32,
+    )
+    value._current_joint_velocity_recovery_envelopes = torch.tensor(
+        [[
+            robust.current_joint_velocity_recovery_envelope(item)
+            for item in value._joint_velocity_limits[0].tolist()
+        ]],
+        dtype=torch.float32,
+    )
+    value._apply_call_count = 1
+    value._decimation = 8
+    value._active_episode_index = 0
+    value._current_joint_velocity_recovery_enabled = True
+    value._current_joint_velocity_recovery_phase = "inactive"
+    value._current_joint_velocity_recovery_consecutive_active_substeps = 0
+    value._current_joint_velocity_recovery_consecutive_clean_samples = 0
+    value._current_joint_velocity_recovery_next_release_ramp_index = None
+    value._current_joint_velocity_recovery_events = []
+    value._current_joint_velocity_recovery_events_count = 0
+    value._current_joint_velocity_recovery_active_substeps = 0
+    value._current_joint_velocity_recovery_recovered_events = 0
+    value._current_joint_velocity_recovery_hold_target_applies = 0
+    value._current_joint_velocity_recovery_release_ramp_target_applies = 0
+    value._current_joint_velocity_recovery_transaction_aborts = 0
+    value._current_joint_velocity_recovery_max_consecutive_substeps = 0
+    value._invariant_abort_count = torch.zeros((), dtype=torch.int64)
+    value._guard_diagnostics = []
+    value._guard_diagnostics_dropped = 0
+    value._max_guard_diagnostics = 32
+    value._arm_release_ramp_enabled = True
+    value._arm_target_transaction_failed = False
+    value._gripper_close_arm_interlock_anchor = torch.full((7,), -1.0)
+    value._gripper_close_arm_interlock_remaining = 38
+    value._arm_release_ramp_phase = "release"
+    value._arm_release_ramp_next_index = None
+    value._arm_release_observed_count = 0
+    value._stage_failure_substep_trace = lambda **_kwargs: None
+    return value
+
+
+inactive_transition = robust.advance_current_joint_velocity_recovery(
+    enabled=True,
+    phase_before_apply="inactive",
+    consecutive_active_substeps_before_apply=0,
+    consecutive_clean_samples_before_apply=0,
+    next_release_ramp_index_before_apply=None,
+    measured_velocity_over_envelope=False,
+)
+normal_v5 = recovery_transaction_action()
+normal_v5._set_targets_and_commit_gripper_close_arm_interlock(
+    safe_target,
+    staged,
+    staged_release,
+    None,
+    inactive_transition,
+    safe_target,
+    zero.unsqueeze(0),
+    safe_target,
+    torch.ones((1, 7), dtype=torch.float32),
+    False,
+)
+assert [entry[0] for entry in normal_v5._asset.calls] == ["velocity", "position"]
+assert normal_v5._current_joint_velocity_recovery_events == []
+
+hold_transition = robust.advance_current_joint_velocity_recovery(
+    enabled=True,
+    phase_before_apply="inactive",
+    consecutive_active_substeps_before_apply=0,
+    consecutive_clean_samples_before_apply=0,
+    next_release_ramp_index_before_apply=None,
+    measured_velocity_over_envelope=True,
+)
+recovery_v5 = recovery_transaction_action()
+recovery_trace = {
+    "new_joint_pos_target": safe_target,
+    "new_joint_vel_target": zero.unsqueeze(0),
+    "new_joint_effort_target": zero.unsqueeze(0),
+}
+recovery_v5._set_targets_and_commit_gripper_close_arm_interlock(
+    safe_target,
+    staged,
+    staged_release,
+    recovery_trace,
+    hold_transition,
+    safe_target,
+    torch.tensor([[11.743, 0, 0, 0, 0, 0, 0]], dtype=torch.float32),
+    safe_target,
+    torch.ones((1, 7), dtype=torch.float32),
+    True,
+)
+assert [entry[0] for entry in recovery_v5._asset.calls] == [
+    "position", "velocity", "effort"
+]
+assert recovery_v5._current_joint_velocity_recovery_phase == "hold"
+assert len(recovery_v5._current_joint_velocity_recovery_events) == 1
+assert recovery_v5._current_joint_velocity_recovery_events[0]["end_reason"] is None
+
+for failure in ("effort", "effort_readback"):
+    failed_v5 = recovery_transaction_action(failure)
+    retained_anchor = failed_v5._gripper_close_arm_interlock_anchor
+    try:
+        failed_v5._set_targets_and_commit_gripper_close_arm_interlock(
+            safe_target,
+            staged,
+            staged_release,
+            recovery_trace,
+            hold_transition,
+            safe_target,
+            torch.tensor([[11.743, 0, 0, 0, 0, 0, 0]], dtype=torch.float32),
+            safe_target,
+            torch.ones((1, 7), dtype=torch.float32),
+            True,
+        )
+    except robust.DifferentialIKInvariantError as error:
+        assert "target transaction failed" in str(error)
+    else:
+        raise AssertionError(f"v5 {failure} failure was swallowed")
+    assert [entry[0] for entry in failed_v5._asset.calls] == [
+        "position", "velocity", "effort"
+    ]
+    assert failed_v5._gripper_close_arm_interlock_anchor is retained_anchor
+    assert failed_v5._gripper_close_arm_interlock_remaining == 38
+    assert failed_v5._current_joint_velocity_recovery_transaction_aborts == 1
+    assert failed_v5._current_joint_velocity_recovery_phase == "inactive"
+    assert len(failed_v5._current_joint_velocity_recovery_events) == 1
+    assert failed_v5._current_joint_velocity_recovery_events[0]["end_reason"] == (
+        "transaction_abort"
+    )
+    terminal_snapshot = failed_v5._current_joint_velocity_recovery_events[0]["last"]
+    assert terminal_snapshot["hold_target_rad"] == [0.0] * 7
+    assert terminal_snapshot["hold_position_target_readback_rad"] is None
+    assert terminal_snapshot["hold_velocity_target_readback_rad_s"] is None
+    assert terminal_snapshot["hold_effort_target_readback_nm"] is None
 
 
 class ParentPathAsset:

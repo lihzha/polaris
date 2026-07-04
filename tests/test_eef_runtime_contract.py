@@ -22,6 +22,12 @@ from polaris.eef_runtime_contract import build_eef_controller_repair_candidate_a
 from polaris.eef_runtime_contract import build_terminal_rollout_evidence
 from polaris.eef_runtime_contract import EEF_RUNTIME_CONTRACT_SCHEMA_VERSION
 from polaris.eef_runtime_contract import EEF_SAFETY_SIDECAR_SCHEMA_VERSION
+from polaris.eef_runtime_contract import (
+    EEF_RUNTIME_CONTRACT_VELOCITY_RECOVERY_SCHEMA_VERSION,
+)
+from polaris.eef_runtime_contract import (
+    EEF_SAFETY_SIDECAR_VELOCITY_RECOVERY_SCHEMA_VERSION,
+)
 from polaris.eef_runtime_contract import eef_episode_safety_report
 from polaris.eef_runtime_contract import load_episode_safety_sidecars
 from polaris.eef_runtime_contract import reconcile_episode_safety_transactions
@@ -33,6 +39,7 @@ from polaris import eef_runtime_contract as runtime_contract_module
 from polaris.config import EEF_CONTROLLER_BASELINE_PROFILE
 from polaris.config import EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
 from polaris.config import EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE
+from polaris.config import EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE
 from polaris.eef_controller_profile import eef_controller_profile
 from polaris.eef_controller_repair import ARM_RELEASE_RAMP_FORMULA_PROFILE
 from polaris.eef_controller_repair import ARM_RELEASE_RAMP_FRACTION_PROFILE
@@ -48,11 +55,33 @@ from polaris.eef_gripper_runtime import (
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+from polaris.eef_ik_safety import (
+    EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+)
+from polaris.eef_ik_safety import current_joint_velocity_recovery_envelope
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_CLEAN_SAMPLES_REQUIRED
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_ENVELOPE_FORMULA_PROFILE,
+)
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_HOLD_PROFILE
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS,
+)
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_PREDICTED_POSITION_PROFILE,
+)
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_PROFILE
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_RELATIVE_ENVELOPE_FLOAT32,
+)
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_TRANSACTION_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_ABORT_MESSAGES
 from polaris.eef_ik_safety import current_joint_velocity_abort_evidence_sha256
 from polaris.eef_ik_safety import format_current_joint_velocity_abort_message
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
@@ -407,6 +436,168 @@ def _controller_aggregate(ik_safety: dict) -> dict:
     }
 
 
+def _empty_velocity_recovery_report() -> dict:
+    limits = np.asarray(
+        PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S,
+        dtype=np.float32,
+    ).tolist()
+    envelopes = [current_joint_velocity_recovery_envelope(value) for value in limits]
+    return {
+        "contract": {
+            "schema_version": CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION,
+            "profile": CURRENT_JOINT_VELOCITY_RECOVERY_PROFILE,
+            "envelope_formula_profile": (
+                CURRENT_JOINT_VELOCITY_RECOVERY_ENVELOPE_FORMULA_PROFILE
+            ),
+            "relative_envelope_float32": (
+                CURRENT_JOINT_VELOCITY_RECOVERY_RELATIVE_ENVELOPE_FLOAT32
+            ),
+            "maximum_active_substeps": (
+                CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS
+            ),
+            "clean_samples_required": (
+                CURRENT_JOINT_VELOCITY_RECOVERY_CLEAN_SAMPLES_REQUIRED
+            ),
+            "hold_profile": CURRENT_JOINT_VELOCITY_RECOVERY_HOLD_PROFILE,
+            "predicted_position_profile": (
+                CURRENT_JOINT_VELOCITY_RECOVERY_PREDICTED_POSITION_PROFILE
+            ),
+            "hard_limit_profile": PHYSX_HARD_LIMIT_PROFILE,
+            "release_ramp_profile": ARM_RELEASE_RAMP_PROFILE,
+            "transaction_profile": CURRENT_JOINT_VELOCITY_RECOVERY_TRANSACTION_PROFILE,
+            "joint_names": [f"panda_joint{index}" for index in range(1, 8)],
+            "velocity_limits_rad_s": limits,
+            "velocity_envelopes_rad_s": envelopes,
+        },
+        "state": {
+            "phase": "inactive",
+            "active": False,
+            "consecutive_active_substeps": 0,
+            "consecutive_clean_samples": 0,
+            "release_ramp_next_index": None,
+        },
+        "counters": {
+            "residual_events": 0,
+            "residual_joints": 0,
+            "recovery_events": 0,
+            "recovery_active_substeps": 0,
+            "recovered_events": 0,
+            "hold_target_applies": 0,
+            "release_ramp_target_applies": 0,
+            "sustained_aborts": 0,
+            "predicted_limit_aborts": 0,
+            "transaction_aborts": 0,
+        },
+        "maxima": {
+            "abs_velocity_to_limit_ratio": 0.0,
+            "consecutive_recovery_substeps": 0,
+            "abs_velocity_residual_excess_rad_s": [0.0] * 7,
+        },
+        "events": [],
+    }
+
+
+def _active_velocity_recovery_report(*, apply_index: int) -> dict:
+    report = _empty_velocity_recovery_report()
+    limits = np.asarray(report["contract"]["velocity_limits_rad_s"], dtype=np.float32)
+    velocity = np.asarray([11.743, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    excess = np.maximum(np.abs(velocity) - limits, np.float32(0.0))
+    ratio = (np.abs(velocity) / limits).astype(np.float32)
+    predicted = (
+        np.zeros(7, dtype=np.float32) + velocity * np.float32(1.0 / 120.0)
+    ).astype(np.float32)
+    snapshot = {
+        "apply_index": apply_index,
+        "policy_step": apply_index // 8,
+        "physics_substep": apply_index % 8,
+        "joint_pos_rad": [0.0] * 7,
+        "joint_velocity_rad_s": velocity.tolist(),
+        "joint_velocity_limit_rad_s": limits.tolist(),
+        "joint_velocity_envelope_rad_s": report["contract"]["velocity_envelopes_rad_s"],
+        "joint_velocity_limit_excess_rad_s": excess.tolist(),
+        "velocity_to_limit_ratio": ratio.tolist(),
+        "predicted_joint_pos_rad": predicted.tolist(),
+        "predicted_hard_limit_clearance_rad": [1.0] * 7,
+        "hold_target_rad": [0.0] * 7,
+        "hold_position_target_readback_rad": [0.0] * 7,
+        "hold_velocity_target_readback_rad_s": [0.0] * 7,
+        "hold_effort_target_readback_nm": [0.0] * 7,
+    }
+    report["state"] = {
+        "phase": "hold",
+        "active": True,
+        "consecutive_active_substeps": 1,
+        "consecutive_clean_samples": 0,
+        "release_ramp_next_index": None,
+    }
+    report["counters"].update(
+        {
+            "residual_events": 1,
+            "residual_joints": 1,
+            "recovery_events": 1,
+            "recovery_active_substeps": 1,
+            "hold_target_applies": 1,
+        }
+    )
+    report["maxima"].update(
+        {
+            "abs_velocity_to_limit_ratio": float(ratio.max()),
+            "consecutive_recovery_substeps": 1,
+            "abs_velocity_residual_excess_rad_s": excess.tolist(),
+        }
+    )
+    report["events"] = [
+        {
+            "event_index": 0,
+            "start_apply_index": apply_index,
+            "end_apply_index": None,
+            "start_reason": "measured_velocity_above_float32_envelope",
+            "end_reason": None,
+            "start": copy.deepcopy(snapshot),
+            "last": copy.deepcopy(snapshot),
+        }
+    ]
+    return report
+
+
+def _predicted_terminal_velocity_recovery_report(*, apply_index: int) -> dict:
+    report = _active_velocity_recovery_report(apply_index=apply_index - 1)
+    terminal = copy.deepcopy(report["events"][0]["last"])
+    terminal.update(
+        {
+            "apply_index": apply_index,
+            "policy_step": apply_index // 8,
+            "physics_substep": apply_index % 8,
+            "predicted_hard_limit_clearance_rad": [
+                float(np.float32(-0.01)),
+                *([1.0] * 6),
+            ],
+            "hold_target_rad": None,
+            "hold_position_target_readback_rad": None,
+            "hold_velocity_target_readback_rad_s": None,
+            "hold_effort_target_readback_nm": None,
+        }
+    )
+    report["state"] = {
+        "phase": "inactive",
+        "active": False,
+        "consecutive_active_substeps": 0,
+        "consecutive_clean_samples": 0,
+        "release_ramp_next_index": None,
+    }
+    report["counters"]["residual_events"] = 2
+    report["counters"]["residual_joints"] = 2
+    report["counters"]["predicted_limit_aborts"] = 1
+    report["events"][0].update(
+        {
+            "end_apply_index": apply_index,
+            "end_reason": "predicted_hard_limit_abort",
+            "last": terminal,
+        }
+    )
+    return report
+
+
 def _candidate_controller_report(
     safety: dict,
     *,
@@ -489,6 +680,8 @@ def _candidate_controller_report(
             "max_abs_nominal_to_ramped_target_change_rad": [0.0] * 7,
             "gripper_target_or_state_write_count": 0,
         }
+    if spec.current_joint_velocity_recovery_enabled:
+        report["current_joint_velocity_recovery"] = _empty_velocity_recovery_report()
     return report
 
 
@@ -1595,6 +1788,98 @@ def test_release_ramp_v4_sidecar_and_aggregate_are_profile_bound(
             )
 
 
+def test_velocity_recovery_v5_sidecar_is_schema7_and_profile_bound(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    result = _episode_result(length=450)
+    safety = _attach_candidate_stub_gripper(
+        _episode_safety(length=450),
+        length=450,
+    )
+    safety["profile"] = EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+    safety["current_joint_velocity_abort"] = None
+    safety["current_joint_velocity_recovery"] = _empty_velocity_recovery_report()
+    report = _candidate_controller_report(
+        safety,
+        initial=False,
+        profile=EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+    )
+    trace = _all_six_trace(episode=0, length=450, apply_calls=3600)
+    terminal = _terminal_rollout(result)
+    sidecar_path = tmp_path / "ik_safety" / "episode_000000.json"
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            runtime_contract_module,
+            "validate_eef_gripper_static_contract",
+            lambda value, **_kwargs: dict(value),
+        )
+        patch.setattr(
+            runtime_contract_module,
+            "validate_eef_gripper_dynamic_evidence",
+            lambda value, **_kwargs: dict(value),
+        )
+        patch.setattr(
+            runtime_contract_module,
+            "validate_eef_controller_safety_evidence",
+            lambda *_args, expected_profile, **_kwargs: eef_controller_profile(
+                expected_profile
+            ),
+        )
+        payload = atomic_write_episode_safety(
+            sidecar_path,
+            eef_controller_profile=(EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE),
+            controller_repair_candidate=report,
+            arm_failure_substep_trace=None,
+            all_six_gripper_trace=trace,
+            episode_index=0,
+            episode_result=result,
+            safety=safety,
+            artifact_identity=_artifact_identity_for_terminal(result, terminal),
+            terminal_rollout=terminal,
+            expected_gripper_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+        )
+        assert (
+            payload["schema_version"]
+            == (EEF_SAFETY_SIDECAR_VELOCITY_RECOVERY_SCHEMA_VERSION)
+            == 7
+        )
+        assert (
+            payload["controller_repair_candidate"]["current_joint_velocity_recovery"]
+            == safety["current_joint_velocity_recovery"]
+        )
+
+        sidecars = load_episode_safety_sidecars(
+            sidecar_path.parent,
+            [0],
+            expected_eef_controller_profile=(
+                EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+            ),
+            expected_gripper_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+        )
+        assert sidecars[0]["schema_version"] == 7
+
+        drifted = copy.deepcopy(payload)
+        drifted["schema_version"] = EEF_SAFETY_SIDECAR_SCHEMA_VERSION
+        sidecar_path.write_text(json.dumps(drifted), encoding="utf-8")
+        with pytest.raises(ValueError, match="sidecar identity"):
+            load_episode_safety_sidecars(
+                sidecar_path.parent,
+                [0],
+                expected_eef_controller_profile=(
+                    EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+                ),
+                expected_gripper_target_slew_profile=(
+                    EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+                ),
+            )
+
+
 def test_prepared_sidecar_recovers_exact_missing_csv_row(tmp_path: Path):
     result = _episode_result(length=450)
     safety = _episode_safety(length=450)
@@ -1770,6 +2055,179 @@ def test_runtime_aggregate_reconstructs_all_resume_history(tmp_path: Path):
     assert aggregate["counters"]["environment_substeps"] == 7200
     assert [item["episode_index"] for item in aggregate["episodes"]] == [0, 1]
     assert all(item["sidecar_sha256"] for item in aggregate["episodes"])
+
+
+def test_velocity_recovery_aggregate_and_runtime_contract_are_schema7(
+    tmp_path: Path,
+) -> None:
+    env, observation = _runtime_fixture()
+    result = _episode_result(length=450)
+    safety = _episode_safety(length=450)
+    safety["profile"] = EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+    safety["current_joint_velocity_abort"] = None
+    safety["current_joint_velocity_recovery"] = _empty_velocity_recovery_report()
+    sidecar = {
+        "episode_index": 0,
+        "episode_result": result,
+        "artifact_identity": {},
+        "cadence_evidence": {"apply_calls": 3600},
+        "terminal_rollout": _terminal_rollout(result),
+        "safety": safety,
+        "path": "episode_000000.json",
+        "sha256": "7" * 64,
+    }
+    aggregate = aggregate_episode_safety(
+        safety,
+        [sidecar],
+        expected_eef_controller_profile=(
+            EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+        ),
+    )
+    assert aggregate["profile"] == (EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE)
+    assert (
+        aggregate["episodes"][0]["current_joint_velocity_recovery"]
+        == (safety["current_joint_velocity_recovery"])
+    )
+    controller_aggregate = {
+        "profile": "polaris_eef_controller_repair_candidate_episode_aggregate_v1",
+        "eef_controller_profile": (EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE),
+        "initial": _candidate_controller_report(
+            safety,
+            initial=True,
+            profile=EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+        ),
+        "episodes": [
+            {
+                "episode_index": 0,
+                "report": _candidate_controller_report(
+                    safety,
+                    initial=False,
+                    profile=EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+                ),
+            }
+        ],
+    }
+    frame = validate_eef_runtime_frame(env, observation)
+    frame["ik_safety_profile"] = EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+    path = tmp_path / "velocity-recovery-runtime.json"
+    atomic_write_runtime_contract(
+        path,
+        eef_controller_profile=EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+        controller_repair_candidate=controller_aggregate,
+        protocol=validate_ego_lap_runtime_protocol(env),
+        frame=frame,
+        ik_safety=aggregate,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == (
+        EEF_RUNTIME_CONTRACT_VELOCITY_RECOVERY_SCHEMA_VERSION
+    )
+    drifted = copy.deepcopy(controller_aggregate)
+    drifted["episodes"][0]["report"]["current_joint_velocity_recovery"]["counters"][
+        "residual_events"
+    ] = 1
+    with pytest.raises(ValueError, match="recovery|counter"):
+        atomic_write_runtime_contract(
+            tmp_path / "velocity-recovery-runtime-drift.json",
+            eef_controller_profile=(EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE),
+            controller_repair_candidate=drifted,
+            protocol=validate_ego_lap_runtime_protocol(env),
+            frame=frame,
+            ik_safety=aggregate,
+        )
+
+
+def test_v5_terminal_recovery_binds_exact_event_digest_and_guard() -> None:
+    result = _episode_result(length=2, numerical_failure=True)
+    safety = _episode_safety(
+        length=2,
+        numerical_failure=True,
+        failure_substeps=3,
+    )
+    recovery = _predicted_terminal_velocity_recovery_report(apply_index=10)
+    velocity = recovery["events"][0]["last"]["joint_velocity_rad_s"]
+    safety["profile"] = EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+    safety["current_joint_velocity_abort"] = None
+    safety["current_joint_velocity_recovery"] = recovery
+    safety["maxima"]["abs_joint_vel_rad_s"] = [abs(value) for value in velocity]
+    safety["counters"]["nonfinite_aborts"] = 0
+    safety["counters"]["invariant_aborts"] = 1
+    safety["guard_diagnostics"][0]["kind"] = "predicted_joint_hard_position_limit_abort"
+    encoded = json.dumps(
+        recovery["events"][0],
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    result["numerical_failure_reason"] = (
+        "DifferentialIKInvariantError: "
+        f"{CURRENT_JOINT_VELOCITY_RECOVERY_ABORT_MESSAGES['predicted_hard_limit_abort']} "
+        f"(evidence_sha256={digest})"
+    )
+    validated = validate_episode_safety_cadence(
+        safety=safety,
+        episode_result=result,
+    )
+    assert validated["abort_count"] == 1
+
+    drifted = copy.deepcopy(result)
+    drifted["numerical_failure_reason"] = drifted["numerical_failure_reason"].replace(
+        digest,
+        "0" * 64,
+    )
+    with pytest.raises(ValueError, match="digest binding drift"):
+        validate_episode_safety_cadence(safety=safety, episode_result=drifted)
+
+
+def test_v5_open_recovery_allows_unrelated_digest_abort_and_horizon_reset() -> None:
+    result = _episode_result(length=2, numerical_failure=True)
+    result["numerical_failure_reason"] = (
+        "DifferentialIKNumericalError: unrelated terminal evidence "
+        f"(evidence_sha256={'a' * 64})"
+    )
+    safety = _episode_safety(
+        length=2,
+        numerical_failure=True,
+        failure_substeps=3,
+    )
+    recovery = _active_velocity_recovery_report(apply_index=9)
+    velocity = recovery["events"][0]["last"]["joint_velocity_rad_s"]
+    safety["profile"] = EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+    safety["current_joint_velocity_abort"] = None
+    safety["current_joint_velocity_recovery"] = recovery
+    safety["maxima"]["abs_joint_vel_rad_s"] = [abs(value) for value in velocity]
+    assert (
+        validate_episode_safety_cadence(
+            safety=safety,
+            episode_result=result,
+        )["abort_count"]
+        == 1
+    )
+
+    legacy = copy.deepcopy(safety)
+    legacy["profile"] = EEF_IK_SAFETY_PROFILE
+    legacy.pop("current_joint_velocity_recovery")
+    with pytest.raises(ValueError, match="abort evidence is missing"):
+        validate_episode_safety_cadence(safety=legacy, episode_result=result)
+
+    completed_safety = _episode_safety(length=2)
+    completed_recovery = _active_velocity_recovery_report(apply_index=15)
+    completed_safety["profile"] = EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+    completed_safety["current_joint_velocity_abort"] = None
+    completed_safety["current_joint_velocity_recovery"] = completed_recovery
+    completed_safety["maxima"]["abs_joint_vel_rad_s"] = [
+        abs(value)
+        for value in completed_recovery["events"][0]["last"]["joint_velocity_rad_s"]
+    ]
+    assert (
+        validate_episode_safety_cadence(
+            safety=completed_safety,
+            episode_result=_episode_result(length=2),
+        )["abort_count"]
+        == 0
+    )
 
 
 @pytest.mark.parametrize(

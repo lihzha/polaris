@@ -14,6 +14,7 @@ from polaris.config import EEF_CONTROLLER_BASELINE_PROFILE
 from polaris.config import EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
 from polaris.config import EEF_CONTROLLER_PROFILES
 from polaris.config import EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE
+from polaris.config import EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE
 from polaris.eef_controller_repair import ARM_RELEASE_PHASE_HOLD
 from polaris.eef_controller_repair import ARM_RELEASE_PHASE_RAMP
 from polaris.eef_controller_repair import ARM_RELEASE_PHASE_RELEASE
@@ -42,6 +43,31 @@ from polaris.eef_gripper_failure_trace import (
 )
 from polaris.eef_ik_safety import ARM_SLEW_HEADROOM_CANDIDATE_PROFILE
 from polaris.eef_ik_safety import ARM_SLEW_HEADROOM_RATIO
+from polaris.eef_ik_safety import current_joint_velocity_recovery_envelope
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_CLEAN_SAMPLES_REQUIRED
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_ENVELOPE_FORMULA_PROFILE,
+)
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_END_REASONS
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_HOLD_PROFILE
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS,
+)
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_RELEASE_RAMP
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_PREDICTED_POSITION_PROFILE,
+)
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_PROFILE
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_RELATIVE_ENVELOPE_FLOAT32,
+)
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_START_REASONS
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_TRANSACTION_PROFILE
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+from polaris.eef_ik_safety import PHYSX_HARD_LIMIT_PROFILE
 
 
 ARM_SLEW_HEADROOM_REPORT_FIELDS = {
@@ -132,6 +158,79 @@ ARM_RELEASE_RAMP_COUNTER_FIELDS = (
     "ramp_limited_target_apply_count",
     "ramp_limited_joint_target_count",
 )
+CURRENT_JOINT_VELOCITY_RECOVERY_FIELDS = {
+    "contract",
+    "state",
+    "counters",
+    "maxima",
+    "events",
+}
+CURRENT_JOINT_VELOCITY_RECOVERY_CONTRACT_FIELDS = {
+    "schema_version",
+    "profile",
+    "envelope_formula_profile",
+    "relative_envelope_float32",
+    "maximum_active_substeps",
+    "clean_samples_required",
+    "hold_profile",
+    "predicted_position_profile",
+    "hard_limit_profile",
+    "release_ramp_profile",
+    "transaction_profile",
+    "joint_names",
+    "velocity_limits_rad_s",
+    "velocity_envelopes_rad_s",
+}
+CURRENT_JOINT_VELOCITY_RECOVERY_STATE_FIELDS = {
+    "phase",
+    "active",
+    "consecutive_active_substeps",
+    "consecutive_clean_samples",
+    "release_ramp_next_index",
+}
+CURRENT_JOINT_VELOCITY_RECOVERY_COUNTER_FIELDS = {
+    "residual_events",
+    "residual_joints",
+    "recovery_events",
+    "recovery_active_substeps",
+    "recovered_events",
+    "hold_target_applies",
+    "release_ramp_target_applies",
+    "sustained_aborts",
+    "predicted_limit_aborts",
+    "transaction_aborts",
+}
+CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMA_FIELDS = {
+    "abs_velocity_to_limit_ratio",
+    "consecutive_recovery_substeps",
+    "abs_velocity_residual_excess_rad_s",
+}
+CURRENT_JOINT_VELOCITY_RECOVERY_EVENT_FIELDS = {
+    "event_index",
+    "start_apply_index",
+    "end_apply_index",
+    "start_reason",
+    "end_reason",
+    "start",
+    "last",
+}
+CURRENT_JOINT_VELOCITY_RECOVERY_SNAPSHOT_FIELDS = {
+    "apply_index",
+    "policy_step",
+    "physics_substep",
+    "joint_pos_rad",
+    "joint_velocity_rad_s",
+    "joint_velocity_limit_rad_s",
+    "joint_velocity_envelope_rad_s",
+    "joint_velocity_limit_excess_rad_s",
+    "velocity_to_limit_ratio",
+    "predicted_joint_pos_rad",
+    "predicted_hard_limit_clearance_rad",
+    "hold_target_rad",
+    "hold_position_target_readback_rad",
+    "hold_velocity_target_readback_rad_s",
+    "hold_effort_target_readback_nm",
+}
 
 
 @dataclass(frozen=True)
@@ -144,6 +243,7 @@ class EefControllerProfileSpec:
     arm_slew_headroom_enabled: bool
     gripper_close_arm_interlock_enabled: bool
     arm_release_ramp_enabled: bool
+    current_joint_velocity_recovery_enabled: bool
     target_slew_rate_0p25_enabled: bool
     target_slew_profile: str
     close_interlock_profile: str
@@ -160,6 +260,7 @@ def _profile_spec(
     arm_slew_headroom_enabled: bool,
     gripper_close_arm_interlock_enabled: bool,
     arm_release_ramp_enabled: bool,
+    current_joint_velocity_recovery_enabled: bool,
     target_slew_rate_0p25_enabled: bool,
     target_slew_profile: str,
     mimic_compliance_profile: str | None,
@@ -172,6 +273,9 @@ def _profile_spec(
         arm_slew_headroom_enabled=arm_slew_headroom_enabled,
         gripper_close_arm_interlock_enabled=gripper_close_arm_interlock_enabled,
         arm_release_ramp_enabled=arm_release_ramp_enabled,
+        current_joint_velocity_recovery_enabled=(
+            current_joint_velocity_recovery_enabled
+        ),
         target_slew_rate_0p25_enabled=target_slew_rate_0p25_enabled,
         target_slew_profile=target.profile,
         close_interlock_profile=target.close_interlock_profile,
@@ -190,6 +294,7 @@ _EEF_CONTROLLER_PROFILE_SPECS = MappingProxyType(
             arm_slew_headroom_enabled=False,
             gripper_close_arm_interlock_enabled=False,
             arm_release_ramp_enabled=False,
+            current_joint_velocity_recovery_enabled=False,
             target_slew_rate_0p25_enabled=False,
             target_slew_profile=EEF_GRIPPER_TARGET_SLEW_PROFILE,
             mimic_compliance_profile=None,
@@ -201,6 +306,7 @@ _EEF_CONTROLLER_PROFILE_SPECS = MappingProxyType(
             arm_slew_headroom_enabled=True,
             gripper_close_arm_interlock_enabled=True,
             arm_release_ramp_enabled=False,
+            current_joint_velocity_recovery_enabled=False,
             target_slew_rate_0p25_enabled=True,
             target_slew_profile=(EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE),
             mimic_compliance_profile=EEF_GRIPPER_MIMIC_COMPLIANCE_PROFILE,
@@ -212,6 +318,19 @@ _EEF_CONTROLLER_PROFILE_SPECS = MappingProxyType(
             arm_slew_headroom_enabled=True,
             gripper_close_arm_interlock_enabled=True,
             arm_release_ramp_enabled=True,
+            current_joint_velocity_recovery_enabled=False,
+            target_slew_rate_0p25_enabled=True,
+            target_slew_profile=(EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE),
+            mimic_compliance_profile=EEF_GRIPPER_MIMIC_COMPLIANCE_PROFILE,
+        ),
+        EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE: _profile_spec(
+            profile=EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+            failure_substep_trace_enabled=True,
+            all_six_gripper_trace_enabled=True,
+            arm_slew_headroom_enabled=True,
+            gripper_close_arm_interlock_enabled=True,
+            arm_release_ramp_enabled=True,
+            current_joint_velocity_recovery_enabled=True,
             target_slew_rate_0p25_enabled=True,
             target_slew_profile=(EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE),
             mimic_compliance_profile=EEF_GRIPPER_MIMIC_COMPLIANCE_PROFILE,
@@ -308,6 +427,10 @@ def validate_eef_controller_profile_config(
             getattr(arm, "enable_arm_release_ramp", None),
             field="arm.enable_arm_release_ramp",
         ),
+        "current_joint_velocity_recovery": _config_bool(
+            getattr(arm, "enable_current_joint_velocity_recovery", None),
+            field="arm.enable_current_joint_velocity_recovery",
+        ),
         "target_slew_rate_0p25": _config_bool(
             getattr(finger, "enable_target_slew_rate_0p25_candidate", None),
             field="finger.enable_target_slew_rate_0p25_candidate",
@@ -319,6 +442,9 @@ def validate_eef_controller_profile_config(
         "arm_slew_headroom": spec.arm_slew_headroom_enabled,
         "gripper_close_arm_interlock": (spec.gripper_close_arm_interlock_enabled),
         "arm_release_ramp": spec.arm_release_ramp_enabled,
+        "current_joint_velocity_recovery": (
+            spec.current_joint_velocity_recovery_enabled
+        ),
         "target_slew_rate_0p25": spec.target_slew_rate_0p25_enabled,
     }
     if actual != expected:
@@ -420,6 +546,7 @@ def configure_eef_controller_profile(
         "enable_arm_slew_headroom",
         "enable_gripper_close_arm_interlock",
         "enable_arm_release_ramp",
+        "enable_current_joint_velocity_recovery",
     )
     for field in candidate_flags:
         if _config_bool(getattr(arm, field, None), field=f"arm.{field}"):
@@ -444,6 +571,9 @@ def configure_eef_controller_profile(
     arm.enable_arm_slew_headroom = True
     arm.enable_gripper_close_arm_interlock = True
     arm.enable_arm_release_ramp = spec.arm_release_ramp_enabled
+    arm.enable_current_joint_velocity_recovery = (
+        spec.current_joint_velocity_recovery_enabled
+    )
     finger.enable_target_slew_rate_0p25_candidate = True
     finger.class_type = make_eef_all_six_gripper_failure_trace_class(finger.class_type)
     configure_eef_gripper_mimic_compliance_spawn_overlay(
@@ -583,6 +713,387 @@ def _is_exact_float32(value: Any) -> bool:
     return float(value) == round_trip
 
 
+def _finite_signed_vector(value: Any, *, field: str) -> list[float]:
+    if (
+        not isinstance(value, list)
+        or len(value) != 7
+        or any(
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(float(item))
+            or not _is_exact_float32(item)
+            for item in value
+        )
+    ):
+        raise ValueError(f"PolaRiS EEF velocity-recovery {field} vector drift")
+    return [float(item) for item in value]
+
+
+def validate_current_joint_velocity_recovery_report(
+    value: Any,
+    *,
+    apply_calls: int,
+) -> dict[str, Any]:
+    """Validate the complete additive v5 recovery report and event history."""
+
+    if type(apply_calls) is not int or apply_calls < 0:
+        raise ValueError("PolaRiS EEF velocity-recovery apply cadence drift")
+    if (
+        not isinstance(value, dict)
+        or set(value) != CURRENT_JOINT_VELOCITY_RECOVERY_FIELDS
+    ):
+        raise ValueError("PolaRiS EEF velocity-recovery report schema drift")
+    contract = value.get("contract")
+    if (
+        not isinstance(contract, dict)
+        or set(contract) != CURRENT_JOINT_VELOCITY_RECOVERY_CONTRACT_FIELDS
+    ):
+        raise ValueError("PolaRiS EEF velocity-recovery contract schema drift")
+    exact_contract = {
+        "schema_version": CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION,
+        "profile": CURRENT_JOINT_VELOCITY_RECOVERY_PROFILE,
+        "envelope_formula_profile": (
+            CURRENT_JOINT_VELOCITY_RECOVERY_ENVELOPE_FORMULA_PROFILE
+        ),
+        "relative_envelope_float32": (
+            CURRENT_JOINT_VELOCITY_RECOVERY_RELATIVE_ENVELOPE_FLOAT32
+        ),
+        "maximum_active_substeps": (
+            CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS
+        ),
+        "clean_samples_required": (
+            CURRENT_JOINT_VELOCITY_RECOVERY_CLEAN_SAMPLES_REQUIRED
+        ),
+        "hold_profile": CURRENT_JOINT_VELOCITY_RECOVERY_HOLD_PROFILE,
+        "predicted_position_profile": (
+            CURRENT_JOINT_VELOCITY_RECOVERY_PREDICTED_POSITION_PROFILE
+        ),
+        "hard_limit_profile": PHYSX_HARD_LIMIT_PROFILE,
+        "release_ramp_profile": ARM_RELEASE_RAMP_PROFILE,
+        "transaction_profile": CURRENT_JOINT_VELOCITY_RECOVERY_TRANSACTION_PROFILE,
+        "joint_names": [f"panda_joint{index}" for index in range(1, 8)],
+    }
+    if any(
+        contract.get(field) != expected for field, expected in exact_contract.items()
+    ):
+        raise ValueError("PolaRiS EEF velocity-recovery contract identity drift")
+    limits = _finite_vector(
+        contract.get("velocity_limits_rad_s"), field="velocity limits"
+    )
+    envelopes = _finite_vector(
+        contract.get("velocity_envelopes_rad_s"), field="velocity envelopes"
+    )
+    expected_limits = [
+        struct.unpack("<f", struct.pack("<f", float(value)))[0]
+        for value in PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+    ]
+    expected_envelopes = [
+        current_joint_velocity_recovery_envelope(limit) for limit in expected_limits
+    ]
+    if limits != expected_limits or envelopes != expected_envelopes:
+        raise ValueError("PolaRiS EEF velocity-recovery envelope binding drift")
+
+    state = value.get("state")
+    if (
+        not isinstance(state, dict)
+        or set(state) != CURRENT_JOINT_VELOCITY_RECOVERY_STATE_FIELDS
+    ):
+        raise ValueError("PolaRiS EEF velocity-recovery state schema drift")
+    phase = state.get("phase")
+    active = state.get("active")
+    consecutive = state.get("consecutive_active_substeps")
+    clean = state.get("consecutive_clean_samples")
+    next_index = state.get("release_ramp_next_index")
+    if (
+        phase
+        not in (
+            CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE,
+            CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD,
+            CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_RELEASE_RAMP,
+        )
+        or type(active) is not bool
+        or active is (phase == CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE)
+        or type(consecutive) is not int
+        or not 0
+        <= consecutive
+        <= CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS
+        or type(clean) is not int
+        or not 0 <= clean < CURRENT_JOINT_VELOCITY_RECOVERY_CLEAN_SAMPLES_REQUIRED
+        or (phase == CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD)
+        is not (consecutive > 0)
+        or (phase == CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_RELEASE_RAMP)
+        is (next_index is None)
+        or (
+            next_index is not None
+            and (
+                type(next_index) is not int
+                or not 0 <= next_index < ARM_RELEASE_RAMP_SUBSTEPS
+            )
+        )
+    ):
+        raise ValueError("PolaRiS EEF velocity-recovery lifecycle drift")
+
+    counters = value.get("counters")
+    if (
+        not isinstance(counters, dict)
+        or set(counters) != CURRENT_JOINT_VELOCITY_RECOVERY_COUNTER_FIELDS
+        or any(type(item) is not int or item < 0 for item in counters.values())
+    ):
+        raise ValueError("PolaRiS EEF velocity-recovery counter schema drift")
+    if (
+        counters["residual_events"] > apply_calls
+        or not counters["residual_events"]
+        <= counters["residual_joints"]
+        <= 7 * counters["residual_events"]
+        or counters["recovery_events"] > apply_calls
+        or counters["recovery_active_substeps"] != counters["hold_target_applies"]
+        or counters["recovery_active_substeps"] > apply_calls
+        or counters["release_ramp_target_applies"] > apply_calls
+        or counters["release_ramp_target_applies"]
+        < ARM_RELEASE_RAMP_SUBSTEPS * counters["recovered_events"]
+        or counters["recovered_events"] > counters["recovery_events"]
+        or counters["sustained_aborts"]
+        + counters["predicted_limit_aborts"]
+        + counters["transaction_aborts"]
+        > counters["recovery_events"]
+    ):
+        raise ValueError("PolaRiS EEF velocity-recovery counter history drift")
+    maxima = value.get("maxima")
+    if (
+        not isinstance(maxima, dict)
+        or set(maxima) != CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMA_FIELDS
+        or isinstance(maxima.get("abs_velocity_to_limit_ratio"), bool)
+        or not isinstance(maxima.get("abs_velocity_to_limit_ratio"), (int, float))
+        or not math.isfinite(float(maxima["abs_velocity_to_limit_ratio"]))
+        or not _is_exact_float32(maxima["abs_velocity_to_limit_ratio"])
+        or float(maxima["abs_velocity_to_limit_ratio"]) < 0.0
+        or type(maxima.get("consecutive_recovery_substeps")) is not int
+        or not 0
+        <= maxima["consecutive_recovery_substeps"]
+        <= CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS
+    ):
+        raise ValueError("PolaRiS EEF velocity-recovery maxima schema drift")
+    residual_maxima = _finite_vector(
+        maxima.get("abs_velocity_residual_excess_rad_s"),
+        field="residual maximum",
+    )
+    if (
+        any(not _is_exact_float32(item) for item in residual_maxima)
+        or maxima["consecutive_recovery_substeps"] < consecutive
+        or (counters["residual_events"] == 0)
+        is not (
+            float(maxima["abs_velocity_to_limit_ratio"]) <= 1.0
+            and all(item == 0.0 for item in residual_maxima)
+        )
+    ):
+        raise ValueError("PolaRiS EEF velocity-recovery maxima history drift")
+
+    events = value.get("events")
+    if not isinstance(events, list) or len(events) != counters["recovery_events"]:
+        raise ValueError("PolaRiS EEF velocity-recovery event count drift")
+    active_event_count = 0
+    previous_end_index: int | None = None
+    end_reason_counts = {
+        reason: 0 for reason in CURRENT_JOINT_VELOCITY_RECOVERY_END_REASONS
+    }
+    observed_event_max_ratio = 0.0
+    observed_event_max_excess = [0.0] * 7
+    for event_index, event in enumerate(events):
+        if (
+            not isinstance(event, dict)
+            or set(event) != CURRENT_JOINT_VELOCITY_RECOVERY_EVENT_FIELDS
+        ):
+            raise ValueError("PolaRiS EEF velocity-recovery event schema drift")
+        if (
+            event.get("event_index") != event_index
+            or type(event.get("start_apply_index")) is not int
+            or not 0 <= event["start_apply_index"] < apply_calls
+            or event.get("start_reason")
+            not in CURRENT_JOINT_VELOCITY_RECOVERY_START_REASONS
+            or (
+                previous_end_index is not None
+                and event["start_apply_index"] <= previous_end_index
+            )
+        ):
+            raise ValueError("PolaRiS EEF velocity-recovery event identity drift")
+        end_reason = event.get("end_reason")
+        end_index = event.get("end_apply_index")
+        if end_reason is None:
+            active_event_count += 1
+            if end_index is not None or event_index != len(events) - 1:
+                raise ValueError("PolaRiS EEF active recovery event has an end index")
+        elif (
+            end_reason not in CURRENT_JOINT_VELOCITY_RECOVERY_END_REASONS
+            or type(end_index) is not int
+            or not event["start_apply_index"] <= end_index < apply_calls
+        ):
+            raise ValueError("PolaRiS EEF recovery event termination drift")
+        else:
+            end_reason_counts[end_reason] += 1
+            previous_end_index = end_index
+        for snapshot_field in ("start", "last"):
+            snapshot = event.get(snapshot_field)
+            if (
+                not isinstance(snapshot, dict)
+                or set(snapshot) != CURRENT_JOINT_VELOCITY_RECOVERY_SNAPSHOT_FIELDS
+                or type(snapshot.get("apply_index")) is not int
+                or not 0 <= snapshot["apply_index"] < apply_calls
+                or snapshot.get("policy_step") != snapshot["apply_index"] // 8
+                or snapshot.get("physics_substep") != snapshot["apply_index"] % 8
+            ):
+                raise ValueError("PolaRiS EEF recovery event snapshot identity drift")
+            joint_velocity = _finite_signed_vector(
+                snapshot.get("joint_velocity_rad_s"), field="joint_velocity_rad_s"
+            )
+            snapshot_limits = _finite_signed_vector(
+                snapshot.get("joint_velocity_limit_rad_s"),
+                field="joint_velocity_limit_rad_s",
+            )
+            snapshot_envelopes = _finite_signed_vector(
+                snapshot.get("joint_velocity_envelope_rad_s"),
+                field="joint_velocity_envelope_rad_s",
+            )
+            recorded_excess = _finite_signed_vector(
+                snapshot.get("joint_velocity_limit_excess_rad_s"),
+                field="joint_velocity_limit_excess_rad_s",
+            )
+            recorded_ratio = _finite_signed_vector(
+                snapshot.get("velocity_to_limit_ratio"),
+                field="velocity_to_limit_ratio",
+            )
+            for vector_field in (
+                "joint_pos_rad",
+                "predicted_joint_pos_rad",
+                "predicted_hard_limit_clearance_rad",
+            ):
+                _finite_signed_vector(snapshot.get(vector_field), field=vector_field)
+            expected_excess = [
+                max(
+                    struct.unpack("<f", struct.pack("<f", abs(velocity) - limit))[0],
+                    0.0,
+                )
+                for velocity, limit in zip(joint_velocity, snapshot_limits, strict=True)
+            ]
+            expected_ratio = [
+                struct.unpack("<f", struct.pack("<f", abs(velocity) / limit))[0]
+                for velocity, limit in zip(joint_velocity, snapshot_limits, strict=True)
+            ]
+            if (
+                any(item < 0.0 for item in recorded_excess)
+                or any(item < 0.0 for item in recorded_ratio)
+                or recorded_excess != expected_excess
+                or recorded_ratio != expected_ratio
+            ):
+                raise ValueError("PolaRiS EEF recovery snapshot numeric binding drift")
+            observed_event_max_ratio = max(
+                observed_event_max_ratio, max(recorded_ratio)
+            )
+            observed_event_max_excess = [
+                max(previous, current)
+                for previous, current in zip(
+                    observed_event_max_excess,
+                    recorded_excess,
+                    strict=True,
+                )
+            ]
+            hold_target = snapshot.get("hold_target_rad")
+            transaction_readbacks = [
+                snapshot.get(field)
+                for field in (
+                    "hold_position_target_readback_rad",
+                    "hold_velocity_target_readback_rad_s",
+                    "hold_effort_target_readback_nm",
+                )
+            ]
+            # A pre-transaction terminal snapshot may know the target while
+            # carrying no readback: the setter/readback failure is precisely
+            # why no successful transaction evidence exists.  Once any
+            # readback is present, however, all three target surfaces and the
+            # target they bind must be closed together.
+            if any(item is not None for item in transaction_readbacks) and (
+                hold_target is None
+                or any(item is None for item in transaction_readbacks)
+            ):
+                raise ValueError("PolaRiS EEF recovery transaction snapshot split")
+            for item in (hold_target, *transaction_readbacks):
+                if item is not None:
+                    _finite_signed_vector(item, field="transaction readback")
+            if all(item is not None for item in transaction_readbacks):
+                if (
+                    transaction_readbacks[0] != hold_target
+                    or any(value != 0.0 for value in transaction_readbacks[1])
+                    or any(value != 0.0 for value in transaction_readbacks[2])
+                ):
+                    raise ValueError(
+                        "PolaRiS EEF recovery transaction readback binding drift"
+                    )
+            if snapshot_limits != limits or snapshot_envelopes != envelopes:
+                raise ValueError("PolaRiS EEF recovery snapshot static binding drift")
+        start_snapshot = event["start"]
+        last_snapshot = event["last"]
+        if (
+            start_snapshot["apply_index"] != event["start_apply_index"]
+            or last_snapshot["apply_index"] < start_snapshot["apply_index"]
+            or (
+                end_reason is not None
+                and last_snapshot["apply_index"] != event["end_apply_index"]
+            )
+        ):
+            raise ValueError("PolaRiS EEF recovery event snapshot cadence drift")
+        if end_reason in (
+            "sustained_recovery_abort",
+            "current_hard_limit_abort",
+            "predicted_hard_limit_abort",
+            "transaction_abort",
+        ):
+            terminal_readbacks = [
+                last_snapshot[field]
+                for field in (
+                    "hold_position_target_readback_rad",
+                    "hold_velocity_target_readback_rad_s",
+                    "hold_effort_target_readback_nm",
+                )
+            ]
+            if any(item is not None for item in terminal_readbacks) or (
+                end_reason != "transaction_abort"
+                and last_snapshot["hold_target_rad"] is not None
+            ):
+                raise ValueError("PolaRiS EEF terminal recovery retained readbacks")
+        elif end_reason == "clean2_release_ramp_complete" or end_reason is None:
+            last_readbacks = [
+                last_snapshot[field]
+                for field in (
+                    "hold_position_target_readback_rad",
+                    "hold_velocity_target_readback_rad_s",
+                    "hold_effort_target_readback_nm",
+                )
+            ]
+            if any(item is None for item in last_readbacks):
+                raise ValueError("PolaRiS EEF live/completed recovery lacks readbacks")
+    if active_event_count != int(active):
+        raise ValueError("PolaRiS EEF velocity-recovery active event drift")
+    expected_end_counts = {
+        "clean2_release_ramp_complete": counters["recovered_events"],
+        "sustained_recovery_abort": counters["sustained_aborts"],
+        "predicted_hard_limit_abort": counters["predicted_limit_aborts"],
+        "transaction_abort": counters["transaction_aborts"],
+    }
+    if any(
+        end_reason_counts[reason] != expected
+        for reason, expected in expected_end_counts.items()
+    ) or (
+        float(maxima["abs_velocity_to_limit_ratio"]) < observed_event_max_ratio
+        or any(
+            maximum < observed
+            for maximum, observed in zip(
+                residual_maxima, observed_event_max_excess, strict=True
+            )
+        )
+    ):
+        raise ValueError("PolaRiS EEF velocity-recovery event history drift")
+    return dict(value)
+
+
 def validate_eef_controller_repair_candidate_report(
     report: Any,
     *,
@@ -614,6 +1125,8 @@ def validate_eef_controller_repair_candidate_report(
     }
     if spec.arm_release_ramp_enabled:
         expected_report_fields.add("arm_release_ramp")
+    if spec.current_joint_velocity_recovery_enabled:
+        expected_report_fields.add("current_joint_velocity_recovery")
     if not isinstance(report, dict) or set(report) != expected_report_fields:
         raise ValueError("PolaRiS EEF controller runtime report schema drift")
     arm = report.get("arm_slew_headroom")
@@ -933,6 +1446,14 @@ def validate_eef_controller_repair_candidate_report(
             )
     elif ramp is not None:
         raise ValueError("Non-ramp PolaRiS EEF controller has release-ramp evidence")
+    recovery = report.get("current_joint_velocity_recovery")
+    if spec.current_joint_velocity_recovery_enabled:
+        validate_current_joint_velocity_recovery_report(
+            recovery,
+            apply_calls=apply_calls,
+        )
+    elif recovery is not None:
+        raise ValueError("Non-v5 PolaRiS EEF controller has velocity-recovery evidence")
     if require_initial_state and (
         apply_calls != 0
         or committed_apply_calls != 0
@@ -955,6 +1476,21 @@ def validate_eef_controller_repair_candidate_report(
                     value != 0.0
                     for value in ramp["max_abs_nominal_to_ramped_target_change_rad"]
                 )
+            )
+        )
+        or (
+            spec.current_joint_velocity_recovery_enabled
+            and (
+                recovery["state"]
+                != {
+                    "phase": CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE,
+                    "active": False,
+                    "consecutive_active_substeps": 0,
+                    "consecutive_clean_samples": 0,
+                    "release_ramp_next_index": None,
+                }
+                or any(recovery["counters"].values())
+                or recovery["events"]
             )
         )
     ):
