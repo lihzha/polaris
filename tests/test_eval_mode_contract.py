@@ -7,6 +7,7 @@ import pytest
 
 from polaris.config import EEF_CONTROLLER_BASELINE_PROFILE
 from polaris.config import EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
+from polaris.config import EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE
 from polaris.config import EvalArgs, PolicyArgs, validate_policy_control_mode
 
 
@@ -53,23 +54,25 @@ def test_ego_lap_requires_eef_controller() -> None:
 
 
 def test_candidate_profile_requires_exact_ego_lap_eef_pairing() -> None:
-    validate_policy_control_mode(
-        _eval_args(
-            client="EgoLAPEefPose",
-            control_mode="eef-pose",
-            eef_controller_profile=(EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE),
-        )
-    )
-    with pytest.raises(ValueError, match="mimic-compliance"):
+    for profile in (
+        EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE,
+        EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+    ):
         validate_policy_control_mode(
             _eval_args(
-                client="DroidJointPos",
-                control_mode="joint-position",
-                eef_controller_profile=(
-                    EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
-                ),
+                client="EgoLAPEefPose",
+                control_mode="eef-pose",
+                eef_controller_profile=profile,
             )
         )
+        with pytest.raises(ValueError, match="mimic-compliance"):
+            validate_policy_control_mode(
+                _eval_args(
+                    client="DroidJointPos",
+                    control_mode="joint-position",
+                    eef_controller_profile=profile,
+                )
+            )
 
 
 def test_unknown_controller_profile_fails_before_isaac_launch() -> None:

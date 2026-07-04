@@ -169,6 +169,7 @@ def main(eval_args: EvalArgs):
             f"profile={controller_profile.profile};"
             f"target_slew={controller_profile.target_slew_profile};"
             f"fixed_activation_anchor={controller_profile.fixed_activation_anchor};"
+            f"arm_release_ramp={controller_profile.arm_release_ramp_enabled};"
             "mimic_compliance="
             f"{controller_profile.mimic_compliance_profile}",
             flush=True,

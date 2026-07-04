@@ -4,6 +4,15 @@ import pytest
 import torch
 
 from polaris.eef_controller_repair import (
+    advance_arm_release_ramp,
+    apply_arm_release_ramp_target,
+    ARM_RELEASE_PHASE_HOLD,
+    ARM_RELEASE_PHASE_RAMP,
+    ARM_RELEASE_PHASE_RELEASE,
+    ARM_RELEASE_RAMP_SUBSTEPS,
+    arm_release_ramp_fraction,
+)
+from polaris.eef_controller_repair import (
     advance_gripper_close_arm_interlock as _advance_gripper_close_arm_interlock,
 )
 from polaris.eef_controller_repair import bound_joint_position_target
@@ -49,6 +58,271 @@ def test_candidate_constants_are_bounded_and_exact():
     assert slow.fixed_activation_anchor is True
     baseline = eef_gripper_target_slew_profile(EEF_GRIPPER_TARGET_SLEW_PROFILE)
     assert baseline.fixed_activation_anchor is False
+
+
+def test_release_ramp_fractions_are_closed_float32_endpoints():
+    fractions = [
+        arm_release_ramp_fraction(index) for index in range(ARM_RELEASE_RAMP_SUBSTEPS)
+    ]
+    assert fractions[0] == 0.0
+    assert fractions[-1] == 1.0
+    assert fractions == sorted(fractions)
+    assert all(
+        float(torch.tensor(value, dtype=torch.float32).item()) == value
+        for value in fractions
+    )
+    for invalid in (-1, ARM_RELEASE_RAMP_SUBSTEPS, True, 0.0):
+        with pytest.raises(ValueError, match="index drift"):
+            arm_release_ramp_fraction(invalid)
+
+
+def test_release_ramp_target_preserves_exact_endpoints_and_float32_clamp():
+    current = torch.tensor([[0.0, 0.4, -0.4]], dtype=torch.float32)
+    nominal = torch.tensor([[0.09, 0.35, -0.31]], dtype=torch.float32)
+    maximum = torch.tensor([[0.095, 0.095, 0.095]], dtype=torch.float32)
+
+    first = apply_arm_release_ramp_target(current, nominal, maximum, ramp_index=0)
+    middle = apply_arm_release_ramp_target(current, nominal, maximum, ramp_index=8)
+    last = apply_arm_release_ramp_target(current, nominal, maximum, ramp_index=15)
+
+    assert torch.equal(first.target, current)
+    assert first.limited_joint_mask.tolist() == [[True, True, True]]
+    fraction = torch.tensor(8 / 15, dtype=torch.float32)
+    expected = current + torch.clamp(
+        nominal - current,
+        min=-(maximum * fraction),
+        max=maximum * fraction,
+    )
+    assert torch.equal(middle.target, expected)
+    assert torch.equal(last.target, nominal)
+    assert not last.limited_joint_mask.any()
+    assert first.target.data_ptr() != current.data_ptr()
+    assert last.target.data_ptr() != nominal.data_ptr()
+
+
+def test_release_ramp_target_matches_randomized_float32_reference():
+    generator = torch.Generator().manual_seed(42)
+    maximum = torch.tensor(
+        [[0.0172187518] * 4 + [0.0206624996] * 3], dtype=torch.float32
+    )
+    for _ in range(100):
+        current = torch.rand((1, 7), generator=generator, dtype=torch.float32) - 0.5
+        raw_delta = (
+            torch.rand((1, 7), generator=generator, dtype=torch.float32) - 0.5
+        ) * 0.1
+        nominal = current + torch.clamp(
+            raw_delta,
+            min=-maximum,
+            max=maximum,
+        )
+        for index in range(ARM_RELEASE_RAMP_SUBSTEPS):
+            result = apply_arm_release_ramp_target(
+                current,
+                nominal,
+                maximum,
+                ramp_index=index,
+            )
+            if index == 0:
+                expected = current
+            elif index == ARM_RELEASE_RAMP_SUBSTEPS - 1:
+                expected = nominal
+            else:
+                fraction = torch.tensor(index / 15, dtype=torch.float32)
+                bound = maximum * fraction
+                expected = current + torch.clamp(
+                    nominal - current,
+                    min=-bound,
+                    max=bound,
+                )
+            assert torch.equal(result.target, expected)
+            assert result.target.dtype == torch.float32
+            assert torch.isfinite(result.target).all()
+
+
+def test_release_ramp_natural_completion_starts_on_following_apply():
+    transition = advance_arm_release_ramp(
+        enabled=True,
+        phase_before_apply=ARM_RELEASE_PHASE_HOLD,
+        next_ramp_index_before_apply=None,
+        interlock_remaining_before_apply=1,
+        interlock_active_this_apply=True,
+        interlock_remaining_after_apply=0,
+        interlock_activation_count_delta=0,
+    )
+    assert transition.phase_after_successful_apply == ARM_RELEASE_PHASE_RAMP
+    assert transition.ramp_index_to_apply is None
+    assert transition.next_ramp_index_after_successful_apply == 0
+    assert transition.release_observed_delta == 1
+    assert transition.ramp_started_delta == 1
+
+    indices = []
+    phase = transition.phase_after_successful_apply
+    next_index = transition.next_ramp_index_after_successful_apply
+    for _ in range(ARM_RELEASE_RAMP_SUBSTEPS):
+        transition = advance_arm_release_ramp(
+            enabled=True,
+            phase_before_apply=phase,
+            next_ramp_index_before_apply=next_index,
+            interlock_remaining_before_apply=0,
+            interlock_active_this_apply=False,
+            interlock_remaining_after_apply=0,
+            interlock_activation_count_delta=0,
+        )
+        indices.append(transition.ramp_index_to_apply)
+        phase = transition.phase_after_successful_apply
+        next_index = transition.next_ramp_index_after_successful_apply
+    assert indices == list(range(ARM_RELEASE_RAMP_SUBSTEPS))
+    assert phase == ARM_RELEASE_PHASE_RELEASE
+    assert next_index is None
+    assert transition.ramp_completed_delta == 1
+
+
+def test_release_ramp_open_cancel_starts_immediately_and_open_is_idempotent():
+    opened = advance_arm_release_ramp(
+        enabled=True,
+        phase_before_apply=ARM_RELEASE_PHASE_HOLD,
+        next_ramp_index_before_apply=None,
+        interlock_remaining_before_apply=42,
+        interlock_active_this_apply=False,
+        interlock_remaining_after_apply=0,
+        interlock_activation_count_delta=0,
+    )
+    assert opened.phase_after_successful_apply == ARM_RELEASE_PHASE_RAMP
+    assert opened.ramp_index_to_apply == 0
+    assert opened.next_ramp_index_after_successful_apply == 1
+    assert opened.release_observed_delta == 1
+
+    repeated_open = advance_arm_release_ramp(
+        enabled=True,
+        phase_before_apply=opened.phase_after_successful_apply,
+        next_ramp_index_before_apply=opened.next_ramp_index_after_successful_apply,
+        interlock_remaining_before_apply=0,
+        interlock_active_this_apply=False,
+        interlock_remaining_after_apply=0,
+        interlock_activation_count_delta=0,
+    )
+    assert repeated_open.ramp_index_to_apply == 1
+    assert repeated_open.release_observed_delta == 0
+    assert repeated_open.ramp_started_delta == 0
+
+
+def test_release_ramp_close_reactivation_atomically_returns_to_hold():
+    transition = advance_arm_release_ramp(
+        enabled=True,
+        phase_before_apply=ARM_RELEASE_PHASE_RAMP,
+        next_ramp_index_before_apply=7,
+        interlock_remaining_before_apply=0,
+        interlock_active_this_apply=True,
+        interlock_remaining_after_apply=85,
+        interlock_activation_count_delta=1,
+    )
+    assert transition.phase_after_successful_apply == ARM_RELEASE_PHASE_HOLD
+    assert transition.ramp_index_to_apply is None
+    assert transition.next_ramp_index_after_successful_apply is None
+    assert transition.ramp_cancelled_by_reactivation_delta == 1
+
+
+def test_profile_bound_86_hold_then_exact_16_release_targets():
+    phase = ARM_RELEASE_PHASE_RELEASE
+    next_index = None
+    remaining = 0
+    endpoint_observed = False
+    observed_changes = 0
+    for apply_index in range(86):
+        interlock = _advance_gripper_close_arm_interlock(
+            enabled=True,
+            previous_endpoint_change_count=observed_changes,
+            current_endpoint_change_count=0,
+            endpoint_observed_before_apply=endpoint_observed,
+            endpoint_is_closed=True,
+            remaining_before_apply=remaining,
+            configured_substeps=86,
+        )
+        ramp = advance_arm_release_ramp(
+            enabled=True,
+            phase_before_apply=phase,
+            next_ramp_index_before_apply=next_index,
+            interlock_remaining_before_apply=remaining,
+            interlock_active_this_apply=interlock.active,
+            interlock_remaining_after_apply=(
+                interlock.remaining_after_successful_apply
+            ),
+            interlock_activation_count_delta=interlock.activation_count_delta,
+        )
+        assert ramp.ramp_index_to_apply is None
+        remaining = interlock.remaining_after_successful_apply
+        endpoint_observed = interlock.endpoint_observed_after_successful_apply
+        observed_changes = interlock.observed_endpoint_change_count
+        phase = ramp.phase_after_successful_apply
+        next_index = ramp.next_ramp_index_after_successful_apply
+        if apply_index < 85:
+            assert phase == ARM_RELEASE_PHASE_HOLD
+        else:
+            assert phase == ARM_RELEASE_PHASE_RAMP
+            assert next_index == 0
+
+    applied_indices = []
+    for _ in range(ARM_RELEASE_RAMP_SUBSTEPS):
+        interlock = _advance_gripper_close_arm_interlock(
+            enabled=True,
+            previous_endpoint_change_count=observed_changes,
+            current_endpoint_change_count=0,
+            endpoint_observed_before_apply=True,
+            endpoint_is_closed=True,
+            remaining_before_apply=remaining,
+            configured_substeps=86,
+        )
+        ramp = advance_arm_release_ramp(
+            enabled=True,
+            phase_before_apply=phase,
+            next_ramp_index_before_apply=next_index,
+            interlock_remaining_before_apply=remaining,
+            interlock_active_this_apply=interlock.active,
+            interlock_remaining_after_apply=(
+                interlock.remaining_after_successful_apply
+            ),
+            interlock_activation_count_delta=interlock.activation_count_delta,
+        )
+        applied_indices.append(ramp.ramp_index_to_apply)
+        phase = ramp.phase_after_successful_apply
+        next_index = ramp.next_ramp_index_after_successful_apply
+    assert applied_indices == list(range(16))
+    assert phase == ARM_RELEASE_PHASE_RELEASE
+    assert next_index is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"phase_before_apply": "unknown"},
+        {
+            "phase_before_apply": ARM_RELEASE_PHASE_RAMP,
+            "next_ramp_index_before_apply": None,
+        },
+        {
+            "phase_before_apply": ARM_RELEASE_PHASE_RELEASE,
+            "next_ramp_index_before_apply": 0,
+        },
+        {
+            "phase_before_apply": ARM_RELEASE_PHASE_HOLD,
+            "interlock_remaining_before_apply": 0,
+        },
+        {"interlock_activation_count_delta": 2},
+    ],
+)
+def test_release_ramp_rejects_state_machine_drift(kwargs):
+    arguments = {
+        "enabled": True,
+        "phase_before_apply": ARM_RELEASE_PHASE_RELEASE,
+        "next_ramp_index_before_apply": None,
+        "interlock_remaining_before_apply": 0,
+        "interlock_active_this_apply": False,
+        "interlock_remaining_after_apply": 0,
+        "interlock_activation_count_delta": 0,
+    }
+    arguments.update(kwargs)
+    with pytest.raises(ValueError, match="release-ramp"):
+        advance_arm_release_ramp(**arguments)
 
 
 def test_pure_interlock_uses_the_explicit_profile_bound_duration():
@@ -446,6 +720,7 @@ def test_controller_candidates_are_explicit_default_off_config_and_wired():
     source = (ROOT / "src/polaris/robust_differential_ik.py").read_text()
     assert source.count("enable_arm_slew_headroom: bool = False") == 1
     assert source.count("enable_gripper_close_arm_interlock: bool = False") == 1
+    assert source.count("enable_arm_release_ramp: bool = False") == 1
     assert "self._nominal_max_delta_joint_pos" in source
     assert "ARM_SLEW_HEADROOM_RATIO if self._arm_slew_headroom_enabled" in source
     assert source.count("self._nominal_max_delta_joint_pos,") >= 2
@@ -462,6 +737,8 @@ def test_controller_candidates_are_explicit_default_off_config_and_wired():
     setter_index = source.index(
         "self._asset.set_joint_position_target(safe_target", transaction_start
     )
+    readback_index = source.index("live_position_target =", setter_index)
+    trace_index = source.index("self._stage_failure_substep_trace", readback_index)
     anchor_commit_index = source.index(
         "self._gripper_close_arm_interlock_anchor = staged.anchor", setter_index
     )
@@ -469,10 +746,23 @@ def test_controller_candidates_are_explicit_default_off_config_and_wired():
         "self._gripper_close_arm_interlock_remaining = staged.remaining",
         setter_index,
     )
-    assert velocity_setter_index < setter_index < anchor_commit_index < commit_index
+    assert (
+        velocity_setter_index
+        < setter_index
+        < readback_index
+        < trace_index
+        < anchor_commit_index
+        < commit_index
+    )
     assert "_StagedGripperCloseArmInterlockState(" in source
     assert "self._set_targets_and_commit_gripper_close_arm_interlock(" in source
     assert "self._reset_gripper_close_arm_interlock_state()" in source
+    assert source.count("self._reset_arm_release_ramp_state()") == 2
+    assert (
+        "if self._arm_release_ramp_enabled and self._arm_target_transaction_failed:"
+        in source
+    )
+    assert '"required before another apply"' in source
     assert "self._gripper_close_arm_interlock_anchor_valid = False" in source
     assert "self._gripper_close_arm_interlock_anchor_refresh_count = 0" in source
     assert (

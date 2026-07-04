@@ -13,6 +13,17 @@ from typing import Any
 from polaris.config import EEF_CONTROLLER_BASELINE_PROFILE
 from polaris.config import EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
 from polaris.config import EEF_CONTROLLER_PROFILES
+from polaris.config import EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_PHASE_HOLD
+from polaris.eef_controller_repair import ARM_RELEASE_PHASE_RAMP
+from polaris.eef_controller_repair import ARM_RELEASE_PHASE_RELEASE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_FORMULA_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_FRACTION_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_STATE_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_SUBSTEPS
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_TRANSACTION_PROFILE
+from polaris.eef_controller_repair import arm_release_ramp_fraction
 from polaris.eef_gripper_runtime import EEF_GRIPPER_MIMIC_COMPLIANCE_PROFILE
 from polaris.eef_gripper_runtime import EEF_GRIPPER_MIMIC_COMPLIANCE_OVERLAY_IDENTITY
 from polaris.eef_gripper_runtime import EEF_GRIPPER_TARGET_SLEW_ACTION_CLASS
@@ -86,6 +97,41 @@ GRIPPER_CLOSE_ARM_INTERLOCK_COUNTER_FIELDS = (
     "anchor_completion_count",
     "anchor_open_cancel_count",
 )
+ARM_RELEASE_RAMP_REPORT_FIELDS = {
+    "enabled",
+    "profile",
+    "state_profile",
+    "substeps",
+    "fraction_profile",
+    "fractions_float32",
+    "formula_profile",
+    "transaction_profile",
+    "open_during_ramp_policy",
+    "phase",
+    "next_index",
+    "release_observed_count",
+    "ramp_started_count",
+    "ramp_completed_count",
+    "ramp_cancelled_by_reactivation_count",
+    "ramp_target_apply_count",
+    "cancelled_ramp_target_apply_count",
+    "ramp_limited_target_apply_count",
+    "ramp_limited_joint_target_count",
+    "last_target_apply_index",
+    "last_ramp_index",
+    "max_abs_nominal_to_ramped_target_change_rad",
+    "gripper_target_or_state_write_count",
+}
+ARM_RELEASE_RAMP_COUNTER_FIELDS = (
+    "release_observed_count",
+    "ramp_started_count",
+    "ramp_completed_count",
+    "ramp_cancelled_by_reactivation_count",
+    "ramp_target_apply_count",
+    "cancelled_ramp_target_apply_count",
+    "ramp_limited_target_apply_count",
+    "ramp_limited_joint_target_count",
+)
 
 
 @dataclass(frozen=True)
@@ -97,6 +143,7 @@ class EefControllerProfileSpec:
     all_six_gripper_trace_enabled: bool
     arm_slew_headroom_enabled: bool
     gripper_close_arm_interlock_enabled: bool
+    arm_release_ramp_enabled: bool
     target_slew_rate_0p25_enabled: bool
     target_slew_profile: str
     close_interlock_profile: str
@@ -112,6 +159,7 @@ def _profile_spec(
     all_six_gripper_trace_enabled: bool,
     arm_slew_headroom_enabled: bool,
     gripper_close_arm_interlock_enabled: bool,
+    arm_release_ramp_enabled: bool,
     target_slew_rate_0p25_enabled: bool,
     target_slew_profile: str,
     mimic_compliance_profile: str | None,
@@ -123,6 +171,7 @@ def _profile_spec(
         all_six_gripper_trace_enabled=all_six_gripper_trace_enabled,
         arm_slew_headroom_enabled=arm_slew_headroom_enabled,
         gripper_close_arm_interlock_enabled=gripper_close_arm_interlock_enabled,
+        arm_release_ramp_enabled=arm_release_ramp_enabled,
         target_slew_rate_0p25_enabled=target_slew_rate_0p25_enabled,
         target_slew_profile=target.profile,
         close_interlock_profile=target.close_interlock_profile,
@@ -140,6 +189,7 @@ _EEF_CONTROLLER_PROFILE_SPECS = MappingProxyType(
             all_six_gripper_trace_enabled=False,
             arm_slew_headroom_enabled=False,
             gripper_close_arm_interlock_enabled=False,
+            arm_release_ramp_enabled=False,
             target_slew_rate_0p25_enabled=False,
             target_slew_profile=EEF_GRIPPER_TARGET_SLEW_PROFILE,
             mimic_compliance_profile=None,
@@ -150,6 +200,18 @@ _EEF_CONTROLLER_PROFILE_SPECS = MappingProxyType(
             all_six_gripper_trace_enabled=True,
             arm_slew_headroom_enabled=True,
             gripper_close_arm_interlock_enabled=True,
+            arm_release_ramp_enabled=False,
+            target_slew_rate_0p25_enabled=True,
+            target_slew_profile=(EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE),
+            mimic_compliance_profile=EEF_GRIPPER_MIMIC_COMPLIANCE_PROFILE,
+        ),
+        EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE: _profile_spec(
+            profile=EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+            failure_substep_trace_enabled=True,
+            all_six_gripper_trace_enabled=True,
+            arm_slew_headroom_enabled=True,
+            gripper_close_arm_interlock_enabled=True,
+            arm_release_ramp_enabled=True,
             target_slew_rate_0p25_enabled=True,
             target_slew_profile=(EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE),
             mimic_compliance_profile=EEF_GRIPPER_MIMIC_COMPLIANCE_PROFILE,
@@ -242,6 +304,10 @@ def validate_eef_controller_profile_config(
             getattr(arm, "enable_gripper_close_arm_interlock", None),
             field="arm.enable_gripper_close_arm_interlock",
         ),
+        "arm_release_ramp": _config_bool(
+            getattr(arm, "enable_arm_release_ramp", None),
+            field="arm.enable_arm_release_ramp",
+        ),
         "target_slew_rate_0p25": _config_bool(
             getattr(finger, "enable_target_slew_rate_0p25_candidate", None),
             field="finger.enable_target_slew_rate_0p25_candidate",
@@ -252,6 +318,7 @@ def validate_eef_controller_profile_config(
         "wrist_energy_brake": False,
         "arm_slew_headroom": spec.arm_slew_headroom_enabled,
         "gripper_close_arm_interlock": (spec.gripper_close_arm_interlock_enabled),
+        "arm_release_ramp": spec.arm_release_ramp_enabled,
         "target_slew_rate_0p25": spec.target_slew_rate_0p25_enabled,
     }
     if actual != expected:
@@ -352,6 +419,7 @@ def configure_eef_controller_profile(
         "enable_wrist_energy_brake",
         "enable_arm_slew_headroom",
         "enable_gripper_close_arm_interlock",
+        "enable_arm_release_ramp",
     )
     for field in candidate_flags:
         if _config_bool(getattr(arm, field, None), field=f"arm.{field}"):
@@ -375,6 +443,7 @@ def configure_eef_controller_profile(
     arm.enable_failure_substep_trace = True
     arm.enable_arm_slew_headroom = True
     arm.enable_gripper_close_arm_interlock = True
+    arm.enable_arm_release_ramp = spec.arm_release_ramp_enabled
     finger.enable_target_slew_rate_0p25_candidate = True
     finger.class_type = make_eef_all_six_gripper_failure_trace_class(finger.class_type)
     configure_eef_gripper_mimic_compliance_spawn_overlay(
@@ -539,10 +608,13 @@ def validate_eef_controller_repair_candidate_report(
         or apply_calls - committed_apply_calls not in (0, 1)
     ):
         raise ValueError("PolaRiS EEF controller committed-apply cadence drift")
-    if not isinstance(report, dict) or set(report) != {
+    expected_report_fields = {
         "arm_slew_headroom",
         "gripper_close_arm_interlock",
-    }:
+    }
+    if spec.arm_release_ramp_enabled:
+        expected_report_fields.add("arm_release_ramp")
+    if not isinstance(report, dict) or set(report) != expected_report_fields:
         raise ValueError("PolaRiS EEF controller runtime report schema drift")
     arm = report.get("arm_slew_headroom")
     interlock = report.get("gripper_close_arm_interlock")
@@ -732,6 +804,135 @@ def validate_eef_controller_repair_candidate_report(
         or interlock["released_apply_count"] != 0
     ):
         raise ValueError("Inactive PolaRiS EEF fixed anchor retained evidence")
+
+    ramp = report.get("arm_release_ramp")
+    if spec.arm_release_ramp_enabled:
+        if (
+            not isinstance(ramp, dict)
+            or set(ramp) != ARM_RELEASE_RAMP_REPORT_FIELDS
+            or ramp.get("enabled") is not True
+            or ramp.get("profile") != ARM_RELEASE_RAMP_PROFILE
+            or ramp.get("state_profile") != ARM_RELEASE_RAMP_STATE_PROFILE
+            or ramp.get("substeps") != ARM_RELEASE_RAMP_SUBSTEPS
+            or ramp.get("fraction_profile") != ARM_RELEASE_RAMP_FRACTION_PROFILE
+            or ramp.get("formula_profile") != ARM_RELEASE_RAMP_FORMULA_PROFILE
+            or ramp.get("transaction_profile") != ARM_RELEASE_RAMP_TRANSACTION_PROFILE
+            or ramp.get("open_during_ramp_policy")
+            != "continue_current_ramp_without_restart_or_skip_v1"
+            or type(ramp.get("gripper_target_or_state_write_count")) is not int
+            or ramp.get("gripper_target_or_state_write_count") != 0
+        ):
+            raise ValueError("PolaRiS EEF controller release-ramp identity drift")
+        fractions = ramp.get("fractions_float32")
+        expected_fractions = [
+            arm_release_ramp_fraction(index)
+            for index in range(ARM_RELEASE_RAMP_SUBSTEPS)
+        ]
+        if (
+            not isinstance(fractions, list)
+            or len(fractions) != ARM_RELEASE_RAMP_SUBSTEPS
+            or fractions != expected_fractions
+            or any(not _is_exact_float32(value) for value in fractions)
+        ):
+            raise ValueError("PolaRiS EEF controller release-ramp fraction drift")
+        phase = ramp.get("phase")
+        next_index = ramp.get("next_index")
+        if (
+            phase
+            not in (
+                ARM_RELEASE_PHASE_HOLD,
+                ARM_RELEASE_PHASE_RAMP,
+                ARM_RELEASE_PHASE_RELEASE,
+            )
+            or (phase == ARM_RELEASE_PHASE_RAMP) is (next_index is None)
+            or (
+                next_index is not None
+                and (
+                    type(next_index) is not int
+                    or not 0 <= next_index < ARM_RELEASE_RAMP_SUBSTEPS
+                )
+            )
+            or (phase == ARM_RELEASE_PHASE_HOLD) is not (remaining > 0)
+        ):
+            raise ValueError("PolaRiS EEF controller release-ramp phase drift")
+        for field in ARM_RELEASE_RAMP_COUNTER_FIELDS:
+            if type(ramp.get(field)) is not int or ramp[field] < 0:
+                raise ValueError(f"PolaRiS EEF controller release-ramp {field} drift")
+        active_ramp_count = int(phase == ARM_RELEASE_PHASE_RAMP)
+        current_ramp_target_count = next_index if next_index is not None else 0
+        if (
+            ramp["release_observed_count"] != ramp["ramp_started_count"]
+            or ramp["ramp_started_count"]
+            != ramp["ramp_completed_count"]
+            + ramp["ramp_cancelled_by_reactivation_count"]
+            + active_ramp_count
+            or ramp["release_observed_count"] != completion_count + cancel_count
+            or ramp["ramp_target_apply_count"]
+            != ramp["ramp_completed_count"] * ARM_RELEASE_RAMP_SUBSTEPS
+            + ramp["cancelled_ramp_target_apply_count"]
+            + current_ramp_target_count
+            or ramp["cancelled_ramp_target_apply_count"]
+            > ramp["ramp_cancelled_by_reactivation_count"]
+            * (ARM_RELEASE_RAMP_SUBSTEPS - 1)
+            or ramp["ramp_target_apply_count"] > committed_apply_calls
+            or not (
+                0
+                <= ramp["ramp_limited_target_apply_count"]
+                <= ramp["ramp_target_apply_count"] - ramp["ramp_completed_count"]
+            )
+            or not (
+                ramp["ramp_limited_target_apply_count"]
+                <= ramp["ramp_limited_joint_target_count"]
+                <= 7 * ramp["ramp_limited_target_apply_count"]
+            )
+        ):
+            raise ValueError("PolaRiS EEF controller release-ramp lifecycle drift")
+        last_target_apply = ramp.get("last_target_apply_index")
+        last_ramp_index = ramp.get("last_ramp_index")
+        if (
+            (last_target_apply is None) != (last_ramp_index is None)
+            or (ramp["ramp_target_apply_count"] == 0) != (last_target_apply is None)
+            or (
+                last_target_apply is not None
+                and (
+                    type(last_target_apply) is not int
+                    or not 0 <= last_target_apply < committed_apply_calls
+                    or type(last_ramp_index) is not int
+                    or not 0 <= last_ramp_index < ARM_RELEASE_RAMP_SUBSTEPS
+                )
+            )
+        ):
+            raise ValueError("PolaRiS EEF controller release-ramp last-target drift")
+        if (
+            phase == ARM_RELEASE_PHASE_RAMP
+            and next_index is not None
+            and next_index > 0
+            and (
+                last_ramp_index != next_index - 1
+                or last_target_apply != committed_apply_calls - 1
+            )
+        ) or (
+            phase == ARM_RELEASE_PHASE_RELEASE
+            and ramp["ramp_target_apply_count"] > 0
+            and last_ramp_index != ARM_RELEASE_RAMP_SUBSTEPS - 1
+        ):
+            raise ValueError("PolaRiS EEF controller release-ramp phase/target drift")
+        maximum_change = _finite_vector(
+            ramp.get("max_abs_nominal_to_ramped_target_change_rad"),
+            field="release-ramp maximum target change",
+        )
+        if any(
+            change > bound + 1e-6
+            for change, bound in zip(maximum_change, nominal, strict=True)
+        ):
+            raise ValueError("PolaRiS EEF controller release-ramp maximum drift")
+        has_positive_maximum = any(change > 0.0 for change in maximum_change)
+        if has_positive_maximum is not (ramp["ramp_limited_target_apply_count"] > 0):
+            raise ValueError(
+                "PolaRiS EEF controller release-ramp limited/maximum drift"
+            )
+    elif ramp is not None:
+        raise ValueError("Non-ramp PolaRiS EEF controller has release-ramp evidence")
     if require_initial_state and (
         apply_calls != 0
         or committed_apply_calls != 0
@@ -742,6 +943,20 @@ def validate_eef_controller_repair_candidate_report(
         or interlock["endpoint_observed"] is not False
         or interlock["anchor_valid"] is not False
         or not zero_vectors
+        or (
+            spec.arm_release_ramp_enabled
+            and (
+                ramp["phase"] != ARM_RELEASE_PHASE_RELEASE
+                or ramp["next_index"] is not None
+                or any(ramp[field] != 0 for field in ARM_RELEASE_RAMP_COUNTER_FIELDS)
+                or ramp["last_target_apply_index"] is not None
+                or ramp["last_ramp_index"] is not None
+                or any(
+                    value != 0.0
+                    for value in ramp["max_abs_nominal_to_ramped_target_change_rad"]
+                )
+            )
+        )
     ):
         raise ValueError("Initial PolaRiS EEF controller report is not empty")
     return dict(report)

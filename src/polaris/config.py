@@ -12,13 +12,19 @@ EEF_CONTROLLER_BASELINE_PROFILE = "baseline"
 EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE = (
     "arm_slew_0p95_gripper_rate0p25_fixed_anchor86_mimic100_damping1p2_v3"
 )
+EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE = (
+    "arm_slew_0p95_gripper_rate0p25_fixed_anchor86_release_ramp16_"
+    "mimic100_damping1p2_v4"
+)
 EEF_CONTROLLER_PROFILES = (
     EEF_CONTROLLER_BASELINE_PROFILE,
     EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE,
+    EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
 )
 EefControllerProfile = Literal[
     "baseline",
     "arm_slew_0p95_gripper_rate0p25_fixed_anchor86_mimic100_damping1p2_v3",
+    "arm_slew_0p95_gripper_rate0p25_fixed_anchor86_release_ramp16_mimic100_damping1p2_v4",
 ]
 
 

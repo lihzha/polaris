@@ -10,6 +10,7 @@ import pytest
 
 from polaris.config import EEF_CONTROLLER_BASELINE_PROFILE
 from polaris.config import EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
+from polaris.config import EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE
 from polaris.eef_controller_profile import configure_eef_controller_profile
 from polaris.eef_controller_profile import eef_controller_apply_counts_from_safety
 from polaris.eef_controller_profile import eef_controller_profile
@@ -17,6 +18,13 @@ from polaris.eef_controller_profile import (
     validate_eef_controller_repair_candidate_report,
 )
 from polaris.eef_controller_profile import validate_eef_controller_profile_config
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_FORMULA_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_FRACTION_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_STATE_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_SUBSTEPS
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_TRANSACTION_PROFILE
+from polaris.eef_controller_repair import arm_release_ramp_fraction
 from polaris.eef_gripper_failure_trace import EEF_ALL_SIX_GRIPPER_TRACE_PROFILE
 from polaris.eef_gripper_failure_trace import (
     make_eef_all_six_gripper_failure_trace_class,
@@ -70,6 +78,7 @@ def _env_cfg() -> SimpleNamespace:
         enable_wrist_energy_brake=False,
         enable_arm_slew_headroom=False,
         enable_gripper_close_arm_interlock=False,
+        enable_arm_release_ramp=False,
     )
     finger = SimpleNamespace(
         enable_target_slew_rate_0p25_candidate=False,
@@ -139,6 +148,7 @@ def test_candidate_configures_exact_accepted_stack_before_spawn(monkeypatch) -> 
     assert cfg.actions.arm.enable_wrist_energy_brake is False
     assert cfg.actions.arm.enable_arm_slew_headroom is True
     assert cfg.actions.arm.enable_gripper_close_arm_interlock is True
+    assert cfg.actions.arm.enable_arm_release_ramp is False
     assert cfg.actions.finger_joint.enable_target_slew_rate_0p25_candidate is True
     assert (
         cfg.actions.finger_joint.class_type.eef_all_six_gripper_trace_profile
@@ -156,6 +166,31 @@ def test_candidate_configures_exact_accepted_stack_before_spawn(monkeypatch) -> 
     validate_eef_controller_profile_config(
         cfg,
         expected_profile=EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE,
+    )
+
+
+def test_release_ramp_profile_adds_only_the_versioned_v4_flag(monkeypatch) -> None:
+    cfg = _env_cfg()
+    monkeypatch.setattr(
+        "polaris.eef_gripper_runtime._expected_original_spawn_func",
+        lambda: _original_spawn,
+    )
+    spec = configure_eef_controller_profile(
+        cfg,
+        profile=EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+    )
+    assert spec.profile == (
+        "arm_slew_0p95_gripper_rate0p25_fixed_anchor86_release_ramp16_"
+        "mimic100_damping1p2_v4"
+    )
+    assert spec.arm_release_ramp_enabled is True
+    assert cfg.actions.arm.enable_arm_release_ramp is True
+    assert cfg.actions.arm.enable_failure_substep_trace is True
+    assert cfg.actions.arm.enable_arm_slew_headroom is True
+    assert cfg.actions.arm.enable_gripper_close_arm_interlock is True
+    validate_eef_controller_profile_config(
+        cfg,
+        expected_profile=EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
     )
 
 
@@ -206,6 +241,7 @@ def test_candidate_fails_closed_on_pre_enabled_or_tampered_components(
     [
         EEF_CONTROLLER_BASELINE_PROFILE,
         EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE,
+        EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
     ],
 )
 def test_profiles_reject_modified_action_classes_and_spawn_before_writes(
@@ -465,8 +501,97 @@ def _candidate_report() -> dict:
     }
 
 
+def _release_ramp_candidate_report() -> dict:
+    report = _candidate_report()
+    report["arm_release_ramp"] = {
+        "enabled": True,
+        "profile": ARM_RELEASE_RAMP_PROFILE,
+        "state_profile": ARM_RELEASE_RAMP_STATE_PROFILE,
+        "substeps": ARM_RELEASE_RAMP_SUBSTEPS,
+        "fraction_profile": ARM_RELEASE_RAMP_FRACTION_PROFILE,
+        "fractions_float32": [
+            arm_release_ramp_fraction(index)
+            for index in range(ARM_RELEASE_RAMP_SUBSTEPS)
+        ],
+        "formula_profile": ARM_RELEASE_RAMP_FORMULA_PROFILE,
+        "transaction_profile": ARM_RELEASE_RAMP_TRANSACTION_PROFILE,
+        "open_during_ramp_policy": ("continue_current_ramp_without_restart_or_skip_v1"),
+        "phase": "release",
+        "next_index": None,
+        "release_observed_count": 0,
+        "ramp_started_count": 0,
+        "ramp_completed_count": 0,
+        "ramp_cancelled_by_reactivation_count": 0,
+        "ramp_target_apply_count": 0,
+        "cancelled_ramp_target_apply_count": 0,
+        "ramp_limited_target_apply_count": 0,
+        "ramp_limited_joint_target_count": 0,
+        "last_target_apply_index": None,
+        "last_ramp_index": None,
+        "max_abs_nominal_to_ramped_target_change_rad": [0.0] * 7,
+        "gripper_target_or_state_write_count": 0,
+    }
+    return report
+
+
 def _float32(value: float) -> float:
     return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def _completed_release_ramp_candidate_report() -> dict:
+    report = _release_ramp_candidate_report()
+    interlock = report["gripper_close_arm_interlock"]
+    anchor = [_float32(0.1 * (index + 1)) for index in range(7)]
+    interlock.update(
+        {
+            "observed_endpoint_change_count": 1,
+            "endpoint_observed": True,
+            "activation_count": 1,
+            "active_apply_count": 86,
+            "anchor_capture_count": 1,
+            "anchor_target_apply_count": 86,
+            "anchor_first_exact_target_count": 1,
+            "anchor_completion_count": 1,
+            "last_activation_apply_index": 0,
+            "last_anchor_joint_pos_rad": anchor,
+            "last_anchor_little_endian_float32_sha256": hashlib.sha256(
+                struct.pack("<7f", *anchor)
+            ).hexdigest(),
+            "released_apply_count": 16,
+        }
+    )
+    report["arm_release_ramp"].update(
+        {
+            "release_observed_count": 1,
+            "ramp_started_count": 1,
+            "ramp_completed_count": 1,
+            "ramp_target_apply_count": 16,
+            "ramp_limited_target_apply_count": 15,
+            "ramp_limited_joint_target_count": 105,
+            "last_target_apply_index": 101,
+            "last_ramp_index": 15,
+            "max_abs_nominal_to_ramped_target_change_rad": [0.0095] * 7,
+        }
+    )
+    return report
+
+
+def _active_release_ramp_candidate_report() -> dict:
+    report = _completed_release_ramp_candidate_report()
+    report["gripper_close_arm_interlock"]["released_apply_count"] = 5
+    report["arm_release_ramp"].update(
+        {
+            "phase": "ramp",
+            "next_index": 5,
+            "ramp_completed_count": 0,
+            "ramp_target_apply_count": 5,
+            "ramp_limited_target_apply_count": 5,
+            "ramp_limited_joint_target_count": 35,
+            "last_target_apply_index": 90,
+            "last_ramp_index": 4,
+        }
+    )
+    return report
 
 
 def _multi_activation_candidate_report() -> dict:
@@ -581,6 +706,145 @@ def test_candidate_report_identity_and_anchor_lifecycle_are_closed(mutation) -> 
             expected_physical_max_delta_joint_pos_rad=[0.01] * 7,
             apply_calls=0,
             require_initial_state=True,
+        )
+
+
+def test_release_ramp_v4_report_is_closed_and_v3_remains_byte_compatible() -> None:
+    ramp = _release_ramp_candidate_report()
+    validate_eef_controller_repair_candidate_report(
+        ramp,
+        expected_profile=EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+        expected_target_slew_profile=(
+            EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+        ),
+        expected_physical_max_delta_joint_pos_rad=[0.01] * 7,
+        apply_calls=0,
+        require_initial_state=True,
+    )
+    with pytest.raises(ValueError, match="schema drift"):
+        validate_eef_controller_repair_candidate_report(
+            ramp,
+            expected_profile=EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE,
+            expected_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+            expected_physical_max_delta_joint_pos_rad=[0.01] * 7,
+            apply_calls=0,
+        )
+    with pytest.raises(ValueError, match="schema drift"):
+        validate_eef_controller_repair_candidate_report(
+            _candidate_report(),
+            expected_profile=EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+            expected_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+            expected_physical_max_delta_joint_pos_rad=[0.01] * 7,
+            apply_calls=0,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda ramp: ramp.__setitem__("phase", "unknown"),
+        lambda ramp: ramp.__setitem__("next_index", 16),
+        lambda ramp: ramp.__setitem__("release_observed_count", 1),
+        lambda ramp: ramp.__setitem__("ramp_target_apply_count", 1),
+        lambda ramp: ramp.__setitem__("open_during_ramp_policy", "restart_on_open"),
+        lambda ramp: ramp.__setitem__("gripper_target_or_state_write_count", False),
+        lambda ramp: ramp["fractions_float32"].__setitem__(8, 0.5),
+        lambda ramp: ramp["max_abs_nominal_to_ramped_target_change_rad"].__setitem__(
+            0, 0.02
+        ),
+    ],
+)
+def test_release_ramp_v4_report_rejects_tampering(mutation) -> None:
+    report = _release_ramp_candidate_report()
+    mutation(report["arm_release_ramp"])
+    with pytest.raises(ValueError, match="release-ramp"):
+        validate_eef_controller_repair_candidate_report(
+            report,
+            expected_profile=EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+            expected_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+            expected_physical_max_delta_joint_pos_rad=[0.01] * 7,
+            apply_calls=0,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda ramp: ramp.__setitem__("last_ramp_index", 0),
+        lambda ramp: ramp.__setitem__("ramp_limited_target_apply_count", 16),
+        lambda ramp: ramp.__setitem__("ramp_limited_joint_target_count", 112),
+        lambda ramp: ramp.__setitem__(
+            "max_abs_nominal_to_ramped_target_change_rad", [0.0] * 7
+        ),
+    ],
+)
+def test_release_ramp_v4_completed_report_rejects_impossible_evidence(
+    mutation,
+) -> None:
+    report = _completed_release_ramp_candidate_report()
+    mutation(report["arm_release_ramp"])
+    with pytest.raises(ValueError, match="release-ramp"):
+        validate_eef_controller_repair_candidate_report(
+            report,
+            expected_profile=EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+            expected_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+            expected_physical_max_delta_joint_pos_rad=[0.01] * 7,
+            apply_calls=102,
+        )
+
+
+def test_release_ramp_v4_report_accepts_completed_cycle() -> None:
+    report = _completed_release_ramp_candidate_report()
+    validate_eef_controller_repair_candidate_report(
+        report,
+        expected_profile=EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+        expected_target_slew_profile=(
+            EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+        ),
+        expected_physical_max_delta_joint_pos_rad=[0.01] * 7,
+        apply_calls=102,
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("last_ramp_index", 3),
+        ("last_target_apply_index", 89),
+    ],
+)
+def test_release_ramp_v4_active_report_binds_latest_index_and_apply(
+    field,
+    value,
+) -> None:
+    report = _active_release_ramp_candidate_report()
+    validate_eef_controller_repair_candidate_report(
+        report,
+        expected_profile=EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+        expected_target_slew_profile=(
+            EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+        ),
+        expected_physical_max_delta_joint_pos_rad=[0.01] * 7,
+        apply_calls=91,
+    )
+    report["arm_release_ramp"][field] = value
+    with pytest.raises(ValueError, match="phase/target"):
+        validate_eef_controller_repair_candidate_report(
+            report,
+            expected_profile=EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+            expected_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+            expected_physical_max_delta_joint_pos_rad=[0.01] * 7,
+            apply_calls=91,
         )
 
 

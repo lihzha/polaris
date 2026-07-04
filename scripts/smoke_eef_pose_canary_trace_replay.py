@@ -55,18 +55,18 @@ EXPECTED_ROBOT_USD_SHA256 = (
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PRODUCTION_EVAL_PATH = SCRIPT_DIR / "eval.py"
-EXPECTED_PRODUCTION_EVAL_SIZE_BYTES = 25905
+EXPECTED_PRODUCTION_EVAL_SIZE_BYTES = 25984
 EXPECTED_PRODUCTION_EVAL_SHA256 = (
-    "4737a1a40cc1f30cd9bcbdb1e93d4a03ce61c9a92b6010ddf3651ce4dc446a83"
+    "b5464158b8cc996bffd55ee744133ba2d0d3708cca2288059076c829cee8a86f"
 )
 PRODUCTION_RESET_CALL = (
     "obs, info = env.reset(object_positions=initial_conditions[episode])"
 )
 PRODUCTION_RESET_PROFILE = "production_environment_seed_none_expensive_default_ic0_v1"
 PRODUCTION_POLICY_CONFIG_PATH = SCRIPT_DIR.parent / "src" / "polaris" / "config.py"
-EXPECTED_PRODUCTION_POLICY_CONFIG_SIZE_BYTES = 5471
+EXPECTED_PRODUCTION_POLICY_CONFIG_SIZE_BYTES = 5762
 EXPECTED_PRODUCTION_POLICY_CONFIG_SHA256 = (
-    "ec14fcac50f371b49731946b03fbc97518d6c651febeecc6d295f156b33b8763"
+    "ea38e87ab20f204929e39454bd9edf6b321d419cb3cebb61c7a6b9487f12373a"
 )
 PRODUCTION_LAP_CLIENT_PATH = (
     SCRIPT_DIR.parent / "src" / "polaris" / "policy" / "lap_eef_pose_client.py"

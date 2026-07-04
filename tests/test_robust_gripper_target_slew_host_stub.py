@@ -219,16 +219,24 @@ class SetterAsset:
     def __init__(self, failure):
         self.failure = failure
         self.calls = []
+        self.data = types.SimpleNamespace(
+            joint_vel_target=torch.full((1, 7), -1.0, dtype=torch.float32),
+            joint_pos_target=torch.full((1, 7), -1.0, dtype=torch.float32),
+        )
 
     def set_joint_velocity_target(self, target, joint_ids):
         self.calls.append(("velocity", target.clone(), list(joint_ids)))
         if self.failure == "velocity":
             raise RuntimeError("forced velocity setter failure")
+        self.data.joint_vel_target[:, joint_ids] = target
 
     def set_joint_position_target(self, target, joint_ids):
         self.calls.append(("position", target.clone(), list(joint_ids)))
         if self.failure == "position":
             raise RuntimeError("forced position setter failure")
+        self.data.joint_pos_target[:, joint_ids] = (
+            target + 1.0 if self.failure == "readback" else target
+        )
 
 
 anchor = torch.arange(7, dtype=torch.float32)
@@ -257,6 +265,21 @@ staged = robust._StagedGripperCloseArmInterlockState(
     active_apply_count=1,
     released_apply_count=0,
 )
+staged_release = robust._StagedArmReleaseRampState(
+    phase="hold",
+    next_index=None,
+    release_observed_count=0,
+    ramp_started_count=0,
+    ramp_completed_count=0,
+    ramp_cancelled_by_reactivation_count=0,
+    ramp_target_apply_count=0,
+    cancelled_ramp_target_apply_count=0,
+    ramp_limited_target_apply_count=0,
+    ramp_limited_joint_target_count=0,
+    last_target_apply_index=None,
+    last_ramp_index=None,
+    max_abs_nominal_to_ramped_target_change=zero,
+)
 safe_target = torch.zeros((1, 7), dtype=torch.float32)
 for failure, expected_calls in (("velocity", 1), ("position", 2)):
     transactional = object.__new__(
@@ -265,6 +288,7 @@ for failure, expected_calls in (("velocity", 1), ("position", 2)):
     transactional._asset = SetterAsset(failure)
     transactional._zero_joint_velocity_target = zero.unsqueeze(0)
     transactional._joint_ids = list(range(7))
+    transactional._arm_release_ramp_enabled = True
     retained_anchor = torch.full((7,), -1.0)
     transactional._gripper_close_arm_interlock_anchor = retained_anchor
     transactional._gripper_close_arm_interlock_anchor_valid = True
@@ -273,9 +297,13 @@ for failure, expected_calls in (("velocity", 1), ("position", 2)):
     transactional._gripper_close_arm_interlock_remaining = 38
     transactional._gripper_close_arm_interlock_activation_count = 1
     transactional._gripper_close_arm_interlock_active_apply_count = 48
+    transactional._arm_release_ramp_phase = "release"
+    transactional._arm_release_ramp_next_index = None
+    transactional._arm_release_observed_count = 0
+    transactional._arm_target_transaction_failed = False
     try:
         transactional._set_targets_and_commit_gripper_close_arm_interlock(
-            safe_target, staged
+            safe_target, staged, staged_release, None
         )
     except RuntimeError as error:
         assert f"forced {failure} setter failure" in str(error)
@@ -289,13 +317,66 @@ for failure, expected_calls in (("velocity", 1), ("position", 2)):
     assert transactional._gripper_close_arm_interlock_remaining == 38
     assert transactional._gripper_close_arm_interlock_activation_count == 1
     assert transactional._gripper_close_arm_interlock_active_apply_count == 48
+    assert transactional._arm_release_ramp_phase == "release"
+    assert transactional._arm_release_ramp_next_index is None
+    assert transactional._arm_release_observed_count == 0
+    assert transactional._arm_target_transaction_failed is True
+
+for failure in ("readback", "trace"):
+    transactional = object.__new__(
+        robust.RobustDifferentialInverseKinematicsAction
+    )
+    transactional._asset = SetterAsset(
+        "readback" if failure == "readback" else None
+    )
+    transactional._zero_joint_velocity_target = zero.unsqueeze(0)
+    transactional._joint_ids = list(range(7))
+    transactional._arm_release_ramp_enabled = True
+    transactional._gripper_close_arm_interlock_anchor = torch.full((7,), -1.0)
+    transactional._gripper_close_arm_interlock_anchor_valid = True
+    transactional._gripper_close_arm_interlock_anchor_capture_count = 1
+    transactional._gripper_close_arm_interlock_anchor_target_apply_count = 48
+    transactional._gripper_close_arm_interlock_remaining = 38
+    transactional._gripper_close_arm_interlock_activation_count = 1
+    transactional._gripper_close_arm_interlock_active_apply_count = 48
+    transactional._arm_release_ramp_phase = "release"
+    transactional._arm_release_ramp_next_index = None
+    transactional._arm_release_observed_count = 0
+    transactional._arm_target_transaction_failed = False
+    if failure == "trace":
+        transactional._stage_failure_substep_trace = lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("forced trace staging failure")
+        )
+    try:
+        transactional._set_targets_and_commit_gripper_close_arm_interlock(
+            safe_target,
+            staged,
+            staged_release,
+            {
+                "new_joint_pos_target": safe_target,
+                "new_joint_vel_target": zero.unsqueeze(0),
+            }
+            if failure == "trace"
+            else None,
+        )
+    except (RuntimeError, ValueError) as error:
+        assert failure in str(error)
+    else:
+        raise AssertionError(f"{failure} failure was swallowed")
+    assert transactional._gripper_close_arm_interlock_remaining == 38
+    assert transactional._arm_release_ramp_phase == "release"
+    assert transactional._arm_release_ramp_next_index is None
+    assert transactional._arm_release_observed_count == 0
+    assert transactional._arm_target_transaction_failed is True
 
 transactional = object.__new__(robust.RobustDifferentialInverseKinematicsAction)
 transactional._asset = SetterAsset(None)
 transactional._zero_joint_velocity_target = zero.unsqueeze(0)
 transactional._joint_ids = list(range(7))
+transactional._arm_release_ramp_enabled = True
+transactional._arm_target_transaction_failed = False
 transactional._set_targets_and_commit_gripper_close_arm_interlock(
-    safe_target, staged
+    safe_target, staged, staged_release, None
 )
 assert [entry[0] for entry in transactional._asset.calls] == [
     "velocity", "position"
@@ -309,6 +390,37 @@ assert transactional._gripper_close_arm_interlock_remaining == 85
 assert transactional._gripper_close_arm_interlock_activation_count == 1
 assert transactional._gripper_close_arm_interlock_active_apply_count == 1
 assert transactional._gripper_close_arm_interlock_last_activation_apply_index == 920
+assert transactional._arm_release_ramp_phase == "hold"
+assert transactional._arm_release_ramp_next_index is None
+assert transactional._arm_release_observed_count == 0
+assert transactional._arm_target_transaction_failed is False
+
+
+class ParentPathAsset:
+    def __init__(self):
+        self.calls = []
+
+    def set_joint_velocity_target(self, target, joint_ids):
+        self.calls.append(("velocity", target.clone(), list(joint_ids)))
+
+    def set_joint_position_target(self, target, joint_ids):
+        self.calls.append(("position", target.clone(), list(joint_ids)))
+
+
+parent_path = object.__new__(robust.RobustDifferentialInverseKinematicsAction)
+parent_path._asset = ParentPathAsset()
+parent_path._zero_joint_velocity_target = zero.unsqueeze(0)
+parent_path._joint_ids = list(range(7))
+parent_path._arm_release_ramp_enabled = False
+parent_path._set_targets_and_commit_gripper_close_arm_interlock(
+    safe_target, staged, None, None
+)
+assert [entry[0] for entry in parent_path._asset.calls] == [
+    "velocity", "position"
+]
+assert not hasattr(parent_path._asset, "data")
+assert parent_path._gripper_close_arm_interlock_remaining == 85
+assert not hasattr(parent_path, "_arm_release_ramp_phase")
 
 report = action._gripper_runtime_dynamic_report()
 assert report["driver_target_slew"] == {"profile": "target-slew-dynamic"}

@@ -32,7 +32,18 @@ from isaaclab.utils.math import compute_pose_error
 from pxr import PhysxSchema
 from pxr import UsdPhysics
 
+from polaris.eef_controller_repair import advance_arm_release_ramp
 from polaris.eef_controller_repair import advance_gripper_close_arm_interlock
+from polaris.eef_controller_repair import apply_arm_release_ramp_target
+from polaris.eef_controller_repair import ARM_RELEASE_PHASE_HOLD
+from polaris.eef_controller_repair import ARM_RELEASE_PHASE_RAMP
+from polaris.eef_controller_repair import ARM_RELEASE_PHASE_RELEASE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_FORMULA_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_FRACTION_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_STATE_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_SUBSTEPS
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_TRANSACTION_PROFILE
 from polaris.eef_controller_repair import (
     bound_joint_position_target as _bound_joint_position_target,
 )
@@ -155,6 +166,25 @@ class _StagedGripperCloseArmInterlockState:
     activation_count: int
     active_apply_count: int
     released_apply_count: int
+
+
+@dataclass(frozen=True)
+class _StagedArmReleaseRampState:
+    """Fully prepared release-ramp state committed after trace staging."""
+
+    phase: str
+    next_index: int | None
+    release_observed_count: int
+    ramp_started_count: int
+    ramp_completed_count: int
+    ramp_cancelled_by_reactivation_count: int
+    ramp_target_apply_count: int
+    cancelled_ramp_target_apply_count: int
+    ramp_limited_target_apply_count: int
+    ramp_limited_joint_target_count: int
+    last_target_apply_index: int | None
+    last_ramp_index: int | None
+    max_abs_nominal_to_ramped_target_change: torch.Tensor
 
 
 def _little_endian_float32_vector_sha256(value: torch.Tensor) -> str:
@@ -665,6 +695,19 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             raise ValueError(
                 "PolaRiS EEF close-interlock candidate requires exactly one environment"
             )
+        arm_release_ramp_enabled = self.cfg.enable_arm_release_ramp
+        if type(arm_release_ramp_enabled) is not bool:
+            raise ValueError("PolaRiS EEF arm release-ramp enable flag must be bool")
+        self._arm_release_ramp_enabled = arm_release_ramp_enabled
+        if self._arm_release_ramp_enabled and (
+            not self._gripper_close_arm_interlock_enabled
+            or not self._arm_slew_headroom_enabled
+            or self.num_envs != 1
+        ):
+            raise ValueError(
+                "PolaRiS EEF arm release ramp requires one environment with "
+                "the close interlock and arm-slew headroom enabled"
+            )
         if (
             self._gripper_close_arm_interlock_enabled
             and self._wrist_energy_brake_enabled
@@ -672,6 +715,10 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             raise ValueError(
                 "PolaRiS EEF close-interlock and wrist-energy-brake candidates "
                 "cannot be combined"
+            )
+        if self._arm_release_ramp_enabled and self._wrist_energy_brake_enabled:
+            raise ValueError(
+                "PolaRiS EEF arm release ramp and wrist-energy brake cannot be combined"
             )
         self._safety_profile = (
             EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
@@ -1112,10 +1159,31 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             self._max_delta_joint_pos[0]
         )
 
+    def _reset_arm_release_ramp_state(self) -> None:
+        """Clear the default-off HOLD/RAMP/RELEASE lifecycle and evidence."""
+
+        self._arm_release_ramp_phase = ARM_RELEASE_PHASE_RELEASE
+        self._arm_release_ramp_next_index: int | None = None
+        self._arm_release_observed_count = 0
+        self._arm_release_ramp_started_count = 0
+        self._arm_release_ramp_completed_count = 0
+        self._arm_release_ramp_cancelled_by_reactivation_count = 0
+        self._arm_release_ramp_target_apply_count = 0
+        self._arm_release_ramp_cancelled_target_apply_count = 0
+        self._arm_release_ramp_limited_target_apply_count = 0
+        self._arm_release_ramp_limited_joint_target_count = 0
+        self._arm_release_ramp_last_target_apply_index: int | None = None
+        self._arm_release_ramp_last_index: int | None = None
+        self._arm_release_ramp_max_abs_nominal_to_ramped_target_change = (
+            torch.zeros_like(self._max_delta_joint_pos[0])
+        )
+        self._arm_target_transaction_failed = False
+
     def _reset_episode_safety_state(self, episode_index: int | None) -> None:
         counter_dtype = torch.int64
         self._active_episode_index = episode_index
         self._reset_gripper_close_arm_interlock_state()
+        self._reset_arm_release_ramp_state()
         self._apply_call_count = 0
         self._slew_limit_event_count = torch.zeros(
             (), dtype=counter_dtype, device=self.device
@@ -1447,18 +1515,192 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         ):
             raise ValueError("PolaRiS EEF fixed activation-anchor lifecycle drift")
 
+    def _validate_arm_release_ramp_state(
+        self, *, require_latest_target: bool = True
+    ) -> None:
+        """Reject lifecycle/counter drift before staging another arm command."""
+
+        if type(require_latest_target) is not bool:
+            raise ValueError("PolaRiS EEF arm release-ramp validation mode drift")
+        phase = self._arm_release_ramp_phase
+        next_index = self._arm_release_ramp_next_index
+        if phase not in (
+            ARM_RELEASE_PHASE_HOLD,
+            ARM_RELEASE_PHASE_RAMP,
+            ARM_RELEASE_PHASE_RELEASE,
+        ) or (phase == ARM_RELEASE_PHASE_RAMP) is (next_index is None):
+            raise ValueError("PolaRiS EEF arm release-ramp phase/index drift")
+        if next_index is not None and (
+            type(next_index) is not int
+            or not 0 <= next_index < ARM_RELEASE_RAMP_SUBSTEPS
+        ):
+            raise ValueError("PolaRiS EEF arm release-ramp next-index drift")
+        if self._arm_release_ramp_enabled:
+            if (phase == ARM_RELEASE_PHASE_HOLD) is not (
+                self._gripper_close_arm_interlock_remaining > 0
+            ):
+                raise ValueError("PolaRiS EEF arm release-ramp HOLD binding drift")
+        elif phase != ARM_RELEASE_PHASE_RELEASE or next_index is not None:
+            raise ValueError("Disabled PolaRiS EEF arm release ramp retained state")
+
+        counters = (
+            self._arm_release_observed_count,
+            self._arm_release_ramp_started_count,
+            self._arm_release_ramp_completed_count,
+            self._arm_release_ramp_cancelled_by_reactivation_count,
+            self._arm_release_ramp_target_apply_count,
+            self._arm_release_ramp_cancelled_target_apply_count,
+            self._arm_release_ramp_limited_target_apply_count,
+            self._arm_release_ramp_limited_joint_target_count,
+        )
+        if any(type(value) is not int or value < 0 for value in counters):
+            raise ValueError("PolaRiS EEF arm release-ramp counter drift")
+        active_ramp_count = int(phase == ARM_RELEASE_PHASE_RAMP)
+        current_ramp_target_count = next_index if next_index is not None else 0
+        if (
+            self._arm_release_observed_count != self._arm_release_ramp_started_count
+            or self._arm_release_ramp_started_count
+            != self._arm_release_ramp_completed_count
+            + self._arm_release_ramp_cancelled_by_reactivation_count
+            + active_ramp_count
+            or self._arm_release_ramp_target_apply_count
+            != self._arm_release_ramp_completed_count * ARM_RELEASE_RAMP_SUBSTEPS
+            + self._arm_release_ramp_cancelled_target_apply_count
+            + current_ramp_target_count
+            or self._arm_release_ramp_cancelled_target_apply_count
+            > self._arm_release_ramp_cancelled_by_reactivation_count
+            * (ARM_RELEASE_RAMP_SUBSTEPS - 1)
+            or not (
+                0
+                <= self._arm_release_ramp_limited_target_apply_count
+                <= self._arm_release_ramp_target_apply_count
+                - self._arm_release_ramp_completed_count
+            )
+            or not (
+                self._arm_release_ramp_limited_target_apply_count
+                <= self._arm_release_ramp_limited_joint_target_count
+                <= 7 * self._arm_release_ramp_limited_target_apply_count
+            )
+            or (
+                self._arm_release_ramp_enabled
+                and self._arm_release_observed_count
+                != self._gripper_close_arm_interlock_anchor_completion_count
+                + self._gripper_close_arm_interlock_anchor_open_cancel_count
+            )
+        ):
+            raise ValueError("PolaRiS EEF arm release-ramp lifecycle drift")
+        last_apply = self._arm_release_ramp_last_target_apply_index
+        last_index = self._arm_release_ramp_last_index
+        if (
+            (last_apply is None) != (last_index is None)
+            or (self._arm_release_ramp_target_apply_count == 0) != (last_apply is None)
+            or (
+                last_apply is not None
+                and (
+                    type(last_apply) is not int
+                    or not 0 <= last_apply < self._apply_call_count
+                    or type(last_index) is not int
+                    or not 0 <= last_index < ARM_RELEASE_RAMP_SUBSTEPS
+                )
+            )
+        ):
+            raise ValueError("PolaRiS EEF arm release-ramp last-target drift")
+        if (
+            phase == ARM_RELEASE_PHASE_RAMP
+            and next_index is not None
+            and next_index > 0
+            and (
+                last_index != next_index - 1
+                or (require_latest_target and last_apply != self._apply_call_count - 1)
+            )
+        ) or (
+            phase == ARM_RELEASE_PHASE_RELEASE
+            and self._arm_release_ramp_target_apply_count > 0
+            and last_index != ARM_RELEASE_RAMP_SUBSTEPS - 1
+        ):
+            raise ValueError("PolaRiS EEF arm release-ramp phase/target drift")
+        maximum_change = self._arm_release_ramp_max_abs_nominal_to_ramped_target_change
+        if (
+            not isinstance(maximum_change, torch.Tensor)
+            or tuple(maximum_change.shape) != (self._num_joints,)
+            or maximum_change.dtype != torch.float32
+            or maximum_change.device != torch.device(self.device)
+            or not bool(torch.isfinite(maximum_change).all().item())
+            or bool((maximum_change < 0.0).any().item())
+            or bool(
+                (
+                    maximum_change
+                    > self._nominal_max_delta_joint_pos[0]
+                    + JOINT_SLEW_FLOAT32_TOLERANCE_RAD
+                )
+                .any()
+                .item()
+            )
+        ):
+            raise ValueError("PolaRiS EEF arm release-ramp maximum drift")
+        has_positive_maximum = bool((maximum_change > 0.0).any().item())
+        if has_positive_maximum is not (
+            self._arm_release_ramp_limited_target_apply_count > 0
+        ):
+            raise ValueError("PolaRiS EEF arm release-ramp limited/maximum drift")
+        if not self._arm_release_ramp_enabled and (
+            any(counters)
+            or last_apply is not None
+            or last_index is not None
+            or bool(maximum_change.any().item())
+        ):
+            raise ValueError("Disabled PolaRiS EEF arm release ramp has evidence")
+
     def _set_targets_and_commit_gripper_close_arm_interlock(
         self,
         safe_target: torch.Tensor,
         staged: _StagedGripperCloseArmInterlockState,
+        staged_release_ramp: _StagedArmReleaseRampState | None,
+        failure_trace: dict[str, torch.Tensor] | None,
     ) -> None:
-        """Set both arm targets, then commit the already-prepared lifecycle."""
+        """Set/read back, stage the final trace target, then commit lifecycle."""
 
-        self._asset.set_joint_velocity_target(
-            self._zero_joint_velocity_target,
-            self._joint_ids,
-        )
-        self._asset.set_joint_position_target(safe_target, self._joint_ids)
+        if not self._arm_release_ramp_enabled:
+            self._asset.set_joint_velocity_target(
+                self._zero_joint_velocity_target,
+                self._joint_ids,
+            )
+            self._asset.set_joint_position_target(safe_target, self._joint_ids)
+        else:
+            if staged_release_ramp is None:
+                raise ValueError("PolaRiS EEF arm release-ramp staged state is absent")
+            try:
+                self._asset.set_joint_velocity_target(
+                    self._zero_joint_velocity_target,
+                    self._joint_ids,
+                )
+                self._asset.set_joint_position_target(safe_target, self._joint_ids)
+                live_velocity_target = self._asset.data.joint_vel_target[
+                    :, self._joint_ids
+                ]
+                live_position_target = self._asset.data.joint_pos_target[
+                    :, self._joint_ids
+                ]
+                if not torch.equal(
+                    live_velocity_target, self._zero_joint_velocity_target
+                ) or not torch.equal(live_position_target, safe_target):
+                    raise ValueError("PolaRiS EEF arm target setter readback drift")
+                if failure_trace is not None:
+                    trace_position_target = failure_trace.get("new_joint_pos_target")
+                    trace_velocity_target = failure_trace.get("new_joint_vel_target")
+                    if (
+                        not isinstance(trace_position_target, torch.Tensor)
+                        or not isinstance(trace_velocity_target, torch.Tensor)
+                        or not torch.equal(trace_position_target, live_position_target)
+                        or not torch.equal(trace_velocity_target, live_velocity_target)
+                    ):
+                        raise ValueError(
+                            "PolaRiS EEF arm failure-trace target binding drift"
+                        )
+                    self._stage_failure_substep_trace(**failure_trace)
+            except Exception:
+                self._arm_target_transaction_failed = True
+                raise
         # Tensor references come first.  The remaining operations are plain
         # assignments of prevalidated Python scalars/references and cannot
         # split a staged activation from its anchor.
@@ -1516,6 +1758,42 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._gripper_close_arm_interlock_released_apply_count = (
             staged.released_apply_count
         )
+        if self._arm_release_ramp_enabled:
+            if staged_release_ramp is None:
+                raise ValueError("PolaRiS EEF arm release-ramp staged state is absent")
+            self._arm_release_ramp_max_abs_nominal_to_ramped_target_change = (
+                staged_release_ramp.max_abs_nominal_to_ramped_target_change
+            )
+            self._arm_release_ramp_phase = staged_release_ramp.phase
+            self._arm_release_ramp_next_index = staged_release_ramp.next_index
+            self._arm_release_observed_count = (
+                staged_release_ramp.release_observed_count
+            )
+            self._arm_release_ramp_started_count = (
+                staged_release_ramp.ramp_started_count
+            )
+            self._arm_release_ramp_completed_count = (
+                staged_release_ramp.ramp_completed_count
+            )
+            self._arm_release_ramp_cancelled_by_reactivation_count = (
+                staged_release_ramp.ramp_cancelled_by_reactivation_count
+            )
+            self._arm_release_ramp_target_apply_count = (
+                staged_release_ramp.ramp_target_apply_count
+            )
+            self._arm_release_ramp_cancelled_target_apply_count = (
+                staged_release_ramp.cancelled_ramp_target_apply_count
+            )
+            self._arm_release_ramp_limited_target_apply_count = (
+                staged_release_ramp.ramp_limited_target_apply_count
+            )
+            self._arm_release_ramp_limited_joint_target_count = (
+                staged_release_ramp.ramp_limited_joint_target_count
+            )
+            self._arm_release_ramp_last_target_apply_index = (
+                staged_release_ramp.last_target_apply_index
+            )
+            self._arm_release_ramp_last_index = staged_release_ramp.last_ramp_index
 
     def _reset_gripper_runtime_evidence(self) -> None:
         dtype = self._asset.data.joint_pos.dtype
@@ -1727,6 +2005,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         if self._wrist_energy_brake_enabled:
             self._reset_wrist_energy_brake_state(env_ids)
         self._reset_gripper_close_arm_interlock_state()
+        self._reset_arm_release_ramp_state()
 
     def _soft_joint_pos_limits(self) -> torch.Tensor:
         return self._asset.data.soft_joint_pos_limits[:, self._joint_ids, :]
@@ -2290,6 +2569,13 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
     def apply_actions(self):
         """Apply finite, velocity-slewed, soft-limited EEF IK joint targets."""
 
+        if self._arm_release_ramp_enabled and self._arm_target_transaction_failed:
+            raise ValueError(
+                "PolaRiS EEF arm target transaction previously failed; reset is "
+                "required before another apply"
+            )
+        if self._arm_release_ramp_enabled:
+            self._validate_arm_release_ramp_state()
         if self._failure_substep_trace_enabled:
             self._finalize_pending_failure_substep_trace(
                 post_joint_pos=self._asset.data.joint_pos[:, self._joint_ids],
@@ -2647,6 +2933,36 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                     soft_limits,
                     target_guard_band_delta_joint_pos=self._max_delta_joint_pos,
                 )
+        release_ramp_transition = None
+        release_ramp_target = None
+        if self._arm_release_ramp_enabled:
+            release_ramp_transition = advance_arm_release_ramp(
+                enabled=True,
+                phase_before_apply=self._arm_release_ramp_phase,
+                next_ramp_index_before_apply=self._arm_release_ramp_next_index,
+                interlock_remaining_before_apply=(
+                    self._gripper_close_arm_interlock_remaining
+                ),
+                interlock_active_this_apply=close_interlock_transition.active,
+                interlock_remaining_after_apply=(
+                    close_interlock_transition.remaining_after_successful_apply
+                ),
+                interlock_activation_count_delta=(
+                    close_interlock_transition.activation_count_delta
+                ),
+            )
+            if release_ramp_transition.ramp_index_to_apply is not None:
+                if close_interlock_transition.active:
+                    raise ValueError(
+                        "PolaRiS EEF arm release ramp overlapped an active HOLD"
+                    )
+                release_ramp_target = apply_arm_release_ramp_target(
+                    joint_pos,
+                    nominal_safe_target,
+                    self._nominal_max_delta_joint_pos,
+                    ramp_index=release_ramp_transition.ramp_index_to_apply,
+                )
+                safe_target = release_ramp_target.target
         applied_delta = safe_target - joint_pos
         raw_target_violation = torch.maximum(
             torch.clamp(lower - raw_joint_pos_target, min=0.0),
@@ -2969,10 +3285,113 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             active_apply_count=next_interlock_active_apply_count,
             released_apply_count=next_interlock_released_apply_count,
         )
+        if self._arm_release_ramp_enabled:
+            if release_ramp_transition is None:
+                raise ValueError("PolaRiS EEF arm release-ramp transition is absent")
+            ramp_target_apply_delta = int(
+                release_ramp_transition.ramp_index_to_apply is not None
+            )
+            if ramp_target_apply_delta:
+                if release_ramp_target is None:
+                    raise ValueError("PolaRiS EEF arm release-ramp target is absent")
+                limited_joint_delta = int(
+                    release_ramp_target.limited_joint_mask.sum().detach().cpu().item()
+                )
+                limited_apply_delta = int(limited_joint_delta > 0)
+                target_change = (nominal_safe_target - safe_target).abs()[0]
+                next_ramp_maximum_change = torch.maximum(
+                    self._arm_release_ramp_max_abs_nominal_to_ramped_target_change,
+                    target_change,
+                )
+                next_ramp_last_target_apply_index = self._apply_call_count - 1
+                next_ramp_last_index = release_ramp_transition.ramp_index_to_apply
+            else:
+                limited_joint_delta = 0
+                limited_apply_delta = 0
+                next_ramp_maximum_change = (
+                    self._arm_release_ramp_max_abs_nominal_to_ramped_target_change
+                )
+                next_ramp_last_target_apply_index = (
+                    self._arm_release_ramp_last_target_apply_index
+                )
+                next_ramp_last_index = self._arm_release_ramp_last_index
+            cancelled_target_apply_delta = (
+                int(self._arm_release_ramp_next_index or 0)
+                * release_ramp_transition.ramp_cancelled_by_reactivation_delta
+            )
+            staged_release_ramp_state = _StagedArmReleaseRampState(
+                phase=release_ramp_transition.phase_after_successful_apply,
+                next_index=(
+                    release_ramp_transition.next_ramp_index_after_successful_apply
+                ),
+                release_observed_count=(
+                    self._arm_release_observed_count
+                    + release_ramp_transition.release_observed_delta
+                ),
+                ramp_started_count=(
+                    self._arm_release_ramp_started_count
+                    + release_ramp_transition.ramp_started_delta
+                ),
+                ramp_completed_count=(
+                    self._arm_release_ramp_completed_count
+                    + release_ramp_transition.ramp_completed_delta
+                ),
+                ramp_cancelled_by_reactivation_count=(
+                    self._arm_release_ramp_cancelled_by_reactivation_count
+                    + release_ramp_transition.ramp_cancelled_by_reactivation_delta
+                ),
+                ramp_target_apply_count=(
+                    self._arm_release_ramp_target_apply_count + ramp_target_apply_delta
+                ),
+                cancelled_ramp_target_apply_count=(
+                    self._arm_release_ramp_cancelled_target_apply_count
+                    + cancelled_target_apply_delta
+                ),
+                ramp_limited_target_apply_count=(
+                    self._arm_release_ramp_limited_target_apply_count
+                    + limited_apply_delta
+                ),
+                ramp_limited_joint_target_count=(
+                    self._arm_release_ramp_limited_joint_target_count
+                    + limited_joint_delta
+                ),
+                last_target_apply_index=next_ramp_last_target_apply_index,
+                last_ramp_index=next_ramp_last_index,
+                max_abs_nominal_to_ramped_target_change=(next_ramp_maximum_change),
+            )
+        else:
+            staged_release_ramp_state = None
+        failure_trace = None
+        if self._failure_substep_trace_enabled and self._arm_release_ramp_enabled:
+            if previous_joint_pos_target is None or pose_error is None:
+                raise ValueError(
+                    "PolaRiS EEF failure substep trace command evidence is absent"
+                )
+            failure_trace = {
+                "joint_pos": joint_pos,
+                "joint_vel": joint_vel,
+                "previous_joint_pos_target": previous_joint_pos_target,
+                "raw_dls_joint_pos_target": raw_joint_pos_target,
+                "new_joint_pos_target": safe_target,
+                "new_joint_vel_target": self._zero_joint_velocity_target,
+                "new_joint_effort_target": self._asset.data.joint_effort_target[
+                    :, self._joint_ids
+                ],
+                "current_eef_position": ee_pos_curr,
+                "current_eef_quaternion": ee_quat_curr,
+                "desired_eef_position": self._ik_controller.ee_pos_des,
+                "desired_eef_quaternion": self._ik_controller.ee_quat_des,
+                "pose_error": pose_error,
+            }
         self._set_targets_and_commit_gripper_close_arm_interlock(
             safe_target,
             staged_interlock_state,
+            staged_release_ramp_state,
+            failure_trace,
         )
+        if self._arm_release_ramp_enabled:
+            self._validate_gripper_close_arm_interlock_anchor_state()
+            self._validate_arm_release_ramp_state()
         if self._wrist_energy_brake_enabled:
             if wrist_energy_brake_result is None:
                 raise ValueError("PolaRiS EEF wrist energy-brake transition is absent")
@@ -3005,7 +3424,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             self._wrist_energy_brake_reversal_detection_armed.copy_(
                 ~wrist_energy_brake_result.active_environment_mask
             )
-        if self._failure_substep_trace_enabled:
+        if self._failure_substep_trace_enabled and not self._arm_release_ramp_enabled:
             if previous_joint_pos_target is None or pose_error is None:
                 raise ValueError(
                     "PolaRiS EEF failure substep trace command evidence is absent"
@@ -3120,7 +3539,9 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             if anchor_capture_count > 0
             else None
         )
-        return {
+        if self._arm_release_ramp_enabled:
+            self._validate_arm_release_ramp_state(require_latest_target=False)
+        report = {
             "arm_slew_headroom": {
                 "enabled": self._arm_slew_headroom_enabled,
                 "profile": ARM_SLEW_HEADROOM_CANDIDATE_PROFILE,
@@ -3209,6 +3630,57 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 ),
             },
         }
+        if self._arm_release_ramp_enabled:
+            report["arm_release_ramp"] = {
+                "enabled": True,
+                "profile": ARM_RELEASE_RAMP_PROFILE,
+                "state_profile": ARM_RELEASE_RAMP_STATE_PROFILE,
+                "substeps": ARM_RELEASE_RAMP_SUBSTEPS,
+                "fraction_profile": ARM_RELEASE_RAMP_FRACTION_PROFILE,
+                "fractions_float32": [
+                    float(
+                        torch.tensor(
+                            index / (ARM_RELEASE_RAMP_SUBSTEPS - 1),
+                            dtype=torch.float32,
+                        ).item()
+                    )
+                    for index in range(ARM_RELEASE_RAMP_SUBSTEPS)
+                ],
+                "formula_profile": ARM_RELEASE_RAMP_FORMULA_PROFILE,
+                "transaction_profile": ARM_RELEASE_RAMP_TRANSACTION_PROFILE,
+                "open_during_ramp_policy": (
+                    "continue_current_ramp_without_restart_or_skip_v1"
+                ),
+                "phase": self._arm_release_ramp_phase,
+                "next_index": self._arm_release_ramp_next_index,
+                "release_observed_count": self._arm_release_observed_count,
+                "ramp_started_count": self._arm_release_ramp_started_count,
+                "ramp_completed_count": self._arm_release_ramp_completed_count,
+                "ramp_cancelled_by_reactivation_count": (
+                    self._arm_release_ramp_cancelled_by_reactivation_count
+                ),
+                "ramp_target_apply_count": (self._arm_release_ramp_target_apply_count),
+                "cancelled_ramp_target_apply_count": (
+                    self._arm_release_ramp_cancelled_target_apply_count
+                ),
+                "ramp_limited_target_apply_count": (
+                    self._arm_release_ramp_limited_target_apply_count
+                ),
+                "ramp_limited_joint_target_count": (
+                    self._arm_release_ramp_limited_joint_target_count
+                ),
+                "last_target_apply_index": (
+                    self._arm_release_ramp_last_target_apply_index
+                ),
+                "last_ramp_index": self._arm_release_ramp_last_index,
+                "max_abs_nominal_to_ramped_target_change_rad": (
+                    self._arm_release_ramp_max_abs_nominal_to_ramped_target_change.detach()
+                    .cpu()
+                    .tolist()
+                ),
+                "gripper_target_or_state_write_count": 0,
+            }
+        return report
 
     def safety_report(self) -> dict[str, object]:
         """Return JSON-serializable evidence for the active rollout."""
@@ -3588,5 +4060,8 @@ class RobustDifferentialInverseKinematicsActionCfg(
 
     enable_gripper_close_arm_interlock: bool = False
     """Hold the arm during the bounded EEF gripper-close ramp."""
+
+    enable_arm_release_ramp: bool = False
+    """Ramp the arm slew cap for 16 substeps after interlock release."""
 
     class_type = RobustDifferentialInverseKinematicsAction

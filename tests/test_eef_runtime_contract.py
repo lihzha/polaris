@@ -32,7 +32,15 @@ from polaris.eef_runtime_contract import validate_ego_lap_runtime_protocol
 from polaris import eef_runtime_contract as runtime_contract_module
 from polaris.config import EEF_CONTROLLER_BASELINE_PROFILE
 from polaris.config import EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
+from polaris.config import EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE
 from polaris.eef_controller_profile import eef_controller_profile
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_FORMULA_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_FRACTION_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_STATE_PROFILE
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_SUBSTEPS
+from polaris.eef_controller_repair import ARM_RELEASE_RAMP_TRANSACTION_PROFILE
+from polaris.eef_controller_repair import arm_release_ramp_fraction
 from polaris.eef_gripper_failure_trace import EEF_ALL_SIX_GRIPPER_TRACE_PROFILE
 from polaris.eef_gripper_runtime import (
     EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE,
@@ -399,15 +407,20 @@ def _controller_aggregate(ik_safety: dict) -> dict:
     }
 
 
-def _candidate_controller_report(safety: dict, *, initial: bool) -> dict:
-    spec = eef_controller_profile(EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE)
+def _candidate_controller_report(
+    safety: dict,
+    *,
+    initial: bool,
+    profile: str = EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE,
+) -> dict:
+    spec = eef_controller_profile(profile)
     physical = np.asarray(safety["max_delta_joint_pos_rad"], dtype=np.float32).tolist()
     nominal = np.multiply(
         np.asarray(physical, dtype=np.float32),
         np.float32(0.95),
         dtype=np.float32,
     ).tolist()
-    return {
+    report = {
         "arm_slew_headroom": {
             "enabled": True,
             "profile": "panda_nominal_target_slew_0p95_physical_limit_v1",
@@ -445,6 +458,38 @@ def _candidate_controller_report(safety: dict, *, initial: bool) -> dict:
             "max_abs_released_delta_joint_pos_rad": [0.0] * 7,
         },
     }
+    if spec.arm_release_ramp_enabled:
+        report["arm_release_ramp"] = {
+            "enabled": True,
+            "profile": ARM_RELEASE_RAMP_PROFILE,
+            "state_profile": ARM_RELEASE_RAMP_STATE_PROFILE,
+            "substeps": ARM_RELEASE_RAMP_SUBSTEPS,
+            "fraction_profile": ARM_RELEASE_RAMP_FRACTION_PROFILE,
+            "fractions_float32": [
+                arm_release_ramp_fraction(index)
+                for index in range(ARM_RELEASE_RAMP_SUBSTEPS)
+            ],
+            "formula_profile": ARM_RELEASE_RAMP_FORMULA_PROFILE,
+            "transaction_profile": ARM_RELEASE_RAMP_TRANSACTION_PROFILE,
+            "open_during_ramp_policy": (
+                "continue_current_ramp_without_restart_or_skip_v1"
+            ),
+            "phase": "release",
+            "next_index": None,
+            "release_observed_count": 0,
+            "ramp_started_count": 0,
+            "ramp_completed_count": 0,
+            "ramp_cancelled_by_reactivation_count": 0,
+            "ramp_target_apply_count": 0,
+            "cancelled_ramp_target_apply_count": 0,
+            "ramp_limited_target_apply_count": 0,
+            "ramp_limited_joint_target_count": 0,
+            "last_target_apply_index": None,
+            "last_ramp_index": None,
+            "max_abs_nominal_to_ramped_target_change_rad": [0.0] * 7,
+            "gripper_target_or_state_write_count": 0,
+        }
+    return report
 
 
 def _all_six_trace(*, episode: int, length: int, apply_calls: int) -> dict:
@@ -1435,6 +1480,119 @@ def test_candidate_schema6_sidecar_resume_and_runtime_profile_propagation(
         assert runtime["controller_repair_candidate"]["episodes"] == [
             {"episode_index": 0, "report": controller_report}
         ]
+
+
+def test_release_ramp_v4_sidecar_and_aggregate_are_profile_bound(
+    tmp_path: Path,
+    monkeypatch,
+):
+    result = _episode_result(length=450)
+    safety = _attach_candidate_stub_gripper(
+        _episode_safety(length=450),
+        length=450,
+    )
+    report = _candidate_controller_report(
+        safety,
+        initial=False,
+        profile=EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+    )
+    initial = _candidate_controller_report(
+        safety,
+        initial=True,
+        profile=EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+    )
+    trace = _all_six_trace(episode=0, length=450, apply_calls=3600)
+    terminal = _terminal_rollout(result)
+    sidecar_path = tmp_path / "ik_safety" / "episode_000000.json"
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            runtime_contract_module,
+            "validate_eef_gripper_static_contract",
+            lambda value, **_kwargs: dict(value),
+        )
+        patch.setattr(
+            runtime_contract_module,
+            "validate_eef_gripper_dynamic_evidence",
+            lambda value, **_kwargs: dict(value),
+        )
+        patch.setattr(
+            runtime_contract_module,
+            "validate_eef_controller_safety_evidence",
+            lambda *_args, expected_profile, **_kwargs: eef_controller_profile(
+                expected_profile
+            ),
+        )
+        payload = atomic_write_episode_safety(
+            sidecar_path,
+            eef_controller_profile=EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE,
+            controller_repair_candidate=report,
+            arm_failure_substep_trace=None,
+            all_six_gripper_trace=trace,
+            episode_index=0,
+            episode_result=result,
+            safety=safety,
+            artifact_identity=_artifact_identity_for_terminal(result, terminal),
+            terminal_rollout=terminal,
+            expected_gripper_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+        )
+        assert payload["eef_controller_profile"] == (
+            EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE
+        )
+        assert (
+            payload["controller_repair_candidate"]["arm_release_ramp"]
+            == (report["arm_release_ramp"])
+        )
+        sidecars = load_episode_safety_sidecars(
+            sidecar_path.parent,
+            [0],
+            expected_eef_controller_profile=(
+                EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE
+            ),
+            expected_gripper_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+        )
+        aggregate = build_eef_controller_repair_candidate_aggregate(
+            live_safety=safety,
+            initial_report=initial,
+            sidecars=sidecars,
+            expected_eef_controller_profile=(
+                EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE
+            ),
+            expected_gripper_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+        )
+        assert aggregate["eef_controller_profile"] == (
+            EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE
+        )
+        assert aggregate["initial"]["arm_release_ramp"] == initial["arm_release_ramp"]
+        assert (
+            aggregate["episodes"][0]["report"]["arm_release_ramp"]
+            == report["arm_release_ramp"]
+        )
+
+        missing = copy.deepcopy(report)
+        missing.pop("arm_release_ramp")
+        with pytest.raises(ValueError, match="schema drift"):
+            atomic_write_episode_safety(
+                tmp_path / "missing_ramp.json",
+                eef_controller_profile=(EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE),
+                controller_repair_candidate=missing,
+                arm_failure_substep_trace=None,
+                all_six_gripper_trace=trace,
+                episode_index=0,
+                episode_result=result,
+                safety=safety,
+                artifact_identity=_artifact_identity_for_terminal(result, terminal),
+                terminal_rollout=terminal,
+                expected_gripper_target_slew_profile=(
+                    EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+                ),
+            )
 
 
 def test_prepared_sidecar_recovers_exact_missing_csv_row(tmp_path: Path):
