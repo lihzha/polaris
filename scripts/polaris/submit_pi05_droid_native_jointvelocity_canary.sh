@@ -25,6 +25,8 @@ die() {
 }
 
 command -v sbatch >/dev/null || die "Run this submitter on l401/l402/l403"
+[[ -z "${PORT+x}" ]] \
+  || die "Ambient PORT is forbidden; the canary server binds an OS-assigned port"
 [[ -z "${RESUME_FROM_TASK_DIR:-}" ]] || die "Native flow canaries forbid prefix resume"
 [[ "${EXPECTED_CONTROLLER_COMPLETION_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
   || die "Malformed job1098174 completion digest"

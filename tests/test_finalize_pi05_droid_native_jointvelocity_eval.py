@@ -1,6 +1,7 @@
 import argparse
 import copy
 import hashlib
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -14,6 +15,11 @@ from scripts.polaris import finalize_pi05_droid_native_jointvelocity_eval as fin
 from polaris.pi05_droid_jointvelocity_contract import (
     PI05_DROID_OPENPI_INFERENCE_COMPATIBILITY_COMMIT,
     reference_openpi_runtime_attestation,
+)
+from polaris.pi05_droid_bound_port import (
+    BOUND_PORT_PROFILE,
+    load_bound_port_record,
+    publish_bound_port_record,
 )
 from polaris.pi05_droid_native_eval_contract import (
     PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS,
@@ -809,7 +815,14 @@ def test_run_record_envelope_integer_fields_are_type_exact(
         "ALL_SIX_CONTROLLER_COMPLETION": str(args.all_six_controller_completion),
         "EXPECTED_ALL_SIX_COMPLETION_SHA256": (args.expected_all_six_completion_sha256),
         "EXPECTED_ALL_SIX_PROFILE": args.expected_all_six_profile,
-        "PORT": "8000",
+        "PORT_REQUESTED": "0",
+        "PORT_ACTUAL": "43123",
+        "SERVER_PID": "12345",
+        "BOUND_PORT_FILE": str(run_dir / "policy_bound_port.json"),
+        "BOUND_PORT_TOKEN": "e" * 64,
+        "BOUND_PORT_FILE_SHA256": "f" * 64,
+        "BOUND_PORT_FILE_IDENTITY": "1:2:123:4:5:292:1",
+        "HANDSHAKE_PATH": str(run_dir / "policy_handshake.json"),
         "MODEL_RUNTIME_CONTRACT": str(run_dir / "pi05_droid_native_model_runtime.json"),
     }
     value = {
@@ -826,8 +839,8 @@ def test_run_record_envelope_integer_fields_are_type_exact(
     assert (
         finalizer._validate_run_record(
             valid_path, args=args, run_dir=run_dir, checkpoint=checkpoint
-        )["port"]
-        == 8000
+        )["actual_port"]
+        == 43123
     )
 
     value[field] = drifted_value
@@ -837,6 +850,77 @@ def test_run_record_envelope_integer_fields_are_type_exact(
         finalizer._validate_run_record(
             path, args=args, run_dir=run_dir, checkpoint=checkpoint
         )
+
+
+def test_finalizer_binds_exact_bound_port_and_real_handshake_artifacts(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    bound_path = run_dir / "policy_bound_port.json"
+    token = "a" * 64
+    record = {
+        "schema_version": 1,
+        "profile": BOUND_PORT_PROFILE,
+        "artifact_path": str(bound_path),
+        "host": "0.0.0.0",
+        "socket_family": "AF_INET",
+        "requested_port": 0,
+        "actual_port": 43123,
+        "pid": os.getpid(),
+        "launch_token": token,
+    }
+    publish_bound_port_record(bound_path, record)
+    _, _, digest, identity = load_bound_port_record(
+        bound_path,
+        expected_pid=os.getpid(),
+        expected_launch_token=token,
+        expected_requested_port=0,
+        require_live_pid=True,
+    )
+    run_record = {
+        "requested_port": 0,
+        "actual_port": 43123,
+        "server_pid": os.getpid(),
+        "launch_token": token,
+        "bound_port_sha256": digest,
+        "bound_port_identity": identity,
+    }
+    bound = finalizer._validate_bound_port_artifact(bound_path, run_record)
+    assert bound["value"] == record
+    assert bound["stable_identity"] == identity
+
+    serving_contract = {
+        "path": str(run_dir / "ego_lap_serving_contract.json"),
+        "size": 123,
+        "sha256": "b" * 64,
+        "contract_sha256": "c" * 64,
+        "mode": "0444",
+        "nlink": 1,
+    }
+    handshake_path = run_dir / "policy_handshake.json"
+    publish_immutable_json(
+        handshake_path,
+        {
+            "schema_version": 1,
+            "profile": "pi05_droid_native_websocket_handshake_v1",
+            "host": "127.0.0.1",
+            "actual_port": 43123,
+            "server_pid": os.getpid(),
+            "openpi_dir": str(tmp_path / "openpi"),
+            "serving_contract": serving_contract,
+            "contract_sha256": "c" * 64,
+        },
+    )
+    handshake = finalizer._validate_handshake_artifact(
+        handshake_path,
+        run_record=run_record,
+        serving_contract=serving_contract,
+        openpi_dir=tmp_path / "openpi",
+    )
+    assert handshake["sha256"] == file_sha256(handshake_path)
+
+    drifted = dict(run_record, actual_port=43124)
+    with pytest.raises(ValueError, match="sealed run record"):
+        finalizer._validate_bound_port_artifact(bound_path, drifted)
 
 
 @pytest.mark.parametrize(
@@ -1269,6 +1353,20 @@ def test_launchers_block_before_download_or_sbatch_and_forbid_resume():
         assert "EXPECTED_ALL_SIX_PROFILE" in source
         assert "1098204" not in source
         assert "RESUME_FROM_TASK_DIR" in source
+        assert "Ambient PORT is forbidden" in source
+    assert "/dev/tcp" not in eval_source
+    assert "20000 +" not in eval_source
+    assert "REQUESTED_PORT=0" in eval_source
+    assert '--bound-port-output "${BOUND_PORT_FILE}"' in eval_source
+    assert '--bound-port-token "${BOUND_PORT_TOKEN}"' in eval_source
+    assert '--policy.port "${ACTUAL_PORT}"' in eval_source
+    assert "validate_pi05_droid_bound_port.py" in eval_source
+    assert "validate_pi05_droid_handshake.py" in eval_source
+    assert "BOUND_PORT_VALIDATION_AFTER_HANDSHAKE" in eval_source
+    assert "BOUND_PORT_VALIDATION_AFTER_EVAL" in eval_source
+    assert "attempt_failed.json" in eval_source
+    assert "failed_not_ready_for_promotion" in eval_source
+    assert "Ambient PORT is forbidden" in sbatch_source
     assert sbatch_source.count("#SBATCH --no-requeue") == 1
     timeout_configuration = evaluator_source.index(
         "configured_episode_length_seconds = configure_native_environment_timeout"
@@ -1313,3 +1411,72 @@ def test_launchers_block_before_download_or_sbatch_and_forbid_resume():
         < lifecycle_source.index("self._simulation_app.close()")
     )
     assert "official_model_eval_contract" in finalizer.finalize.__code__.co_consts
+
+
+def test_atomic_port_server_pin_preserves_attested_scientific_prefix():
+    relative = "scripts/polaris/serve_pi05_droid_native_jointvelocity.py"
+    current = (ROOT / relative).read_bytes()
+    accepted = subprocess.run(
+        [
+            "git",
+            "-C",
+            ROOT,
+            "show",
+            f"{finalizer.PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT}:{relative}",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert hashlib.sha256(current).hexdigest() == (
+        finalizer.ATOMIC_PORT_SERVER_SOURCE_SHA256
+    )
+    assert finalizer._scientific_server_prefix(current) == (
+        finalizer._scientific_server_prefix(accepted)
+    )
+
+    model_drift = current.replace(
+        b"train_config, args.checkpoint_dir.resolve()",
+        b"train_config, args.checkpoint_dir",
+        1,
+    )
+    assert model_drift != current
+    assert finalizer._scientific_server_prefix(model_drift) != (
+        finalizer._scientific_server_prefix(accepted)
+    )
+
+    orchestration_drift = current.replace(
+        b"publishing contracts", b"publishing artifacts", 1
+    )
+    assert orchestration_drift != current
+    assert finalizer._scientific_server_prefix(orchestration_drift) == (
+        finalizer._scientific_server_prefix(accepted)
+    )
+
+
+def test_atomic_port_preflight_pins_every_runtime_handoff_source(monkeypatch):
+    original_git = finalizer._git
+
+    def candidate_git(repository, *arguments):
+        if (
+            len(arguments) == 2
+            and arguments[0] == "show"
+            and arguments[1].startswith("HEAD:")
+        ):
+            return (ROOT / arguments[1].removeprefix("HEAD:")).read_bytes()
+        return original_git(repository, *arguments)
+
+    # The candidate isn't committed until the implementation gate passes.
+    # Production still requires byte identity with HEAD.
+    monkeypatch.setattr(finalizer, "_git", candidate_git)
+    report = finalizer.validate_atomic_port_runtime_sources(ROOT)
+    assert report["profile"] == finalizer.ATOMIC_PORT_SERVER_PROFILE
+    assert set(report["files"]) == set(finalizer.ATOMIC_PORT_RUNTIME_SOURCE_SHA256)
+    for relative, expected in finalizer.ATOMIC_PORT_RUNTIME_SOURCE_SHA256.items():
+        assert report["files"][relative]["sha256"] == expected
+
+    drifted = dict(finalizer.ATOMIC_PORT_RUNTIME_SOURCE_SHA256)
+    relative = "src/polaris/pi05_droid_bound_port.py"
+    drifted[relative] = "0" * 64
+    monkeypatch.setattr(finalizer, "ATOMIC_PORT_RUNTIME_SOURCE_SHA256", drifted)
+    with pytest.raises(ValueError, match="Atomic-port runtime source drift"):
+        finalizer.validate_atomic_port_runtime_sources(ROOT)

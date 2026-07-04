@@ -20,7 +20,7 @@ EXPECTED_IMAGE_SHA256=ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d55
 EXPECTED_MANIFEST_SHA256=6f9ccfa5695c669962ad10dbe0dcb7d44bf903918e5fffe33e5d1ff531287922
 EXPECTED_NORM_SHA256=403b3a22f897e9ae5dd617966a3c8f7d1835ac79dfd5a8993179514be26a3b8b
 POLARIS_ENVIRONMENT=DROID-FoodBussing
-PORT="${PORT:-$((20000 + ${SLURM_JOB_ID:-1} % 20000))}"
+REQUESTED_PORT=0
 SERVER_START_TIMEOUT_SECS="${SERVER_START_TIMEOUT_SECS:-2400}"
 
 : "${RUN_DIR:?Set RUN_DIR to one fresh canary attempt directory}"
@@ -42,9 +42,10 @@ die() {
   || die "Malformed job1098174 completion digest"
 [[ "${EXPECTED_ALL_SIX_COMPLETION_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
   || die "Malformed all-six completion digest"
-if [[ ! "${PORT}" =~ ^[1-9][0-9]*$ ]] || (( PORT > 65535 )); then
-  die "Invalid port"
-fi
+[[ -z "${PORT+x}" ]] \
+  || die "Ambient PORT is forbidden; the WebSocket server must bind port 0"
+[[ "${SERVER_START_TIMEOUT_SECS}" =~ ^[1-9][0-9]*$ ]] \
+  || die "SERVER_START_TIMEOUT_SECS must be a positive integer"
 [[ -z "${RESUME_FROM_TASK_DIR:-}" ]] || die "Native flow attempts forbid prefix resume"
 
 [[ ! -L "${POLARIS_DIR}" ]] || die "POLARIS_DIR must not be a symlink"
@@ -79,6 +80,8 @@ git_common_dir="$(git -C "${POLARIS_DIR}" rev-parse --path-format=absolute --git
 [[ -f "${POLARIS_VULKAN_ICD_PATH}" ]] || die "Missing Vulkan ICD"
 [[ "$(sha256sum "${CHECKPOINT_MANIFEST}" | awk '{print $1}')" == "${EXPECTED_MANIFEST_SHA256}" ]] \
   || die "Native checkpoint manifest mismatch"
+[[ -d "${RUN_DIR}" && ! -L "${RUN_DIR}" ]] || die "Missing regular RUN_DIR"
+RUN_DIR="$(realpath -e -- "${RUN_DIR}")"
 
 # This is intentionally the first Python action.  It blocks before checkpoint
 # download or GPU work until both independently reviewed controller captures
@@ -106,12 +109,26 @@ CHECKPOINT_VERIFICATION="${RUN_DIR}/checkpoint_verification.json"
 INFERENCE_ENVIRONMENT="${RUN_DIR}/inference_environment.json"
 RUN_RECORD="${RUN_DIR}/run_record.json"
 COMMANDS_FILE="${RUN_DIR}/commands.sh"
+BOUND_PORT_FILE="${RUN_DIR}/policy_bound_port.json"
+HANDSHAKE_PATH="${RUN_DIR}/policy_handshake.json"
+FAILURE_PATH="${RUN_DIR}/attempt_failed.json"
+BOUND_PORT_VALIDATOR="${SCRIPT_DIR}/validate_pi05_droid_bound_port.py"
+HANDSHAKE_VALIDATOR="${SCRIPT_DIR}/validate_pi05_droid_handshake.py"
+BOUND_PORT_TOKEN="$(
+  printf '%s\0%s\0%s\0' \
+    "${EXPECTED_POLARIS_COMMIT}" "${SLURM_JOB_ID}" "${RUN_DIR}" \
+    | sha256sum | awk '{print $1}'
+)"
+[[ "${BOUND_PORT_TOKEN}" =~ ^[0-9a-f]{64}$ ]] \
+  || die "Failed to derive the bound-port launch token"
 SERVER_PID=""
+FAILURE_STAGE=checkpoint_setup
 
 mkdir -p "${TASK_DIR}" "${POLARIS_CACHE_DIR}/home"
 for output in "${SERVER_LOG}" "${EVAL_LOG}" "${TRACE_PATH}" "${RUNTIME_PATH}" \
   "${LIFECYCLE_PATH}" "${SERVING_CONTRACT_PATH}" "${CHECKPOINT_VERIFICATION}" \
   "${MODEL_RUNTIME_CONTRACT}" "${INFERENCE_ENVIRONMENT}" "${RUN_RECORD}" "${COMMANDS_FILE}" \
+  "${BOUND_PORT_FILE}" "${HANDSHAKE_PATH}" "${FAILURE_PATH}" \
   "${INCIDENT_PATH}" "${SIDECAR_PATH}" \
   "${TASK_DIR}/eval_results.csv" "${TASK_DIR}/episode_0.mp4" "${RUN_DIR}/eval_success.txt"; do
   [[ ! -e "${output}" && ! -L "${output}" ]] || die "Refusing existing output: ${output}"
@@ -135,6 +152,30 @@ on_exit() {
   set +e
   stop_server
   if (( code != 0 )); then
+    export FAILURE_PATH FAILURE_STAGE ATTEMPT_EXIT_CODE="${code}"
+    export BOUND_PORT_ARTIFACT_PRESENT=false
+    if [[ -f "${BOUND_PORT_FILE}" && ! -L "${BOUND_PORT_FILE}" ]]; then
+      export BOUND_PORT_ARTIFACT_PRESENT=true
+    fi
+    PYTHONPATH="${POLARIS_DIR}/src" /usr/bin/python3 - <<'PY' || true
+import os
+from pathlib import Path
+from polaris.pi05_droid_native_eval_contract import publish_immutable_json
+
+publish_immutable_json(
+    Path(os.environ["FAILURE_PATH"]),
+    {
+        "schema_version": 1,
+        "profile": "openpi_pi05_droid_native_jointvelocity_polaris_canary_v1",
+        "status": "failed_not_ready_for_promotion",
+        "job_id": int(os.environ["SLURM_JOB_ID"]),
+        "exit_code": int(os.environ["ATTEMPT_EXIT_CODE"]),
+        "failure_stage": os.environ["FAILURE_STAGE"],
+        "requested_port": 0,
+        "bound_port_artifact_present": os.environ["BOUND_PORT_ARTIFACT_PRESENT"] == "true",
+    },
+)
+PY
     printf 'native canary failed with exit %s at %s\n' "${code}" "$(date -Iseconds)" >&2
   fi
   exit "${code}"
@@ -166,39 +207,6 @@ OPENPI_DATA_HOME="${OPENPI_DATA_HOME}" JAX_PLATFORMS=cuda \
   "${SCRIPT_DIR}/capture_pi05_droid_native_environment.py" \
   --openpi-dir "${OPENPI_DIR}" --output "${INFERENCE_ENVIRONMENT}"
 
-export RUN_RECORD RUN_DIR CHECKPOINT_PATH="${checkpoint_path}" POLARIS_DIR OPENPI_DIR
-export EXPECTED_POLARIS_COMMIT CHECKPOINT_URI CHECKPOINT_MANIFEST POLARIS_PYXIS_IMAGE
-export POLARIS_DATA_DIR CONTROLLER_COMPLETION EXPECTED_CONTROLLER_COMPLETION_SHA256
-export ALL_SIX_CONTROLLER_COMPLETION EXPECTED_ALL_SIX_COMPLETION_SHA256
-export EXPECTED_ALL_SIX_PROFILE PORT
-export MODEL_RUNTIME_CONTRACT
-PYTHONPATH="${POLARIS_DIR}/src" /usr/bin/python3 - <<'PY'
-import os
-from pathlib import Path
-from polaris.pi05_droid_native_eval_contract import publish_immutable_json
-
-keys = (
-    "RUN_DIR", "CHECKPOINT_PATH", "POLARIS_DIR", "OPENPI_DIR",
-    "EXPECTED_POLARIS_COMMIT", "CHECKPOINT_URI", "CHECKPOINT_MANIFEST",
-    "POLARIS_PYXIS_IMAGE", "POLARIS_DATA_DIR", "CONTROLLER_COMPLETION",
-    "EXPECTED_CONTROLLER_COMPLETION_SHA256", "ALL_SIX_CONTROLLER_COMPLETION",
-    "EXPECTED_ALL_SIX_COMPLETION_SHA256", "EXPECTED_ALL_SIX_PROFILE", "PORT",
-    "MODEL_RUNTIME_CONTRACT",
-)
-publish_immutable_json(
-    Path(os.environ["RUN_RECORD"]),
-    {
-        "schema_version": 1,
-        "profile": "openpi_pi05_droid_native_jointvelocity_polaris_canary_v1",
-        "job_id": int(os.environ["SLURM_JOB_ID"]),
-        "fresh_attempt_no_resume": True,
-        "task": "DROID-FoodBussing",
-        "rollouts": 1,
-        "values": {key: os.environ[key] for key in keys},
-    },
-)
-PY
-
 server_command=(
   "${OPENPI_DIR}/.venv/bin/python"
   "${SCRIPT_DIR}/serve_pi05_droid_native_jointvelocity.py"
@@ -207,15 +215,113 @@ server_command=(
   --manifest "${CHECKPOINT_MANIFEST}"
   --serving-contract-output "${SERVING_CONTRACT_PATH}"
   --model-runtime-contract-output "${MODEL_RUNTIME_CONTRACT}"
-  --port "${PORT}"
+  --port "${REQUESTED_PORT}"
+  --bound-port-output "${BOUND_PORT_FILE}"
+  --bound-port-token "${BOUND_PORT_TOKEN}"
 )
+FAILURE_STAGE=server_bind_and_readiness
+(
+  cd "${POLARIS_DIR}"
+  exec setsid env \
+    OPENPI_DATA_HOME="${OPENPI_DATA_HOME}" \
+    PYTHONPATH="${POLARIS_DIR}/src" \
+    JAX_PLATFORMS=cuda \
+    XLA_PYTHON_CLIENT_MEM_FRACTION=0.35 \
+    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    PYTHONUNBUFFERED=1 \
+    "${server_command[@]}"
+) > "${SERVER_LOG}" 2>&1 &
+SERVER_PID=$!
+
+elapsed=0
+while [[ ! -f "${BOUND_PORT_FILE}" || -L "${BOUND_PORT_FILE}" \
+  || "$(stat -c '%a' -- "${BOUND_PORT_FILE}" 2>/dev/null || true)" != 444 ]]; do
+  if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+    wait "${SERVER_PID}" || server_code=$?
+    SERVER_PID=""
+    tail -n 160 "${SERVER_LOG}" >&2 || true
+    exit "${server_code:-1}"
+  fi
+  sleep 2
+  elapsed=$((elapsed + 2))
+  (( elapsed < SERVER_START_TIMEOUT_SECS )) \
+    || die "Policy server did not publish a bound port before timeout"
+done
+
+bound_port_command=(
+  "${OPENPI_DIR}/.venv/bin/python"
+  "${BOUND_PORT_VALIDATOR}"
+  --artifact "${BOUND_PORT_FILE}"
+  --expected-pid "${SERVER_PID}"
+  --expected-launch-token "${BOUND_PORT_TOKEN}"
+  --expected-requested-port "${REQUESTED_PORT}"
+  --require-live-pid
+  --output-format tsv
+)
+set +e
+BOUND_PORT_VALIDATION="$(PYTHONPATH="${POLARIS_DIR}/src" "${bound_port_command[@]}")"
+bound_port_code=$?
+set -e
+IFS=$'\t' read -r ACTUAL_PORT BOUND_PORT_FILE_SHA256 \
+  BOUND_PORT_FILE_IDENTITY BOUND_PORT_EXTRA <<< "${BOUND_PORT_VALIDATION}"
+if [[ "${bound_port_code}" != 0 || -n "${BOUND_PORT_EXTRA}" \
+  || ! "${ACTUAL_PORT}" =~ ^[1-9][0-9]{0,4}$ \
+  || ! "${BOUND_PORT_FILE_SHA256}" =~ ^[0-9a-f]{64}$ \
+  || ! "${BOUND_PORT_FILE_IDENTITY}" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+:[0-9]+$ ]] \
+  || (( 10#${ACTUAL_PORT:-0} > 65535 )); then
+  die "Policy server published an invalid bound-port artifact"
+fi
+
+handshake_command=(
+  "${OPENPI_DIR}/.venv/bin/python"
+  "${HANDSHAKE_VALIDATOR}"
+  --host 127.0.0.1
+  --port "${ACTUAL_PORT}"
+  --expected-server-pid "${SERVER_PID}"
+  --openpi-dir "${OPENPI_DIR}"
+  --serving-contract "${SERVING_CONTRACT_PATH}"
+  --timeout-seconds 3
+  --output "${HANDSHAKE_PATH}"
+)
+while true; do
+  if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+    wait "${SERVER_PID}" || server_code=$?
+    SERVER_PID=""
+    tail -n 160 "${SERVER_LOG}" >&2 || true
+    exit "${server_code:-1}"
+  fi
+  set +e
+  PYTHONPATH="${POLARIS_DIR}/src" "${handshake_command[@]}"
+  handshake_code=$?
+  set -e
+  if (( handshake_code == 0 )); then
+    break
+  fi
+  (( handshake_code == 3 )) \
+    || die "Policy server WebSocket handshake validation failed"
+  sleep 2
+  elapsed=$((elapsed + 2))
+  (( elapsed < SERVER_START_TIMEOUT_SECS )) \
+    || die "Policy server WebSocket handshake timed out"
+done
+
+BOUND_PORT_VALIDATION_AFTER_HANDSHAKE="$(
+  PYTHONPATH="${POLARIS_DIR}/src" "${bound_port_command[@]}"
+)" || die "Bound-port artifact failed post-handshake validation"
+[[ "${BOUND_PORT_VALIDATION_AFTER_HANDSHAKE}" == "${BOUND_PORT_VALIDATION}" ]] \
+  || die "Bound-port artifact changed across the real WebSocket handshake"
+[[ -f "${MODEL_RUNTIME_CONTRACT}" && ! -L "${MODEL_RUNTIME_CONTRACT}" \
+  && "$(stat -c '%a' -- "${MODEL_RUNTIME_CONTRACT}")" == 444 ]] \
+  || die "Listener did not publish the immutable model runtime contract"
+FAILURE_STAGE=evaluator_execution
+
 eval_args=(
   scripts/eval.py
   --environment "${POLARIS_ENVIRONMENT}"
   --control-mode joint-velocity
   --policy.client DroidJointVelocity
   --policy.host 127.0.0.1
-  --policy.port "${PORT}"
+  --policy.port "${ACTUAL_PORT}"
   --policy.open-loop-horizon 8
   --policy.state-type joint_position
   --policy.frame-description 'robot base frame'
@@ -253,11 +359,52 @@ eval_command=(
   /.venv/bin/python "${eval_args[@]}"
 )
 
+export RUN_RECORD RUN_DIR CHECKPOINT_PATH="${checkpoint_path}" POLARIS_DIR OPENPI_DIR
+export EXPECTED_POLARIS_COMMIT CHECKPOINT_URI CHECKPOINT_MANIFEST POLARIS_PYXIS_IMAGE
+export POLARIS_DATA_DIR CONTROLLER_COMPLETION EXPECTED_CONTROLLER_COMPLETION_SHA256
+export ALL_SIX_CONTROLLER_COMPLETION EXPECTED_ALL_SIX_COMPLETION_SHA256
+export EXPECTED_ALL_SIX_PROFILE MODEL_RUNTIME_CONTRACT
+export PORT_REQUESTED="${REQUESTED_PORT}" PORT_ACTUAL="${ACTUAL_PORT}" SERVER_PID
+export BOUND_PORT_FILE BOUND_PORT_TOKEN BOUND_PORT_FILE_SHA256 BOUND_PORT_FILE_IDENTITY
+export HANDSHAKE_PATH
+PYTHONPATH="${POLARIS_DIR}/src" /usr/bin/python3 - <<'PY'
+import os
+from pathlib import Path
+from polaris.pi05_droid_native_eval_contract import publish_immutable_json
+
+keys = (
+    "RUN_DIR", "CHECKPOINT_PATH", "POLARIS_DIR", "OPENPI_DIR",
+    "EXPECTED_POLARIS_COMMIT", "CHECKPOINT_URI", "CHECKPOINT_MANIFEST",
+    "POLARIS_PYXIS_IMAGE", "POLARIS_DATA_DIR", "CONTROLLER_COMPLETION",
+    "EXPECTED_CONTROLLER_COMPLETION_SHA256", "ALL_SIX_CONTROLLER_COMPLETION",
+    "EXPECTED_ALL_SIX_COMPLETION_SHA256", "EXPECTED_ALL_SIX_PROFILE",
+    "PORT_REQUESTED", "PORT_ACTUAL", "SERVER_PID", "BOUND_PORT_FILE",
+    "BOUND_PORT_TOKEN", "BOUND_PORT_FILE_SHA256", "BOUND_PORT_FILE_IDENTITY",
+    "HANDSHAKE_PATH", "MODEL_RUNTIME_CONTRACT",
+)
+publish_immutable_json(
+    Path(os.environ["RUN_RECORD"]),
+    {
+        "schema_version": 1,
+        "profile": "openpi_pi05_droid_native_jointvelocity_polaris_canary_v1",
+        "job_id": int(os.environ["SLURM_JOB_ID"]),
+        "fresh_attempt_no_resume": True,
+        "task": "DROID-FoodBussing",
+        "rollouts": 1,
+        "values": {key: os.environ[key] for key in keys},
+    },
+)
+PY
+
 {
   printf '#!/usr/bin/env bash\nset -euo pipefail\n'
   printf 'env OPENPI_DATA_HOME=%q PYTHONPATH=%q JAX_PLATFORMS=cuda ' \
     "${OPENPI_DATA_HOME}" "${POLARIS_DIR}/src"
   printf '%q ' "${server_command[@]}"
+  printf '\nPYTHONPATH=%q ' "${POLARIS_DIR}/src"
+  printf '%q ' "${bound_port_command[@]}"
+  printf '\nPYTHONPATH=%q ' "${POLARIS_DIR}/src"
+  printf '%q ' "${handshake_command[@]}"
   printf '\n'
   printf '%q ' "${eval_command[@]}"
   printf '\n'
@@ -266,41 +413,18 @@ chmod 0444 "${COMMANDS_FILE}"
 sync -f "${COMMANDS_FILE}"
 sync -f "${RUN_DIR}"
 
-if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; then
-  die "Port ${PORT} is already in use"
-fi
-(
-  cd "${POLARIS_DIR}"
-  exec setsid env \
-    OPENPI_DATA_HOME="${OPENPI_DATA_HOME}" \
-    PYTHONPATH="${POLARIS_DIR}/src" \
-    JAX_PLATFORMS=cuda \
-    XLA_PYTHON_CLIENT_MEM_FRACTION=0.35 \
-    XLA_PYTHON_CLIENT_PREALLOCATE=false \
-    PYTHONUNBUFFERED=1 \
-    "${server_command[@]}"
-) > "${SERVER_LOG}" 2>&1 &
-SERVER_PID=$!
-
-elapsed=0
-until curl --fail --silent --show-error --max-time 2 \
-  "http://127.0.0.1:${PORT}/healthz" >/dev/null; do
-  if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-    wait "${SERVER_PID}" || server_code=$?
-    tail -n 160 "${SERVER_LOG}" >&2 || true
-    exit "${server_code:-1}"
-  fi
-  sleep 2
-  elapsed=$((elapsed + 2))
-  (( elapsed < SERVER_START_TIMEOUT_SECS )) || die "Policy server startup timed out"
-done
-
 set +e
 (cd "${POLARIS_DIR}" && "${eval_command[@]}") 2>&1 | tee "${EVAL_LOG}"
 pipeline_codes=("${PIPESTATUS[@]}")
 set -e
 eval_code="${pipeline_codes[0]}"
 tee_code="${pipeline_codes[1]}"
+set +e
+BOUND_PORT_VALIDATION_AFTER_EVAL="$(
+  PYTHONPATH="${POLARIS_DIR}/src" "${bound_port_command[@]}"
+)"
+bound_port_after_eval_code=$?
+set -e
 stop_server
 
 export SRUN_STATUS="${RUN_DIR}/srun-${SLURM_JOB_ID}.status.json" SRUN_EXIT_CODE="${eval_code}"
@@ -313,9 +437,14 @@ publish_immutable_json(
     {"job_id": int(os.environ["SLURM_JOB_ID"]), "srun_exit_code": int(os.environ["SRUN_EXIT_CODE"])},
 )
 PY
+(( bound_port_after_eval_code == 0 )) \
+  || die "Bound-port artifact failed post-evaluator validation"
+[[ "${BOUND_PORT_VALIDATION_AFTER_EVAL}" == "${BOUND_PORT_VALIDATION}" ]] \
+  || die "Bound-port artifact changed during evaluator execution"
 (( eval_code == 0 )) || exit "${eval_code}"
 (( tee_code == 0 )) || exit "${tee_code}"
 
+FAILURE_STAGE=host_finalization
 PYTHONPATH="${POLARIS_DIR}/src:${SCRIPT_DIR}" "${OPENPI_DIR}/.venv/bin/python" \
   "${SCRIPT_DIR}/finalize_pi05_droid_native_jointvelocity_eval.py" finalize \
   --job-id "${SLURM_JOB_ID}" \

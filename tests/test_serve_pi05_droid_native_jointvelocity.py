@@ -1,4 +1,5 @@
 import dataclasses
+from pathlib import Path
 
 import pytest
 
@@ -104,3 +105,18 @@ def test_runtime_transform_observed_subset_is_canonical_type_exact():
     assert data_config.use_quantile_norm == 1
     with pytest.raises(ValueError, match="transform pipeline mismatch"):
         validate_official_pi05_data_config(data_config)
+
+
+def test_authoritative_server_artifacts_publish_only_inside_bound_listener_callback():
+    source = Path("scripts/polaris/serve_pi05_droid_native_jointvelocity.py").read_text(
+        encoding="utf-8"
+    )
+    callback = source.index("def publish_listener_artifacts(actual_port: int)")
+    serving_publication = source.index("publish_immutable_serving_contract(")
+    runtime_publication = source.index("publish_immutable_json(", callback)
+    server = source.index("server = BoundPortWebsocketPolicyServer(")
+    serve_forever = source.index("server.serve_forever()")
+    assert callback < serving_publication < runtime_publication < server < serve_forever
+    assert "port=args.port" in source
+    assert "bound_port_output=args.bound_port_output" in source
+    assert "launch_token=args.bound_port_token" in source

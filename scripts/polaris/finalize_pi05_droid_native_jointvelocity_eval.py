@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 from typing import Any
@@ -22,6 +24,7 @@ else:
 
 from polaris.joint_velocity_runtime import validate_joint_velocity_runtime_report
 from polaris.native_all_six_smoke import validate_immutable_native_all_six_smoke
+from polaris.pi05_droid_bound_port import load_bound_port_record
 from polaris.pi05_droid_jointvelocity_contract import (
     PI05_DROID_CHECKPOINT_BYTES,
     PI05_DROID_CHECKPOINT_MANIFEST_SHA256,
@@ -90,15 +93,44 @@ SOURCE_PATHS = (
     "scripts/polaris/l40s_pi05_droid_native_jointvelocity_canary.sbatch",
     "scripts/polaris/serve_pi05_droid_native_jointvelocity.py",
     "scripts/polaris/submit_pi05_droid_native_jointvelocity_canary.sh",
+    "scripts/polaris/validate_pi05_droid_bound_port.py",
+    "scripts/polaris/validate_pi05_droid_handshake.py",
     "scripts/polaris/validate_pi05_droid_jointvelocity_trace.py",
     "scripts/polaris/verify_pi05_droid_native_checkpoint.py",
     "src/polaris/config.py",
     "src/polaris/joint_velocity_runtime.py",
+    "src/polaris/pi05_droid_bound_port.py",
     "src/polaris/pi05_droid_jointvelocity_contract.py",
     "src/polaris/pi05_droid_native_eval_contract.py",
     "src/polaris/pi05_droid_native_lifecycle.py",
     "src/polaris/policy/droid_jointvelocity_client.py",
 )
+
+ATOMIC_PORT_SERVER_PROFILE = "pi05_droid_server_atomic_bound_port_additive_v1"
+# Updated only after the implementation source is otherwise final.  This pin
+# makes the accepted post-controller descendant explicit and non-generic.
+ATOMIC_PORT_SERVER_SOURCE_SHA256 = (
+    "d0eb961a5068400fa0d4772bf6ddb6921d8d6477e978948c0215d82435a3f581"
+)
+ATOMIC_PORT_RUNTIME_SOURCE_SHA256 = {
+    "scripts/polaris/eval_pi05_droid_native_jointvelocity.sh": (
+        "dde53327f23cd7772c6219ccb74d14eeecdbc38a48805d133b6b401e83572e39"
+    ),
+    "scripts/polaris/serve_pi05_droid_native_jointvelocity.py": (
+        ATOMIC_PORT_SERVER_SOURCE_SHA256
+    ),
+    "scripts/polaris/validate_pi05_droid_bound_port.py": (
+        "ba9e4510f86bd0aea0b396990a30e31e0ad4c7d64eae8da5f5451427987ee559"
+    ),
+    "scripts/polaris/validate_pi05_droid_handshake.py": (
+        "736493f6729bb51598367f39c1d14bbc10788df6fcffde9195af4a0bd5d5daa6"
+    ),
+    "src/polaris/pi05_droid_bound_port.py": (
+        "2e5c559aaf3dcd5fdb41c21ef919bf7eb23e6fb52f855195fa528d3102af2e3b"
+    ),
+}
+_LOWER_SHA256 = re.compile(r"[0-9a-f]{64}")
+_BOUND_IDENTITY = re.compile(r"[0-9]+(?::[0-9]+){6}")
 
 
 def _require(condition: bool, message: str) -> None:
@@ -429,8 +461,7 @@ def _validate_base_controller_slurm_artifact(
         or type(value["host_declared_path"]) is not str
         or not value["host_declared_path"].startswith("/")
         or value["host_declared_path"].startswith("//")
-        or value["host_declared_path"]
-        != os.path.normpath(value["host_declared_path"])
+        or value["host_declared_path"] != os.path.normpath(value["host_declared_path"])
         or type(value["resolved_path"]) is not str
         or not value["resolved_path"].startswith("/")
         or value["resolved_path"].startswith("//")
@@ -578,7 +609,7 @@ def _validate_base_controller_slurm_artifacts(slurm: dict[str, Any]) -> None:
     ):
         raise ValueError("job1098174 GPU inventory metadata mismatch")
     expected_gpu_bytes = (
-        f'{gpu["uuid"]}, {gpu["name"]}, {gpu["driver_version"]}\n'.encode()
+        f"{gpu['uuid']}, {gpu['name']}, {gpu['driver_version']}\n".encode()
     )
     if (
         len(expected_gpu_bytes) != gpu["size"]
@@ -609,6 +640,107 @@ def _validate_bound_json_record(
         f"{field} identity mismatch",
     )
     return artifact
+
+
+def _scientific_server_prefix(source: bytes) -> str:
+    """Bind every model/checkpoint statement before serving orchestration."""
+
+    tree = ast.parse(source)
+    mains = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    ]
+    if len(mains) != 1:
+        raise ValueError("Official pi0.5 server main function drift")
+    body = mains[0].body
+
+    def assignment_name(statement: ast.stmt) -> str | None:
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+        ):
+            return statement.targets[0].id
+        return None
+
+    args_indices = [
+        index
+        for index, statement in enumerate(body)
+        if assignment_name(statement) == "args"
+    ]
+    metadata_indices = [
+        index
+        for index, statement in enumerate(body)
+        if assignment_name(statement) == "metadata"
+    ]
+    if (
+        len(args_indices) != 1
+        or len(metadata_indices) != 1
+        or args_indices[0] >= metadata_indices[0]
+    ):
+        raise ValueError("Official pi0.5 server scientific prefix boundaries drifted")
+    prefix = ast.Module(
+        body=body[args_indices[0] + 1 : metadata_indices[0] + 1],
+        type_ignores=[],
+    )
+    return ast.dump(prefix, include_attributes=False)
+
+
+def _validate_atomic_port_server_descendant(
+    repository: Path,
+    relative_path: str,
+    *,
+    attested_record: dict[str, Any],
+) -> dict[str, Any]:
+    current = (repository / relative_path).read_bytes()
+    current_sha256 = hashlib.sha256(current).hexdigest()
+    if current_sha256 != ATOMIC_PORT_SERVER_SOURCE_SHA256:
+        raise ValueError("Atomic-port pi0.5 server source pin mismatch")
+    attested = _git(
+        repository,
+        "show",
+        f"{PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT}:{relative_path}",
+    )
+    if (
+        len(attested) != attested_record["size"]
+        or hashlib.sha256(attested).hexdigest() != attested_record["sha256"]
+    ):
+        raise ValueError("All-six attested pi0.5 server base is unavailable")
+    current_semantics = _scientific_server_prefix(current)
+    attested_semantics = _scientific_server_prefix(attested)
+    if current_semantics != attested_semantics:
+        raise ValueError(
+            "Atomic-port pi0.5 server changed checkpoint/model scientific semantics"
+        )
+    semantic_sha256 = hashlib.sha256(current_semantics.encode("utf-8")).hexdigest()
+    return {
+        "profile": ATOMIC_PORT_SERVER_PROFILE,
+        "base_commit": PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT,
+        "base_size": len(attested),
+        "base_sha256": hashlib.sha256(attested).hexdigest(),
+        "size": len(current),
+        "sha256": current_sha256,
+        "scientific_prefix_sha256": semantic_sha256,
+    }
+
+
+def validate_atomic_port_runtime_sources(repository: Path) -> dict[str, Any]:
+    """Fail closed before download unless every port handoff source is pinned."""
+
+    repository = Path(repository).resolve()
+    files = {}
+    for relative_path, expected_sha256 in ATOMIC_PORT_RUNTIME_SOURCE_SHA256.items():
+        working = (repository / relative_path).read_bytes()
+        committed = _git(repository, "show", f"HEAD:{relative_path}")
+        digest = hashlib.sha256(working).hexdigest()
+        if working != committed or digest != expected_sha256:
+            raise ValueError(f"Atomic-port runtime source drift: {relative_path}")
+        files[relative_path] = {"size": len(working), "sha256": digest}
+    return {
+        "profile": ATOMIC_PORT_SERVER_PROFILE,
+        "files": files,
+    }
 
 
 def validate_all_six_controller_completion(
@@ -802,14 +934,24 @@ def validate_all_six_controller_completion(
             )
         path = repository / relative_path
         if (
-            path.stat().st_size != record["size"]
-            or file_sha256(path) != record["sha256"]
+            path.stat().st_size == record["size"]
+            and file_sha256(path) == record["sha256"]
         ):
-            raise ValueError(
-                "Reviewed official model validation differs from "
-                f"job{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}: {relative_path}"
+            current = {
+                "profile": "all_six_attested_exact_source_v1",
+                "size": record["size"],
+                "sha256": record["sha256"],
+            }
+        else:
+            current = _validate_atomic_port_server_descendant(
+                repository,
+                relative_path,
+                attested_record=record,
             )
-        reviewed_validation_files[relative_path] = record
+        reviewed_validation_files[relative_path] = {
+            "controller_attested": record,
+            "current_canary_server": current,
+        }
 
     smoke_record = value["smoke"]
     if not isinstance(smoke_record, dict) or not isinstance(
@@ -1473,7 +1615,14 @@ def _validate_run_record(
         "ALL_SIX_CONTROLLER_COMPLETION",
         "EXPECTED_ALL_SIX_COMPLETION_SHA256",
         "EXPECTED_ALL_SIX_PROFILE",
-        "PORT",
+        "PORT_REQUESTED",
+        "PORT_ACTUAL",
+        "SERVER_PID",
+        "BOUND_PORT_FILE",
+        "BOUND_PORT_TOKEN",
+        "BOUND_PORT_FILE_SHA256",
+        "BOUND_PORT_FILE_IDENTITY",
+        "HANDSHAKE_PATH",
         "MODEL_RUNTIME_CONTRACT",
     }
     if type(args.job_id) is not int or args.job_id <= 0:
@@ -1517,6 +1666,8 @@ def _validate_run_record(
         "POLARIS_DATA_DIR": Path(args.data_dir),
         "CONTROLLER_COMPLETION": Path(args.controller_completion),
         "ALL_SIX_CONTROLLER_COMPLETION": Path(args.all_six_controller_completion),
+        "BOUND_PORT_FILE": run_dir / "policy_bound_port.json",
+        "HANDSHAKE_PATH": run_dir / "policy_handshake.json",
         "MODEL_RUNTIME_CONTRACT": run_dir / "pi05_droid_native_model_runtime.json",
     }
     if any(
@@ -1536,15 +1687,108 @@ def _validate_run_record(
     if any(values[key] != expected for key, expected in expected_scalars.items()):
         raise ValueError("Run-record scalar binding mismatch")
     try:
-        port = int(values["PORT"])
+        requested_port = int(values["PORT_REQUESTED"])
+        actual_port = int(values["PORT_ACTUAL"])
+        server_pid = int(values["SERVER_PID"])
     except ValueError as error:
-        raise ValueError("Run-record port is invalid") from error
-    if str(port) != values["PORT"] or not 1 <= port <= 65535:
-        raise ValueError("Run-record port is invalid")
+        raise ValueError("Run-record listener identity is invalid") from error
+    if (
+        str(requested_port) != values["PORT_REQUESTED"]
+        or requested_port != 0
+        or str(actual_port) != values["PORT_ACTUAL"]
+        or not 1 <= actual_port <= 65535
+        or str(server_pid) != values["SERVER_PID"]
+        or server_pid <= 0
+        or _LOWER_SHA256.fullmatch(values["BOUND_PORT_TOKEN"]) is None
+        or _LOWER_SHA256.fullmatch(values["BOUND_PORT_FILE_SHA256"]) is None
+        or _BOUND_IDENTITY.fullmatch(values["BOUND_PORT_FILE_IDENTITY"]) is None
+    ):
+        raise ValueError("Run-record listener identity is invalid")
     return {
         **{key: artifact[key] for key in ("path", "size", "sha256", "mode", "nlink")},
-        "port": port,
+        "requested_port": requested_port,
+        "actual_port": actual_port,
+        "server_pid": server_pid,
+        "launch_token": values["BOUND_PORT_TOKEN"],
+        "bound_port_sha256": values["BOUND_PORT_FILE_SHA256"],
+        "bound_port_identity": values["BOUND_PORT_FILE_IDENTITY"],
     }
+
+
+def _validate_bound_port_artifact(
+    path: Path, run_record: dict[str, Any]
+) -> dict[str, Any]:
+    record, actual_port, content_sha256, stable_identity = load_bound_port_record(
+        path,
+        expected_pid=run_record["server_pid"],
+        expected_launch_token=run_record["launch_token"],
+        expected_requested_port=run_record["requested_port"],
+        require_live_pid=False,
+    )
+    if (
+        actual_port != run_record["actual_port"]
+        or content_sha256 != run_record["bound_port_sha256"]
+        or stable_identity != run_record["bound_port_identity"]
+    ):
+        raise ValueError("Bound-port artifact differs from the sealed run record")
+    identity = [int(part) for part in stable_identity.split(":")]
+    if len(identity) != 7 or identity[5:] != [0o444, 1]:
+        raise ValueError("Bound-port artifact immutable identity is invalid")
+    return {
+        "path": str(Path(path).resolve()),
+        "size": identity[2],
+        "sha256": content_sha256,
+        "mode": "0444",
+        "nlink": 1,
+        "stable_identity": stable_identity,
+        "value": record,
+    }
+
+
+def _validate_handshake_artifact(
+    path: Path,
+    *,
+    run_record: dict[str, Any],
+    serving_contract: dict[str, Any],
+    openpi_dir: Path,
+) -> dict[str, Any]:
+    artifact = validate_immutable_json(path)
+    value = artifact["value"]
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "schema_version",
+            "profile",
+            "host",
+            "actual_port",
+            "server_pid",
+            "openpi_dir",
+            "serving_contract",
+            "contract_sha256",
+        }
+        or value["profile"] != "pi05_droid_native_websocket_handshake_v1"
+        or value["host"] != "127.0.0.1"
+        or type(value["openpi_dir"]) is not str
+        or Path(value["openpi_dir"]).resolve() != Path(openpi_dir).resolve()
+        or not isinstance(value["serving_contract"], dict)
+        or canonical_json_bytes(value["serving_contract"])
+        != canonical_json_bytes(serving_contract)
+        or type(value["contract_sha256"]) is not str
+        or _LOWER_SHA256.fullmatch(value["contract_sha256"]) is None
+        or value["contract_sha256"] != serving_contract["contract_sha256"]
+    ):
+        raise ValueError("WebSocket handshake artifact schema or identity mismatch")
+    _require_exact_json_subset(
+        value,
+        {
+            "schema_version": 1,
+            "actual_port": run_record["actual_port"],
+            "server_pid": run_record["server_pid"],
+        },
+        "WebSocket handshake artifact schema or identity mismatch",
+    )
+    return {key: artifact[key] for key in ("path", "size", "sha256", "mode", "nlink")}
 
 
 def _validate_submission_record(
@@ -1610,6 +1854,7 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("Run directory is invalid")
     task_dir = run_dir / PI05_DROID_NATIVE_TASK
     source = _source_provenance(args.polaris_repo, args.expected_polaris_commit)
+    atomic_port_sources = validate_atomic_port_runtime_sources(args.polaris_repo)
     openpi = _openpi_provenance(args.openpi_dir)
     base_controller = validate_base_controller_completion(
         args.controller_completion,
@@ -1640,6 +1885,15 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
     )
     serving_contract_path = run_dir / PI05_DROID_CONTRACT_FILENAME
     serving_contract = validate_persisted_serving_contract(serving_contract_path)
+    bound_port = _validate_bound_port_artifact(
+        run_dir / "policy_bound_port.json", run_record
+    )
+    handshake = _validate_handshake_artifact(
+        run_dir / "policy_handshake.json",
+        run_record=run_record,
+        serving_contract=serving_contract,
+        openpi_dir=Path(args.openpi_dir),
+    )
     runtime = _validate_runtime_artifact(task_dir / "joint_velocity_runtime.json")
     if runtime["runtime_sha256"] != all_six_controller["runtime_sha256"]:
         raise ValueError(
@@ -1778,6 +2032,11 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         "model_runtime": model_runtime,
         "official_model_eval_contract": model_runtime["official_model_eval_contract"],
         "serving_contract": serving_contract,
+        "serving_transport": {
+            "runtime_sources": atomic_port_sources,
+            "bound_port": bound_port,
+            "websocket_handshake": handshake,
+        },
         "runtime": runtime,
         "evaluator_close_ready": close_ready,
         "sensor_liveness": trace_summary["sensor_liveness"],
@@ -1863,6 +2122,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.command == "preflight":
+        atomic_port = validate_atomic_port_runtime_sources(args.polaris_repo)
         base = validate_base_controller_completion(
             args.controller_completion,
             args.expected_controller_completion_sha256,
@@ -1875,7 +2135,9 @@ def main() -> None:
             args.polaris_repo,
         )
         print(
-            canonical_json_bytes({"base": base, "all_six": all_six}).decode("ascii"),
+            canonical_json_bytes(
+                {"atomic_port": atomic_port, "base": base, "all_six": all_six}
+            ).decode("ascii"),
             end="",
         )
         return

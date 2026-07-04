@@ -34,6 +34,8 @@ die() {
   exit 2
 }
 
+[[ -z "${PORT+x}" ]] \
+  || die "Ambient PORT is forbidden; the canary server binds an OS-assigned port"
 [[ -d "${RUN_DIR}" && ! -L "${RUN_DIR}" ]] || die "Missing regular RUN_DIR"
 for output in "${SAVED_JOB_SCRIPT}" "${GPU_INVENTORY}"; do
   [[ ! -e "${output}" && ! -L "${output}" ]] || die "Refusing existing output: ${output}"

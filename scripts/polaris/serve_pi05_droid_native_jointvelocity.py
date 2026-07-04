@@ -16,6 +16,7 @@ from polaris.pi05_droid_native_eval_contract import (
     canonical_json_bytes,
     publish_immutable_json,
 )
+from polaris.pi05_droid_bound_port import BoundPortWebsocketPolicyServer
 
 
 def _class_path(value: object) -> str:
@@ -195,7 +196,9 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--serving-contract-output", type=Path, required=True)
     parser.add_argument("--model-runtime-contract-output", type=Path, required=True)
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--bound-port-output", type=Path, required=True)
+    parser.add_argument("--bound-port-token", required=True)
     args = parser.parse_args()
 
     from polaris.pi05_droid_jointvelocity_contract import (
@@ -259,31 +262,41 @@ def main() -> None:
     verify_openpi_git_checkout(openpi_dir)
     runtime_attestation = attest_imported_openpi_modules(openpi_dir)
     metadata = expected_pi05_droid_server_metadata(runtime_attestation)
-    contract_artifact = publish_immutable_serving_contract(
-        args.serving_contract_output, metadata
-    )
-    logging.info("Immutable serving contract: %s", contract_artifact)
-    model_runtime_artifact = publish_immutable_json(
-        args.model_runtime_contract_output,
-        {
-            "schema_version": 1,
-            "profile": PI05_DROID_NATIVE_CANARY_PROFILE,
-            "status": "pass",
-            "checkpoint": checkpoint_report,
-            "train_config": static_contract,
-            "transform_runtime": transform_contract,
-            "policy": policy_runtime,
-            "official_model_eval_contract": PI05_DROID_NATIVE_MODEL_EVAL_CONTRACT,
-            "openpi_runtime_attestation": runtime_attestation,
-        },
-    )
-    logging.info("Immutable model runtime contract: %s", model_runtime_artifact)
 
-    server = websocket_policy_server.WebsocketPolicyServer(
+    def publish_listener_artifacts(actual_port: int) -> None:
+        logging.info(
+            "WebSocket listener owns OS-assigned port %d; publishing contracts",
+            actual_port,
+        )
+        contract_artifact = publish_immutable_serving_contract(
+            args.serving_contract_output, metadata
+        )
+        logging.info("Immutable serving contract: %s", contract_artifact)
+        model_runtime_artifact = publish_immutable_json(
+            args.model_runtime_contract_output,
+            {
+                "schema_version": 1,
+                "profile": PI05_DROID_NATIVE_CANARY_PROFILE,
+                "status": "pass",
+                "checkpoint": checkpoint_report,
+                "train_config": static_contract,
+                "transform_runtime": transform_contract,
+                "policy": policy_runtime,
+                "official_model_eval_contract": PI05_DROID_NATIVE_MODEL_EVAL_CONTRACT,
+                "openpi_runtime_attestation": runtime_attestation,
+            },
+        )
+        logging.info("Immutable model runtime contract: %s", model_runtime_artifact)
+
+    server = BoundPortWebsocketPolicyServer(
+        websocket_policy_server=websocket_policy_server,
         policy=policy,
         host="0.0.0.0",
         port=args.port,
         metadata=metadata,
+        bound_port_output=args.bound_port_output,
+        launch_token=args.bound_port_token,
+        publish_listener_artifacts=publish_listener_artifacts,
     )
     server.serve_forever()
 

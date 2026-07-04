@@ -5,6 +5,9 @@ import subprocess
 import pytest
 
 from scripts.polaris import (
+    finalize_pi05_droid_native_jointvelocity_eval as canary_finalizer,
+)
+from scripts.polaris import (
     finalize_pi05_native_all_six_controller_smoke as finalizer,
 )
 from polaris import pi05_droid_native_eval_contract as native_contract
@@ -38,9 +41,9 @@ def test_official_manifest_is_byte_unchanged_and_serve_validation_is_exactly_rev
         PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT, serve_relative
     )
     base_serve = _git_show(finalizer.BASE_COMMIT, serve_relative)
-    assert accepted_serve == current_serve
+    assert accepted_serve != current_serve
     assert current_serve != base_serve
-    reviewed = finalizer._reviewed_serve_validation(current_serve, base_serve)
+    reviewed = finalizer._reviewed_serve_validation(accepted_serve, base_serve)
     assert reviewed["sha256"] == (
         finalizer.REVIEWED_ADDITIVE_MODEL_VALIDATION_SOURCE_SHA256
     )
@@ -48,6 +51,13 @@ def test_official_manifest_is_byte_unchanged_and_serve_validation_is_exactly_rev
         finalizer.REVIEWED_ADDITIVE_MODEL_VALIDATION_PROFILE
     )
     assert reviewed["model_semantics_sha256"] == reviewed["base_model_semantics_sha256"]
+    descendant = canary_finalizer._validate_atomic_port_server_descendant(
+        ROOT,
+        serve_relative,
+        attested_record=reviewed,
+    )
+    assert descendant["profile"] == canary_finalizer.ATOMIC_PORT_SERVER_PROFILE
+    assert descendant["base_sha256"] == reviewed["sha256"]
     assert (
         subprocess.run(
             ["git", "-C", ROOT, "ls-tree", "HEAD", "third_party/openpi"],
@@ -61,7 +71,7 @@ def test_official_manifest_is_byte_unchanged_and_serve_validation_is_exactly_rev
 
 def test_reviewed_serve_gate_rejects_validation_or_model_semantic_drift(monkeypatch):
     relative = finalizer.REVIEWED_ADDITIVE_MODEL_VALIDATION_PATH
-    current = (ROOT / relative).read_bytes()
+    current = _git_show(PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT, relative)
     base = _git_show(finalizer.BASE_COMMIT, relative)
 
     validation_drift = current.replace(
