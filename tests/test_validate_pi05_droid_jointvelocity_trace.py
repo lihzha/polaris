@@ -731,6 +731,80 @@ def test_terminal_failure_consumes_incident_from_stable_bound_read(
     assert (alias_root / filename).resolve() == wrong_root / filename
 
 
+@pytest.mark.parametrize("sample_kind", ["apply_entry", "post_policy_step"])
+def test_full_trace_audit_does_not_reopen_bound_incident_after_alias_retarget(
+    tmp_path, monkeypatch, sample_kind
+):
+    original_root = tmp_path / "original"
+    original_root.mkdir()
+    wrong_root = tmp_path / "wrong"
+    wrong_root.mkdir()
+    alias_root = tmp_path / "alias"
+    alias_root.symlink_to(original_root, target_is_directory=True)
+    filename = "incident.json"
+    original_path = original_root / filename
+    wrong_path = wrong_root / filename
+    records, result = _failure_records(
+        original_root,
+        sample_kind=sample_kind,
+        substep=0 if sample_kind == "apply_entry" else 8,
+        incident_path=original_path,
+    )
+    terminal = records[-1]["terminal_failure"]
+    terminal["incident_artifact"]["path"] = str(alias_root / filename)
+    duplicate = publish_immutable_json(
+        wrong_path,
+        terminal["dynamic_report"]["terminal_velocity_failure"],
+    )
+    assert duplicate["sha256"] == terminal["incident_artifact"]["sha256"]
+    assert (original_path.stat().st_dev, original_path.stat().st_ino) != (
+        wrong_path.stat().st_dev,
+        wrong_path.stat().st_ino,
+    )
+    trace, metrics = _write_case(
+        tmp_path,
+        records,
+        episode_length=result["episode_length"],
+        numerical_failure=True,
+        numerical_failure_reason=result["numerical_failure_reason"],
+        progress=0.0,
+    )
+
+    stable_validate = validator.validate_terminal_numerical_failure_evidence
+    retargeted = False
+
+    def retarget_after_terminal_bind(*args, **kwargs):
+        nonlocal retargeted
+        validated = stable_validate(*args, **kwargs)
+        alias_root.unlink()
+        alias_root.symlink_to(wrong_root, target_is_directory=True)
+        retargeted = True
+        return validated
+
+    def reject_downstream_reopen(*_args, **_kwargs):
+        pytest.fail("full trace audit reopened the incident after stable validation")
+
+    monkeypatch.setattr(
+        validator,
+        "validate_terminal_numerical_failure_evidence",
+        retarget_after_terminal_bind,
+    )
+    monkeypatch.setattr(
+        validator,
+        "validate_immutable_json",
+        reject_downstream_reopen,
+        raising=False,
+    )
+    summary = validator.audit_trace(trace, metrics)
+    assert retargeted is True
+    assert summary["status"] == "pass"
+    assert (
+        summary["terminal_outcome"]["incident_artifact"]["sha256"]
+        == duplicate["sha256"]
+    )
+    assert (alias_root / filename).resolve() == wrong_path
+
+
 @pytest.mark.parametrize(
     ("sample_kind", "failed_step", "substep", "expected_executions"),
     [

@@ -214,3 +214,41 @@ inspection used only login-host read operations.
   passed with the same hashes and the checkout remained clean. The subsequent
   enclosing documentation-only commit records this identity and does not alter
   source or tests.
+
+## Additive full-trace incident-consumption closure
+
+- Parent branch tip: `3d0b992a41d028ab5c39ee3596bc72b7b5dc92cf`;
+  parent executable implementation:
+  `db6eaa2d86b47b1477a9ff00028520da7c05a513`. Work remains isolated
+  on `codex/pi05-native-bound-artifact-toctou-v4-20260704`; no canonical,
+  registry, shared-document, simulator, GPU, evaluator, or model-server action
+  is authorized.
+- A downstream caller defect remained in the full trace auditor. It first used
+  `validate_terminal_numerical_failure_evidence` to bind and validate the
+  incident through the stable descriptor read, then
+  `_validate_incident_bound_arm_state` reopened the recorded lexical path with
+  `validate_immutable_json`. A parent alias could therefore move to another
+  inode between terminal validation and arm-state consumption.
+- `_validate_incident_bound_arm_state` now consumes
+  `terminal.dynamic_report.terminal_velocity_failure` directly. The terminal
+  validator has already required that exact returned evidence to equal the
+  canonical JSON parsed from the bound incident descriptor, so the arm-state
+  sample kind, substep, position, and velocity checks remain byte-derived
+  without any path reopen. Trace schemas and result identities are unchanged.
+- Deterministic full-`audit_trace` regressions cover both downstream call sites:
+  apply-entry failure at physics substep 0 and post-policy failure at substep 8.
+  Each publishes a byte-identical canonical incident on a distinct inode,
+  retargets the parent alias immediately after terminal validation returns,
+  forbids any subsequent immutable-JSON open, and requires the complete audit
+  to pass from the already validated evidence.
+- The remaining call audit found no later incident-content reopen. The policy
+  client emits the returned terminal value directly; sidecar construction uses
+  terminal dynamic evidence and stable identity validation; close-ready and
+  host-finalizer paths consume stable bound sidecar JSON; the finalizer's
+  incident `Path.resolve` is only a namespace/location check and does not read
+  incident content.
+- Focused contract/trace/finalizer suite: `85 passed`. Broad pinned-OpenPI
+  pi0.5/native host suite: `161 passed`, with only three external dependency
+  deprecation warnings. Ruff 0.15.16 lint/format, Python byte compilation,
+  Bash syntax, ShellCheck, and `git diff --check`: pass. Exact-commit read-only
+  replay of preserved job `1098704` remains the final gate before freeze.

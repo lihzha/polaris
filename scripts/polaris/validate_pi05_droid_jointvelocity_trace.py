@@ -30,7 +30,6 @@ from polaris.pi05_droid_native_eval_contract import (
     canonical_json_bytes,
     make_environment_runtime_contract,
     publish_immutable_json,
-    validate_immutable_json,
     validate_terminal_numerical_failure_evidence,
     validate_terminal_rollout_evidence,
 )
@@ -376,12 +375,10 @@ def _validate_incident_bound_arm_state(
     expected_physics_substep: int,
     field: str,
 ) -> None:
-    incident_path = Path(terminal["incident_artifact"]["path"])
-    incident = validate_immutable_json(incident_path)["value"]
-    _require(
-        incident == terminal["dynamic_report"]["terminal_velocity_failure"],
-        f"{field} immutable incident differs from terminal evidence",
-    )
+    # Terminal validation has already required this evidence to equal the JSON
+    # parsed from the stable descriptor-bound incident read.  Consume that
+    # exact validated value instead of reopening its now-racy lexical path.
+    incident = terminal["dynamic_report"]["terminal_velocity_failure"]
     _require(
         incident["sample_kind"] == expected_sample_kind,
         f"{field} incident sample kind mismatch",
