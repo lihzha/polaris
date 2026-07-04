@@ -91,6 +91,7 @@ SOURCE_PATHS = (
     "scripts/polaris/eval_pi05_droid_native_jointvelocity.sh",
     "scripts/polaris/finalize_pi05_droid_native_jointvelocity_eval.py",
     "scripts/polaris/l40s_pi05_droid_native_jointvelocity_canary.sbatch",
+    "scripts/polaris/pi05_droid_native_runtime_overlay_requirements.txt",
     "scripts/polaris/serve_pi05_droid_native_jointvelocity.py",
     "scripts/polaris/submit_pi05_droid_native_jointvelocity_canary.sh",
     "scripts/polaris/validate_pi05_droid_bound_port.py",

@@ -109,3 +109,85 @@ identities, and terminal scheduler state before any wider evaluation.
 
 There are no owned processes, jobs, monitors, deployment checkouts, packages,
 or registry drafts to clean up or transfer.
+
+## Official OpenPI runtime dependency recovery — 2026-07-04
+
+- Recovery agent: `CODEX_AGENT_ID=pi05-runtime-dependency-fix`; same isolated
+  branch and worktree. The workstation Ego-LAP checkout remained the primary
+  clean `main` worktree apart from its preexisting ignored artifact/cache
+  directories. No Ego-LAP integration worktree or shared registry record was
+  modified by this recovery.
+- Root launched the previously sealed source `84a3407a5912...` as Slurm job
+  `1098869`. It ran on L40S node `pool0-00021` from
+  `2026-07-04T11:21:40-07:00` through `11:22:48-07:00` and terminated
+  `FAILED`, exit `1:0`, elapsed `00:01:08`. The exact run directory is
+  `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris-pi05-native/canary/20260704T174000Z-84a3407-atomic-port-canary1`.
+- The external controller attestations, one-L40S inventory, official checkpoint
+  content/MD5 gate, global-DROID normalization digest/probes, and inference
+  environment capture all passed. Server import then failed at
+  `third_party/openpi/src/openpi/models_pytorch/gemma_pytorch.py:3` with
+  `ModuleNotFoundError: No module named 'pytest'`, before port bind, WebSocket
+  handshake, simulator startup, or any policy action. Immutable
+  `attempt_failed.json` records `failure_stage=server_bind_and_readiness`,
+  `bound_port_artifact_present=false`, and SHA-256
+  `4dc8e6764dbf402ecae129007274fa431e978534f323806239101f4a0d913e92`.
+  The checkpoint-verification SHA-256 is
+  `3a2e6479f488b422c565ed70f3f93c29d8e091d15addbbc7371a29a3c0c557e4`;
+  inference-environment SHA-256 is
+  `9e5564047f869cd0d2dba14e5ec0c24790d797e53026b247ca39e794268e74a1`;
+  server-log SHA-256 is
+  `2bafe8e53da6210def34165612fb71bd5b04cc54374bf0e6efe5c24b5b546fe2`.
+  A byte-identical local evidence copy is under
+  `/home/lzha/code/ego-lap/.codex_artifacts/polaris-pi05/job1098869-failed-server-import`.
+- The failed source, bundle, wrapper, and job evidence were not mutated. The
+  original source remains detached/clean at `84a3407...`, tree `5927d7d...`,
+  with no writable source entries. Its mode-0444 Git bundle remains SHA-256
+  `7f1a08959a9de8c9b7da131338aa096986600660e75f5e8d42b14df931d34bf3`;
+  its mode-0444 wrapper remains SHA-256
+  `ddbda137d45b0bb672877250136b341fa6f89f896e09ca25a7c44ca7e3d616ee`.
+
+### Diagnosis and minimal repair
+
+- Official OpenPI commit `bd70b8f4011e85b3f3b0f039f12113f78718e7bf`
+  imports `pytest` at module scope and evaluates the annotation `pytest.Cache`
+  in production `gemma_pytorch.py`, while declaring `pytest>=8.3.4` only in
+  its `dev` dependency group. The intentional `uv sync --frozen --no-dev`
+  therefore removed `pytest==8.3.5` and its missing runtime dependencies
+  `iniconfig==2.1.0` and `pluggy==1.6.0`. Existing `packaging==25.0` already
+  satisfied pytest's remaining Linux dependency.
+- Preserve the official OpenPI source and submodule SHA exactly. Add one
+  requirements overlay containing the exact OpenPI-lock wheel versions and
+  SHA-256 hashes for pytest and its three Linux requirements. Install it after
+  the no-dev sync with `uv pip install --no-config --require-hashes`; the
+  `--no-config` gate prevents PolaRiS's unrelated torch override from entering
+  this resolver transaction.
+- The native inference-environment contract now requires all four overlay
+  distributions to be present at their exact locked versions, verifies each
+  wheel hash against committed OpenPI `uv.lock`, imports `pytest.Cache`, and
+  proves the imported pytest module is inside the exact checkout-local venv.
+  The public submitter runs this check before `sbatch`; the GPU environment
+  capture reruns it before the server import. The finalizer binds the overlay
+  requirements as a critical source file.
+- No checkpoint, data transform, image order/resolution, normalization,
+  sampler, policy I/O, controller, physics, task, asset, or scientific model
+  source changed. The atomic-port server and eval shell remain byte-identical
+  to the already reviewed `17616d4` implementation.
+
+### Host validation before deployment
+
+- Exact overlay install into an empty CPython 3.11.15 venv with
+  `uv pip install --no-config --require-hashes`: pass; exact versions
+  `iniconfig 2.1.0`, `packaging 25.0`, `pluggy 1.6.0`, and `pytest 8.3.5`;
+  `pytest.Cache` resolves to `_pytest.cacheprovider.Cache`; `uv pip check`
+  passes.
+- Preflight against an existing exact-commit full OpenPI venv: pass. Direct
+  production import of `openpi.models.model` and
+  `openpi.models_pytorch.gemma_pytorch`: pass from exact official source.
+- New dependency/provenance regressions: `4 passed`.
+- Native server/atomic-port/finalizer focused suite: `67 passed`.
+- Broad repository host suite scoped to `tests/`, excluding only the real-Isaac
+  `test_robust_differential_ik.py`: `309 passed, 1 skipped`.
+- Ruff 0.15.16 format/lint, in-memory compilation, Bash syntax, ShellCheck,
+  and `git diff --check`: pass. A fresh detached deployment, exact no-dev plus
+  overlay environment validation, immutable package manifest, and root-owned
+  one-rollout relaunch remain the next gates.

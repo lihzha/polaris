@@ -52,6 +52,16 @@ POLARIS_COMMIT="$(git -C "${POLARIS_DIR}" rev-parse HEAD)"
 [[ -x "${POLARIS_DIR}/third_party/openpi/.venv/bin/python" ]] \
   || die "Missing exact checkout-local OpenPI venv"
 
+# The official OpenPI commit imports pytest.Cache from a module reached by the
+# production server, despite declaring pytest only in its dev group.  Reject a
+# no-dev environment without the exact hash-pinned runtime overlay before an
+# L40S allocation is submitted.
+PYTHONPATH="${POLARIS_DIR}/src:${SCRIPT_DIR}" \
+  "${POLARIS_DIR}/third_party/openpi/.venv/bin/python" \
+  "${SCRIPT_DIR}/capture_pi05_droid_native_environment.py" \
+  --openpi-dir "${POLARIS_DIR}/third_party/openpi" \
+  --runtime-package-preflight
+
 # Block submission before any allocation until both external controller gates
 # validate, including job1098682 all-six coupling and child lifecycle.
 PYTHONPATH="${POLARIS_DIR}/src:${SCRIPT_DIR}" \

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import importlib.metadata
 from pathlib import Path
 import platform
@@ -35,8 +36,37 @@ RELEVANT_PACKAGES = (
     "numpy",
     "orbax-checkpoint",
     "pillow",
+    "iniconfig",
+    "packaging",
+    "pluggy",
+    "pytest",
     "websockets",
 )
+
+RUNTIME_OVERLAY_REQUIREMENTS = Path(__file__).with_name(
+    "pi05_droid_native_runtime_overlay_requirements.txt"
+)
+RUNTIME_OVERLAY_REQUIREMENTS_SHA256 = (
+    "a9b0c7d984382044c67e7a9ed58e4fa37f439921cdec6ec6ae3d968b25188ae5"
+)
+RUNTIME_OVERLAY_PACKAGES = {
+    "iniconfig": {
+        "version": "2.1.0",
+        "wheel_sha256": "9deba5723312380e77435581c6bf4935c94cbfab9b1ed33ef8d238ea168eb760",
+    },
+    "packaging": {
+        "version": "25.0",
+        "wheel_sha256": "29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484",
+    },
+    "pluggy": {
+        "version": "1.6.0",
+        "wheel_sha256": "e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746",
+    },
+    "pytest": {
+        "version": "8.3.5",
+        "wheel_sha256": "c69214aa47deac29fad6c2a4f590b9c4a9fdb16a403176fe154b79c0b4d4d820",
+    },
+}
 
 
 def _canonical_name(value: str) -> str:
@@ -76,7 +106,97 @@ def _locked_versions(lock_path: Path) -> dict[str, list[str]]:
     return {name: sorted(versions) for name, versions in sorted(packages.items())}
 
 
+def _validate_runtime_overlay(lock_path: Path) -> None:
+    requirements = RUNTIME_OVERLAY_REQUIREMENTS
+    if not requirements.is_file() or requirements.is_symlink():
+        raise ValueError("Native pi0.5 runtime overlay must be one regular file")
+    if file_sha256(requirements) != RUNTIME_OVERLAY_REQUIREMENTS_SHA256:
+        raise ValueError("Native pi0.5 runtime overlay SHA-256 mismatch")
+
+    lock = tomllib.loads(lock_path.read_text(encoding="utf-8"))
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for package in lock.get("package", []):
+        by_name.setdefault(_canonical_name(package["name"]), []).append(package)
+    for name, expected in RUNTIME_OVERLAY_PACKAGES.items():
+        candidates = [
+            package
+            for package in by_name.get(name, [])
+            if str(package.get("version")) == expected["version"]
+        ]
+        if len(candidates) != 1:
+            raise ValueError(f"OpenPI lock does not uniquely pin runtime {name}")
+        wheel_hashes = {
+            str(wheel.get("hash", "")) for wheel in candidates[0].get("wheels", [])
+        }
+        if f"sha256:{expected['wheel_sha256']}" not in wheel_hashes:
+            raise ValueError(f"OpenPI lock wheel hash mismatch for runtime {name}")
+
+
+def _validate_runtime_imports(
+    installed_by_name: dict[str, str], expected_venv: Path
+) -> None:
+    pytest_module = importlib.import_module("pytest")
+    if (
+        installed_by_name.get("pytest") != RUNTIME_OVERLAY_PACKAGES["pytest"]["version"]
+        or getattr(pytest_module, "__version__", None)
+        != installed_by_name.get("pytest")
+        or not isinstance(getattr(pytest_module, "Cache", None), type)
+    ):
+        raise ValueError("OpenPI runtime pytest.Cache contract mismatch")
+    module_file = getattr(pytest_module, "__file__", None)
+    if not isinstance(module_file, str):
+        raise ValueError("OpenPI runtime pytest has no regular module path")
+    module_path = Path(module_file).resolve()
+    if not module_path.is_relative_to(expected_venv.resolve()):
+        raise ValueError("OpenPI runtime pytest resolved outside its exact venv")
+
+
+def validate_runtime_packages(openpi_dir: Path) -> dict[str, Any]:
+    """Validate the minimal lock-derived overlay needed by official OpenPI."""
+
+    checkout = verify_openpi_git_checkout(openpi_dir)
+    root = Path(checkout["root"])
+    lock_path = root / "uv.lock"
+    if not lock_path.is_file() or lock_path.is_symlink():
+        raise ValueError("OpenPI uv.lock must be one regular file")
+    if _git_bytes(root, "show", "HEAD:uv.lock") != lock_path.read_bytes():
+        raise ValueError("OpenPI uv.lock differs from the committed bytes")
+    _validate_runtime_overlay(lock_path)
+
+    expected_venv = root / ".venv"
+    expected_python = expected_venv / "bin/python"
+    if (
+        not expected_python.is_file()
+        or Path(sys.prefix).resolve() != expected_venv.resolve()
+    ):
+        raise ValueError("Runtime-package check must use the exact OpenPI venv")
+    installed = _installed_packages()
+    installed_by_name = {item["name"]: item["version"] for item in installed}
+    locked = _locked_versions(lock_path)
+    for name in RELEVANT_PACKAGES:
+        if name not in installed_by_name or name not in locked:
+            raise ValueError(f"Required locked inference package is missing: {name}")
+        if installed_by_name[name] not in locked[name]:
+            raise ValueError(
+                f"Installed {name}={installed_by_name[name]} is absent from uv.lock {locked[name]}"
+            )
+    for name, expected in RUNTIME_OVERLAY_PACKAGES.items():
+        if installed_by_name.get(name) != expected["version"]:
+            raise ValueError(f"Native pi0.5 runtime overlay version mismatch: {name}")
+    _validate_runtime_imports(installed_by_name, expected_venv)
+    return {
+        "status": "pass",
+        "openpi_commit": checkout["git_head"],
+        "requirements_path": str(RUNTIME_OVERLAY_REQUIREMENTS.resolve()),
+        "requirements_sha256": RUNTIME_OVERLAY_REQUIREMENTS_SHA256,
+        "packages": {
+            name: installed_by_name[name] for name in sorted(RUNTIME_OVERLAY_PACKAGES)
+        },
+    }
+
+
 def capture_environment(openpi_dir: Path) -> dict[str, Any]:
+    validate_runtime_packages(openpi_dir)
     checkout = verify_openpi_git_checkout(openpi_dir)
     root = Path(checkout["root"])
     lock_path = root / "uv.lock"
@@ -269,15 +389,22 @@ def validate_environment(
             or record["locked_versions"] != locked_now.get(name)
         ):
             raise ValueError(f"Relevant-package provenance mismatch: {name}")
+    _validate_runtime_overlay(expected_openpi_dir / "uv.lock")
+    _validate_runtime_imports(installed_by_name, expected_openpi_dir / ".venv")
     return value
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--openpi-dir", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    output = parser.add_mutually_exclusive_group(required=True)
+    output.add_argument("--output", type=Path)
+    output.add_argument("--runtime-package-preflight", action="store_true")
     args = parser.parse_args()
-    publish_immutable_json(args.output, capture_environment(args.openpi_dir))
+    if args.runtime_package_preflight:
+        print(validate_runtime_packages(args.openpi_dir))
+    else:
+        publish_immutable_json(args.output, capture_environment(args.openpi_dir))
 
 
 if __name__ == "__main__":

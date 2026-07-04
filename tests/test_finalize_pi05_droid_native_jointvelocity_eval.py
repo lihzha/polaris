@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -604,6 +605,10 @@ def test_inference_environment_recomputes_lock_and_installed_inventory(
     python = Path(sys.executable)
     installed, value = _environment_value(openpi_dir, python)
     monkeypatch.setattr(environment, "_installed_packages", lambda: installed)
+    monkeypatch.setattr(environment, "_validate_runtime_overlay", lambda _: None)
+    monkeypatch.setattr(
+        environment, "_validate_runtime_imports", lambda _installed, _venv: None
+    )
 
     assert environment.validate_environment(value, openpi_dir, python) == value
 
@@ -616,6 +621,71 @@ def test_inference_environment_recomputes_lock_and_installed_inventory(
     wrong_jax["jax"]["jaxlib_version"] = "9.9"
     with pytest.raises(ValueError, match="JAX runtime mismatch"):
         environment.validate_environment(wrong_jax, openpi_dir, python)
+
+
+def test_native_runtime_overlay_is_exactly_lock_derived():
+    requirements = environment.RUNTIME_OVERLAY_REQUIREMENTS
+    assert file_sha256(requirements) == (
+        environment.RUNTIME_OVERLAY_REQUIREMENTS_SHA256
+    )
+    environment._validate_runtime_overlay(ROOT / "third_party/openpi/uv.lock")
+    assert environment.RUNTIME_OVERLAY_PACKAGES == {
+        "iniconfig": {
+            "version": "2.1.0",
+            "wheel_sha256": "9deba5723312380e77435581c6bf4935c94cbfab9b1ed33ef8d238ea168eb760",
+        },
+        "packaging": {
+            "version": "25.0",
+            "wheel_sha256": "29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484",
+        },
+        "pluggy": {
+            "version": "1.6.0",
+            "wheel_sha256": "e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746",
+        },
+        "pytest": {
+            "version": "8.3.5",
+            "wheel_sha256": "c69214aa47deac29fad6c2a4f590b9c4a9fdb16a403176fe154b79c0b4d4d820",
+        },
+    }
+    assert set(environment.RUNTIME_OVERLAY_PACKAGES) <= set(
+        environment.RELEVANT_PACKAGES
+    )
+
+
+def test_native_runtime_import_requires_pytest_cache_from_exact_venv(
+    tmp_path, monkeypatch
+):
+    venv = tmp_path / ".venv"
+    module_path = venv / "lib/python3.11/site-packages/pytest/__init__.py"
+    module_path.parent.mkdir(parents=True)
+    module_path.write_text("", encoding="utf-8")
+    installed = {
+        name: record["version"]
+        for name, record in environment.RUNTIME_OVERLAY_PACKAGES.items()
+    }
+    valid = SimpleNamespace(
+        __version__="8.3.5", Cache=type("Cache", (), {}), __file__=str(module_path)
+    )
+    monkeypatch.setattr(environment.importlib, "import_module", lambda _: valid)
+    environment._validate_runtime_imports(installed, venv)
+
+    missing_cache = SimpleNamespace(__version__="8.3.5", __file__=str(module_path))
+    monkeypatch.setattr(environment.importlib, "import_module", lambda _: missing_cache)
+    with pytest.raises(ValueError, match="pytest.Cache contract mismatch"):
+        environment._validate_runtime_imports(installed, venv)
+
+
+def test_submitter_rejects_missing_runtime_overlay_before_sbatch():
+    source = (
+        ROOT / "scripts/polaris/submit_pi05_droid_native_jointvelocity_canary.sh"
+    ).read_text(encoding="utf-8")
+    preflight = source.index("--runtime-package-preflight")
+    submission = source.index('job_id="$(sbatch')
+    assert preflight < submission
+    assert (
+        "scripts/polaris/pi05_droid_native_runtime_overlay_requirements.txt"
+        in finalizer.SOURCE_PATHS
+    )
 
 
 def _checkpoint_verification_value(tmp_path):
