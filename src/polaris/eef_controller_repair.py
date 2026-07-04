@@ -182,7 +182,11 @@ def advance_current_joint_velocity_recovery(
             ),
             release_ramp_index_to_apply=(0 if recovered else None),
             next_release_ramp_index_after_successful_apply=(1 if recovered else None),
-            skip_dls=not recovered,
+            # Clean sample 2 is still the final recovery-owned hold apply.  It
+            # also emits release-ramp index 0, whose exact target is current q;
+            # invoking DLS here would be both unnecessary and able to fail
+            # before the transactional hold commits.
+            skip_dls=True,
             hold_current_position=not recovered,
             recovery_event_delta=0,
             active_substep_delta=1,

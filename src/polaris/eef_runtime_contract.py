@@ -249,6 +249,7 @@ VELOCITY_RECOVERY_SAFETY_DIAGNOSTIC_COUNTERS = {
     "predicted_joint_hard_position_limit_abort": "invariant_aborts",
     "measured_velocity_recovery_sustained_abort": "invariant_aborts",
     "measured_velocity_recovery_transaction_abort": "invariant_aborts",
+    "measured_velocity_recovery_lower_endpoint_transition_abort": ("invariant_aborts"),
 }
 SAFETY_STATIC_FIELDS = (
     "profile",
@@ -1933,6 +1934,10 @@ _VELOCITY_RECOVERY_TERMINAL_BINDINGS = {
         "measured_velocity_recovery_transaction_abort",
         "invariant_aborts",
     ),
+    "lower_endpoint_transition_overflow_abort": (
+        "measured_velocity_recovery_lower_endpoint_transition_abort",
+        "invariant_aborts",
+    ),
 }
 
 
@@ -2947,6 +2952,7 @@ def _validate_episode_controller_artifacts(
         apply_calls=apply_calls,
         committed_apply_calls=committed_apply_calls,
     )
+    lower_endpoint_transition_overflow = False
     if spec.current_joint_velocity_recovery_enabled:
         recovery = validate_current_joint_velocity_recovery_report(
             safety.get("current_joint_velocity_recovery"),
@@ -2956,6 +2962,11 @@ def _validate_episode_controller_artifacts(
             raise ValueError(
                 "Episode safety/controller velocity-recovery evidence drift"
             )
+        lower_endpoint_transition_overflow = bool(
+            recovery["events"]
+            and recovery["events"][-1]["end_reason"]
+            == "lower_endpoint_transition_overflow_abort"
+        )
     maxima = safety.get("maxima")
     if not isinstance(maxima, Mapping):
         raise ValueError("Episode controller artifacts lack safety maxima")
@@ -2985,11 +2996,24 @@ def _validate_episode_controller_artifacts(
             "observed_endpoint_change_count"
         ]
         finger_endpoint_changes = target_slew.get("endpoint_change_count")
-        endpoint_change_counts_match = (
-            arm_endpoint_changes <= finger_endpoint_changes <= arm_endpoint_changes + 1
-            if result["numerical_failure"]
-            else arm_endpoint_changes == finger_endpoint_changes
-        )
+        if lower_endpoint_transition_overflow:
+            # Recovery freezes the lower interlock's consumed count.  The first
+            # deferred endpoint is tolerated; the second is the exact terminal
+            # condition, so the uncommitted finger count must lead by two.
+            endpoint_change_counts_match = (
+                result["numerical_failure"]
+                and finger_endpoint_changes == arm_endpoint_changes + 2
+            )
+        elif result["numerical_failure"]:
+            endpoint_change_counts_match = (
+                arm_endpoint_changes
+                <= finger_endpoint_changes
+                <= arm_endpoint_changes + 1
+            )
+        else:
+            endpoint_change_counts_match = (
+                arm_endpoint_changes == finger_endpoint_changes
+            )
         if not endpoint_change_counts_match:
             raise ValueError("Candidate arm/gripper endpoint-change cadence drift")
         validate_eef_all_six_gripper_trace(

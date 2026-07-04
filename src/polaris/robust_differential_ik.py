@@ -100,9 +100,12 @@ from polaris.eef_ik_safety import PHYSX_DERIVED_SOFT_LIMIT_PROFILE
 from polaris.eef_ik_safety import PHYSX_HARD_LIMIT_PROFILE
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+from polaris.eef_ik_safety import PANDA_EEF_PHYSICS_DT_FLOAT32
 from polaris.eef_ik_safety import PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT
 from polaris.eef_ik_safety import PANDA_EEF_SOLVER_VELOCITY_ITERATION_COUNT
 from polaris.eef_ik_safety import PANDA_EEF_PHYSX_SOLVER_TYPE
+from polaris.eef_ik_safety import PANDA_PHYSX_HARD_JOINT_POS_LIMITS_FLOAT32_SHA256
+from polaris.eef_ik_safety import PANDA_PHYSX_HARD_JOINT_POS_LIMITS_RAD
 from polaris.eef_ik_safety import TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE
 from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_JOINT_NAMES
 from polaris.eef_ik_safety import WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS
@@ -940,6 +943,11 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._zero_joint_velocity_target = torch.zeros_like(self._max_delta_joint_pos)
         if self._current_joint_velocity_recovery_enabled:
             self._zero_joint_effort_target = torch.zeros_like(self._max_delta_joint_pos)
+            self._current_joint_velocity_recovery_physics_dt_float32 = torch.tensor(
+                self._physics_dt,
+                dtype=torch.float32,
+                device=self.device,
+            )
             canonical_velocity_limits = torch.tensor(
                 PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S,
                 dtype=torch.float32,
@@ -949,6 +957,23 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 raise ValueError(
                     "PolaRiS EEF current-velocity recovery requires canonical live "
                     "float32 velocity-limit bytes"
+                )
+            canonical_hard_limits = torch.tensor(
+                PANDA_PHYSX_HARD_JOINT_POS_LIMITS_RAD,
+                dtype=torch.float32,
+                device=self.device,
+            ).expand_as(self._physx_hard_joint_position_limits)
+            if float(
+                self._current_joint_velocity_recovery_physics_dt_float32.detach()
+                .cpu()
+                .item()
+            ) != PANDA_EEF_PHYSICS_DT_FLOAT32 or not torch.equal(
+                self._physx_hard_joint_position_limits,
+                canonical_hard_limits,
+            ):
+                raise ValueError(
+                    "PolaRiS EEF current-velocity recovery requires canonical "
+                    "float32 physics dt and installed hard-limit bytes"
                 )
             envelope_values = [
                 current_joint_velocity_recovery_envelope(value)
@@ -1282,8 +1307,10 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._current_joint_velocity_recovery_hold_target_applies = 0
         self._current_joint_velocity_recovery_release_ramp_target_applies = 0
         self._current_joint_velocity_recovery_sustained_aborts = 0
+        self._current_joint_velocity_recovery_current_hard_limit_aborts = 0
         self._current_joint_velocity_recovery_predicted_limit_aborts = 0
         self._current_joint_velocity_recovery_transaction_aborts = 0
+        self._current_joint_velocity_recovery_lower_endpoint_transition_aborts = 0
         self._current_joint_velocity_recovery_max_ratio = torch.zeros_like(
             self._max_delta_joint_pos[0]
         )
@@ -2827,6 +2854,66 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._current_joint_velocity_recovery_consecutive_clean_samples = 0
         self._current_joint_velocity_recovery_next_release_ramp_index = None
 
+    def _current_joint_velocity_recovery_completed_previous_apply(self) -> bool:
+        """Return whether one just-completed event owns the stale lower target."""
+
+        if (
+            not self._current_joint_velocity_recovery_enabled
+            or self._current_joint_velocity_recovery_phase
+            != CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE
+            or not self._current_joint_velocity_recovery_events
+        ):
+            return False
+        event = self._current_joint_velocity_recovery_events[-1]
+        return bool(
+            event.get("end_reason") == "clean2_release_ramp_complete"
+            and event.get("end_apply_index") == self._apply_call_count - 1
+        )
+
+    def _deferred_gripper_endpoint_transition_count(self) -> int:
+        """Observe, but do not consume, endpoint flips during v5 ownership."""
+
+        finger_term = getattr(self, "_gripper_target_slew_term", None)
+        current = getattr(
+            finger_term,
+            "_gripper_target_slew_endpoint_change_count",
+            None,
+        )
+        previous = self._gripper_close_arm_interlock_observed_endpoint_change_count
+        if type(current) is not int or current < 0 or current < previous:
+            raise ValueError(
+                "PolaRiS EEF deferred gripper endpoint-transition state drift"
+            )
+        return current - previous
+
+    def _abort_on_deferred_gripper_endpoint_transition_overflow(
+        self,
+        *,
+        lower_controller_suspended: bool,
+        snapshot: dict[str, object],
+    ) -> None:
+        """Fail closed when recovery has deferred more than one endpoint flip."""
+
+        if type(lower_controller_suspended) is not bool:
+            raise ValueError("PolaRiS EEF lower-controller suspension flag drift")
+        if not isinstance(snapshot, dict):
+            raise ValueError("PolaRiS EEF lower-controller abort snapshot drift")
+        if (
+            not lower_controller_suspended
+            or self._deferred_gripper_endpoint_transition_count() <= 1
+        ):
+            return
+        self._current_joint_velocity_recovery_lower_endpoint_transition_aborts += 1
+        self._raise_current_joint_velocity_recovery_abort(
+            kind="measured_velocity_recovery_lower_endpoint_transition_abort",
+            start_reason="measured_velocity_above_float32_envelope",
+            end_reason="lower_endpoint_transition_overflow_abort",
+            message=CURRENT_JOINT_VELOCITY_RECOVERY_ABORT_MESSAGES[
+                "lower_endpoint_transition_overflow_abort"
+            ],
+            snapshot=snapshot,
+        )
+
     def _raise_current_joint_velocity_recovery_abort(
         self,
         *,
@@ -3023,6 +3110,29 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             self._max_raw_delta_diagnostic_jacobian_max_abs,
         )
 
+    def _compute_recovery_aware_joint_position_target(
+        self,
+        *,
+        recovery_transition: object | None,
+        ee_pos_curr: torch.Tensor,
+        ee_quat_curr: torch.Tensor,
+        joint_pos: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Dispatch DLS unless the current v5 apply is recovery-owned."""
+
+        if recovery_transition is not None and recovery_transition.skip_dls:
+            return joint_pos.detach().clone(), None
+        jacobian = self._compute_frame_jacobian()
+        return (
+            self._ik_controller.compute(
+                ee_pos_curr,
+                ee_quat_curr,
+                jacobian,
+                joint_pos,
+            ),
+            jacobian,
+        )
+
     def apply_actions(self):
         """Apply finite, velocity-slewed, soft-limited EEF IK joint targets."""
 
@@ -3035,8 +3145,11 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             self._validate_arm_release_ramp_state(
                 require_latest_target=(
                     not self._current_joint_velocity_recovery_enabled
-                    or self._current_joint_velocity_recovery_phase
-                    == CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE
+                    or (
+                        self._current_joint_velocity_recovery_phase
+                        == CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE
+                        and not self._current_joint_velocity_recovery_completed_previous_apply()
+                    )
                 )
             )
         if self._failure_substep_trace_enabled:
@@ -3048,6 +3161,12 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         if self._gripper_close_arm_interlock_enabled:
             self._validate_gripper_close_arm_interlock_anchor_state()
         close_interlock_transition = None
+        if not self._current_joint_velocity_recovery_enabled:
+            close_interlock_transition = (
+                self._next_gripper_close_arm_interlock_transition()
+                if self._gripper_close_arm_interlock_enabled
+                else DISABLED_GRIPPER_CLOSE_ARM_INTERLOCK_TRANSITION
+            )
         ee_pos_curr, ee_quat_curr = self._compute_frame_pose()
         joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
         joint_vel = self._asset.data.joint_vel[:, self._joint_ids]
@@ -3096,12 +3215,9 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             current_joint_velocity_over_recovery_envelope = (
                 joint_vel.abs() > self._current_joint_velocity_recovery_envelopes
             )
-            physics_dt_float32 = torch.tensor(
-                self._physics_dt,
-                dtype=torch.float32,
-                device=self.device,
+            predicted_delta_joint_pos = (
+                joint_vel * self._current_joint_velocity_recovery_physics_dt_float32
             )
-            predicted_delta_joint_pos = joint_vel * physics_dt_float32
             predicted_joint_pos = joint_pos + predicted_delta_joint_pos
             predicted_hard_limit_clearance = torch.minimum(
                 predicted_joint_pos - hard_lower,
@@ -3274,6 +3390,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                     (current_hard_limit_violation > 0.0).any().detach().cpu().item()
                 )
                 if current_hard_invalid:
+                    self._current_joint_velocity_recovery_current_hard_limit_aborts += 1
                     self._current_joint_limit_abort_count += self.num_envs
                     self._raise_current_joint_velocity_recovery_abort(
                         kind="current_joint_hard_position_limit_abort",
@@ -3300,6 +3417,10 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                         ],
                         snapshot=recovery_snapshot,
                     )
+                self._abort_on_deferred_gripper_endpoint_transition_overflow(
+                    lower_controller_suspended=lower_controller_suspended,
+                    snapshot=recovery_snapshot,
+                )
                 if recovery_transition.sustained_abort:
                     self._current_joint_velocity_recovery_sustained_aborts += 1
                     self._raise_current_joint_velocity_recovery_abort(
@@ -3410,13 +3531,14 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 rot_error_type="axis_angle",
             )
             pose_error = torch.cat((position_error, axis_angle_error), dim=1)
-            if recovery_transition is not None and recovery_transition.skip_dls:
-                raw_joint_pos_target = joint_pos.detach().clone()
-            else:
-                jacobian = self._compute_frame_jacobian()
-                raw_joint_pos_target = self._ik_controller.compute(
-                    ee_pos_curr, ee_quat_curr, jacobian, joint_pos
+            raw_joint_pos_target, jacobian = (
+                self._compute_recovery_aware_joint_position_target(
+                    recovery_transition=recovery_transition,
+                    ee_pos_curr=ee_pos_curr,
+                    ee_quat_curr=ee_quat_curr,
+                    joint_pos=joint_pos,
                 )
+            )
         except DifferentialIKInvariantError:
             raise
         except DifferentialIKNumericalError:
@@ -3436,22 +3558,27 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             lower_controller_suspended
             and self._gripper_close_arm_interlock_remaining > 0
         )
-        if lower_controller_suspended:
-            close_interlock_transition = suspend_gripper_close_arm_interlock(
-                remaining_before_apply=(self._gripper_close_arm_interlock_remaining),
-                observed_endpoint_change_count=(
-                    self._gripper_close_arm_interlock_observed_endpoint_change_count
-                ),
-                endpoint_observed_before_apply=(
-                    self._gripper_close_arm_interlock_endpoint_observed
-                ),
-            )
-        else:
-            close_interlock_transition = (
-                self._next_gripper_close_arm_interlock_transition()
-                if self._gripper_close_arm_interlock_enabled
-                else DISABLED_GRIPPER_CLOSE_ARM_INTERLOCK_TRANSITION
-            )
+        if self._current_joint_velocity_recovery_enabled:
+            if lower_controller_suspended:
+                close_interlock_transition = suspend_gripper_close_arm_interlock(
+                    remaining_before_apply=(
+                        self._gripper_close_arm_interlock_remaining
+                    ),
+                    observed_endpoint_change_count=(
+                        self._gripper_close_arm_interlock_observed_endpoint_change_count
+                    ),
+                    endpoint_observed_before_apply=(
+                        self._gripper_close_arm_interlock_endpoint_observed
+                    ),
+                )
+            else:
+                close_interlock_transition = (
+                    self._next_gripper_close_arm_interlock_transition()
+                    if self._gripper_close_arm_interlock_enabled
+                    else DISABLED_GRIPPER_CLOSE_ARM_INTERLOCK_TRANSITION
+                )
+        if close_interlock_transition is None:
+            raise ValueError("PolaRiS EEF close-interlock transition is absent")
 
         nominal_safe_target, raw_delta, slew_limited, position_limited = (
             _bound_joint_position_target(
@@ -4153,8 +4280,10 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             or self._current_joint_velocity_recovery_recovered_events
             > self._current_joint_velocity_recovery_events_count
             or self._current_joint_velocity_recovery_sustained_aborts
+            + self._current_joint_velocity_recovery_current_hard_limit_aborts
             + self._current_joint_velocity_recovery_predicted_limit_aborts
             + self._current_joint_velocity_recovery_transaction_aborts
+            + self._current_joint_velocity_recovery_lower_endpoint_transition_aborts
             > self._current_joint_velocity_recovery_events_count
         ):
             raise ValueError("PolaRiS EEF velocity-recovery event counter drift")
@@ -4169,6 +4298,14 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 allow_nan=False,
             )
         )
+        hard_limits = self._physx_hard_joint_position_limits[0].detach().cpu().tolist()
+        hard_limit_digest = hashlib.sha256(
+            b"".join(
+                struct.pack("<f", float(item)) for row in hard_limits for item in row
+            )
+        ).hexdigest()
+        if hard_limit_digest != PANDA_PHYSX_HARD_JOINT_POS_LIMITS_FLOAT32_SHA256:
+            raise ValueError("PolaRiS EEF velocity-recovery hard-limit digest drift")
         return {
             "contract": {
                 "schema_version": CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION,
@@ -4203,6 +4340,15 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                     .detach()
                     .cpu()
                     .tolist()
+                ),
+                "physics_dt_float32": float(
+                    self._current_joint_velocity_recovery_physics_dt_float32.detach()
+                    .cpu()
+                    .item()
+                ),
+                "hard_joint_position_limits_rad": hard_limits,
+                "hard_joint_position_limits_little_endian_float32_sha256": (
+                    hard_limit_digest
                 ),
             },
             "state": {
@@ -4239,11 +4385,17 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 "sustained_aborts": (
                     self._current_joint_velocity_recovery_sustained_aborts
                 ),
+                "current_hard_limit_aborts": (
+                    self._current_joint_velocity_recovery_current_hard_limit_aborts
+                ),
                 "predicted_limit_aborts": (
                     self._current_joint_velocity_recovery_predicted_limit_aborts
                 ),
                 "transaction_aborts": (
                     self._current_joint_velocity_recovery_transaction_aborts
+                ),
+                "lower_endpoint_transition_aborts": (
+                    self._current_joint_velocity_recovery_lower_endpoint_transition_aborts
                 ),
             },
             "maxima": {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import math
 import struct
 
@@ -36,6 +37,9 @@ from polaris.eef_ik_safety import (
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_TRANSACTION_PROFILE
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+from polaris.eef_ik_safety import PANDA_EEF_PHYSICS_DT_FLOAT32
+from polaris.eef_ik_safety import PANDA_PHYSX_HARD_JOINT_POS_LIMITS_FLOAT32_SHA256
+from polaris.eef_ik_safety import PANDA_PHYSX_HARD_JOINT_POS_LIMITS_RAD
 from polaris.eef_ik_safety import PHYSX_HARD_LIMIT_PROFILE
 from polaris.eef_ik_safety import predict_joint_position_against_hard_limits
 
@@ -51,6 +55,10 @@ def _next_float32(value: float, *, positive: bool = True) -> float:
     else:
         bits += -1 if positive else 1
     return struct.unpack("<f", struct.pack("<I", bits))[0]
+
+
+def _neutral_hard_position() -> list[float]:
+    return [0.0, 0.0, 0.0, -1.5, 0.0, 1.8, 0.0]
 
 
 @pytest.mark.parametrize("limit", [2.175, 2.61])
@@ -204,6 +212,7 @@ def test_recovery_state_machine_bounds_clean2_ramp_and_reexceed_lifecycle() -> N
         CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_RELEASE_RAMP
     )
     assert second_clean.release_ramp_index_to_apply == 0
+    assert second_clean.skip_dls is True
     assert second_clean.recovered_event_delta == 0
     assert second_clean.active_substep_delta == 1
     assert (
@@ -275,29 +284,72 @@ def test_recovery_suspends_lower_interlock_and_release_ramp_without_counting() -
     assert ramp.ramp_cancelled_by_reactivation_delta == 0
 
 
+def _recovery_snapshot(
+    *,
+    apply_index: int,
+    joint_position: list[float],
+    joint_velocity: list[float],
+    committed: bool,
+) -> dict:
+    limits = [_float32(value) for value in PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S]
+    envelopes = [current_joint_velocity_recovery_envelope(value) for value in limits]
+    position = [_float32(value) for value in joint_position]
+    velocity = [_float32(value) for value in joint_velocity]
+    excess = [
+        max(_float32(abs(value) - limit), 0.0)
+        for value, limit in zip(velocity, limits, strict=True)
+    ]
+    ratio = [
+        _float32(abs(value) / limit)
+        for value, limit in zip(velocity, limits, strict=True)
+    ]
+    predicted = [
+        _float32(q + _float32(dq * PANDA_EEF_PHYSICS_DT_FLOAT32))
+        for q, dq in zip(position, velocity, strict=True)
+    ]
+    clearance = [
+        min(_float32(q - lower), _float32(upper - q))
+        for q, (lower, upper) in zip(
+            predicted,
+            PANDA_PHYSX_HARD_JOINT_POS_LIMITS_RAD,
+            strict=True,
+        )
+    ]
+    return {
+        "apply_index": apply_index,
+        "policy_step": apply_index // 8,
+        "physics_substep": apply_index % 8,
+        "joint_pos_rad": position,
+        "joint_velocity_rad_s": velocity,
+        "joint_velocity_limit_rad_s": limits,
+        "joint_velocity_envelope_rad_s": envelopes,
+        "joint_velocity_limit_excess_rad_s": excess,
+        "velocity_to_limit_ratio": ratio,
+        "predicted_joint_pos_rad": predicted,
+        "predicted_hard_limit_clearance_rad": clearance,
+        "hold_target_rad": position,
+        "hold_position_target_readback_rad": (position if committed else None),
+        "hold_velocity_target_readback_rad_s": ([0.0] * 7 if committed else None),
+        "hold_effort_target_readback_nm": ([0.0] * 7 if committed else None),
+    }
+
+
 def _active_recovery_report() -> dict:
     limits = [_float32(value) for value in PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S]
     envelopes = [current_joint_velocity_recovery_envelope(value) for value in limits]
     velocity = [_float32(11.743), *([0.0] * 6)]
     excess = [_float32(abs(velocity[0]) - limits[0]), *([0.0] * 6)]
     ratio = [_float32(abs(velocity[0]) / limits[0]), *([0.0] * 6)]
-    snapshot = {
-        "apply_index": 0,
-        "policy_step": 0,
-        "physics_substep": 0,
-        "joint_pos_rad": [0.0] * 7,
-        "joint_velocity_rad_s": velocity,
-        "joint_velocity_limit_rad_s": limits,
-        "joint_velocity_envelope_rad_s": envelopes,
-        "joint_velocity_limit_excess_rad_s": excess,
-        "velocity_to_limit_ratio": ratio,
-        "predicted_joint_pos_rad": [0.0] * 7,
-        "predicted_hard_limit_clearance_rad": [1.0] * 7,
-        "hold_target_rad": [0.0] * 7,
-        "hold_position_target_readback_rad": [0.0] * 7,
-        "hold_velocity_target_readback_rad_s": [0.0] * 7,
-        "hold_effort_target_readback_nm": [0.0] * 7,
-    }
+    hard_limits = [list(row) for row in PANDA_PHYSX_HARD_JOINT_POS_LIMITS_RAD]
+    hard_digest = hashlib.sha256(
+        b"".join(struct.pack("<f", value) for row in hard_limits for value in row)
+    ).hexdigest()
+    snapshot = _recovery_snapshot(
+        apply_index=0,
+        joint_position=_neutral_hard_position(),
+        joint_velocity=velocity,
+        committed=True,
+    )
     return {
         "contract": {
             "schema_version": CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION,
@@ -324,6 +376,9 @@ def _active_recovery_report() -> dict:
             "joint_names": [f"panda_joint{index}" for index in range(1, 8)],
             "velocity_limits_rad_s": limits,
             "velocity_envelopes_rad_s": envelopes,
+            "physics_dt_float32": PANDA_EEF_PHYSICS_DT_FLOAT32,
+            "hard_joint_position_limits_rad": hard_limits,
+            "hard_joint_position_limits_little_endian_float32_sha256": hard_digest,
         },
         "state": {
             "phase": CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD,
@@ -341,8 +396,10 @@ def _active_recovery_report() -> dict:
             "hold_target_applies": 1,
             "release_ramp_target_applies": 0,
             "sustained_aborts": 0,
+            "current_hard_limit_aborts": 0,
             "predicted_limit_aborts": 0,
             "transaction_aborts": 0,
+            "lower_endpoint_transition_aborts": 0,
         },
         "maxima": {
             "abs_velocity_to_limit_ratio": ratio[0],
@@ -380,6 +437,126 @@ def test_recovery_report_schema_and_open_event_are_closed() -> None:
             validate_current_joint_velocity_recovery_report(drifted, apply_calls=1)
 
 
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        (
+            lambda value: value["contract"].__setitem__("physics_dt_float32", 0.01),
+            "identity drift",
+        ),
+        (
+            lambda value: value["contract"]["hard_joint_position_limits_rad"][
+                0
+            ].__setitem__(
+                0,
+                _next_float32(
+                    value["contract"]["hard_joint_position_limits_rad"][0][0]
+                ),
+            ),
+            "binding drift",
+        ),
+        (
+            lambda value: value["contract"].__setitem__(
+                "hard_joint_position_limits_little_endian_float32_sha256",
+                "0" * 64,
+            ),
+            "binding drift",
+        ),
+        (
+            lambda value: value["events"][0]["last"]["joint_pos_rad"].__setitem__(
+                0,
+                _float32(value["events"][0]["last"]["joint_pos_rad"][0] + 0.125),
+            ),
+            "numeric binding drift",
+        ),
+        (
+            lambda value: value["events"][0]["start"]["joint_pos_rad"].__setitem__(
+                0,
+                _float32(value["events"][0]["start"]["joint_pos_rad"][0] + 0.125),
+            ),
+            "numeric binding drift",
+        ),
+        (
+            lambda value: value["events"][0]["last"][
+                "joint_velocity_rad_s"
+            ].__setitem__(
+                0, _next_float32(value["events"][0]["last"]["joint_velocity_rad_s"][0])
+            ),
+            "numeric binding drift",
+        ),
+        (
+            lambda value: value["events"][0]["start"][
+                "joint_velocity_rad_s"
+            ].__setitem__(
+                0,
+                _next_float32(value["events"][0]["start"]["joint_velocity_rad_s"][0]),
+            ),
+            "numeric binding drift",
+        ),
+        (
+            lambda value: value["events"][0]["last"][
+                "predicted_joint_pos_rad"
+            ].__setitem__(
+                0,
+                _next_float32(value["events"][0]["last"]["predicted_joint_pos_rad"][0]),
+            ),
+            "numeric binding drift",
+        ),
+        (
+            lambda value: value["events"][0]["start"][
+                "predicted_joint_pos_rad"
+            ].__setitem__(
+                0,
+                _next_float32(
+                    value["events"][0]["start"]["predicted_joint_pos_rad"][0]
+                ),
+            ),
+            "numeric binding drift",
+        ),
+        (
+            lambda value: value["events"][0]["last"][
+                "predicted_hard_limit_clearance_rad"
+            ].__setitem__(
+                0,
+                _next_float32(
+                    value["events"][0]["last"]["predicted_hard_limit_clearance_rad"][0]
+                ),
+            ),
+            "numeric binding drift",
+        ),
+        (
+            lambda value: value["events"][0]["start"][
+                "predicted_hard_limit_clearance_rad"
+            ].__setitem__(
+                0,
+                _next_float32(
+                    value["events"][0]["start"]["predicted_hard_limit_clearance_rad"][0]
+                ),
+            ),
+            "numeric binding drift",
+        ),
+        (
+            lambda value: value["events"][0].__setitem__(
+                "start_reason", "predicted_hard_limit_crossing"
+            ),
+            "reason predicate drift",
+        ),
+    ],
+)
+def test_recovery_report_rejects_numeric_and_reason_mutations(
+    mutation,
+    match: str,
+) -> None:
+    report = _active_recovery_report()
+    assert (
+        report["contract"]["hard_joint_position_limits_little_endian_float32_sha256"]
+        == PANDA_PHYSX_HARD_JOINT_POS_LIMITS_FLOAT32_SHA256
+    )
+    mutation(report)
+    with pytest.raises(ValueError, match=match):
+        validate_current_joint_velocity_recovery_report(report, apply_calls=1)
+
+
 def test_transaction_abort_snapshot_allows_target_without_readbacks() -> None:
     report = _active_recovery_report()
     report["state"] = {
@@ -409,6 +586,56 @@ def test_transaction_abort_snapshot_allows_target_without_readbacks() -> None:
         validate_current_joint_velocity_recovery_report(drifted, apply_calls=1)
 
 
+def test_current_hard_limit_abort_has_an_exact_nested_terminal_counter() -> None:
+    report = _active_recovery_report()
+    position = _neutral_hard_position()
+    position[0] = _next_float32(PANDA_PHYSX_HARD_JOINT_POS_LIMITS_RAD[0][1])
+    snapshot = _recovery_snapshot(
+        apply_index=0,
+        joint_position=position,
+        joint_velocity=[0.0] * 7,
+        committed=False,
+    )
+    snapshot["hold_target_rad"] = None
+    report["state"] = {
+        "phase": CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE,
+        "active": False,
+        "consecutive_active_substeps": 0,
+        "consecutive_clean_samples": 0,
+        "release_ramp_next_index": None,
+    }
+    report["counters"] = {field: 0 for field in report["counters"]}
+    report["counters"].update(
+        {
+            "recovery_events": 1,
+            "current_hard_limit_aborts": 1,
+        }
+    )
+    report["maxima"] = {
+        "abs_velocity_to_limit_ratio": 0.0,
+        "consecutive_recovery_substeps": 0,
+        "abs_velocity_residual_excess_rad_s": [0.0] * 7,
+    }
+    report["events"] = [
+        {
+            "event_index": 0,
+            "start_apply_index": 0,
+            "end_apply_index": 0,
+            "start_reason": "current_hard_limit_violation",
+            "end_reason": "current_hard_limit_abort",
+            "start": copy.deepcopy(snapshot),
+            "last": copy.deepcopy(snapshot),
+        }
+    ]
+    validated = validate_current_joint_velocity_recovery_report(report, apply_calls=1)
+    assert validated["counters"]["current_hard_limit_aborts"] == 1
+
+    drifted = copy.deepcopy(report)
+    drifted["counters"]["current_hard_limit_aborts"] = 0
+    with pytest.raises(ValueError, match="event history drift"):
+        validate_current_joint_velocity_recovery_report(drifted, apply_calls=1)
+
+
 def test_reexceed_completed_report_has_one_closed_event_and_truthful_counts() -> None:
     report = _active_recovery_report()
     report["state"] = {
@@ -430,16 +657,11 @@ def test_reexceed_completed_report_has_one_closed_event_and_truthful_counts() ->
         }
     )
     report["maxima"]["consecutive_recovery_substeps"] = 3
-    final_snapshot = copy.deepcopy(report["events"][0]["last"])
-    final_snapshot.update(
-        {
-            "apply_index": 37,
-            "policy_step": 4,
-            "physics_substep": 5,
-            "joint_velocity_rad_s": [0.0] * 7,
-            "joint_velocity_limit_excess_rad_s": [0.0] * 7,
-            "velocity_to_limit_ratio": [0.0] * 7,
-        }
+    final_snapshot = _recovery_snapshot(
+        apply_index=37,
+        joint_position=_neutral_hard_position(),
+        joint_velocity=[0.0] * 7,
+        committed=True,
     )
     report["events"][0].update(
         {

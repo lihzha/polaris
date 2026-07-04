@@ -11,6 +11,7 @@ def test_robust_action_binds_finger_target_slew_report_in_isolated_host_stub():
     code = r"""
 import sys
 import types
+import inspect
 
 import torch
 
@@ -602,6 +603,271 @@ except ValueError:
     pass
 else:
     raise AssertionError("post-apply gripper contract installation was accepted")
+
+# Clean sample 2 is still recovery-owned: it emits release-ramp index zero,
+# which is exactly current q, and must not enter either the Jacobian or DLS
+# path.  Exercise the pure transition and the live action dispatcher together.
+recovery_start = robust.advance_current_joint_velocity_recovery(
+    enabled=True,
+    phase_before_apply="inactive",
+    consecutive_active_substeps_before_apply=0,
+    consecutive_clean_samples_before_apply=0,
+    next_release_ramp_index_before_apply=None,
+    measured_velocity_over_envelope=True,
+)
+clean_one = robust.advance_current_joint_velocity_recovery(
+    enabled=True,
+    phase_before_apply=recovery_start.phase_after_successful_apply,
+    consecutive_active_substeps_before_apply=(
+        recovery_start.consecutive_active_substeps_after_successful_apply
+    ),
+    consecutive_clean_samples_before_apply=(
+        recovery_start.consecutive_clean_samples_after_successful_apply
+    ),
+    next_release_ramp_index_before_apply=(
+        recovery_start.next_release_ramp_index_after_successful_apply
+    ),
+    measured_velocity_over_envelope=False,
+)
+clean_two = robust.advance_current_joint_velocity_recovery(
+    enabled=True,
+    phase_before_apply=clean_one.phase_after_successful_apply,
+    consecutive_active_substeps_before_apply=(
+        clean_one.consecutive_active_substeps_after_successful_apply
+    ),
+    consecutive_clean_samples_before_apply=(
+        clean_one.consecutive_clean_samples_after_successful_apply
+    ),
+    next_release_ramp_index_before_apply=(
+        clean_one.next_release_ramp_index_after_successful_apply
+    ),
+    measured_velocity_over_envelope=False,
+)
+assert clean_two.skip_dls is True
+assert clean_two.release_ramp_index_to_apply == 0
+dls_probe = object.__new__(robust.RobustDifferentialInverseKinematicsAction)
+dls_probe._compute_frame_jacobian = lambda: (_ for _ in ()).throw(
+    AssertionError("clean sample 2 entered the Jacobian path")
+)
+dls_probe._ik_controller = types.SimpleNamespace(
+    compute=lambda *_args: (_ for _ in ()).throw(
+        AssertionError("clean sample 2 entered DLS")
+    )
+)
+joint_position = torch.arange(7, dtype=torch.float32).unsqueeze(0)
+recovery_target, recovery_jacobian = (
+    dls_probe._compute_recovery_aware_joint_position_target(
+        recovery_transition=clean_two,
+        ee_pos_curr=torch.zeros((1, 3), dtype=torch.float32),
+        ee_quat_curr=torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32),
+        joint_pos=joint_position,
+    )
+)
+assert torch.equal(recovery_target, joint_position)
+assert recovery_target.data_ptr() != joint_position.data_ptr()
+assert recovery_jacobian is None
+
+# Preserve the inherited v3/v4 failure precedence: malformed lower endpoint
+# state must be rejected before frame/Jacobian/DLS staging, irrespective of
+# whether the lower arm-release ramp is enabled.
+for release_ramp_enabled in (False, True):
+    legacy = object.__new__(robust.RobustDifferentialInverseKinematicsAction)
+    legacy._arm_release_ramp_enabled = release_ramp_enabled
+    legacy._arm_target_transaction_failed = False
+    legacy._failure_substep_trace_enabled = False
+    legacy._apply_call_count = 0
+    legacy._gripper_close_arm_interlock_enabled = True
+    legacy._current_joint_velocity_recovery_enabled = False
+    legacy._validate_arm_release_ramp_state = lambda **_kwargs: None
+    legacy._validate_gripper_close_arm_interlock_anchor_state = lambda: None
+    legacy._next_gripper_close_arm_interlock_transition = lambda: (
+        (_ for _ in ()).throw(ValueError("malformed endpoint wins"))
+    )
+    legacy._compute_frame_pose = lambda: (_ for _ in ()).throw(
+        AssertionError("legacy endpoint validation ran after frame/DLS")
+    )
+    try:
+        legacy.apply_actions()
+    except ValueError as error:
+        assert str(error) == "malformed endpoint wins"
+    else:
+        raise AssertionError("legacy malformed endpoint was accepted")
+
+# A lower release ramp frozen at index five can survive an arbitrarily long
+# v5-owned interval.  The first inactive apply accepts only the one stale
+# target created by the immediately completed recovery event, advances exact
+# index five, and restores strict latest-target validation thereafter.
+lower = object.__new__(robust.RobustDifferentialInverseKinematicsAction)
+lower._env = types.SimpleNamespace(num_envs=1, device="cpu")
+lower._num_joints = 7
+lower._apply_call_count = 28
+lower._arm_release_ramp_enabled = True
+lower._arm_release_ramp_phase = "ramp"
+lower._arm_release_ramp_next_index = 5
+lower._gripper_close_arm_interlock_remaining = 0
+lower._gripper_close_arm_interlock_anchor_completion_count = 1
+lower._gripper_close_arm_interlock_anchor_open_cancel_count = 0
+lower._arm_release_observed_count = 1
+lower._arm_release_ramp_started_count = 1
+lower._arm_release_ramp_completed_count = 0
+lower._arm_release_ramp_cancelled_by_reactivation_count = 0
+lower._arm_release_ramp_target_apply_count = 5
+lower._arm_release_ramp_cancelled_target_apply_count = 0
+lower._arm_release_ramp_limited_target_apply_count = 0
+lower._arm_release_ramp_limited_joint_target_count = 0
+lower._arm_release_ramp_last_target_apply_index = 10
+lower._arm_release_ramp_last_index = 4
+lower._arm_release_ramp_max_abs_nominal_to_ramped_target_change = torch.zeros(
+    7, dtype=torch.float32
+)
+lower._nominal_max_delta_joint_pos = torch.full(
+    (1, 7), 0.02, dtype=torch.float32
+)
+lower._current_joint_velocity_recovery_enabled = True
+lower._current_joint_velocity_recovery_phase = "inactive"
+lower._current_joint_velocity_recovery_events = [{
+    "end_reason": "clean2_release_ramp_complete",
+    "end_apply_index": 27,
+}]
+for _ in range(16):
+    frozen = robust.suspend_arm_release_ramp(
+        phase_before_apply=lower._arm_release_ramp_phase,
+        next_ramp_index_before_apply=lower._arm_release_ramp_next_index,
+    )
+    assert frozen.phase_after_successful_apply == "ramp"
+    assert frozen.next_ramp_index_after_successful_apply == 5
+    assert frozen.ramp_index_to_apply is None
+try:
+    lower._validate_arm_release_ramp_state(require_latest_target=True)
+except ValueError as error:
+    assert "phase/target drift" in str(error)
+else:
+    raise AssertionError("stale lower-ramp target passed strict validation")
+assert lower._current_joint_velocity_recovery_completed_previous_apply() is True
+lower._validate_arm_release_ramp_state(
+    require_latest_target=(
+        not lower._current_joint_velocity_recovery_enabled
+        or (
+            lower._current_joint_velocity_recovery_phase == "inactive"
+            and not lower._current_joint_velocity_recovery_completed_previous_apply()
+        )
+    )
+)
+lower_resume = robust.advance_arm_release_ramp(
+    enabled=True,
+    phase_before_apply=lower._arm_release_ramp_phase,
+    next_ramp_index_before_apply=lower._arm_release_ramp_next_index,
+    interlock_remaining_before_apply=0,
+    interlock_active_this_apply=False,
+    interlock_remaining_after_apply=0,
+    interlock_activation_count_delta=0,
+)
+assert lower_resume.ramp_index_to_apply == 5
+lower._apply_call_count += 1
+lower._arm_release_ramp_phase = lower_resume.phase_after_successful_apply
+lower._arm_release_ramp_next_index = (
+    lower_resume.next_ramp_index_after_successful_apply
+)
+lower._arm_release_ramp_target_apply_count += 1
+lower._arm_release_ramp_last_target_apply_index = lower._apply_call_count - 1
+lower._arm_release_ramp_last_index = lower_resume.ramp_index_to_apply
+lower._validate_arm_release_ramp_state(require_latest_target=True)
+
+# One deferred endpoint transition is observed without consuming the lower
+# counter, then processed on the first inactive resume.
+one_flip_finger = Finger()
+one_flip_finger._gripper_target_slew_endpoint.fill_(torch.pi / 4.0)
+one_flip_finger._gripper_target_slew_endpoint_change_count = 1
+one_flip = bare_action()
+one_flip._gripper_target_slew_term = one_flip_finger
+one_flip._gripper_close_arm_interlock_enabled = True
+one_flip._gripper_close_arm_interlock_configured_substeps = 48
+one_flip._gripper_close_arm_interlock_observed_endpoint_change_count = 0
+one_flip._gripper_close_arm_interlock_endpoint_observed = True
+one_flip._gripper_close_arm_interlock_remaining = 0
+assert one_flip._deferred_gripper_endpoint_transition_count() == 1
+frozen_interlock = robust.suspend_gripper_close_arm_interlock(
+    remaining_before_apply=0,
+    observed_endpoint_change_count=0,
+    endpoint_observed_before_apply=True,
+)
+assert frozen_interlock.observed_endpoint_change_count == 0
+resumed_interlock = one_flip._next_gripper_close_arm_interlock_transition()
+assert resumed_interlock.observed_endpoint_change_count == 1
+assert resumed_interlock.activation_count_delta == 1
+
+# A second deferred endpoint transition terminalizes the active v5 event and
+# emits a rollout diagnostic with an event digest.  The call site must remain
+# before DLS dispatch and every target setter.
+overflow = recovery_transaction_action()
+overflow._current_joint_velocity_recovery_lower_endpoint_transition_aborts = 0
+overflow._gripper_close_arm_interlock_observed_endpoint_change_count = 0
+overflow._gripper_target_slew_term = types.SimpleNamespace(
+    _gripper_target_slew_endpoint_change_count=2
+)
+overflow._current_joint_velocity_recovery_phase = "hold"
+overflow._current_joint_velocity_recovery_consecutive_active_substeps = 1
+joint_position = torch.tensor(
+    [[0.0, 0.0, 0.0, -1.5, 0.0, 1.8, 0.0]], dtype=torch.float32
+)
+joint_velocity = torch.tensor(
+    [[11.743, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=torch.float32
+)
+hard_limits = torch.tensor(
+    robust.PANDA_PHYSX_HARD_JOINT_POS_LIMITS_RAD,
+    dtype=torch.float32,
+).unsqueeze(0)
+predicted_position = joint_position + joint_velocity * torch.tensor(
+    robust.PANDA_EEF_PHYSICS_DT_FLOAT32, dtype=torch.float32
+)
+predicted_clearance = torch.minimum(
+    predicted_position - hard_limits[..., 0],
+    hard_limits[..., 1] - predicted_position,
+)
+overflow_snapshot = overflow._current_joint_velocity_recovery_snapshot(
+    joint_pos=joint_position,
+    joint_vel=joint_velocity,
+    predicted_joint_pos=predicted_position,
+    predicted_hard_limit_clearance=predicted_clearance,
+)
+overflow._start_current_joint_velocity_recovery_event(
+    reason="measured_velocity_above_float32_envelope",
+    snapshot=overflow_snapshot,
+)
+try:
+    overflow._abort_on_deferred_gripper_endpoint_transition_overflow(
+        lower_controller_suspended=True,
+        snapshot=overflow_snapshot,
+    )
+except robust.DifferentialIKInvariantError as error:
+    overflow_message = str(error)
+    assert "more than one deferred gripper endpoint transition" in overflow_message
+    digest = overflow_message.rsplit("evidence_sha256=", 1)[1].rstrip(")")
+    assert len(digest) == 64
+    int(digest, 16)
+else:
+    raise AssertionError("two deferred endpoint transitions were accepted")
+assert overflow._current_joint_velocity_recovery_phase == "inactive"
+assert overflow._current_joint_velocity_recovery_lower_endpoint_transition_aborts == 1
+assert overflow._current_joint_velocity_recovery_events[-1]["end_reason"] == (
+    "lower_endpoint_transition_overflow_abort"
+)
+assert overflow._guard_diagnostics[-1]["kind"] == (
+    "measured_velocity_recovery_lower_endpoint_transition_abort"
+)
+apply_source = inspect.getsource(
+    robust.RobustDifferentialInverseKinematicsAction.apply_actions
+)
+overflow_guard = apply_source.index(
+    "self._abort_on_deferred_gripper_endpoint_transition_overflow("
+)
+dls_dispatch = apply_source.index(
+    "self._compute_recovery_aware_joint_position_target("
+)
+target_setter = apply_source.index(
+    "self._set_targets_and_commit_gripper_close_arm_interlock("
+)
+assert overflow_guard < dls_dispatch < target_setter
 
 print("robust_target_slew_host_stub_ok")
 """

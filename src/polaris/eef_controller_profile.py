@@ -67,6 +67,9 @@ from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_START_REASONS
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_TRANSACTION_PROFILE
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+from polaris.eef_ik_safety import PANDA_EEF_PHYSICS_DT_FLOAT32
+from polaris.eef_ik_safety import PANDA_PHYSX_HARD_JOINT_POS_LIMITS_FLOAT32_SHA256
+from polaris.eef_ik_safety import PANDA_PHYSX_HARD_JOINT_POS_LIMITS_RAD
 from polaris.eef_ik_safety import PHYSX_HARD_LIMIT_PROFILE
 
 
@@ -180,6 +183,9 @@ CURRENT_JOINT_VELOCITY_RECOVERY_CONTRACT_FIELDS = {
     "joint_names",
     "velocity_limits_rad_s",
     "velocity_envelopes_rad_s",
+    "physics_dt_float32",
+    "hard_joint_position_limits_rad",
+    "hard_joint_position_limits_little_endian_float32_sha256",
 }
 CURRENT_JOINT_VELOCITY_RECOVERY_STATE_FIELDS = {
     "phase",
@@ -197,8 +203,10 @@ CURRENT_JOINT_VELOCITY_RECOVERY_COUNTER_FIELDS = {
     "hold_target_applies",
     "release_ramp_target_applies",
     "sustained_aborts",
+    "current_hard_limit_aborts",
     "predicted_limit_aborts",
     "transaction_aborts",
+    "lower_endpoint_transition_aborts",
 }
 CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMA_FIELDS = {
     "abs_velocity_to_limit_ratio",
@@ -729,6 +737,26 @@ def _finite_signed_vector(value: Any, *, field: str) -> list[float]:
     return [float(item) for item in value]
 
 
+def _finite_hard_limit_matrix(value: Any, *, field: str) -> list[list[float]]:
+    if not isinstance(value, list) or len(value) != 7:
+        raise ValueError(f"PolaRiS EEF velocity-recovery {field} matrix drift")
+    result: list[list[float]] = []
+    for row in value:
+        if (
+            not isinstance(row, list)
+            or len(row) != 2
+            or any(not _is_exact_float32(item) for item in row)
+            or not float(row[0]) < float(row[1])
+        ):
+            raise ValueError(f"PolaRiS EEF velocity-recovery {field} matrix drift")
+        result.append([float(item) for item in row])
+    return result
+
+
+def _float32_round(value: float) -> float:
+    return struct.unpack("<f", struct.pack("<f", float(value)))[0]
+
+
 def validate_current_joint_velocity_recovery_report(
     value: Any,
     *,
@@ -772,6 +800,7 @@ def validate_current_joint_velocity_recovery_report(
         "release_ramp_profile": ARM_RELEASE_RAMP_PROFILE,
         "transaction_profile": CURRENT_JOINT_VELOCITY_RECOVERY_TRANSACTION_PROFILE,
         "joint_names": [f"panda_joint{index}" for index in range(1, 8)],
+        "physics_dt_float32": PANDA_EEF_PHYSICS_DT_FLOAT32,
     }
     if any(
         contract.get(field) != expected for field, expected in exact_contract.items()
@@ -790,7 +819,25 @@ def validate_current_joint_velocity_recovery_report(
     expected_envelopes = [
         current_joint_velocity_recovery_envelope(limit) for limit in expected_limits
     ]
-    if limits != expected_limits or envelopes != expected_envelopes:
+    hard_limits = _finite_hard_limit_matrix(
+        contract.get("hard_joint_position_limits_rad"),
+        field="hard limits",
+    )
+    expected_hard_limits = [
+        [float(lower), float(upper)]
+        for lower, upper in PANDA_PHYSX_HARD_JOINT_POS_LIMITS_RAD
+    ]
+    hard_limit_digest = hashlib.sha256(
+        b"".join(struct.pack("<f", item) for row in hard_limits for item in row)
+    ).hexdigest()
+    if (
+        limits != expected_limits
+        or envelopes != expected_envelopes
+        or hard_limits != expected_hard_limits
+        or contract.get("hard_joint_position_limits_little_endian_float32_sha256")
+        != hard_limit_digest
+        or hard_limit_digest != PANDA_PHYSX_HARD_JOINT_POS_LIMITS_FLOAT32_SHA256
+    ):
         raise ValueError("PolaRiS EEF velocity-recovery envelope binding drift")
 
     state = value.get("state")
@@ -853,8 +900,10 @@ def validate_current_joint_velocity_recovery_report(
         < ARM_RELEASE_RAMP_SUBSTEPS * counters["recovered_events"]
         or counters["recovered_events"] > counters["recovery_events"]
         or counters["sustained_aborts"]
+        + counters["current_hard_limit_aborts"]
         + counters["predicted_limit_aborts"]
         + counters["transaction_aborts"]
+        + counters["lower_endpoint_transition_aborts"]
         > counters["recovery_events"]
     ):
         raise ValueError("PolaRiS EEF velocity-recovery counter history drift")
@@ -931,6 +980,7 @@ def validate_current_joint_velocity_recovery_report(
         else:
             end_reason_counts[end_reason] += 1
             previous_end_index = end_index
+        snapshot_facts: dict[str, dict[str, Any]] = {}
         for snapshot_field in ("start", "last"):
             snapshot = event.get(snapshot_field)
             if (
@@ -944,6 +994,9 @@ def validate_current_joint_velocity_recovery_report(
                 raise ValueError("PolaRiS EEF recovery event snapshot identity drift")
             joint_velocity = _finite_signed_vector(
                 snapshot.get("joint_velocity_rad_s"), field="joint_velocity_rad_s"
+            )
+            joint_position = _finite_signed_vector(
+                snapshot.get("joint_pos_rad"), field="joint_pos_rad"
             )
             snapshot_limits = _finite_signed_vector(
                 snapshot.get("joint_velocity_limit_rad_s"),
@@ -961,12 +1014,14 @@ def validate_current_joint_velocity_recovery_report(
                 snapshot.get("velocity_to_limit_ratio"),
                 field="velocity_to_limit_ratio",
             )
-            for vector_field in (
-                "joint_pos_rad",
-                "predicted_joint_pos_rad",
-                "predicted_hard_limit_clearance_rad",
-            ):
-                _finite_signed_vector(snapshot.get(vector_field), field=vector_field)
+            recorded_predicted_position = _finite_signed_vector(
+                snapshot.get("predicted_joint_pos_rad"),
+                field="predicted_joint_pos_rad",
+            )
+            recorded_predicted_clearance = _finite_signed_vector(
+                snapshot.get("predicted_hard_limit_clearance_rad"),
+                field="predicted_hard_limit_clearance_rad",
+            )
             expected_excess = [
                 max(
                     struct.unpack("<f", struct.pack("<f", abs(velocity) - limit))[0],
@@ -975,14 +1030,37 @@ def validate_current_joint_velocity_recovery_report(
                 for velocity, limit in zip(joint_velocity, snapshot_limits, strict=True)
             ]
             expected_ratio = [
-                struct.unpack("<f", struct.pack("<f", abs(velocity) / limit))[0]
+                _float32_round(abs(velocity) / limit)
                 for velocity, limit in zip(joint_velocity, snapshot_limits, strict=True)
+            ]
+            expected_predicted_position = [
+                _float32_round(
+                    position + _float32_round(velocity * PANDA_EEF_PHYSICS_DT_FLOAT32)
+                )
+                for position, velocity in zip(
+                    joint_position,
+                    joint_velocity,
+                    strict=True,
+                )
+            ]
+            expected_predicted_clearance = [
+                min(
+                    _float32_round(predicted - lower),
+                    _float32_round(upper - predicted),
+                )
+                for predicted, (lower, upper) in zip(
+                    expected_predicted_position,
+                    hard_limits,
+                    strict=True,
+                )
             ]
             if (
                 any(item < 0.0 for item in recorded_excess)
                 or any(item < 0.0 for item in recorded_ratio)
                 or recorded_excess != expected_excess
                 or recorded_ratio != expected_ratio
+                or recorded_predicted_position != expected_predicted_position
+                or recorded_predicted_clearance != expected_predicted_clearance
             ):
                 raise ValueError("PolaRiS EEF recovery snapshot numeric binding drift")
             observed_event_max_ratio = max(
@@ -1029,6 +1107,34 @@ def validate_current_joint_velocity_recovery_report(
                     )
             if snapshot_limits != limits or snapshot_envelopes != envelopes:
                 raise ValueError("PolaRiS EEF recovery snapshot static binding drift")
+            current_hard_violation = any(
+                position < lower or position > upper
+                for position, (lower, upper) in zip(
+                    joint_position,
+                    hard_limits,
+                    strict=True,
+                )
+            )
+            predicted_hard_crossing = any(
+                clearance < 0.0 for clearance in expected_predicted_clearance
+            )
+            velocity_over_envelope = any(
+                abs(velocity) > envelope
+                for velocity, envelope in zip(
+                    joint_velocity,
+                    envelopes,
+                    strict=True,
+                )
+            )
+            snapshot_facts[snapshot_field] = {
+                "current_hard_violation": current_hard_violation,
+                "predicted_hard_crossing": predicted_hard_crossing,
+                "velocity_over_envelope": velocity_over_envelope,
+                "hold_target_present": hold_target is not None,
+                "readbacks_present": all(
+                    item is not None for item in transaction_readbacks
+                ),
+            }
         start_snapshot = event["start"]
         last_snapshot = event["last"]
         if (
@@ -1040,11 +1146,68 @@ def validate_current_joint_velocity_recovery_report(
             )
         ):
             raise ValueError("PolaRiS EEF recovery event snapshot cadence drift")
+        start_reason = event["start_reason"]
+        start_facts = snapshot_facts["start"]
+        last_facts = snapshot_facts["last"]
+        start_reason_valid = {
+            "measured_velocity_above_float32_envelope": (
+                start_facts["velocity_over_envelope"]
+                and not start_facts["current_hard_violation"]
+            ),
+            "current_hard_limit_violation": start_facts["current_hard_violation"],
+            "predicted_hard_limit_crossing": (
+                not start_facts["current_hard_violation"]
+                and start_facts["predicted_hard_crossing"]
+                and not start_facts["velocity_over_envelope"]
+            ),
+            "target_transaction_failure": (
+                not start_facts["current_hard_violation"]
+                and not start_facts["predicted_hard_crossing"]
+                and start_facts["velocity_over_envelope"]
+                and start_facts["hold_target_present"]
+                and not start_facts["readbacks_present"]
+                and end_reason == "transaction_abort"
+                and end_index == event["start_apply_index"]
+            ),
+        }[start_reason]
+        end_reason_valid = {
+            None: (
+                not last_facts["current_hard_violation"]
+                and not last_facts["predicted_hard_crossing"]
+            ),
+            "clean2_release_ramp_complete": (
+                not last_facts["current_hard_violation"]
+                and not last_facts["predicted_hard_crossing"]
+                and not last_facts["velocity_over_envelope"]
+            ),
+            "sustained_recovery_abort": (
+                not last_facts["current_hard_violation"]
+                and not last_facts["predicted_hard_crossing"]
+            ),
+            "current_hard_limit_abort": last_facts["current_hard_violation"],
+            "predicted_hard_limit_abort": (
+                not last_facts["current_hard_violation"]
+                and last_facts["predicted_hard_crossing"]
+            ),
+            "transaction_abort": (
+                not last_facts["current_hard_violation"]
+                and not last_facts["predicted_hard_crossing"]
+                and last_facts["hold_target_present"]
+                and not last_facts["readbacks_present"]
+            ),
+            "lower_endpoint_transition_overflow_abort": (
+                not last_facts["current_hard_violation"]
+                and not last_facts["predicted_hard_crossing"]
+            ),
+        }[end_reason]
+        if not start_reason_valid or not end_reason_valid:
+            raise ValueError("PolaRiS EEF recovery event reason predicate drift")
         if end_reason in (
             "sustained_recovery_abort",
             "current_hard_limit_abort",
             "predicted_hard_limit_abort",
             "transaction_abort",
+            "lower_endpoint_transition_overflow_abort",
         ):
             terminal_readbacks = [
                 last_snapshot[field]
@@ -1075,8 +1238,12 @@ def validate_current_joint_velocity_recovery_report(
     expected_end_counts = {
         "clean2_release_ramp_complete": counters["recovered_events"],
         "sustained_recovery_abort": counters["sustained_aborts"],
+        "current_hard_limit_abort": counters["current_hard_limit_aborts"],
         "predicted_hard_limit_abort": counters["predicted_limit_aborts"],
         "transaction_abort": counters["transaction_aborts"],
+        "lower_endpoint_transition_overflow_abort": counters[
+            "lower_endpoint_transition_aborts"
+        ],
     }
     if any(
         end_reason_counts[reason] != expected

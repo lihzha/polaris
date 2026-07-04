@@ -56,7 +56,7 @@ EEF_QUATERNION_UNIT_NORM_TOLERANCE = 1e-3
 CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE = (
     "current_joint_velocity_limit_abort_signed_dq_limit_excess_v1"
 )
-CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION = 1
+CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION = 2
 CURRENT_JOINT_VELOCITY_RECOVERY_PROFILE = (
     "current_joint_velocity_residual_hold_recovery_v1"
 )
@@ -66,6 +66,7 @@ CURRENT_JOINT_VELOCITY_RECOVERY_ENVELOPE_FORMULA_PROFILE = (
 CURRENT_JOINT_VELOCITY_RECOVERY_RELATIVE_ENVELOPE_FLOAT32 = struct.unpack(
     "<f", struct.pack("<f", 1e-4)
 )[0]
+PANDA_EEF_PHYSICS_DT_FLOAT32 = struct.unpack("<f", struct.pack("<f", 1.0 / 120.0))[0]
 CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS = 8
 CURRENT_JOINT_VELOCITY_RECOVERY_CLEAN_SAMPLES_REQUIRED = 2
 CURRENT_JOINT_VELOCITY_RECOVERY_HOLD_PROFILE = (
@@ -97,6 +98,7 @@ CURRENT_JOINT_VELOCITY_RECOVERY_END_REASONS = (
     "current_hard_limit_abort",
     "predicted_hard_limit_abort",
     "transaction_abort",
+    "lower_endpoint_transition_overflow_abort",
 )
 CURRENT_JOINT_VELOCITY_RECOVERY_ABORT_MESSAGES = {
     "sustained_recovery_abort": (
@@ -114,6 +116,10 @@ CURRENT_JOINT_VELOCITY_RECOVERY_ABORT_MESSAGES = {
     "transaction_abort": (
         "PolaRiS EEF measured-velocity recovery target transaction failed; "
         "reset is required before another apply"
+    ),
+    "lower_endpoint_transition_overflow_abort": (
+        "PolaRiS EEF measured-velocity recovery observed more than one deferred "
+        "gripper endpoint transition; aborting before DLS and PhysX"
     ),
 }
 
@@ -285,6 +291,23 @@ PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256 = (
 )
 PANDA_PHYSX_HARD_JOINT_POS_LIMITS_FLOAT32_SHA256 = (
     PANDA_TARGET_JOINT_POS_LIMITS_FLOAT32_SHA256
+)
+PANDA_PHYSX_HARD_JOINT_POS_LIMITS_RAD = tuple(
+    (
+        _float32(
+            _float32(lower)
+            + _float32(_float32(velocity) * PANDA_EEF_PHYSICS_DT_FLOAT32)
+        ),
+        _float32(
+            _float32(upper)
+            - _float32(_float32(velocity) * PANDA_EEF_PHYSICS_DT_FLOAT32)
+        ),
+    )
+    for (lower, upper), velocity in zip(
+        PANDA_SOFT_JOINT_POS_LIMITS_RAD,
+        PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S,
+        strict=True,
+    )
 )
 # Isaac Lab derives its soft buffer from the installed hard limits with
 # float32 midpoint/range arithmetic.  Even with factor=1 this is not a bitwise

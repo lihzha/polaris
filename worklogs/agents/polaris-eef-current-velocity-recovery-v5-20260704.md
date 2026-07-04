@@ -126,3 +126,64 @@ next gate is review of the exact producer/consumer source pins, followed by a
 pinned L40S target-runtime smoke and parallel official LAP-3B/reasoning canaries.
 Those jobs must inspect logs, sidecars, runtime contracts, traces, and videos
 before any promotion.
+
+## P1/P2 pre-launch review closure
+
+The follow-up revision is an additive commit above feature commit
+`048bfd20ac1ba69051a8c628349a7407c01335c8`; that commit and its parent were not
+rewritten. The review found and closed five launch-blocking integration gaps:
+
+- Nested recovery evidence is now schema 2 and binds the exact float32 physics
+  timestep, the installed canonical PhysX hard-limit matrix, and its little-
+  endian float32 SHA-256. For both the start and last snapshot, the consumer
+  independently recomputes `float32(q + float32(dq * dt))`, signed minimum hard-
+  limit clearance, velocity residual/ratio, and start/end-reason predicates.
+  Mutation tests cover timestep, hard-limit bytes/digest, and every recomputed
+  state vector on both snapshots. Impossible historical fixtures were replaced
+  with physically consistent Panda states.
+- Clean sample 2 now bypasses the Jacobian and DLS path while transactionally
+  applying current position as recovery release-ramp index 0. An isolated host
+  integration test uses Jacobian and controller failure sentinels to prove that
+  neither path is entered.
+- A lower arm release ramp suspended by v5 may carry exactly one stale target
+  into the first inactive apply only when the last recovery event completed at
+  the immediately preceding apply. That apply resumes the exact frozen lower
+  ramp index and restores strict latest-target validation. The overlap test
+  freezes index 5 for 16 recovery-owned applies, resumes index 5, and validates
+  the resulting index-6 state strictly.
+- Every recovery-owned apply observes the frozen lower endpoint-transition
+  counter without consuming it. One deferred flip remains frozen and is
+  processed on the first inactive resume. A second flip closes the active event
+  with `lower_endpoint_transition_overflow_abort`, increments the nested
+  `lower_endpoint_transition_aborts` counter, emits
+  `measured_velocity_recovery_lower_endpoint_transition_abort`, and raises a
+  canonical-event-digest-bound `DifferentialIKInvariantError` before DLS or a
+  PhysX target setter. Sidecar validation now requires the uncommitted finger
+  endpoint count to lead the frozen arm count by exactly two for this terminal
+  reason; all other failure/completion count rules remain unchanged.
+- Recovery-disabled legacy profiles again stage lower endpoint validation before
+  frame/Jacobian/DLS work. Runtime sentinels cover both release-ramp-disabled
+  and v4-style release-ramp-enabled paths, proving malformed endpoint evidence
+  wins over a later DLS failure.
+
+The previously outer-only current-hard abort count is also represented by the
+closed nested `current_hard_limit_aborts` counter and bound one-for-one to a
+`current_hard_limit_abort` event.
+
+Post-review validation used:
+
+```bash
+PYTHONPATH=$PWD/src /home/lzha/code/ego-lap/.venv/bin/python -m pytest -q \
+  tests/test_eef_current_velocity_recovery.py \
+  tests/test_eef_runtime_contract.py \
+  tests/test_eef_controller_repair.py \
+  tests/test_eef_controller_profile.py \
+  tests/test_robust_gripper_target_slew_host_stub.py
+PYTHONPATH=$PWD/src /home/lzha/code/ego-lap/.venv/bin/python -m pytest -q \
+  tests --ignore=tests/test_robust_differential_ik.py
+```
+
+The focused suite passed `217` tests. The broad host-safe suite passed `906`
+tests plus `30` subtests. The only emitted warning was the existing Torch
+`pynvml` deprecation warning. No cluster job was launched during this review
+closure.
