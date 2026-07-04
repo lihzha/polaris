@@ -478,3 +478,47 @@ inspection used only login-host read operations.
 - No new Slurm job, allocation, GPU process, simulator, model server,
   evaluator, registry mutation, or shared-document write was performed during
   the rebind or replay.
+
+## Strict base-controller producer-schema correction
+
+- The first official-model wrapper dry preflight stopped before `sbatch` on a
+  consumer defect introduced by the fixed-metadata closure. The exact pinned
+  job `1098174` completion remained byte-identical at SHA-256
+  `05403d0aabf3ebc8111cecf64d33f56f50a3a5673e7a84653ae096e7f4027ad3`
+  and 13,947 bytes, but its producer-defined `slurm` object contains
+  `job_id`, `srun_exit_code`, `status_artifact`, `gpu_inventory`, and
+  `saved_job_script`. The tightened consumer incorrectly required that object
+  to contain only the first two fields, making the public canary submitter
+  unlaunchable.
+- The correction preserves a closed exact schema. It requires all five Slurm
+  fields; exact integer rather than bool/float job and exit values; exact
+  producer path/host/resolved spellings and alias booleans; lowercase device
+  identity, integer inode/size, SHA-256, mode `0444`, and one current link. It
+  reopens every nested artifact through the stable alias-aware descriptor
+  validator, checks the current device/inode before and after, parses the srun
+  status as exact canonical JSON, cross-binds the one-L40S GPU metadata to its
+  exact CSV bytes, and revalidates the saved Slurm script content identity.
+  No field is ignored and no permissive legacy alternative was added.
+- Positive tests now reproduce the complete producer schema. Negative tests
+  reject bool/numeric/type substitutions, missing or additional top-level and
+  nested fields, altered alias booleans, GPU metadata drift, and post-record
+  file tampering. The focused finalizer file passed `37` tests; the broad
+  non-Isaac host suite passed `287` tests plus 5 subtests with the same three
+  external dependency warnings. Targeted Ruff lint with the repository's
+  existing exemptions, AST parsing, Bash syntax, ShellCheck, and
+  `git diff --check` passed.
+- Final strict-consumer executable commit:
+  `f5a851660cda2a9b6121b205273bcfdbeefddbd2`; tree:
+  `289832ba6e3c96b7ad4dea3aafce3fa4bbb1a022`.
+- A fresh detached, clean, filesystem-read-only `l401` checkout of that exact
+  executable commit and OpenPI `bd70b8f...` ran the public model-canary
+  preflight read-only. It passed job `1098174`, descendant authority
+  `required_job1098723_all_six_gate`, job `1098723`, all 14 current source
+  records, the completion/smoke/runtime identities, and promotion scope
+  `prerequisite_only_for_one_checkpoint_canary`. Canonical preflight output
+  SHA-256 was
+  `6e1bb0bb509065ca12eddd1db4b78babe083dd6cd3fac0bda53f3d47a03d4da8`.
+- No model was loaded and no Slurm job, allocation, simulator, evaluator,
+  registry operation, or shared-document mutation occurred. This correction
+  permits rebuilding a fresh prepared-only official-model canary package; it
+  does not itself establish model success.
