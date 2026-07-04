@@ -3,12 +3,15 @@ from __future__ import annotations
 import ast
 import copy
 from functools import lru_cache
+import hashlib
 import importlib.util
 import inspect
 import json
 import math
 import os
 from pathlib import Path
+import stat
+import subprocess
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -50,6 +53,10 @@ replay = load_module(
 validator = load_module(
     "reasoning_production_v4_core_replay_validator",
     "validate_eef_pose_reasoning_production_v4_core_replay.py",
+)
+gate_io = load_module(
+    "reasoning_production_v4_core_gate_io",
+    "eef_pose_reasoning_production_v4_core_gate_io.py",
 )
 
 
@@ -111,6 +118,9 @@ def test_fixture_action_and_tail_bytes_are_exact() -> None:
 
 def test_production_v4_exact_expected_ramp_contract() -> None:
     assert replay.PRODUCTION_BASE_COMMIT == ("7fc74d648328432a7f9f06d13c0e82a03f73a0c1")
+    assert replay.REPLAY_VALIDATION_FIX_COMMIT == (
+        "585ab6f72098fd67118fd8b33cdd90be809bed3a"
+    )
     assert replay.REPLAY_IMPLEMENTATION_COMMIT == (
         "2ebfe7db5b2a31887481781b214608976e8023db"
     )
@@ -1068,10 +1078,244 @@ def test_validator_result_schema_matches_runner_contract() -> None:
     }
 
 
+def _gate_io_publish_cli(temporary: Path, marker: Path) -> list[str]:
+    return [
+        sys.executable,
+        str(SCRIPTS / "eef_pose_reasoning_production_v4_core_gate_io.py"),
+        "publish-success",
+        "--temporary",
+        str(temporary),
+        "--marker",
+        str(marker),
+        "--job-id",
+        "12345",
+        "--variant",
+        replay.VARIANT,
+        "--result-sha256",
+        "1" * 64,
+        "--video-sha256",
+        "2" * 64,
+        "--manifest-sha256",
+        "3" * 64,
+    ]
+
+
+def _gate_io_payload() -> bytes:
+    return gate_io.success_payload(
+        job_id="12345",
+        variant=replay.VARIANT,
+        result_sha256="1" * 64,
+        video_sha256="2" * 64,
+        manifest_sha256="3" * 64,
+    )
+
+
+def test_gate_io_success_marker_is_immutable_single_link(tmp_path: Path) -> None:
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    temporary = attempt / ".SUCCESS.12345.tmp"
+    marker = attempt / "SUCCESS"
+
+    identity = gate_io.publish_success(temporary, marker, _gate_io_payload())
+
+    metadata = os.lstat(marker)
+    payload = marker.read_bytes()
+    assert not temporary.exists()
+    assert payload == _gate_io_payload()
+    assert stat.S_ISREG(metadata.st_mode)
+    assert stat.S_IMODE(metadata.st_mode) == 0o444
+    assert metadata.st_nlink == 1
+    assert identity == {
+        "path": str(marker.resolve()),
+        "size_bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "mode": "0444",
+        "nlink": 1,
+    }
+
+
+def test_gate_io_forced_post_link_failure_propagates_and_cleans(
+    tmp_path: Path,
+) -> None:
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    temporary = attempt / ".SUCCESS.12345.tmp"
+    marker = attempt / "SUCCESS"
+    command = [*_gate_io_publish_cli(temporary, marker), "--test-fail-after-link"]
+
+    completed = subprocess.run(
+        ["bash", "-c", 'set -Eeuo pipefail\n"$@"', "gate-io-shell", *command],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    assert "forced post-link publication failure" in completed.stderr
+    assert not temporary.exists() and not temporary.is_symlink()
+    assert not marker.exists() and not marker.is_symlink()
+
+
+def test_gate_io_preserves_preexisting_success_inode_and_bytes(
+    tmp_path: Path,
+) -> None:
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    temporary = attempt / ".SUCCESS.12345.tmp"
+    marker = attempt / "SUCCESS"
+    marker.write_bytes(b"preexisting-authoritative-marker\n")
+    before = os.lstat(marker)
+
+    completed = subprocess.run(
+        _gate_io_publish_cli(temporary, marker),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    after = os.lstat(marker)
+    assert completed.returncode == 1
+    assert marker.read_bytes() == b"preexisting-authoritative-marker\n"
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert not temporary.exists() and not temporary.is_symlink()
+
+
+def test_gate_io_post_link_cleanup_preserves_replacement_inode(
+    tmp_path: Path,
+) -> None:
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    temporary = attempt / ".SUCCESS.12345.tmp"
+    marker = attempt / "SUCCESS"
+    replacement: dict[str, int] = {}
+
+    def replace_marker_and_fail() -> None:
+        marker.unlink()
+        marker.write_bytes(b"unrelated-replacement\n")
+        metadata = os.lstat(marker)
+        replacement.update(dev=metadata.st_dev, ino=metadata.st_ino)
+        raise gate_io.GateIoError("forced replacement failure")
+
+    with pytest.raises(gate_io.GateIoError, match="forced replacement failure"):
+        gate_io.publish_success(
+            temporary,
+            marker,
+            _gate_io_payload(),
+            after_link=replace_marker_and_fail,
+        )
+
+    after = os.lstat(marker)
+    assert marker.read_bytes() == b"unrelated-replacement\n"
+    assert (after.st_dev, after.st_ino) == (replacement["dev"], replacement["ino"])
+    assert not temporary.exists() and not temporary.is_symlink()
+
+
+def test_gate_io_cleans_link_that_succeeds_before_link_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    temporary = attempt / ".SUCCESS.12345.tmp"
+    marker = attempt / "SUCCESS"
+    real_link = gate_io.os.link
+
+    def link_then_raise(*args: Any, **kwargs: Any) -> None:
+        real_link(*args, **kwargs)
+        raise OSError("injected post-link syscall error")
+
+    monkeypatch.setattr(gate_io.os, "link", link_then_raise)
+    with pytest.raises(OSError, match="injected post-link syscall error"):
+        gate_io.publish_success(temporary, marker, _gate_io_payload())
+
+    assert not temporary.exists() and not temporary.is_symlink()
+    assert not marker.exists() and not marker.is_symlink()
+
+
+def test_gate_io_cleans_temp_after_initial_metadata_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt = tmp_path / "attempt"
+    attempt.mkdir()
+    temporary = attempt / ".SUCCESS.12345.tmp"
+    marker = attempt / "SUCCESS"
+    real_fstat = gate_io.os.fstat
+    call_count = 0
+
+    def first_fstat_has_extra_link(descriptor: int) -> Any:
+        nonlocal call_count
+        call_count += 1
+        metadata = real_fstat(descriptor)
+        if call_count == 1:
+            return SimpleNamespace(
+                st_dev=metadata.st_dev,
+                st_ino=metadata.st_ino,
+                st_mode=metadata.st_mode,
+                st_nlink=2,
+            )
+        return metadata
+
+    monkeypatch.setattr(gate_io.os, "fstat", first_fstat_has_extra_link)
+    with pytest.raises(gate_io.GateIoError, match="temp metadata drift"):
+        gate_io.publish_success(temporary, marker, _gate_io_payload())
+
+    assert not temporary.exists() and not temporary.is_symlink()
+    assert not marker.exists() and not marker.is_symlink()
+
+
+def test_gate_io_rejects_directory_symlink_with_or_without_trailing_slash(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    cache = tmp_path / "cache"
+    output.mkdir()
+    cache.mkdir()
+    output_link = tmp_path / "output-link"
+    output_link.symlink_to(output, target_is_directory=True)
+
+    for supplied_output in (str(output_link), f"{output_link}/"):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "eef_pose_reasoning_production_v4_core_gate_io.py"),
+                "validate-roots",
+                "--output-root",
+                supplied_output,
+                "--cache-root",
+                str(cache),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert completed.returncode == 1
+        assert "must be a non-symlink directory" in completed.stderr
+
+
+def test_gate_io_accepts_normal_disjoint_roots(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    cache = tmp_path / "cache"
+    output.mkdir()
+    cache.mkdir()
+
+    assert gate_io.validate_disjoint_roots(str(output), str(cache)) == (
+        str(output.resolve()),
+        str(cache.resolve()),
+    )
+    assert gate_io.validate_disjoint_roots(f"{output}/", f"{cache}/") == (
+        str(output.resolve()),
+        str(cache.resolve()),
+    )
+
+
 def test_srun_wrapper_is_single_variant_and_launch_only() -> None:
     source = (
         SCRIPTS / "run_eef_pose_reasoning_production_v4_core_replay_srun.sh"
     ).read_text()
+    gate_io_sha256 = hashlib.sha256(
+        (SCRIPTS / "eef_pose_reasoning_production_v4_core_gate_io.py").read_bytes()
+    ).hexdigest()
     assert "production_v4_core_ramp16" in source
     assert "cap8_abrupt_release" not in source
     assert "cap24_abrupt_release" not in source
@@ -1088,21 +1332,24 @@ def test_srun_wrapper_is_single_variant_and_launch_only() -> None:
     assert 'rm -rf -- "${cache}"' in source
     assert "status --porcelain=v1 --untracked-files=all" in source
     assert "FULLTRACE_SAFETY_VALIDATOR_SHA256" in source
-    assert 'realpath -e -- "${FULLTRACE_OUTPUT_ROOT}"' in source
-    assert 'realpath -e -- "${FULLTRACE_HOST_CACHE_ROOT}"' in source
-    assert 'paths_overlap "${output_root}" "${cache_root}"' in source
+    assert "FULLTRACE_GATE_IO_SHA256" in source
+    assert "eef_pose_reasoning_production_v4_core_gate_io.py" in source
+    assert f"readonly gate_io_sha256={gate_io_sha256}" in source
+    assert '"${gate_io}" validate-roots' in source
     assert 'mkdir -- "${attempt}"' in source
     assert 'mkdir -- "${cache}"' in source
-    assert "os.O_EXCL" in source
-    assert "os.O_NOFOLLOW" in source
-    assert "os.link(temporary, marker, follow_symlinks=False)" in source
-    assert "os.fsync(directory_descriptor)" in source
-    assert "published.st_nlink == 1" in source
+    assert 'if ! /usr/bin/python3 "${gate_io}" publish-success \\' in source
+    assert "read -r success_size success_sha < <(" not in source
     assert 'rm -f "${success_marker}"' not in source
     assert 'mv -T "${success_temporary}"' not in source
-    assert 'rev-parse HEAD^)" == "${replay_implementation_commit}"' in source
-    assert 'rev-parse HEAD^^)" == "${replay_parent_commit}"' in source
-    assert 'rev-parse HEAD^^^)" == "${production_base_commit}"' in source
+    assert 'rev-parse HEAD^)" == "${replay_validation_fix_commit}"' in source
+    assert 'rev-parse HEAD^^)" == "${replay_implementation_commit}"' in source
+    assert 'rev-parse HEAD^^^)" == "${replay_parent_commit}"' in source
+    assert 'rev-parse HEAD^^^^)" == "${production_base_commit}"' in source
+    assert source.endswith(
+        "status=0\nprintf 'FULLTRACE_PRODUCTION_V4_SUCCESS=%s\\n' "
+        '"${success_marker}" || true\n'
+    )
 
 
 def test_fixture_builder_still_reproduces_pinned_action_payload() -> None:

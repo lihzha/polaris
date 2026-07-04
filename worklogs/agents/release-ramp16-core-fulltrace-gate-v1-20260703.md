@@ -29,16 +29,19 @@ changes relative to `7fc74d6`. This replay branch was fast-forwarded to
 Required final first-parent ancestry is therefore:
 
 ```text
-<independent validation fix commit>
+<synchronous publication / lexical-root P2 fix commit>
+  -> 585ab6f72098fd67118fd8b33cdd90be809bed3a
   -> 2ebfe7db5b2a31887481781b214608976e8023db
   -> e18b8ebbc26fd309d8e45bd58bef9c867948098a
   -> 7fc74d648328432a7f9f06d13c0e82a03f73a0c1
   -> 0611d384f5f26ef9bd8ff114be273e875c3fe719
 ```
 
-Commit `2ebfe7d` is the original replay implementation. The fix child is the
-launch checkout, so the runner and wrapper explicitly require `2ebfe7d` as
-`HEAD^`, `e18b8eb` as `HEAD^^`, and `7fc74d6` as `HEAD^^^`.
+Commit `2ebfe7d` is the original replay implementation and `585ab6f` is its
+independent validator/publication hardening child. The current P2 child is the
+launch checkout, so the runner and wrapper explicitly require `585ab6f` as
+`HEAD^`, `2ebfe7d` as `HEAD^^`, `e18b8eb` as `HEAD^^^`, and `7fc74d6` as
+`HEAD^^^^`.
 
 The four production-core SHA-256 identities remain:
 
@@ -60,6 +63,7 @@ Added:
 - `scripts/smoke_eef_pose_reasoning_production_v4_core_replay.py`
 - `scripts/validate_eef_pose_reasoning_production_v4_core_replay.py`
 - `scripts/run_eef_pose_reasoning_production_v4_core_replay_srun.sh`
+- `scripts/eef_pose_reasoning_production_v4_core_gate_io.py`
 - `tests/test_smoke_eef_pose_reasoning_production_v4_core_replay.py`
 - this worklog
 
@@ -125,15 +129,47 @@ changing `src/polaris`:
   non-replacing hard-link publication, temp unlink, directory fsync, and
   independent reread/hash/mode/link-count checks.
 
-Pinned launch component SHA-256 values for the fix are:
+## Synchronous publication and lexical-root P2 fix
+
+The current child factors the host-only namespace and `SUCCESS` operations
+into a pinned, standard-library-only helper. The wrapper executes both helper
+commands synchronously and checks their statuses directly; the `SUCCESS`
+publisher is no longer hidden inside process substitution.
+
+The publisher records the exclusive temporary inode before metadata checks,
+tracks the hard-link attempt and successful return, and treats link completion
+as uncertain when `link(2)` raises. Every exception removes the temporary only
+when `lstat` still matches that owned inode. After a link attempt it likewise
+removes `SUCCESS` only when its device and inode match, fsyncs the directory,
+and re-raises. A pre-existing or concurrently replaced unrelated marker is
+never removed. On success the helper seals mode `0444`, removes the temporary,
+fsyncs, and validates exact inode, regular-file, size, single-link, and payload
+identity. The wrapper has no fallible command after publication that can turn
+an authoritative success into wrapper failure.
+
+Root validation strips only trailing separators before the first `lstat`, so
+a final-component directory symlink is rejected both with and without a
+trailing slash. It requires an absolute normalized non-symlink directory,
+rechecks the lexical inode around canonicalization, and only then compares the
+canonical output/cache trees for equality or nesting.
+
+Behavioral tests cover forced post-link failure with synchronous nonzero
+propagation and no marker/temp, pre-existing marker byte/inode preservation,
+unrelated replacement preservation, successful `0444`/single-link
+publication, link-success-before-error cleanup, initial metadata rejection
+cleanup, directory symlink rejection with and without a trailing slash, and
+normal disjoint roots.
+
+Pinned launch component SHA-256 values for the current P2 child are:
 
 - finalizer: `74dccfeb25c9522e5741eb72510f3f7940abd64678be8a357aca102fe2038fc7`
-- wrapper: `a39ce5fe83ec382ab451c248efae687ef0a11908e119d6a05f2b8002dde2ffe0`
-- runner: `6e0d18e73cde9c76a257feb093e5226e8a3ea99df213edc5f2bfffa2596993b7`
-- validator: `4349d07521094ea6e458b5eca9946ed5446ddb3faad56f37e76767510e04e58f`
+- wrapper: `cf5351fcc666c7fb6fa3abd0f742867f43d99bebff9e9a1000eca2e5d3316b5d`
+- runner: `8a60694870d8e8efeddcc21bea063d1f900b39e8b53d4a4942c95527342d6c8b`
+- validator: `7131c69a098ac0f512e6437efa45f96dc397e03927a650eee6a885952b8967c4`
 - fixture: `daf2aa682f2296a93170f842a5adb13a4fbc6b2694fa5dca28de7ac7ad83d7cb`
 - fixture builder: `d9151df864a447fc5e18a900188125f89a49fcd04e0bf703f1b7dc2e8a5872e4`
-- focused test: `810ad9a317cb8f1cfa233b342cb83c8a3ca57c0b039b72297c01a9e619c89533`
+- focused test: `dd1cd389c1071774888a3923a4f937ec2e3bf1f8b425ef40a575b6a6c35fd9cf`
+- gate I/O helper: `34b1cc6b493d2e0e078bd5769fb44a68d824a4deac8f58a54aefc41f83641cdb`
 
 ## Frozen replay contract
 
@@ -161,12 +197,13 @@ Commands and results:
 ```bash
 ruff check \
   scripts/build_reasoning_fulltrace_replay_fixture.py \
+  scripts/eef_pose_reasoning_production_v4_core_gate_io.py \
   scripts/smoke_eef_pose_reasoning_production_v4_core_replay.py \
   scripts/validate_eef_pose_reasoning_production_v4_core_replay.py \
   tests/test_smoke_eef_pose_reasoning_production_v4_core_replay.py
 
-ruff format --check <the same four files>
-python3 -m py_compile <the three Python scripts and focused test>
+ruff format --check <the same five files>
+python3 -m py_compile <the four Python scripts and focused test>
 bash -n scripts/run_eef_pose_reasoning_production_v4_core_replay_srun.sh
 git diff --check
 
@@ -202,6 +239,20 @@ ShellCheck: passed
 git diff --check: passed
 ```
 
+The synchronous publication / lexical-root P2 child then passed:
+
+```text
+focused behavioral gate: 41 passed
+selected controller/gripper regression: 213 passed
+full host-safe suite: 908 passed, 30 subtests passed
+Ruff check: passed
+Ruff format --check: passed
+Python compile: passed
+bash -n: passed
+ShellCheck: passed
+git diff --check: passed
+```
+
 The unrestricted host suite stops during collection only because the local
 environment lacks `isaaclab`. The launch wrapper runs the omitted
 `tests/test_robust_differential_ik.py` first in the pinned Isaac image. It
@@ -229,13 +280,18 @@ reviewed outer `sbatch` wrapper must contain literal values for all of:
 - `FULLTRACE_FIXTURE_SHA256`
 - `FULLTRACE_FIXTURE_BUILDER_SHA256`
 - `FULLTRACE_TEST_SHA256`
+- `FULLTRACE_GATE_IO_SHA256`
 - `FULLTRACE_WRAPPER_SHA256`
 
 No command substitution, Git lookup, or hash computation from the launch
-checkout is permitted for those values. The prior outer wrapper SHA-256
+checkout is permitted for those values. The most recent independently reviewed
+outer wrapper SHA-256
+`343f9d2126b5549964985ba794be01c5dfce17b649b5cfb2646ff5abe841edb1`
+targets parent `585ab6f72098fd67118fd8b33cdd90be809bed3a`; it does not carry the gate-I/O
+helper literal and is intentionally invalid for this P2 child. The still older
+outer SHA-256
 `724867f6227ba4100db1c3f7d4e7f946312d9785c860499745e4f4cd519cf504`
-was reviewed for commit `2ebfe7db5b2a31887481781b214608976e8023db`; it is intentionally invalid
-for this fix child and must not be used. A new outer wrapper may be reviewed
+targets `2ebfe7d` and is likewise invalid. A new outer wrapper may be reviewed
 only after the final child commit and component hashes are frozen.
 
 The resource contract remains one ordinary, non-array, non-requeue L40S job:

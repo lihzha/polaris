@@ -17,6 +17,7 @@ required=(
   FULLTRACE_FIXTURE_SHA256
   FULLTRACE_FIXTURE_BUILDER_SHA256
   FULLTRACE_TEST_SHA256
+  FULLTRACE_GATE_IO_SHA256
   FULLTRACE_WRAPPER_SHA256
   SLURM_JOB_ID
 )
@@ -37,6 +38,7 @@ hash_variables=(
   FULLTRACE_FIXTURE_SHA256
   FULLTRACE_FIXTURE_BUILDER_SHA256
   FULLTRACE_TEST_SHA256
+  FULLTRACE_GATE_IO_SHA256
   FULLTRACE_WRAPPER_SHA256
 )
 for name in "${hash_variables[@]}"; do
@@ -48,6 +50,7 @@ done
 
 readonly variant=production_v4_core_ramp16
 readonly production_base_commit=7fc74d648328432a7f9f06d13c0e82a03f73a0c1
+readonly replay_validation_fix_commit=585ab6f72098fd67118fd8b33cdd90be809bed3a
 readonly replay_implementation_commit=2ebfe7db5b2a31887481781b214608976e8023db
 readonly replay_parent_commit=e18b8ebbc26fd309d8e45bd58bef9c867948098a
 readonly container_size_bytes=7183130624
@@ -60,6 +63,7 @@ readonly five_sidecar_sha256=f0b5c2c2211c8d67ed15e75e656c7862d086e9245420892a7de
 readonly isaac_pytest_bootstrap_sha256=d2814cd641820e08f64daf88903c4b972efb3ae1d336d0b0c5e42924eb781dd5
 readonly robust_ik_test_sha256=5af936fcd0227672f7738b6e6f45a505f942403702fc4de3b0a5af982b46ed5c
 readonly safety_validator_sha256=74dccfeb25c9522e5741eb72510f3f7940abd64678be8a357aca102fe2038fc7
+readonly gate_io_sha256=34b1cc6b493d2e0e078bd5769fb44a68d824a4deac8f58a54aefc41f83641cdb
 
 readonly runner="${FULLTRACE_POLARIS_REPO}/scripts/smoke_eef_pose_reasoning_production_v4_core_replay.py"
 readonly validator="${FULLTRACE_POLARIS_REPO}/scripts/validate_eef_pose_reasoning_production_v4_core_replay.py"
@@ -67,13 +71,15 @@ readonly safety_validator="${FULLTRACE_POLARIS_REPO}/scripts/finalize_eef_pose_s
 readonly fixture="${FULLTRACE_POLARIS_REPO}/scripts/fixtures/reasoning_43075_job1098523_fulltrace_actions.json"
 readonly fixture_builder="${FULLTRACE_POLARIS_REPO}/scripts/build_reasoning_fulltrace_replay_fixture.py"
 readonly focused_test="${FULLTRACE_POLARIS_REPO}/tests/test_smoke_eef_pose_reasoning_production_v4_core_replay.py"
+readonly gate_io="${FULLTRACE_POLARIS_REPO}/scripts/eef_pose_reasoning_production_v4_core_gate_io.py"
 wrapper="$(readlink -f "$0")"
 readonly wrapper
 
 [[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD)" == "${FULLTRACE_REPLAY_COMMIT}" ]]
-[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^)" == "${replay_implementation_commit}" ]]
-[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^^)" == "${replay_parent_commit}" ]]
-[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^^^)" == "${production_base_commit}" ]]
+[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^)" == "${replay_validation_fix_commit}" ]]
+[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^^)" == "${replay_implementation_commit}" ]]
+[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^^^)" == "${replay_parent_commit}" ]]
+[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^^^^)" == "${production_base_commit}" ]]
 [[ -z "$(git -C "${FULLTRACE_POLARIS_REPO}" branch --show-current)" ]]
 [[ -z "$(git -C "${FULLTRACE_POLARIS_REPO}" status --porcelain --untracked-files=all)" ]]
 [[ "${FULLTRACE_CONTAINER_SHA256}" == "${container_sha256}" ]]
@@ -88,6 +94,8 @@ readonly wrapper
 [[ "$(sha256sum "${fixture}" | awk '{print $1}')" == "${FULLTRACE_FIXTURE_SHA256}" ]]
 [[ "$(sha256sum "${fixture_builder}" | awk '{print $1}')" == "${FULLTRACE_FIXTURE_BUILDER_SHA256}" ]]
 [[ "$(sha256sum "${focused_test}" | awk '{print $1}')" == "${FULLTRACE_TEST_SHA256}" ]]
+[[ "${FULLTRACE_GATE_IO_SHA256}" == "${gate_io_sha256}" ]]
+[[ "$(sha256sum "${gate_io}" | awk '{print $1}')" == "${FULLTRACE_GATE_IO_SHA256}" ]]
 [[ "$(sha256sum "${wrapper}" | awk '{print $1}')" == "${FULLTRACE_WRAPPER_SHA256}" ]]
 [[ "$(sha256sum "${FULLTRACE_POLARIS_REPO}/scripts/run_isaac_pytest.py" | awk '{print $1}')" == "${isaac_pytest_bootstrap_sha256}" ]]
 [[ "$(sha256sum "${FULLTRACE_POLARIS_REPO}/tests/test_robust_differential_ik.py" | awk '{print $1}')" == "${robust_ik_test_sha256}" ]]
@@ -95,21 +103,18 @@ readonly wrapper
 [[ "$(sha256sum "${FULLTRACE_POLARIS_DATA_PATH}/food_bussing/initial_conditions.json" | awk '{print $1}')" == 40091faee14f692350220871d30705294f21f17ae3d2974cd3c09a34d560f5de ]]
 [[ "$(sha256sum "${FULLTRACE_POLARIS_DATA_PATH}/food_bussing/scene.usda" | awk '{print $1}')" == 82cd641e422935b394ce7ea7b6be55214c9952a2544000222921e544c409b489 ]]
 
-[[ "${FULLTRACE_OUTPUT_ROOT}" == /* && "${FULLTRACE_HOST_CACHE_ROOT}" == /* ]]
-[[ -d "${FULLTRACE_OUTPUT_ROOT}" && ! -L "${FULLTRACE_OUTPUT_ROOT}" ]]
-[[ -d "${FULLTRACE_HOST_CACHE_ROOT}" && ! -L "${FULLTRACE_HOST_CACHE_ROOT}" ]]
-output_root="$(realpath -e -- "${FULLTRACE_OUTPUT_ROOT}")"
-cache_root="$(realpath -e -- "${FULLTRACE_HOST_CACHE_ROOT}")"
-readonly output_root cache_root
-paths_overlap() {
-  local left="${1%/}/"
-  local right="${2%/}/"
-  [[ "${left}" == "${right}" || "${left}" == "${right}"* || "${right}" == "${left}"* ]]
-}
-if paths_overlap "${output_root}" "${cache_root}"; then
-  printf 'resolved output/cache roots overlap: %s ; %s\n' "${output_root}" "${cache_root}" >&2
+root_record=""
+if ! root_record="$(
+  /usr/bin/python3 "${gate_io}" validate-roots \
+    --output-root "${FULLTRACE_OUTPUT_ROOT}" \
+    --cache-root "${FULLTRACE_HOST_CACHE_ROOT}"
+)"; then
+  printf 'lexical output/cache root validation failed\n' >&2
   exit 2
 fi
+IFS=$'\t' read -r output_root cache_root extra_root_field <<<"${root_record}"
+[[ -n "${output_root}" && -n "${cache_root}" && -z "${extra_root_field}" ]]
+readonly root_record output_root cache_root extra_root_field
 readonly attempt_parent="${output_root}/${variant}"
 readonly cache_parent="${cache_root}/${variant}"
 mkdir -p -- "${attempt_parent}" "${cache_parent}"
@@ -198,10 +203,11 @@ readonly isaaclab_tasks_root=/.venv/lib/python3.11/site-packages/isaaclab/source
 readonly isaaclab_assets_root=/.venv/lib/python3.11/site-packages/isaaclab/source/isaaclab_assets
 readonly container_pythonpath="${FULLTRACE_POLARIS_REPO}/src:${FULLTRACE_POLARIS_REPO}/scripts:${isaaclab_root}:${isaaclab_tasks_root}:${isaaclab_assets_root}"
 readonly record="${attempt}/run_record.env"
-printf 'PROFILE=%s\nSLURM_JOB_ID=%s\nSLURM_RESTART_COUNT=%s\nVARIANT=%s\nLAUNCH_ID=%s\nREPLAY_COMMIT=%s\nREPLAY_IMPLEMENTATION_COMMIT=%s\nREPLAY_PARENT_COMMIT=%s\nPRODUCTION_BASE_COMMIT=%s\nCONTAINER_IMAGE=%s\nCONTAINER_SHA256=%s\nCONTAINER_PYTHONPATH=%s\nRESULT_JSON=%s\nVIDEO=%s\nMANIFEST=%s\n' \
+printf 'PROFILE=%s\nSLURM_JOB_ID=%s\nSLURM_RESTART_COUNT=%s\nVARIANT=%s\nLAUNCH_ID=%s\nREPLAY_COMMIT=%s\nREPLAY_VALIDATION_FIX_COMMIT=%s\nREPLAY_IMPLEMENTATION_COMMIT=%s\nREPLAY_PARENT_COMMIT=%s\nPRODUCTION_BASE_COMMIT=%s\nCONTAINER_IMAGE=%s\nCONTAINER_SHA256=%s\nCONTAINER_PYTHONPATH=%s\nRESULT_JSON=%s\nVIDEO=%s\nMANIFEST=%s\n' \
   production_v4_core_fulltrace_srun_v1 \
   "${SLURM_JOB_ID}" "${SLURM_RESTART_COUNT:-0}" "${variant}" \
   "${FULLTRACE_LAUNCH_ID}" "${FULLTRACE_REPLAY_COMMIT}" \
+  "${replay_validation_fix_commit}" \
   "${replay_implementation_commit}" "${replay_parent_commit}" \
   "${production_base_commit}" "${FULLTRACE_CONTAINER_IMAGE}" \
   "${FULLTRACE_CONTAINER_SHA256}" "${container_pythonpath}" "${result_json}" "${video}" \
@@ -326,100 +332,16 @@ result_sha="$(sha256sum "${result_json}" | awk '{print $1}')"
 video_sha="$(sha256sum "${video}" | awk '{print $1}')"
 readonly manifest_sha result_sha video_sha
 [[ ! -e "${success_temporary}" && ! -e "${success_marker}" ]]
-read -r success_size success_sha < <(
-  /usr/bin/python3 - "${success_temporary}" "${success_marker}" \
-    "${SLURM_JOB_ID}" "${variant}" "${result_sha}" "${video_sha}" \
-    "${manifest_sha}" <<'PY'
-import hashlib
-import os
-from pathlib import Path
-import stat
-import sys
-
-
-temporary = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = (
-    "profile=production_v4_core_fulltrace_success_v1\n"
-    f"job_id={sys.argv[3]}\n"
-    f"variant={sys.argv[4]}\n"
-    f"result_sha256={sys.argv[5]}\n"
-    f"video_sha256={sys.argv[6]}\n"
-    f"manifest_sha256={sys.argv[7]}\n"
-).encode()
-flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
-descriptor = None
-temporary_identity = None
-try:
-    descriptor = os.open(temporary, flags, 0o600)
-    metadata = os.fstat(descriptor)
-    temporary_identity = (metadata.st_dev, metadata.st_ino)
-    view = memoryview(payload)
-    while view:
-        written = os.write(descriptor, view)
-        if written <= 0:
-            raise OSError("short SUCCESS marker write")
-        view = view[written:]
-    os.fsync(descriptor)
-    os.fchmod(descriptor, 0o444)
-    os.fsync(descriptor)
-    os.close(descriptor)
-    descriptor = None
-    os.link(temporary, marker, follow_symlinks=False)
-    os.unlink(temporary)
-    directory_descriptor = os.open(
-        marker.parent,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
-    )
-    try:
-        os.fsync(directory_descriptor)
-    finally:
-        os.close(directory_descriptor)
-    published = os.lstat(marker)
-    if not (
-        stat.S_ISREG(published.st_mode)
-        and stat.S_IMODE(published.st_mode) == 0o444
-        and published.st_nlink == 1
-        and published.st_size == len(payload)
-    ):
-        raise OSError("published SUCCESS metadata drift")
-    read_descriptor = os.open(
-        marker,
-        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-    )
-    try:
-        reread = b""
-        while chunk := os.read(read_descriptor, 1024 * 1024):
-            reread += chunk
-        reread_metadata = os.fstat(read_descriptor)
-    finally:
-        os.close(read_descriptor)
-    if reread != payload or (
-        reread_metadata.st_dev,
-        reread_metadata.st_ino,
-        reread_metadata.st_nlink,
-    ) != (published.st_dev, published.st_ino, 1):
-        raise OSError("published SUCCESS reread drift")
-    print(len(reread), hashlib.sha256(reread).hexdigest())
-finally:
-    if descriptor is not None:
-        os.close(descriptor)
-    if temporary_identity is not None:
-        try:
-            leftover = os.lstat(temporary)
-        except FileNotFoundError:
-            pass
-        else:
-            if (leftover.st_dev, leftover.st_ino) == temporary_identity:
-                os.unlink(temporary)
-PY
-)
-readonly success_size success_sha
-[[ ! -e "${success_temporary}" && ! -L "${success_temporary}" ]]
-[[ -f "${success_marker}" && ! -L "${success_marker}" ]]
-[[ "$(stat -c '%a' "${success_marker}")" == 444 ]]
-[[ "$(stat -c '%h' "${success_marker}")" == 1 ]]
-[[ "$(stat -c '%s' "${success_marker}")" == "${success_size}" ]]
-[[ "$(sha256sum "${success_marker}" | awk '{print $1}')" == "${success_sha}" ]]
+if ! /usr/bin/python3 "${gate_io}" publish-success \
+  --temporary "${success_temporary}" \
+  --marker "${success_marker}" \
+  --job-id "${SLURM_JOB_ID}" \
+  --variant "${variant}" \
+  --result-sha256 "${result_sha}" \
+  --video-sha256 "${video_sha}" \
+  --manifest-sha256 "${manifest_sha}"; then
+  printf 'SUCCESS publication failed\n' >&2
+  exit 1
+fi
 status=0
-printf 'FULLTRACE_PRODUCTION_V4_SUCCESS=%s\n' "${success_marker}"
+printf 'FULLTRACE_PRODUCTION_V4_SUCCESS=%s\n' "${success_marker}" || true
