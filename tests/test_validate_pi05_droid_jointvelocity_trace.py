@@ -8,6 +8,9 @@ import struct
 
 import pytest
 
+from scripts.polaris import (
+    finalize_pi05_droid_native_jointvelocity_eval as finalizer,
+)
 from scripts.polaris import validate_pi05_droid_jointvelocity_trace as validator
 
 from polaris.pi05_droid_jointvelocity_contract import (
@@ -41,6 +44,7 @@ from polaris.native_gripper_runtime import (
 
 Q = [0.0, -0.5, 0.0, -1.5, 0.0, 1.0, 0.0]
 DQ = [0.0] * 7
+PANDA_VELOCITY_LIMITS = validator.PANDA_VELOCITY_LIMITS
 ENVIRONMENT_RUNTIME = make_environment_runtime_contract(
     configured_episode_length_seconds=(
         PI05_DROID_NATIVE_CONFIGURED_EPISODE_LENGTH_SECONDS
@@ -122,7 +126,7 @@ def _records():
                     "query_index": query_index,
                     "prompt": "Put all the foods in the bowl",
                     "state": {
-                        "joint_position": Q,
+                        "joint_position": Q.copy(),
                         "gripper_position": [0.25],
                     },
                     "images": {
@@ -174,8 +178,8 @@ def _records():
                 "clipped_action": clipped,
                 "emitted_joint_velocity": clipped[:7],
                 "emitted_gripper_closed": clipped[7],
-                "measured_joint_position_before": Q,
-                "measured_joint_velocity_before": DQ,
+                "measured_joint_position_before": Q.copy(),
+                "measured_joint_velocity_before": DQ.copy(),
                 "measured_normalized_gripper_position_before": [0.25],
             }
         )
@@ -210,8 +214,8 @@ def _records():
                 ],
                 "processed_finger_position_target": [finger],
                 "articulation_finger_position_target": [finger],
-                "measured_joint_position_after": Q,
-                "measured_joint_velocity_after": DQ,
+                "measured_joint_position_after": Q.copy(),
+                "measured_joint_velocity_after": DQ.copy(),
                 "measured_normalized_gripper_position_after": [0.25],
             }
         )
@@ -241,9 +245,16 @@ def _records():
 
 
 def _failure_records(
-    tmp_path, *, failed_step=238, sample_kind="apply_entry", substep=3
+    tmp_path,
+    *,
+    failed_step=238,
+    sample_kind="apply_entry",
+    substep=3,
+    violating_joint_index=12,
+    incident_path=None,
 ):
     assert sample_kind in {"apply_entry", "post_policy_step"}
+    assert 0 <= violating_joint_index < 13
     if sample_kind == "post_policy_step":
         substep = 8
     prefix = []
@@ -270,8 +281,9 @@ def _failure_records(
         failed_step * 8 + substep if sample_kind == "apply_entry" else attempts * 8
     )
     expected_limits = [float(_float32(value)) for value in EXPECTED_FULL_LIMITS_CAPPED]
-    velocity = [0.0] * 13
-    velocity[12] = 5.25
+    joint_position = [*Q, *([0.0] * 6)]
+    velocity = [*DQ, *([0.0] * 6)]
+    velocity[violating_joint_index] = expected_limits[violating_joint_index] + 0.25
     thresholds = [
         value + PHYSX_VELOCITY_LIMIT_ABSOLUTE_TOLERANCE_RAD_S
         for value in expected_limits
@@ -293,7 +305,7 @@ def _failure_records(
         "completed_apply_calls": completed_apply,
         "completed_post_policy_step_samples": completed_post,
         "outer_step_physics_complete": sample_kind == "post_policy_step",
-        "joint_position": [0.0] * 13,
+        "joint_position": joint_position,
         "joint_velocity": velocity,
         "joint_acceleration": [0.0] * 13,
         "joint_velocity_target": [0.0] * 13,
@@ -308,10 +320,23 @@ def _failure_records(
             max(abs(value) - threshold, 0.0)
             for value, threshold in zip(velocity, thresholds, strict=True)
         ],
-        "violating_joint_indices": [12],
-        "violating_joint_names": [EXPECTED_DROID_JOINT_NAMES[12]],
+        "violating_joint_indices": [violating_joint_index],
+        "violating_joint_names": [EXPECTED_DROID_JOINT_NAMES[violating_joint_index]],
     }
-    incident = publish_immutable_json(tmp_path / "incident.json", evidence)
+    if sample_kind == "post_policy_step":
+        execution = prefix[-1]
+        assert execution["record_type"] == "openpi_joint_velocity_execution"
+        execution["measured_joint_position_after"] = joint_position[:7]
+        execution["measured_joint_velocity_after"] = velocity[:7]
+    elif substep == 0:
+        action["measured_joint_position_before"] = joint_position[:7]
+        action["measured_joint_velocity_before"] = velocity[:7]
+    incident = publish_immutable_json(
+        Path(incident_path)
+        if incident_path is not None
+        else tmp_path / "incident.json",
+        evidence,
+    )
     incident_identity = {
         key: incident[key] for key in ("path", "size", "sha256", "mode", "nlink")
     }
@@ -612,8 +637,23 @@ def test_typed_partial_failure_trace_passes_and_binds_incident(tmp_path):
     assert sidecar["value"]["artifacts"]["incident"] == terminal["incident_artifact"]
 
 
-def test_post_policy_failure_closes_full_artifact_transaction_and_cleanup(tmp_path):
-    records, result = _failure_records(tmp_path, sample_kind="post_policy_step")
+@pytest.mark.parametrize(
+    ("sample_kind", "failed_step", "substep", "expected_executions"),
+    [
+        ("post_policy_step", 238, 8, 239),
+        ("apply_entry", 0, 0, 0),
+    ],
+)
+def test_arm_joint5_terminal_state_is_exactly_cross_bound_to_incident(
+    tmp_path, sample_kind, failed_step, substep, expected_executions
+):
+    records, result = _failure_records(
+        tmp_path,
+        failed_step=failed_step,
+        sample_kind=sample_kind,
+        substep=substep,
+        violating_joint_index=4,
+    )
     trace, metrics = _write_case(
         tmp_path,
         records,
@@ -623,6 +663,206 @@ def test_post_policy_failure_closes_full_artifact_transaction_and_cleanup(tmp_pa
         progress=0.0,
     )
     summary = validator.audit_trace(trace, metrics)
+    assert summary["execution_records"] == expected_executions
+    failure = summary["terminal_outcome"]["dynamic_report"]["terminal_velocity_failure"]
+    assert failure["violating_joint_indices"] == [4]
+    assert failure["violating_joint_names"] == ["panda_joint5"]
+    assert failure["joint_velocity"][4] > PANDA_VELOCITY_LIMITS[4]
+
+
+@pytest.mark.parametrize(
+    ("sample_kind", "state_key", "vector_key", "index", "message"),
+    [
+        (
+            "post_policy_step",
+            "openpi_joint_velocity_execution",
+            "measured_joint_position_after",
+            0,
+            "position differs from immutable incident",
+        ),
+        (
+            "post_policy_step",
+            "openpi_joint_velocity_execution",
+            "measured_joint_velocity_after",
+            4,
+            "velocity differs from immutable incident",
+        ),
+        (
+            "apply_entry",
+            "openpi_joint_velocity_action",
+            "measured_joint_position_before",
+            0,
+            "position differs from immutable incident",
+        ),
+        (
+            "apply_entry",
+            "openpi_joint_velocity_action",
+            "measured_joint_velocity_before",
+            4,
+            "velocity differs from immutable incident",
+        ),
+    ],
+)
+def test_terminal_arm_state_q_and_dq_mutations_fail_cross_binding(
+    tmp_path, sample_kind, state_key, vector_key, index, message
+):
+    failed_step = 238 if sample_kind == "post_policy_step" else 0
+    records, result = _failure_records(
+        tmp_path,
+        failed_step=failed_step,
+        sample_kind=sample_kind,
+        substep=0,
+        violating_joint_index=4,
+    )
+    state = next(
+        record for record in reversed(records) if record["record_type"] == state_key
+    )
+    state[vector_key][index] += 0.01
+    trace, metrics = _write_case(
+        tmp_path,
+        records,
+        episode_length=result["episode_length"],
+        numerical_failure=True,
+        numerical_failure_reason=result["numerical_failure_reason"],
+        progress=0.0,
+    )
+    with pytest.raises(ValueError, match=message):
+        validator.audit_trace(trace, metrics)
+
+
+def test_apply_entry_substep_greater_than_zero_keeps_trace_pre_state_strict(tmp_path):
+    records, result = _failure_records(
+        tmp_path,
+        failed_step=0,
+        sample_kind="apply_entry",
+        substep=1,
+        violating_joint_index=4,
+    )
+    trace, metrics = _write_case(
+        tmp_path,
+        records,
+        episode_length=result["episode_length"],
+        numerical_failure=True,
+        numerical_failure_reason=result["numerical_failure_reason"],
+        progress=0.0,
+    )
+    assert validator.audit_trace(trace, metrics)["execution_records"] == 0
+
+    records, result = _failure_records(
+        tmp_path / "over-limit-pre-state",
+        failed_step=0,
+        sample_kind="apply_entry",
+        substep=1,
+        violating_joint_index=4,
+    )
+    action = next(
+        record
+        for record in reversed(records)
+        if record["record_type"] == "openpi_joint_velocity_action"
+    )
+    action["measured_joint_velocity_before"][4] = PANDA_VELOCITY_LIMITS[4] + 0.25
+    case_dir = tmp_path / "strict-mid-step"
+    case_dir.mkdir()
+    trace, metrics = _write_case(
+        case_dir,
+        records,
+        episode_length=result["episode_length"],
+        numerical_failure=True,
+        numerical_failure_reason=result["numerical_failure_reason"],
+        progress=0.0,
+    )
+    with pytest.raises(ValueError, match="pre-state joint 5 exceeds"):
+        validator.audit_trace(trace, metrics)
+
+
+def test_terminal_failure_index_kind_and_healthy_neighbor_mutations_fail(tmp_path):
+    records, result = _failure_records(
+        tmp_path,
+        failed_step=238,
+        sample_kind="post_policy_step",
+        violating_joint_index=4,
+    )
+    records[-1]["outer_step_index"] = 237
+    trace, metrics = _write_case(
+        tmp_path,
+        records,
+        episode_length=result["episode_length"],
+        numerical_failure=True,
+        numerical_failure_reason=result["numerical_failure_reason"],
+        progress=0.0,
+    )
+    with pytest.raises(ValueError, match="action identity mismatch"):
+        validator.audit_trace(trace, metrics)
+
+    kind_dir = tmp_path / "kind"
+    kind_dir.mkdir()
+    records, result = _failure_records(
+        kind_dir,
+        failed_step=238,
+        sample_kind="post_policy_step",
+        violating_joint_index=4,
+    )
+    records[-1]["terminal_failure"]["failure_sample_kind"] = "apply_entry"
+    trace, metrics = _write_case(
+        kind_dir,
+        records,
+        episode_length=result["episode_length"],
+        numerical_failure=True,
+        numerical_failure_reason=result["numerical_failure_reason"],
+        progress=0.0,
+    )
+    with pytest.raises(ValueError, match="count mismatch"):
+        validator.audit_trace(trace, metrics)
+
+    neighbor_dir = tmp_path / "neighbor"
+    neighbor_dir.mkdir()
+    records, result = _failure_records(
+        neighbor_dir,
+        failed_step=238,
+        sample_kind="post_policy_step",
+        violating_joint_index=4,
+    )
+    neighboring_execution = next(
+        record
+        for record in records
+        if record["record_type"] == "openpi_joint_velocity_execution"
+        and record["outer_step_index"] == 237
+    )
+    neighboring_execution["measured_joint_velocity_after"][4] = (
+        PANDA_VELOCITY_LIMITS[4] + 0.25
+    )
+    trace, metrics = _write_case(
+        neighbor_dir,
+        records,
+        episode_length=result["episode_length"],
+        numerical_failure=True,
+        numerical_failure_reason=result["numerical_failure_reason"],
+        progress=0.0,
+    )
+    with pytest.raises(ValueError, match="post-state joint 5 exceeds"):
+        validator.audit_trace(trace, metrics)
+
+
+def test_post_policy_failure_closes_full_artifact_transaction_and_cleanup(tmp_path):
+    run_dir = tmp_path / "run"
+    task_dir = run_dir / "DROID-FoodBussing"
+    task_dir.mkdir(parents=True)
+    records, result = _failure_records(
+        task_dir,
+        sample_kind="post_policy_step",
+        violating_joint_index=4,
+        incident_path=task_dir / "native_failures" / "episode_000000.json",
+    )
+    trace, metrics = _write_case(
+        task_dir,
+        records,
+        episode_length=result["episode_length"],
+        numerical_failure=True,
+        numerical_failure_reason=result["numerical_failure_reason"],
+        progress=0.0,
+    )
+    summary = validator.audit_trace(trace, metrics)
+    assert finalizer.audit_trace(trace, metrics) == summary
     terminal = summary["terminal_outcome"]
     assert summary["action_records"] == 239
     assert summary["execution_records"] == 239
@@ -641,12 +881,12 @@ def test_post_policy_failure_closes_full_artifact_transaction_and_cleanup(tmp_pa
     metrics.replace(metrics_temporary)
     metrics_artifact = publish_immutable_file_from_temporary(metrics_temporary, metrics)
     assert metrics_artifact["path"] == str(metrics.resolve())
-    video_temporary = tmp_path / ".episode_0.partial.mp4"
+    video_temporary = task_dir / ".episode_0.partial.mp4"
     video_temporary.write_bytes(b"synthetic-post-policy-video")
     video_artifact = publish_immutable_file_from_temporary(
-        video_temporary, tmp_path / "episode_0.mp4"
+        video_temporary, task_dir / "episode_0.mp4"
     )
-    sidecar_path = tmp_path / "native_runtime" / "episode_000000.json"
+    sidecar_path = task_dir / "native_runtime" / "episode_000000.json"
     sidecar = publish_immutable_json(
         sidecar_path,
         make_episode_sidecar(
@@ -662,7 +902,7 @@ def test_post_policy_failure_closes_full_artifact_transaction_and_cleanup(tmp_pa
     sidecar_identity = {
         key: sidecar[key] for key in ("path", "size", "sha256", "mode", "nlink")
     }
-    runtime_path = tmp_path / "joint_velocity_runtime.json"
+    runtime_path = task_dir / "joint_velocity_runtime.json"
     runtime = publish_immutable_json(runtime_path, {"runtime": "synthetic"})
     close_payload = make_close_ready_artifact(
         runtime_artifact=runtime,
@@ -684,7 +924,7 @@ def test_post_policy_failure_closes_full_artifact_transaction_and_cleanup(tmp_pa
         def close(self):
             events.append(self.name)
 
-    close_path = tmp_path / "evaluator_close_ready.json"
+    close_path = task_dir / "evaluator_close_ready.json"
 
     def publish_close(path, payload):
         events.append("publish")
@@ -697,12 +937,17 @@ def test_post_policy_failure_closes_full_artifact_transaction_and_cleanup(tmp_pa
     assert events == ["env.close", "publish", "simulation.close"]
     close = validate_immutable_json(close_path)["value"]
     assert close["terminal_outcome"] == terminal
-    assert (
-        validate_episode_sidecar(sidecar_path, ENVIRONMENT_RUNTIME)["value"][
-            "episode_result"
-        ]
-        == result
+    validated_sidecar = validate_episode_sidecar(sidecar_path, ENVIRONMENT_RUNTIME)
+    assert validated_sidecar["value"]["episode_result"] == result
+    runtime_for_finalizer = {
+        **{key: runtime[key] for key in ("path", "size", "sha256", "mode", "nlink")},
+        "environment_runtime_contract": ENVIRONMENT_RUNTIME,
+    }
+    finalized_close = finalizer._validate_close_ready(
+        close_path, runtime_for_finalizer, run_dir
     )
+    assert finalized_close["terminal_outcome"] == terminal
+    assert finalized_close["episode_sidecar"]["value"] == validated_sidecar["value"]
 
 
 @pytest.mark.parametrize(

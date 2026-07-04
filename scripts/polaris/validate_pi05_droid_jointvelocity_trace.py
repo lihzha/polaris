@@ -29,6 +29,7 @@ from polaris.pi05_droid_native_eval_contract import (
     canonical_json_bytes,
     make_environment_runtime_contract,
     publish_immutable_json,
+    validate_immutable_json,
     validate_terminal_numerical_failure_evidence,
     validate_terminal_rollout_evidence,
 )
@@ -331,7 +332,13 @@ def _processed_action(raw: list[float]) -> tuple[list[float], list[float]]:
     return binary, clipped
 
 
-def _validate_joint_state(q: list[float], dq: list[float], field: str) -> None:
+def _validate_joint_state(
+    q: list[float],
+    dq: list[float],
+    field: str,
+    *,
+    allow_incident_velocity: bool = False,
+) -> None:
     for index, (value, (lower, upper)) in enumerate(
         zip(q, PANDA_SOFT_LIMITS, strict=True)
     ):
@@ -339,11 +346,48 @@ def _validate_joint_state(q: list[float], dq: list[float], field: str) -> None:
             lower - 1e-5 <= value <= upper + 1e-5,
             f"{field} joint {index + 1} is outside the live soft limit",
         )
-    for index, (value, limit) in enumerate(zip(dq, PANDA_VELOCITY_LIMITS, strict=True)):
-        _require(
-            abs(value) <= limit + 1e-4,
-            f"{field} joint {index + 1} exceeds its velocity limit",
-        )
+    if not allow_incident_velocity:
+        for index, (value, limit) in enumerate(
+            zip(dq, PANDA_VELOCITY_LIMITS, strict=True)
+        ):
+            _require(
+                abs(value) <= limit + 1e-4,
+                f"{field} joint {index + 1} exceeds its velocity limit",
+            )
+
+
+def _validate_incident_bound_arm_state(
+    q: list[float],
+    dq: list[float],
+    terminal: dict[str, Any],
+    *,
+    expected_sample_kind: str,
+    expected_physics_substep: int,
+    field: str,
+) -> None:
+    incident_path = Path(terminal["incident_artifact"]["path"])
+    incident = validate_immutable_json(incident_path)["value"]
+    _require(
+        incident == terminal["dynamic_report"]["terminal_velocity_failure"],
+        f"{field} immutable incident differs from terminal evidence",
+    )
+    _require(
+        incident["sample_kind"] == expected_sample_kind,
+        f"{field} incident sample kind mismatch",
+    )
+    _require(
+        incident["physics_substep_index"] == expected_physics_substep,
+        f"{field} incident physics substep mismatch",
+    )
+    incident_q = _finite_vector(
+        incident["joint_position"][:7], 7, f"{field} incident arm position"
+    )
+    incident_dq = _finite_vector(
+        incident["joint_velocity"][:7], 7, f"{field} incident arm velocity"
+    )
+    _require(q == incident_q, f"{field} position differs from immutable incident")
+    _require(dq == incident_dq, f"{field} velocity differs from immutable incident")
+    _validate_joint_state(q, dq, field, allow_incident_velocity=True)
 
 
 def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
@@ -666,7 +710,30 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
         )
         normalized_gripper_min = min(normalized_gripper_min, gripper_before[0])
         normalized_gripper_max = max(normalized_gripper_max, gripper_before[0])
-        _validate_joint_state(q_before, dq_before, f"action {step} pre-state")
+        is_terminal_apply_failure = (
+            failure_sample_kind == "apply_entry" and step == actions_attempted - 1
+        )
+        if is_terminal_apply_failure:
+            terminal_outcome = consume_failure_record(
+                step=step,
+                query_index=query_index,
+                action_index=action_index,
+                last_environment=environment_after,
+            )
+            failure = terminal_outcome["dynamic_report"]["terminal_velocity_failure"]
+            if failure["physics_substep_index"] == 0:
+                _validate_incident_bound_arm_state(
+                    q_before,
+                    dq_before,
+                    terminal_outcome,
+                    expected_sample_kind="apply_entry",
+                    expected_physics_substep=0,
+                    field=f"action {step} pre-state",
+                )
+            else:
+                _validate_joint_state(q_before, dq_before, f"action {step} pre-state")
+        else:
+            _validate_joint_state(q_before, dq_before, f"action {step} pre-state")
         if action_index == 0:
             _require(
                 q_before == active_query_q, "Query and emitted-action state mismatch"
@@ -686,13 +753,7 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
                 "Measured gripper state continuity mismatch",
             )
 
-        if failure_sample_kind == "apply_entry" and step == actions_attempted - 1:
-            terminal_outcome = consume_failure_record(
-                step=step,
-                query_index=query_index,
-                action_index=action_index,
-                last_environment=environment_after,
-            )
+        if is_terminal_apply_failure:
             break
 
         execution = records[cursor]
@@ -782,18 +843,33 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
         )
         normalized_gripper_min = min(normalized_gripper_min, previous_gripper[0])
         normalized_gripper_max = max(normalized_gripper_max, previous_gripper[0])
-        _validate_joint_state(previous_q, previous_dq, f"execution {step} post-state")
-        for index, value in enumerate(previous_dq):
-            max_abs_measured_velocity[index] = max(
-                max_abs_measured_velocity[index], abs(value)
-            )
-        if failure_sample_kind == "post_policy_step" and step == actions_attempted - 1:
+        is_terminal_post_failure = (
+            failure_sample_kind == "post_policy_step" and step == actions_attempted - 1
+        )
+        if is_terminal_post_failure:
             terminal_outcome = consume_failure_record(
                 step=step,
                 query_index=query_index,
                 action_index=action_index,
                 last_environment=environment_after,
             )
+            _validate_incident_bound_arm_state(
+                previous_q,
+                previous_dq,
+                terminal_outcome,
+                expected_sample_kind="post_policy_step",
+                expected_physics_substep=8,
+                field=f"execution {step} post-state",
+            )
+        else:
+            _validate_joint_state(
+                previous_q, previous_dq, f"execution {step} post-state"
+            )
+        for index, value in enumerate(previous_dq):
+            max_abs_measured_velocity[index] = max(
+                max_abs_measured_velocity[index], abs(value)
+            )
+        if is_terminal_post_failure:
             break
 
     if not metrics["numerical_failure"]:

@@ -107,8 +107,8 @@ rebound before another official pi0.5 model canary.
 
 - PolaRiS Ruff check and Ruff format check: pass for every changed Python file.
 - Host test suite, excluding only the Isaac-import-only
-  `tests/test_robust_differential_ik.py`: `170 passed, 1 skipped` after the
-  additive formal-review repair.
+  `tests/test_robust_differential_ik.py`: `178 passed, 1 skipped` after both
+  additive formal-review repairs.
 - Focused recovery/attestation suite: pass, including typed incident
   persistence, partial cadence mutation rejection, trace/sidecar mutation
   rejection, close ordering/error propagation, exact source manifests, and
@@ -161,3 +161,29 @@ integrated model base. The all-six source gate remains non-circular: repaired
 evaluator/runtime/client bytes require a new exact-commit smoke, while the eval
 contract containing post-smoke completion constants remains in model-canary
 commit provenance rather than the pre/post-smoke byte-equality set.
+
+## Additive formal re-review repair
+
+Formal re-review of `6af3c48e21b8dd9065050a0c3f59c00d6d32f560`
+found that the trace auditor still applied healthy Panda velocity bounds before
+consuming the terminal evidence. Two incident-authoritative trace states can
+legitimately carry the measured over-limit arm value:
+
+- the final execution post-state for a `post_policy_step` failure; and
+- the final action pre-state for an `apply_entry` failure at physics substep 0.
+
+The auditor now validates and reopens the immutable terminal incident before
+classifying either exception. It requires the trace arm q/dq to equal the first
+seven incident q/dq values exactly, requires the expected sample kind and
+physics substep, preserves Panda soft-position limits, and only then exempts
+that exact state from the healthy velocity bound. No other state is exempt:
+apply-entry substeps 1..7 remain strict because their incident is mid-step,
+and every earlier/later neighboring pre/post state remains strict.
+
+Arm-joint-5 reproductions now cover both allowed boundaries. Mutating trace q,
+trace dq, terminal action index, terminal sample kind, or an adjacent healthy
+state fails closed. A substep-1 incident passes only with a healthy trace
+pre-state and fails if that pre-state is replaced by the incident velocity.
+The full immutable incident/trace/video/CSV/sidecar/cleanup transaction now uses
+the arm-joint-5 post-policy reproduction and is also consumed through the host
+finalizer's `audit_trace` and close-ready validation path.
