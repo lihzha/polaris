@@ -203,3 +203,14 @@ inspection used only login-host read operations.
   The alias-aware validator above is the authoritative host check. This remains
   selective validation of a job produced under `f9c82d7`, not a claim that the
   old runtime artifact satisfies the exact current runtime schema.
+
+### Implementation freeze identity
+
+- Final implementation commit:
+  `db6eaa2d86b47b1477a9ff00028520da7c05a513`; tree:
+  `a5c8216ec86845c2d1034131878453083595e87f`.
+- The read-only trace plus close-ready replay above was repeated after the
+  agent-owned `l401` checkout moved to that exact implementation commit; both
+  passed with the same hashes and the checkout remained clean. The subsequent
+  enclosing documentation-only commit records this identity and does not alter
+  source or tests.
