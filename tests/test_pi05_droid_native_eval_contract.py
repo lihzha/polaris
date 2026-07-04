@@ -193,7 +193,7 @@ def test_runtime_and_close_artifacts_bind_internal_timeout_and_terminal_state(tm
             temporary, tmp_path / f"{label}.bin"
         )
     dynamic = {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": NATIVE_GRIPPER_DYNAMIC_PROFILE,
         "joint_names": list(EXPECTED_DROID_JOINT_NAMES),
         "joint_indices": list(range(13)),

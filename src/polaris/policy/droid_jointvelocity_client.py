@@ -185,6 +185,7 @@ class DroidJointVelocityClient(InferenceClient):
         self._environment_runtime_contract: dict[str, Any] | None = None
         self._rollout_environment_before: dict[str, Any] | None = None
         self._last_environment_after: dict[str, Any] | None = None
+        self._last_execution_identity: dict[str, int] | None = None
         self._execution_step_index = 0
         self._terminated_false_count = 0
         self._truncated_false_count = 0
@@ -353,6 +354,7 @@ class DroidJointVelocityClient(InferenceClient):
             )
         self._rollout_environment_before = before
         self._last_environment_after = None
+        self._last_execution_identity = None
         self._execution_step_index = 0
         self._terminated_false_count = 0
         self._truncated_false_count = 0
@@ -437,6 +439,7 @@ class DroidJointVelocityClient(InferenceClient):
 
         if self._pending_execution is None:
             raise RuntimeError("No pending DroidJointVelocity action to record")
+        pending = self._pending_execution
         if (
             self._environment_runtime_contract is None
             or self._rollout_environment_before is None
@@ -549,7 +552,6 @@ class DroidJointVelocityClient(InferenceClient):
             raise ValueError("Articulation finger target differs from binary emission")
 
         if self.trace_path is not None:
-            pending = self._pending_execution
             self._append_trace(
                 {
                     "schema_version": PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
@@ -573,6 +575,11 @@ class DroidJointVelocityClient(InferenceClient):
                 }
             )
         self._last_environment_after = environment_after
+        self._last_execution_identity = {
+            "query_index": pending["query_index"],
+            "chunk_action_index": pending["chunk_action_index"],
+            "outer_step_index": self._execution_step_index,
+        }
         self._execution_step_index += 1
         self._terminated_false_count += 1
         self._truncated_false_count += 1
@@ -645,7 +652,7 @@ class DroidJointVelocityClient(InferenceClient):
     def record_execution_failure(
         self, error: BaseException, env: Any, dynamic_report: dict[str, Any]
     ) -> dict[str, Any]:
-        """Finalize the only allowed partial native rollout failure."""
+        """Finalize the only allowed typed native monitor failure."""
 
         from polaris.native_gripper_runtime import (  # noqa: PLC0415
             NativeAllJointVelocityLimitError,
@@ -655,8 +662,6 @@ class DroidJointVelocityClient(InferenceClient):
             raise TypeError(
                 "Native failure finalization requires the exact typed error"
             )
-        if self._pending_execution is None:
-            raise RuntimeError("Native failure has no pending emitted action")
         if (
             self._environment_runtime_contract is None
             or self._rollout_environment_before is None
@@ -666,7 +671,23 @@ class DroidJointVelocityClient(InferenceClient):
             raise RuntimeError("Native velocity failure was not durably published")
         if dynamic_report.get("terminal_velocity_failure") != error.evidence:
             raise RuntimeError("Native velocity failure differs from dynamic evidence")
-        pending = self._pending_execution
+        sample_kind = error.evidence["sample_kind"]
+        if sample_kind == "apply_entry":
+            if self._pending_execution is None:
+                raise RuntimeError("Apply-entry failure has no pending emitted action")
+            failure_identity = {
+                "query_index": self._pending_execution["query_index"],
+                "chunk_action_index": self._pending_execution["chunk_action_index"],
+                "outer_step_index": self._execution_step_index,
+            }
+            actions_attempted = self._execution_step_index + 1
+        else:
+            if self._pending_execution is not None:
+                raise RuntimeError("Post-policy failure retained a pending action")
+            if self._last_execution_identity is None:
+                raise RuntimeError("Post-policy failure has no completed execution")
+            failure_identity = dict(self._last_execution_identity)
+            actions_attempted = self._execution_step_index
         environment_after_failure = _capture_environment_state(
             env, self._environment_runtime_contract
         )
@@ -678,7 +699,7 @@ class DroidJointVelocityClient(InferenceClient):
         reason = f"{type(error).__name__}: {error}"
         episode_result = {
             "episode": 0,
-            "episode_length": self._execution_step_index + 1,
+            "episode_length": actions_attempted,
             "success": False,
             "progress": 0.0,
             "numerical_failure": True,
@@ -686,17 +707,18 @@ class DroidJointVelocityClient(InferenceClient):
         }
         terminal = validate_terminal_numerical_failure_evidence(
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "profile": PI05_DROID_NATIVE_TERMINAL_FAILURE_PROFILE,
                 "terminal_form": "native_all_joint_velocity_limit_failure",
                 "environment_runtime_sha256": self._environment_runtime_contract[
                     "sha256"
                 ],
                 "failure_type": type(error).__name__,
+                "failure_sample_kind": sample_kind,
                 "episode_result": episode_result,
-                "actions_attempted": self._execution_step_index + 1,
+                "actions_attempted": actions_attempted,
                 "outer_steps_completed": self._execution_step_index,
-                "failed_outer_step_index": self._execution_step_index,
+                "failed_outer_step_index": actions_attempted - 1,
                 "terminated_false_count": self._terminated_false_count,
                 "truncated_false_count": self._truncated_false_count,
                 "environment_before": self._rollout_environment_before,
@@ -715,14 +737,13 @@ class DroidJointVelocityClient(InferenceClient):
                     "profile": PI05_DROID_JOINTVELOCITY_PROFILE,
                     **self._trace_contract_identity(),
                     "reset_index": self.reset_index,
-                    "query_index": pending["query_index"],
-                    "chunk_action_index": pending["chunk_action_index"],
-                    "outer_step_index": self._execution_step_index,
+                    **failure_identity,
                     "terminal_failure": terminal,
                 }
             )
             self._finalized_trace_artifact = self._seal_trace()
-        self._pending_execution = None
+        if sample_kind == "apply_entry":
+            self._pending_execution = None
         self._terminal_rollout = terminal
         return terminal
 

@@ -463,7 +463,7 @@ def test_finalizer_binds_internal_timeout_terminal_state_and_close_artifact(
             temporary, task_dir / f"{label}.bin"
         )
     dynamic = {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": NATIVE_GRIPPER_DYNAMIC_PROFILE,
         "joint_names": list(EXPECTED_DROID_JOINT_NAMES),
         "joint_indices": list(range(13)),
@@ -646,7 +646,23 @@ def test_launchers_block_before_download_or_sbatch_and_forbid_resume():
     assert evaluator_source.index("bind_native_all_joint_failure_path") < (
         evaluator_source.index("env.step(")
     )
-    assert "except NativeAllJointVelocityLimitError as error:" in evaluator_source
+    assert (
+        evaluator_source.count("except NativeAllJointVelocityLimitError as error:") == 2
+    )
+    assert evaluator_source.count("finalize_native_velocity_failure(error)") == 3
+    post_sample = evaluator_source.index(
+        "native_arm_term.record_native_all_joint_post_policy_step()"
+    )
+    post_failure = evaluator_source.index(
+        "except NativeAllJointVelocityLimitError as error:", post_sample
+    )
+    post_execution = evaluator_source.index(
+        "policy_client.record_execution(", post_failure
+    )
+    post_terminal = evaluator_source.index(
+        "finalize_native_velocity_failure(error)", post_failure
+    )
+    assert post_sample < post_failure < post_execution < post_terminal
     assert evaluator_source.index("make_episode_sidecar(") < evaluator_source.index(
         "episode_df.to_csv"
     )

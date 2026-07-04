@@ -94,7 +94,7 @@ rebound before another official pi0.5 model canary.
   - `src/polaris/environments/droid_cfg.py`:
     `2947a19d75d75229462debd0b7faddd4cce75e73ea67e2dbf41eefb3ae90467f`
   - `src/polaris/native_gripper_runtime.py`:
-    `4130fd5e3e0a929627d002a002b5915f08da776f26e21a7980627d28e78e03f2`
+    `2c0d79d63ee7f0a3809b6249565f29f80218511a6baf7aa4942913b03a71e6d5`
 - The next all-six completion will bind the repaired evaluator, lifecycle, and
   policy client in its exact source manifest. The eval-contract module remains
   part of the exact model-canary commit provenance because it contains the
@@ -107,7 +107,8 @@ rebound before another official pi0.5 model canary.
 
 - PolaRiS Ruff check and Ruff format check: pass for every changed Python file.
 - Host test suite, excluding only the Isaac-import-only
-  `tests/test_robust_differential_ik.py`: `165 passed, 1 skipped`.
+  `tests/test_robust_differential_ik.py`: `170 passed, 1 skipped` after the
+  additive formal-review repair.
 - Focused recovery/attestation suite: pass, including typed incident
   persistence, partial cadence mutation rejection, trace/sidecar mutation
   rejection, close ordering/error propagation, exact source manifests, and
@@ -117,3 +118,46 @@ rebound before another official pi0.5 model canary.
   exact-commit, one-L40S, no-model all-six controller smoke. Only after its
   immutable completion is reviewed and rebound may an official pi0.5-DROID
   model canary be submitted.
+
+## Additive formal-review repair
+
+A formal review of `b7376aea3e19b843aeb51677844b3f1e8689db76`
+identified one P1 boundary hole: after eight healthy `apply_entry` samples, an
+over-limit `post_policy_step` sample entered the recorder, but the incident
+validator accepted only `apply_entry`. That produced a plain `ValueError`
+outside the evaluator's typed catch and therefore no terminal transaction.
+
+The additive repair explicitly models both monitored boundaries:
+
+- Failure evidence schema 2 records `sample_kind`, a generic failed-sample
+  index, completed apply and post-policy sample counts, physics substep 0..7
+  for apply entry or exactly 8 for post policy, and whether all physics for the
+  outer step completed.
+- Dynamic report schema 3 independently validates the partial cadence for
+  either boundary. A failed post-policy sample requires all eight apply-entry
+  samples for the current outer action while leaving that failed boundary
+  sample exclusively in the immutable incident.
+- For a post-policy failure, the evaluator first records the already-complete
+  execution and its fully advanced episode/simulation/common/camera counters,
+  then uses the same centralized typed-failure finalizer as an apply-entry
+  failure. Trace schema 4 therefore contains action, execution, and terminal
+  failure for this case; apply-entry failures retain action then terminal
+  failure without inventing an execution.
+- Terminal failure schema 2 binds the sample kind and validates the two exact
+  environment tails. Post-policy failure has `N` attempted and `N` completed
+  outer steps with identical last-completed and failure environments;
+  apply-entry failure has `N` attempted and `N-1` completed steps plus the
+  exact partial simulator substep.
+- The reviewer reproduction is a host test: eight healthy apply samples, then
+  a 5.25 rad/s follower at the post-policy boundary. It now yields the exact
+  typed exception and a mode-0444 incident. Kind, cadence, boundary-completion,
+  and incident-identity mutations all fail closed.
+- A full post-policy terminal transaction test validates 239 actions, 239
+  executions, immutable incident/trace/video/CSV/sidecar, close-ready
+  publication after environment close, and SimulationApp close ordering.
+
+The official policy input/output semantic AST remains unchanged from the
+integrated model base. The all-six source gate remains non-circular: repaired
+evaluator/runtime/client bytes require a new exact-commit smoke, while the eval
+contract containing post-smoke completion constants remains in model-canary
+commit provenance rather than the pre/post-smoke byte-equality set.

@@ -119,6 +119,7 @@ class NativeAllJointVelocityLimitError(FloatingPointError):
         super().__init__(
             "measured all-joint velocity exceeded the live physical limit: "
             f"policy_step={validated['policy_step_index']} "
+            f"sample_kind={validated['sample_kind']} "
             f"physics_substep={validated['physics_substep_index']} "
             f"joints={violating}"
         )
@@ -555,14 +556,15 @@ def validate_native_all_joint_velocity_failure(value: Any) -> dict[str, Any]:
         "schema_version",
         "profile",
         "reason",
-        "kind",
+        "sample_kind",
         "joint_names",
         "joint_indices",
         "policy_step_index",
         "physics_substep_index",
-        "failed_apply_call_index",
+        "failed_sample_index",
         "completed_apply_calls",
-        "completed_policy_steps",
+        "completed_post_policy_step_samples",
+        "outer_step_physics_complete",
         "joint_position",
         "joint_velocity",
         "joint_acceleration",
@@ -583,10 +585,10 @@ def validate_native_all_joint_velocity_failure(value: Any) -> dict[str, Any]:
         "all-joint velocity failure schema drift",
     )
     _require(
-        value["schema_version"] == 1
+        value["schema_version"] == 2
         and value["profile"] == NATIVE_ALL_JOINT_VELOCITY_FAILURE_PROFILE
         and value["reason"] == "measured_all_joint_velocity_limit_exceeded"
-        and value["kind"] == "apply_entry"
+        and value["sample_kind"] in {"apply_entry", "post_policy_step"}
         and value["joint_names"] == list(EXPECTED_DROID_JOINT_NAMES)
         and value["joint_indices"] == list(range(13)),
         "all-joint velocity failure identity drift",
@@ -594,22 +596,37 @@ def validate_native_all_joint_velocity_failure(value: Any) -> dict[str, Any]:
     indices = (
         value["policy_step_index"],
         value["physics_substep_index"],
-        value["failed_apply_call_index"],
+        value["failed_sample_index"],
         value["completed_apply_calls"],
-        value["completed_policy_steps"],
+        value["completed_post_policy_step_samples"],
     )
     _require(
         all(type(item) is int and item >= 0 for item in indices),
         "all-joint velocity failure index drift",
     )
+    sample_kind = value["sample_kind"]
+    completed_apply = value["completed_apply_calls"]
+    completed_post = value["completed_post_policy_step_samples"]
     _require(
-        value["physics_substep_index"] in range(8)
-        and value["failed_apply_call_index"] == value["completed_apply_calls"]
-        and value["completed_apply_calls"] // 8 == value["completed_policy_steps"]
-        and value["completed_apply_calls"] % 8 == value["physics_substep_index"]
-        and value["policy_step_index"] == value["completed_policy_steps"],
+        type(value["outer_step_physics_complete"]) is bool
+        and value["failed_sample_index"] == completed_apply + completed_post
+        and value["policy_step_index"] == completed_post,
         "all-joint velocity failure cadence drift",
     )
+    if sample_kind == "apply_entry":
+        _require(
+            value["physics_substep_index"] in range(8)
+            and value["outer_step_physics_complete"] is False
+            and completed_apply == completed_post * 8 + value["physics_substep_index"],
+            "all-joint apply-entry velocity failure cadence drift",
+        )
+    else:
+        _require(
+            value["physics_substep_index"] == 8
+            and value["outer_step_physics_complete"] is True
+            and completed_apply == (completed_post + 1) * 8,
+            "all-joint post-policy velocity failure cadence drift",
+        )
     vectors = {
         field: _failure_vector(value[field], field=field)
         for field in (
@@ -701,6 +718,10 @@ class NativeAllJointDynamicRecorder:
         self._failure_path = path
 
     def _sample(self, asset: Any, *, kind: str) -> dict[str, Any]:
+        _require(
+            kind in {"apply_entry", "post_policy_step"},
+            "native all-joint sample kind drift",
+        )
         _joint_names(asset)
         position, _, _ = _tensor_numpy(asset.data.joint_pos, field="all-joint position")
         velocity, _, _ = _tensor_numpy(asset.data.joint_vel, field="all-joint velocity")
@@ -747,17 +768,22 @@ class NativeAllJointDynamicRecorder:
             violating_indices = np.flatnonzero(excess_mask).tolist()
             evidence = validate_native_all_joint_velocity_failure(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "profile": NATIVE_ALL_JOINT_VELOCITY_FAILURE_PROFILE,
                     "reason": "measured_all_joint_velocity_limit_exceeded",
-                    "kind": kind,
+                    "sample_kind": kind,
                     "joint_names": list(EXPECTED_DROID_JOINT_NAMES),
                     "joint_indices": list(range(13)),
                     "policy_step_index": self.post_policy_step_samples,
-                    "physics_substep_index": self.apply_calls % 8,
-                    "failed_apply_call_index": self.apply_calls,
+                    "physics_substep_index": (
+                        self.apply_calls % 8 if kind == "apply_entry" else 8
+                    ),
+                    "failed_sample_index": len(self.samples),
                     "completed_apply_calls": self.apply_calls,
-                    "completed_policy_steps": self.post_policy_step_samples,
+                    "completed_post_policy_step_samples": (
+                        self.post_policy_step_samples
+                    ),
+                    "outer_step_physics_complete": kind == "post_policy_step",
                     "joint_position": position[0].tolist(),
                     "joint_velocity": velocity[0].tolist(),
                     "joint_acceleration": acceleration.tolist(),
@@ -837,7 +863,7 @@ class NativeAllJointDynamicRecorder:
         expected_samples = self.apply_calls + self.post_policy_step_samples
         _require(len(self.samples) == expected_samples, "dynamic sample count drift")
         value = {
-            "schema_version": 2,
+            "schema_version": 3,
             "profile": NATIVE_GRIPPER_DYNAMIC_PROFILE,
             "joint_names": list(EXPECTED_DROID_JOINT_NAMES),
             "joint_indices": list(range(13)),
@@ -875,7 +901,7 @@ def validate_native_all_joint_dynamic_report(
         "dynamic report schema drift",
     )
     _require(
-        value["schema_version"] == 2
+        value["schema_version"] == 3
         and value["profile"] == NATIVE_GRIPPER_DYNAMIC_PROFILE
         and value["joint_names"] == list(EXPECTED_DROID_JOINT_NAMES)
         and value["joint_indices"] == list(range(13)),
@@ -901,11 +927,20 @@ def validate_native_all_joint_dynamic_report(
     else:
         failure = validate_native_all_joint_velocity_failure(terminal_failure)
         _require(
-            apply_calls // 8 == policy_samples
-            and failure["completed_apply_calls"] == apply_calls
-            and failure["completed_policy_steps"] == policy_samples,
+            failure["completed_apply_calls"] == apply_calls
+            and failure["completed_post_policy_step_samples"] == policy_samples,
             "failed dynamic report cadence drift",
         )
+        if failure["sample_kind"] == "apply_entry":
+            _require(
+                apply_calls == policy_samples * 8 + failure["physics_substep_index"],
+                "failed apply-entry dynamic report cadence drift",
+            )
+        else:
+            _require(
+                apply_calls == (policy_samples + 1) * 8,
+                "failed post-policy dynamic report cadence drift",
+            )
     for field in (
         "max_abs_joint_velocity_rad_s",
         "max_abs_joint_acceleration_rad_s2",
@@ -951,11 +986,14 @@ def validate_native_all_joint_dynamic_report(
         )
         expected_cadence.append(("post_policy_step", policy_step_index, 8))
     if terminal_failure is not None:
+        trailing_apply_samples = (
+            terminal_failure["physics_substep_index"]
+            if terminal_failure["sample_kind"] == "apply_entry"
+            else 8
+        )
         expected_cadence.extend(
             ("apply_entry", policy_samples, physics_substep_index)
-            for physics_substep_index in range(
-                terminal_failure["physics_substep_index"]
-            )
+            for physics_substep_index in range(trailing_apply_samples)
         )
     _require(
         len(expected_cadence) == sample_count,

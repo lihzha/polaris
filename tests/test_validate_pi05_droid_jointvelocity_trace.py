@@ -20,12 +20,15 @@ from polaris.pi05_droid_native_eval_contract import (
     PI05_DROID_NATIVE_SENSOR_LIVENESS_PROFILE,
     PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
     make_environment_runtime_contract,
+    make_close_ready_artifact,
     make_episode_sidecar,
     publish_immutable_file_from_temporary,
     publish_immutable_json,
     validate_episode_sidecar,
     validate_immutable_file,
+    validate_immutable_json,
 )
+from polaris.pi05_droid_native_lifecycle import NativeEvaluatorLifecycle
 from polaris.native_gripper_runtime import (
     EXPECTED_DROID_JOINT_NAMES,
     EXPECTED_FULL_LIMITS_CAPPED,
@@ -237,17 +240,35 @@ def _records():
     return records
 
 
-def _failure_records(tmp_path, *, failed_step=238, substep=3):
+def _failure_records(
+    tmp_path, *, failed_step=238, sample_kind="apply_entry", substep=3
+):
+    assert sample_kind in {"apply_entry", "post_policy_step"}
+    if sample_kind == "post_policy_step":
+        substep = 8
     prefix = []
     action_count = 0
+    action = None
     for record in _records():
         prefix.append(record)
         if record["record_type"] == "openpi_joint_velocity_action":
             action_count += 1
             if action_count == failed_step + 1:
-                break
-    action = prefix[-1]
-    completed = failed_step
+                action = record
+                if sample_kind == "apply_entry":
+                    break
+        if (
+            sample_kind == "post_policy_step"
+            and record["record_type"] == "openpi_joint_velocity_execution"
+            and record["outer_step_index"] == failed_step
+        ):
+            break
+    assert action is not None
+    attempts = failed_step + 1
+    completed_post = failed_step
+    completed_apply = (
+        failed_step * 8 + substep if sample_kind == "apply_entry" else attempts * 8
+    )
     expected_limits = [float(_float32(value)) for value in EXPECTED_FULL_LIMITS_CAPPED]
     velocity = [0.0] * 13
     velocity[12] = 5.25
@@ -260,17 +281,18 @@ def _failure_records(tmp_path, *, failed_step=238, substep=3):
         for value, threshold in zip(velocity, thresholds, strict=True)
     ]
     evidence = {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": NATIVE_ALL_JOINT_VELOCITY_FAILURE_PROFILE,
         "reason": "measured_all_joint_velocity_limit_exceeded",
-        "kind": "apply_entry",
+        "sample_kind": sample_kind,
         "joint_names": list(EXPECTED_DROID_JOINT_NAMES),
         "joint_indices": list(range(13)),
-        "policy_step_index": completed,
+        "policy_step_index": completed_post,
         "physics_substep_index": substep,
-        "failed_apply_call_index": completed * 8 + substep,
-        "completed_apply_calls": completed * 8 + substep,
-        "completed_policy_steps": completed,
+        "failed_sample_index": completed_apply + completed_post,
+        "completed_apply_calls": completed_apply,
+        "completed_post_policy_step_samples": completed_post,
+        "outer_step_physics_complete": sample_kind == "post_policy_step",
         "joint_position": [0.0] * 13,
         "joint_velocity": velocity,
         "joint_acceleration": [0.0] * 13,
@@ -297,7 +319,7 @@ def _failure_records(tmp_path, *, failed_step=238, substep=3):
     reason = f"{type(error).__name__}: {error}"
     result = {
         "episode": 0,
-        "episode_length": completed + 1,
+        "episode_length": attempts,
         "success": False,
         "progress": 0.0,
         "numerical_failure": True,
@@ -305,7 +327,7 @@ def _failure_records(tmp_path, *, failed_step=238, substep=3):
     }
     last_environment = (
         copy.deepcopy(ENVIRONMENT_BEFORE)
-        if completed == 0
+        if failed_step == 0 and sample_kind == "apply_entry"
         else copy.deepcopy(
             next(
                 record["environment_after"]
@@ -315,32 +337,35 @@ def _failure_records(tmp_path, *, failed_step=238, substep=3):
         )
     )
     dynamic = {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": NATIVE_GRIPPER_DYNAMIC_PROFILE,
         "joint_names": list(EXPECTED_DROID_JOINT_NAMES),
         "joint_indices": list(range(13)),
-        "apply_calls": completed * 8 + substep,
-        "post_policy_step_samples": completed,
-        "sample_count": completed * 9 + substep,
+        "apply_calls": completed_apply,
+        "post_policy_step_samples": completed_post,
+        "sample_count": completed_apply + completed_post,
         "max_abs_joint_velocity_rad_s": [0.0] * 13,
         "max_abs_joint_acceleration_rad_s2": [0.0] * 13,
         "terminal_velocity_failure": evidence,
         "samples": None,
     }
     after_failure = copy.deepcopy(last_environment)
-    after_failure["sim_step_counter"] += substep + 1
+    if sample_kind == "apply_entry":
+        after_failure["sim_step_counter"] += substep + 1
+    completed_outer = failed_step + int(sample_kind == "post_policy_step")
     terminal = {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": "openpi_pi05_droid_native_jointvelocity_numerical_failure_v1",
         "terminal_form": "native_all_joint_velocity_limit_failure",
         "environment_runtime_sha256": ENVIRONMENT_RUNTIME["sha256"],
         "failure_type": "NativeAllJointVelocityLimitError",
+        "failure_sample_kind": sample_kind,
         "episode_result": result,
-        "actions_attempted": completed + 1,
-        "outer_steps_completed": completed,
-        "failed_outer_step_index": completed,
-        "terminated_false_count": completed,
-        "truncated_false_count": completed,
+        "actions_attempted": attempts,
+        "outer_steps_completed": completed_outer,
+        "failed_outer_step_index": failed_step,
+        "terminated_false_count": completed_outer,
+        "truncated_false_count": completed_outer,
         "environment_before": copy.deepcopy(ENVIRONMENT_BEFORE),
         "last_completed_environment": last_environment,
         "environment_after_failure": after_failure,
@@ -356,7 +381,7 @@ def _failure_records(tmp_path, *, failed_step=238, substep=3):
             "reset_index": 0,
             "query_index": action["query_index"],
             "chunk_action_index": action["chunk_action_index"],
-            "outer_step_index": completed,
+            "outer_step_index": failed_step,
             "terminal_failure": terminal,
         }
     )
@@ -587,6 +612,99 @@ def test_typed_partial_failure_trace_passes_and_binds_incident(tmp_path):
     assert sidecar["value"]["artifacts"]["incident"] == terminal["incident_artifact"]
 
 
+def test_post_policy_failure_closes_full_artifact_transaction_and_cleanup(tmp_path):
+    records, result = _failure_records(tmp_path, sample_kind="post_policy_step")
+    trace, metrics = _write_case(
+        tmp_path,
+        records,
+        episode_length=result["episode_length"],
+        numerical_failure=True,
+        numerical_failure_reason=result["numerical_failure_reason"],
+        progress=0.0,
+    )
+    summary = validator.audit_trace(trace, metrics)
+    terminal = summary["terminal_outcome"]
+    assert summary["action_records"] == 239
+    assert summary["execution_records"] == 239
+    assert summary["trace_record_count"] == 510
+    assert terminal["failure_sample_kind"] == "post_policy_step"
+    assert terminal["outer_steps_completed"] == 239
+    assert terminal["dynamic_report"]["apply_calls"] == 1912
+    assert terminal["dynamic_report"]["post_policy_step_samples"] == 238
+    assert (
+        terminal["last_completed_environment"] == terminal["environment_after_failure"]
+    )
+
+    trace.chmod(0o444)
+    trace_artifact = validate_immutable_file(trace)
+    metrics_temporary = metrics.with_name(".eval_results.partial.csv")
+    metrics.replace(metrics_temporary)
+    metrics_artifact = publish_immutable_file_from_temporary(metrics_temporary, metrics)
+    assert metrics_artifact["path"] == str(metrics.resolve())
+    video_temporary = tmp_path / ".episode_0.partial.mp4"
+    video_temporary.write_bytes(b"synthetic-post-policy-video")
+    video_artifact = publish_immutable_file_from_temporary(
+        video_temporary, tmp_path / "episode_0.mp4"
+    )
+    sidecar_path = tmp_path / "native_runtime" / "episode_000000.json"
+    sidecar = publish_immutable_json(
+        sidecar_path,
+        make_episode_sidecar(
+            episode_result=result,
+            terminal_outcome=terminal,
+            environment_runtime_contract=ENVIRONMENT_RUNTIME,
+            dynamic_report=terminal["dynamic_report"],
+            trace_artifact=trace_artifact,
+            video_artifact=video_artifact,
+            incident_artifact=terminal["incident_artifact"],
+        ),
+    )
+    sidecar_identity = {
+        key: sidecar[key] for key in ("path", "size", "sha256", "mode", "nlink")
+    }
+    runtime_path = tmp_path / "joint_velocity_runtime.json"
+    runtime = publish_immutable_json(runtime_path, {"runtime": "synthetic"})
+    close_payload = make_close_ready_artifact(
+        runtime_artifact=runtime,
+        runtime_path=runtime_path,
+        metrics_path=metrics,
+        trace_path=trace,
+        video_path=Path(video_artifact["path"]),
+        environment_runtime_contract=ENVIRONMENT_RUNTIME,
+        terminal_outcome=terminal,
+        episode_sidecar=sidecar_identity,
+    )
+
+    events = []
+
+    class _Closer:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            events.append(self.name)
+
+    close_path = tmp_path / "evaluator_close_ready.json"
+
+    def publish_close(path, payload):
+        events.append("publish")
+        return publish_immutable_json(path, payload)
+
+    lifecycle = NativeEvaluatorLifecycle(_Closer("simulation.close"))
+    lifecycle.bind_environment(_Closer("env.close"))
+    lifecycle.prepare_close_ready(publish_close, close_path, close_payload)
+    lifecycle.close()
+    assert events == ["env.close", "publish", "simulation.close"]
+    close = validate_immutable_json(close_path)["value"]
+    assert close["terminal_outcome"] == terminal
+    assert (
+        validate_episode_sidecar(sidecar_path, ENVIRONMENT_RUNTIME)["value"][
+            "episode_result"
+        ]
+        == result
+    )
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -601,6 +719,16 @@ def test_typed_partial_failure_trace_passes_and_binds_incident(tmp_path):
                 "terminal_velocity_failure"
             ].update({"physics_substep_index": 2}),
             "cadence drift",
+        ),
+        (
+            lambda terminal: terminal.update(
+                {"failure_sample_kind": "post_policy_step"}
+            ),
+            "count mismatch",
+        ),
+        (
+            lambda terminal: terminal["incident_artifact"].update({"sha256": "0" * 64}),
+            "artifact identity drift",
         ),
         (
             lambda terminal: terminal["environment_after_failure"].update(

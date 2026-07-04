@@ -220,17 +220,33 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         # loop reset before incrementing ``episode``, repeating condition zero.
         obs, info = env.reset(object_positions=initial_conditions[episode])
         policy_client.reset()
+        native_arm_term = None
         if eval_args.control_mode == "joint-velocity":
             policy_client.begin_rollout(env)
-            getattr(env, "unwrapped", env).action_manager._terms[
+            native_arm_term = getattr(env, "unwrapped", env).action_manager._terms[
                 "arm"
-            ].bind_native_all_joint_failure_path(incident_path)
+            ]
+            native_arm_term.bind_native_all_joint_failure_path(incident_path)
         video = []
         numerical_failure_reason = ""
         incident_artifact = None
         dynamic_report = None
         bar = tqdm.tqdm(total=horizon)
         print(f" >>> Starting eval job from episode {episode + 1} of {rollouts} <<< ")
+
+        def finalize_native_velocity_failure(error):
+            if native_arm_term is None:
+                raise RuntimeError("Native velocity failure has no audited action term")
+            report = native_arm_term.native_all_joint_dynamic_report(
+                include_samples=False
+            )
+            terminal = policy_client.record_execution_failure(error, env, report)
+            return (
+                f"{type(error).__name__}: {error}",
+                report,
+                terminal,
+                error.incident_artifact,
+            )
 
         while bar.n < horizon:
             try:
@@ -244,7 +260,7 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                 if eval_args.control_mode == "joint-velocity" and isinstance(
                     error, JointVelocityObservationNumericalError
                 ):
-                    # The native canary has exactly one partial terminal form.
+                    # The native canary has one typed monitor terminal form.
                     # Observation/schema failures remain fatal contract errors.
                     raise
                 numerical_failure_reason = f"{type(error).__name__}: {error}"
@@ -269,15 +285,12 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
             except NativeAllJointVelocityLimitError as error:
                 if eval_args.control_mode != "joint-velocity":
                     raise
-                numerical_failure_reason = f"{type(error).__name__}: {error}"
-                arm_term = getattr(env, "unwrapped", env).action_manager._terms["arm"]
-                dynamic_report = arm_term.native_all_joint_dynamic_report(
-                    include_samples=False
-                )
-                terminal_outcome = policy_client.record_execution_failure(
-                    error, env, dynamic_report
-                )
-                incident_artifact = error.incident_artifact
+                (
+                    numerical_failure_reason,
+                    dynamic_report,
+                    terminal_outcome,
+                    incident_artifact,
+                ) = finalize_native_velocity_failure(error)
                 print(
                     f"Numerical failure in episode {episode} at action "
                     f"{bar.n}: {numerical_failure_reason}"
@@ -295,9 +308,29 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                 bar.update(1)
                 break
             if eval_args.control_mode == "joint-velocity":
-                getattr(env, "unwrapped", env).action_manager._terms[
-                    "arm"
-                ].record_native_all_joint_post_policy_step()
+                try:
+                    native_arm_term.record_native_all_joint_post_policy_step()
+                except NativeAllJointVelocityLimitError as error:
+                    # env.step completed all eight physics substeps. Persist its
+                    # execution record before closing the failing boundary sample.
+                    policy_client.record_execution(
+                        obs,
+                        env,
+                        terminated=term,
+                        truncated=trunc,
+                    )
+                    (
+                        numerical_failure_reason,
+                        dynamic_report,
+                        terminal_outcome,
+                        incident_artifact,
+                    ) = finalize_native_velocity_failure(error)
+                    print(
+                        f"Numerical failure in episode {episode} at completed action "
+                        f"{bar.n}: {numerical_failure_reason}"
+                    )
+                    bar.update(1)
+                    break
                 policy_client.record_execution(
                     obs,
                     env,

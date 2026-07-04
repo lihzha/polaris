@@ -35,7 +35,7 @@ PI05_DROID_NATIVE_DECIMATION = 8
 PI05_DROID_NATIVE_RESPONSE_HORIZON = 15
 PI05_DROID_NATIVE_EXECUTION_HORIZON = 8
 PI05_DROID_NATIVE_ACTION_WIDTH = 8
-PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION = 3
+PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION = 4
 PI05_DROID_NATIVE_EPISODE_SIDECAR_SCHEMA_VERSION = 1
 PI05_DROID_NATIVE_EPISODE_SIDECAR_PROFILE = (
     "openpi_pi05_droid_native_jointvelocity_episode_transaction_v1"
@@ -784,7 +784,7 @@ def validate_native_episode_result(value: Any) -> dict[str, Any]:
 def validate_terminal_numerical_failure_evidence(
     value: Any, environment_runtime_contract: Any
 ) -> dict[str, Any]:
-    """Validate the only allowed partial terminal form for native pi0.5."""
+    """Validate the only allowed monitored-boundary failure for native pi0.5."""
 
     from polaris.native_gripper_runtime import (  # noqa: PLC0415
         NativeAllJointVelocityLimitError,
@@ -799,6 +799,7 @@ def validate_terminal_numerical_failure_evidence(
         "terminal_form",
         "environment_runtime_sha256",
         "failure_type",
+        "failure_sample_kind",
         "episode_result",
         "actions_attempted",
         "outer_steps_completed",
@@ -815,7 +816,7 @@ def validate_terminal_numerical_failure_evidence(
         raise ValueError("Native terminal numerical-failure schema mismatch")
     result = validate_native_episode_result(value["episode_result"])
     if (
-        value["schema_version"] != 1
+        value["schema_version"] != 2
         or value["profile"] != PI05_DROID_NATIVE_TERMINAL_FAILURE_PROFILE
         or value["terminal_form"] != "native_all_joint_velocity_limit_failure"
         or value["environment_runtime_sha256"] != runtime["sha256"]
@@ -823,17 +824,6 @@ def validate_terminal_numerical_failure_evidence(
         or result["numerical_failure"] is not True
     ):
         raise ValueError("Native terminal numerical-failure identity mismatch")
-    attempts = result["episode_length"]
-    completed = attempts - 1
-    if (
-        value["actions_attempted"] != attempts
-        or value["outer_steps_completed"] != completed
-        or value["failed_outer_step_index"] != completed
-        or value["terminated_false_count"] != completed
-        or value["truncated_false_count"] != completed
-    ):
-        raise ValueError("Native terminal numerical-failure count mismatch")
-
     incident = validate_bound_artifact(
         value["incident_artifact"],
         expected_path=None,
@@ -847,15 +837,34 @@ def validate_terminal_numerical_failure_evidence(
     )
     if dynamic["terminal_velocity_failure"] != failure:
         raise ValueError("Native dynamic report incident drift")
+    sample_kind = failure["sample_kind"]
+    attempts = result["episode_length"]
+    completed = attempts - int(sample_kind == "apply_entry")
     if (
-        failure["policy_step_index"] != completed
-        or failure["completed_policy_steps"] != completed
-        or failure["completed_apply_calls"]
-        != completed * PI05_DROID_NATIVE_DECIMATION + failure["physics_substep_index"]
+        value["failure_sample_kind"] != sample_kind
+        or value["actions_attempted"] != attempts
+        or value["outer_steps_completed"] != completed
+        or value["failed_outer_step_index"] != attempts - 1
+        or value["terminated_false_count"] != completed
+        or value["truncated_false_count"] != completed
+    ):
+        raise ValueError("Native terminal numerical-failure count mismatch")
+    expected_completed_post = attempts - 1
+    if (
+        failure["policy_step_index"] != attempts - 1
+        or failure["completed_post_policy_step_samples"] != expected_completed_post
         or dynamic["apply_calls"] != failure["completed_apply_calls"]
-        or dynamic["post_policy_step_samples"] != completed
+        or dynamic["post_policy_step_samples"] != expected_completed_post
     ):
         raise ValueError("Native terminal numerical-failure cadence mismatch")
+    if sample_kind == "apply_entry":
+        if failure["completed_apply_calls"] != (
+            expected_completed_post * PI05_DROID_NATIVE_DECIMATION
+            + failure["physics_substep_index"]
+        ):
+            raise ValueError("Native apply-entry terminal cadence mismatch")
+    elif failure["completed_apply_calls"] != (attempts * PI05_DROID_NATIVE_DECIMATION):
+        raise ValueError("Native post-policy terminal cadence mismatch")
     expected_reason = "NativeAllJointVelocityLimitError: " + str(
         NativeAllJointVelocityLimitError(failure, incident)
     )
@@ -899,7 +908,11 @@ def validate_terminal_numerical_failure_evidence(
             raise ValueError("Native terminal numerical-failure environment drift")
     before, last_completed, after_failure = environments
     expected_last_sim = before["sim_step_counter"] + completed * 8
-    expected_failure_sim = expected_last_sim + failure["physics_substep_index"] + 1
+    expected_failure_sim = (
+        expected_last_sim + failure["physics_substep_index"] + 1
+        if sample_kind == "apply_entry"
+        else expected_last_sim
+    )
     if (
         before["episode_length"] != 0
         or last_completed["episode_length"] != completed

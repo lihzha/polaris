@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import torch
 
+from polaris.pi05_droid_native_eval_contract import validate_immutable_json
 from polaris.native_gripper_runtime import (
     EXPECTED_DROID_JOINT_NAMES,
     EXPECTED_FULL_LIMITS_CAPPED,
@@ -168,7 +169,7 @@ def test_dynamic_recorder_requires_exact_eight_apply_plus_post_cadence():
     assert full["apply_calls"] == 8
     assert full["post_policy_step_samples"] == 1
     assert full["sample_count"] == 9
-    assert full["schema_version"] == 2
+    assert full["schema_version"] == 3
     assert full["terminal_velocity_failure"] is None
     assert validate_native_all_joint_dynamic_report(full, require_samples=True) == full
     aggregate = recorder.report(include_samples=False)
@@ -200,6 +201,7 @@ def test_dynamic_recorder_persists_typed_arm_or_gripper_velocity_limit_violation
     with pytest.raises(NativeAllJointVelocityLimitError) as captured:
         recorder.record_apply_entry(asset)
     evidence = captured.value.evidence
+    assert evidence["sample_kind"] == "apply_entry"
     assert evidence["physics_substep_index"] == 0
     assert evidence["policy_step_index"] == 0
     assert evidence["excess_mask"] == [False] * 7 + [True] + [False] * 5
@@ -245,10 +247,12 @@ def test_dynamic_failure_records_exact_partial_cadence_and_rejects_mutations(tmp
         recorder.record_apply_entry(asset)
     evidence = captured.value.evidence
     assert evidence["policy_step_index"] == 1
+    assert evidence["sample_kind"] == "apply_entry"
     assert evidence["physics_substep_index"] == 3
-    assert evidence["failed_apply_call_index"] == 11
+    assert evidence["failed_sample_index"] == 12
     assert evidence["completed_apply_calls"] == 11
-    assert evidence["completed_policy_steps"] == 1
+    assert evidence["completed_post_policy_step_samples"] == 1
+    assert evidence["outer_step_physics_complete"] is False
     report = recorder.report(include_samples=True)
     assert report["apply_calls"] == 11
     assert report["post_policy_step_samples"] == 1
@@ -266,6 +270,53 @@ def test_dynamic_failure_records_exact_partial_cadence_and_rejects_mutations(tmp
         ("live_joint_velocity_limit", [9.0] * 13, "limit"),
         ("excess_rad_s", [0.0] * 13, "arithmetic"),
         ("violating_joint_names", ["finger_joint"], "joint identity"),
+    ):
+        mutated = copy.deepcopy(evidence)
+        mutated[field] = replacement
+        with pytest.raises(ValueError, match=match):
+            validate_native_all_joint_velocity_failure(mutated)
+
+
+def test_post_policy_limit_failure_is_typed_after_exactly_eight_healthy_applies(
+    tmp_path,
+):
+    asset = _DynamicAsset()
+    recorder = NativeAllJointDynamicRecorder()
+    incident_path = tmp_path / "post-policy.json"
+    recorder.bind_failure_path(incident_path)
+    for _ in range(8):
+        recorder.record_apply_entry(asset)
+    asset.data.joint_vel[0, 12] = 5.25
+
+    with pytest.raises(NativeAllJointVelocityLimitError) as captured:
+        recorder.record_post_policy_step(asset)
+
+    evidence = captured.value.evidence
+    assert evidence["sample_kind"] == "post_policy_step"
+    assert evidence["policy_step_index"] == 0
+    assert evidence["physics_substep_index"] == 8
+    assert evidence["failed_sample_index"] == 8
+    assert evidence["completed_apply_calls"] == 8
+    assert evidence["completed_post_policy_step_samples"] == 0
+    assert evidence["outer_step_physics_complete"] is True
+    assert captured.value.incident_artifact["path"] == str(incident_path.resolve())
+    assert incident_path.stat().st_mode & 0o777 == 0o444
+    assert validate_immutable_json(incident_path)["value"] == evidence
+
+    report = recorder.report(include_samples=True)
+    assert report["schema_version"] == 3
+    assert report["apply_calls"] == 8
+    assert report["post_policy_step_samples"] == 0
+    assert report["sample_count"] == 8
+    assert report["terminal_velocity_failure"] == evidence
+    assert (
+        validate_native_all_joint_dynamic_report(report, require_samples=True) == report
+    )
+
+    for field, replacement, match in (
+        ("sample_kind", "apply_entry", "apply-entry.*cadence"),
+        ("physics_substep_index", 7, "post-policy.*cadence"),
+        ("outer_step_physics_complete", False, "cadence"),
     ):
         mutated = copy.deepcopy(evidence)
         mutated[field] = replacement

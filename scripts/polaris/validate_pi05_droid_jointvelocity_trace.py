@@ -374,7 +374,17 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
             records.append(record)
 
     actions_attempted = metrics["episode_length"]
-    execution_records = actions_attempted - int(metrics["numerical_failure"])
+    failure_sample_kind = None
+    if metrics["numerical_failure"]:
+        try:
+            failure_sample_kind = records[-1]["terminal_failure"]["failure_sample_kind"]
+        except (IndexError, KeyError, TypeError) as error:
+            raise ValueError("Trace lacks a closed terminal failure kind") from error
+        _require(
+            failure_sample_kind in {"apply_entry", "post_policy_step"},
+            "Trace terminal failure sample kind mismatch",
+        )
+    execution_records = actions_attempted - int(failure_sample_kind == "apply_entry")
     expected_queries = math.ceil(
         actions_attempted / PI05_DROID_NATIVE_EXECUTION_HORIZON
     )
@@ -430,6 +440,51 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
     normalized_gripper_max = -math.inf
 
     terminal_outcome = None
+
+    def consume_failure_record(
+        *, step: int, query_index: int, action_index: int, last_environment: dict
+    ) -> dict[str, Any]:
+        nonlocal cursor
+        failure_record = records[cursor]
+        cursor += 1
+        _require(
+            set(failure_record) == ROLLOUT_FAILURE_KEYS,
+            "Rollout failure schema mismatch",
+        )
+        _require(
+            failure_record["schema_version"] == PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION
+            and failure_record["record_type"] == "openpi_joint_velocity_rollout_failure"
+            and failure_record["profile"] == PI05_DROID_JOINTVELOCITY_PROFILE
+            and failure_record["reset_index"] == 0,
+            "Rollout failure identity mismatch",
+        )
+        _validate_contract_identity(
+            failure_record, contract_identity, "rollout failure"
+        )
+        _require(
+            failure_record["query_index"] == query_index
+            and failure_record["chunk_action_index"] == action_index
+            and failure_record["outer_step_index"] == step,
+            "Rollout failure action identity mismatch",
+        )
+        terminal = validate_terminal_numerical_failure_evidence(
+            failure_record["terminal_failure"], environment_runtime_contract
+        )
+        _require(
+            terminal["failure_sample_kind"] == failure_sample_kind,
+            "Rollout failure sample-kind drift",
+        )
+        _require(
+            terminal["episode_result"] == metrics,
+            "Terminal failure differs from metrics",
+        )
+        _require(
+            terminal["environment_before"] == environment_before
+            and terminal["last_completed_environment"] == last_environment,
+            "Terminal failure environment endpoints drift",
+        )
+        return terminal
+
     for step in range(actions_attempted):
         query_index = step // PI05_DROID_NATIVE_EXECUTION_HORIZON
         action_index = step % PI05_DROID_NATIVE_EXECUTION_HORIZON
@@ -631,42 +686,12 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
                 "Measured gripper state continuity mismatch",
             )
 
-        if metrics["numerical_failure"] and step == actions_attempted - 1:
-            failure_record = records[cursor]
-            cursor += 1
-            _require(
-                set(failure_record) == ROLLOUT_FAILURE_KEYS,
-                "Rollout failure schema mismatch",
-            )
-            _require(
-                failure_record["schema_version"]
-                == PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION
-                and failure_record["record_type"]
-                == "openpi_joint_velocity_rollout_failure"
-                and failure_record["profile"] == PI05_DROID_JOINTVELOCITY_PROFILE
-                and failure_record["reset_index"] == 0,
-                "Rollout failure identity mismatch",
-            )
-            _validate_contract_identity(
-                failure_record, contract_identity, "rollout failure"
-            )
-            _require(
-                failure_record["query_index"] == query_index
-                and failure_record["chunk_action_index"] == action_index
-                and failure_record["outer_step_index"] == step,
-                "Rollout failure action identity mismatch",
-            )
-            terminal_outcome = validate_terminal_numerical_failure_evidence(
-                failure_record["terminal_failure"], environment_runtime_contract
-            )
-            _require(
-                terminal_outcome["episode_result"] == metrics,
-                "Terminal failure differs from metrics",
-            )
-            _require(
-                terminal_outcome["environment_before"] == environment_before
-                and terminal_outcome["last_completed_environment"] == environment_after,
-                "Terminal failure environment endpoints drift",
+        if failure_sample_kind == "apply_entry" and step == actions_attempted - 1:
+            terminal_outcome = consume_failure_record(
+                step=step,
+                query_index=query_index,
+                action_index=action_index,
+                last_environment=environment_after,
             )
             break
 
@@ -762,6 +787,14 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
             max_abs_measured_velocity[index] = max(
                 max_abs_measured_velocity[index], abs(value)
             )
+        if failure_sample_kind == "post_policy_step" and step == actions_attempted - 1:
+            terminal_outcome = consume_failure_record(
+                step=step,
+                query_index=query_index,
+                action_index=action_index,
+                last_environment=environment_after,
+            )
+            break
 
     if not metrics["numerical_failure"]:
         rollout_end = records[cursor]
