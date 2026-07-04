@@ -45,6 +45,55 @@ from polaris.native_gripper_runtime import (
 ROOT = Path(__file__).parents[1]
 
 
+def _legacy_slurm_artifact(path: Path, **extra):
+    file_stat = path.stat()
+    rendered = str(path)
+    resolved = str(path.resolve())
+    return {
+        "path": rendered,
+        "host_declared_path": rendered,
+        "resolved_path": resolved,
+        "path_alias_equivalent": rendered != resolved,
+        "producer_host_spelling_match": True,
+        "device": format(file_stat.st_dev, "x"),
+        "inode": file_stat.st_ino,
+        "size": file_stat.st_size,
+        "sha256": file_sha256(path),
+        "mode": "0444",
+        **extra,
+    }
+
+
+def _base_controller_slurm_fixture(tmp_path: Path):
+    status_path = tmp_path / "srun-1098174.status.json"
+    publish_immutable_json(
+        status_path,
+        {"job_id": 1098174, "srun_exit_code": 0},
+    )
+    gpu_path = tmp_path / "gpu-1098174.csv"
+    gpu_path.write_text("GPU-test, NVIDIA L40S, 580.105.08\n", encoding="utf-8")
+    gpu_path.chmod(0o444)
+    saved_path = tmp_path / "job-1098174.sbatch"
+    saved_path.write_text("#!/usr/bin/env bash\ntrue\n", encoding="utf-8")
+    saved_path.chmod(0o444)
+    return {
+        "job_id": 1098174,
+        "srun_exit_code": 0,
+        "status_artifact": _legacy_slurm_artifact(status_path),
+        "gpu_inventory": _legacy_slurm_artifact(
+            gpu_path,
+            uuid="GPU-test",
+            name="NVIDIA L40S",
+            driver_version="580.105.08",
+        ),
+        "saved_job_script": _legacy_slurm_artifact(saved_path),
+    }, {
+        "status": status_path,
+        "gpu": gpu_path,
+        "saved": saved_path,
+    }
+
+
 def test_bound_json_record_expected_value_requires_canonical_identity(tmp_path):
     artifact = publish_immutable_json(tmp_path / "record.json", {"job_id": 1.0})
     record = {key: artifact[key] for key in ("path", "size", "sha256", "mode", "nlink")}
@@ -76,6 +125,7 @@ def test_base_controller_gate_binds_job1098174_runtime_image_and_sources(
             "sha256": file_sha256(path),
         }
     completion_path = tmp_path / "controller-completion.json"
+    slurm, _ = _base_controller_slurm_fixture(tmp_path)
     artifact = publish_immutable_json(
         completion_path,
         {
@@ -83,7 +133,7 @@ def test_base_controller_gate_binds_job1098174_runtime_image_and_sources(
             "profile": finalizer.CONTROLLER_PROFILE,
             "status": "pass",
             "scope": "controller_only_no_model_or_checkpoint",
-            "slurm": {"job_id": 1098174, "srun_exit_code": 0},
+            "slurm": slurm,
             "source": {
                 "commit": finalizer.PI05_DROID_BASE_CONTROLLER_SOURCE_COMMIT,
                 "detached_head": True,
@@ -129,6 +179,67 @@ def test_base_controller_gate_binds_job1098174_runtime_image_and_sources(
         finalizer.validate_base_controller_completion(
             completion_path, "0" * 64, repository
         )
+
+
+@pytest.mark.parametrize(
+    ("record_name", "field", "invalid"),
+    [
+        (None, "job_id", True),
+        (None, "srun_exit_code", False),
+        ("status_artifact", "inode", True),
+        ("status_artifact", "size", 38.0),
+        ("status_artifact", "path_alias_equivalent", 1),
+        ("status_artifact", "producer_host_spelling_match", 1),
+        ("gpu_inventory", "uuid", 7),
+        ("gpu_inventory", "driver_version", True),
+    ],
+)
+def test_base_controller_slurm_artifacts_reject_numeric_bool_and_type_drift(
+    tmp_path, record_name, field, invalid
+):
+    slurm, _ = _base_controller_slurm_fixture(tmp_path)
+    target = slurm if record_name is None else slurm[record_name]
+    target[field] = invalid
+    with pytest.raises(ValueError, match="mismatch"):
+        finalizer._validate_base_controller_slurm_artifacts(slurm)
+
+
+@pytest.mark.parametrize(
+    ("record_name", "field", "remove"),
+    [
+        (None, "unexpected", False),
+        (None, "saved_job_script", True),
+        ("status_artifact", "unexpected", False),
+        ("gpu_inventory", "inode", True),
+    ],
+)
+def test_base_controller_slurm_artifacts_reject_extra_or_missing_fields(
+    tmp_path, record_name, field, remove
+):
+    slurm, _ = _base_controller_slurm_fixture(tmp_path)
+    target = slurm if record_name is None else slurm[record_name]
+    if remove:
+        del target[field]
+    else:
+        target[field] = "forbidden"
+    with pytest.raises(ValueError, match="mismatch"):
+        finalizer._validate_base_controller_slurm_artifacts(slurm)
+
+
+def test_base_controller_slurm_artifacts_reject_file_tamper(tmp_path):
+    slurm, paths = _base_controller_slurm_fixture(tmp_path)
+    paths["saved"].chmod(0o644)
+    paths["saved"].write_text("#!/usr/bin/env bash\nfalse\n", encoding="utf-8")
+    paths["saved"].chmod(0o444)
+    with pytest.raises(ValueError, match="saved Slurm script"):
+        finalizer._validate_base_controller_slurm_artifacts(slurm)
+
+
+def test_base_controller_slurm_artifacts_reject_gpu_metadata_tamper(tmp_path):
+    slurm, _ = _base_controller_slurm_fixture(tmp_path)
+    slurm["gpu_inventory"]["name"] = "NVIDIA A40"
+    with pytest.raises(ValueError, match="GPU inventory metadata mismatch"):
+        finalizer._validate_base_controller_slurm_artifacts(slurm)
 
 
 def test_all_six_gate_revalidates_coupling_lifecycle_runtime_and_source(

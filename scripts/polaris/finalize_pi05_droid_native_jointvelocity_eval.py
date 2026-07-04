@@ -311,7 +311,13 @@ def validate_base_controller_completion(
     if not isinstance(value, dict):
         raise ValueError("Controller completion must be an object")
     slurm = value.get("slurm")
-    if not isinstance(slurm, dict) or set(slurm) != {"job_id", "srun_exit_code"}:
+    if not isinstance(slurm, dict) or set(slurm) != {
+        "job_id",
+        "srun_exit_code",
+        "status_artifact",
+        "gpu_inventory",
+        "saved_job_script",
+    }:
         raise ValueError("Controller completion identity mismatch")
     _require_exact_json_subset(
         value,
@@ -323,11 +329,12 @@ def validate_base_controller_completion(
         },
         "Controller completion identity mismatch",
     )
-    _require_exact_json(
+    _require_exact_json_subset(
         slurm,
         {"job_id": PI05_DROID_CONTROLLER_JOB_ID, "srun_exit_code": 0},
         "Controller completion identity mismatch",
     )
+    _validate_base_controller_slurm_artifacts(slurm)
     attested_files = value.get("source", {}).get("files")
     source = value.get("source")
     if (
@@ -384,6 +391,205 @@ def validate_base_controller_completion(
             f"required_job{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}_all_six_gate"
         ),
     }
+
+
+_BASE_CONTROLLER_SLURM_ARTIFACT_KEYS = {
+    "path",
+    "host_declared_path",
+    "resolved_path",
+    "path_alias_equivalent",
+    "producer_host_spelling_match",
+    "device",
+    "inode",
+    "size",
+    "sha256",
+    "mode",
+}
+
+
+def _validate_base_controller_slurm_artifact(
+    value: Any,
+    *,
+    field: str,
+    expected_filename: str,
+    extra_keys: set[str] | None = None,
+    expected_json: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Revalidate one producer-defined job-1098174 Slurm artifact."""
+
+    extra_keys = set() if extra_keys is None else extra_keys
+    expected_keys = _BASE_CONTROLLER_SLURM_ARTIFACT_KEYS | extra_keys
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ValueError(f"{field} schema mismatch")
+    if (
+        type(value["path"]) is not str
+        or not value["path"].startswith("/")
+        or value["path"].startswith("//")
+        or value["path"] != os.path.normpath(value["path"])
+        or type(value["host_declared_path"]) is not str
+        or not value["host_declared_path"].startswith("/")
+        or value["host_declared_path"].startswith("//")
+        or value["host_declared_path"]
+        != os.path.normpath(value["host_declared_path"])
+        or type(value["resolved_path"]) is not str
+        or not value["resolved_path"].startswith("/")
+        or value["resolved_path"].startswith("//")
+        or value["resolved_path"] != os.path.normpath(value["resolved_path"])
+        or type(value["path_alias_equivalent"]) is not bool
+        or type(value["producer_host_spelling_match"]) is not bool
+        or type(value["device"]) is not str
+        or not value["device"]
+        or any(character not in "0123456789abcdef" for character in value["device"])
+        or type(value["inode"]) is not int
+        or value["inode"] <= 0
+        or type(value["size"]) is not int
+        or value["size"] <= 0
+        or type(value["sha256"]) is not str
+        or len(value["sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in value["sha256"])
+        or type(value["mode"]) is not str
+        or value["mode"] != "0444"
+    ):
+        raise ValueError(f"{field} identity type mismatch")
+    recorded = Path(value["path"])
+    declared = Path(value["host_declared_path"])
+    resolved = Path(value["resolved_path"])
+    if (
+        recorded.name != expected_filename
+        or declared.name != expected_filename
+        or resolved.name != expected_filename
+    ):
+        raise ValueError(f"{field} filename mismatch")
+    try:
+        recorded_resolved = recorded.resolve(strict=True)
+        declared_resolved = declared.resolve(strict=True)
+        resolved_resolved = resolved.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"{field} path is not readable") from error
+    if (
+        recorded_resolved != resolved
+        or declared_resolved != resolved
+        or resolved_resolved != resolved
+    ):
+        raise ValueError(f"{field} resolved path mismatch")
+    _require_exact_json_subset(
+        value,
+        {
+            "path_alias_equivalent": (
+                recorded != declared or recorded != resolved or declared != resolved
+            ),
+            "producer_host_spelling_match": recorded == declared,
+            "mode": "0444",
+        },
+        f"{field} path spelling mismatch",
+    )
+    try:
+        before = os.stat(resolved, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError(f"{field} resolved target is not readable") from error
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o444
+        or format(before.st_dev, "x") != value["device"]
+        or before.st_ino != value["inode"]
+    ):
+        raise ValueError(f"{field} filesystem identity mismatch")
+    bound_value = {
+        "path": value["path"],
+        "size": value["size"],
+        "sha256": value["sha256"],
+        "mode": value["mode"],
+        "nlink": 1,
+    }
+    if expected_json is None:
+        bound = validate_bound_artifact(
+            bound_value,
+            expected_path=resolved,
+            field=field,
+        )
+    else:
+        bound = validate_bound_json_artifact(
+            bound_value,
+            expected_path=resolved,
+            field=field,
+        )
+        _require_exact_json(
+            bound["value"],
+            expected_json,
+            f"{field} JSON content mismatch",
+        )
+    try:
+        after = os.stat(resolved, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError(f"{field} resolved target changed") from error
+    identity_fields = ("st_dev", "st_ino", "st_size", "st_mode", "st_nlink")
+    if any(getattr(before, key) != getattr(after, key) for key in identity_fields):
+        raise ValueError(f"{field} resolved target changed")
+    return bound
+
+
+def _validate_base_controller_slurm_artifacts(slurm: dict[str, Any]) -> None:
+    """Require the complete producer schema and all three immutable artifacts."""
+
+    if not isinstance(slurm, dict) or set(slurm) != {
+        "job_id",
+        "srun_exit_code",
+        "status_artifact",
+        "gpu_inventory",
+        "saved_job_script",
+    }:
+        raise ValueError("Controller completion identity mismatch")
+    _require_exact_json_subset(
+        slurm,
+        {"job_id": PI05_DROID_CONTROLLER_JOB_ID, "srun_exit_code": 0},
+        "Controller completion identity mismatch",
+    )
+
+    status = _validate_base_controller_slurm_artifact(
+        slurm["status_artifact"],
+        field="job1098174 srun status",
+        expected_filename=f"srun-{PI05_DROID_CONTROLLER_JOB_ID}.status.json",
+        expected_json={
+            "job_id": PI05_DROID_CONTROLLER_JOB_ID,
+            "srun_exit_code": 0,
+        },
+    )
+    if status["size"] != len(
+        canonical_json_bytes(
+            {"job_id": PI05_DROID_CONTROLLER_JOB_ID, "srun_exit_code": 0}
+        )
+    ):
+        raise ValueError("job1098174 srun status size mismatch")
+    gpu = slurm["gpu_inventory"]
+    _validate_base_controller_slurm_artifact(
+        gpu,
+        field="job1098174 GPU inventory",
+        expected_filename=f"gpu-{PI05_DROID_CONTROLLER_JOB_ID}.csv",
+        extra_keys={"uuid", "name", "driver_version"},
+    )
+    if (
+        type(gpu["uuid"]) is not str
+        or not gpu["uuid"].startswith("GPU-")
+        or type(gpu["name"]) is not str
+        or gpu["name"] != "NVIDIA L40S"
+        or type(gpu["driver_version"]) is not str
+        or not gpu["driver_version"]
+    ):
+        raise ValueError("job1098174 GPU inventory metadata mismatch")
+    expected_gpu_bytes = (
+        f'{gpu["uuid"]}, {gpu["name"]}, {gpu["driver_version"]}\n'.encode()
+    )
+    if (
+        len(expected_gpu_bytes) != gpu["size"]
+        or hashlib.sha256(expected_gpu_bytes).hexdigest() != gpu["sha256"]
+    ):
+        raise ValueError("job1098174 GPU inventory content mismatch")
+    _validate_base_controller_slurm_artifact(
+        slurm["saved_job_script"],
+        field="job1098174 saved Slurm script",
+        expected_filename=f"job-{PI05_DROID_CONTROLLER_JOB_ID}.sbatch",
+    )
 
 
 def _validate_bound_json_record(
