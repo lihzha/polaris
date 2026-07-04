@@ -113,9 +113,30 @@ Negative coverage explicitly exercises missing, tampered, symlinked,
 hard-linked, non-regular, path-drifted, task-omitted, suite-omitted,
 artifact-drifted, and authorization-prerequisite-drifted evidence.
 
-## Remaining handoff step
+## L401 fresh standard-authorization verification
 
-Commit this exact implementation, seal a Git bundle/manifest, deploy the Git
-revision read-only to l401, run the 138-artifact verifier there, then append
-the exact verification digest and package identities. No evaluation launch is
-authorized from this implementation task.
+Implementation commit `92fbca47a56b50848a75fbd74e31d2e9d01eda2d` (tree
+`d162a3ce223214ca953218e5ffb32a05c57bea17`) was sealed in a complete-history
+Git bundle, SHA-256
+`d490d900c42d8723c8f3c850767df4579679244aec698855795f4f44f8899fda`,
+and checked out detached and clean at
+`/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-standard-promotion-preflight-92fbca4-20260704`.
+
+The public
+`validate_and_authorize_eef_velocity_recovery_v5_standard` entrypoint was then
+run on the l401 login host with no root override. It securely reopened and
+rehashed all `138/138` pinned artifacts: `69` per suite, `12` tasks, two exact
+canonical roots. It returned:
+
+- artifact inventory SHA-256
+  `b2649ef53c4a64e27ccb9e0e84c9cc594ab1c5f2dd8bb16b60ba4e46dda94226`;
+- verification SHA-256
+  `467a4933a54f38a395233c569ed4aa18709fffe521917df49cdea82c9a7161cf`;
+- promotion evidence SHA-256
+  `7fd7a390da9dbe61531bdc8de75f83867a2011a6685fa2cfe761b1d965aba458`;
+- `standard_authorized: true` and `root_overrides_used: false`.
+
+No Slurm job, local long-running process, registry write, or evaluation launch
+was created by this implementation. The final handoff package is sealed after
+this append-only evidence update; its exact final commit/tree/bundle/manifest
+identities are reported to the orchestrator.
