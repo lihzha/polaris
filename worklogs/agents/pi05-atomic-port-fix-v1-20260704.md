@@ -191,3 +191,52 @@ or registry drafts to clean up or transfer.
   and `git diff --check`: pass. A fresh detached deployment, exact no-dev plus
   overlay environment validation, immutable package manifest, and root-owned
   one-rollout relaunch remain the next gates.
+
+### Sealed root-launch handoff
+
+- Dependency-repair implementation commit
+  `014a7d5c0bd74fd1e25af35f49dd471fa4fde22c`, tree
+  `57ead78fe6294b31f67147d36bea21f48468d929`, is pushed to
+  `lihzha/codex/pi05-atomic-port-fix-v1-20260704`.
+- A full Git bundle was used to create a fresh standalone, detached remote
+  source at
+  `/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-pi05-runtime-dependency-014a7d5-20260704T183503Z-standalone`.
+  OpenPI's configured SSH submodule URL initially failed authentication before
+  populating content; a command-scoped HTTPS URL rewrite then initialized the
+  public submodule at the same exact `bd70b8f...` Git SHA. The first uv attempt
+  failed before environment creation because `$HOME/.cache/uv` exceeded quota;
+  the retry used dedicated NFS `UV_CACHE_DIR`/`XDG_CACHE_HOME` roots.
+- Fresh environment construction performed `uv sync --frozen --no-dev` for
+  204 packages, then the exact hash-required overlay. It installed only the
+  three missing distributions, producing 207 total compatible packages.
+  Canonical installed-inventory SHA-256 is
+  `82e8f99ba721abce4311589a26158339fab022a222d9e863a61b5baba50931b4`;
+  sorted `uv pip freeze` SHA-256 is
+  `f424a7a7b5d851259244360e6064b692e1eb10abf10335d4da2553b32189029f`.
+  `uv sync --frozen --no-dev --inexact --dry-run` reports no changes.
+- The first direct model import on the login host inherited 64 BLAS threads and
+  made slow progress for five minutes; it was terminated without source or
+  artifact output. Repeating with OpenBLAS/OMP/MKL threads pinned to one passed
+  in under a minute and resolved both production modules from the exact
+  OpenPI source. Fresh-venv dependency regressions passed `4/4`, and the full
+  native controller plus atomic-port preflight passed against jobs
+  `1098174/1098723`.
+- The complete source plus checkout-local venv is read-only: 45,852 regular
+  files, zero writable regular files or directories, detached/clean exact Git
+  identities, and a successful post-seal package preflight. A global `sync`
+  used during sealing blocked in Lustre `super_lock`; independent path checks
+  established the zero-writable and Git identities, and only path-scoped fsync
+  was used for the final package manifest.
+- Root-owned immutable stage:
+  `/lustre/fsw/portfolios/nvr/users/lzha/staging/pi05-runtime-dependency-014a7d5-20260704T183503Z`.
+  Bundle SHA-256:
+  `ce55ec8e6b78b2b6a43a7b5bc276c9c0a8227522c9c0398ef2a7a59f8e638648`;
+  launch-wrapper SHA-256:
+  `62ccc47a86427c9e66f780c8fbf9490186c629a4ef90a7c4b5f5cd0d7eb07bd5`;
+  package-manifest SHA-256:
+  `70cc66f768a4225195cc52bdbeada2bf25c8b6ca8906bbc7a1f078f5192a3ab3`.
+  All three are mode `0444`, one link, re-read after sealing. The wrapper's
+  fresh target
+  `.../20260704T183503Z-014a7d5-runtime-overlay-canary2` did not exist at
+  handoff. This recovery agent did not execute the wrapper, submit Slurm,
+  mutate the registry, or claim a rollout result.
