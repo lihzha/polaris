@@ -68,11 +68,11 @@ The sole failure was in `test_standard_action_reset_clears_selected_candidate_st
 
 The repair is test-only. The Isaac test uses the exact float32 Panda velocity-limit vector divided by 120 Hz, matching real construction, and the host stub now invokes the same reset lifecycle with a faithful parent raw-action reset plus an initialization-order assertion. Ruff, Python compilation, `git diff --check`, the focused host stub, and the full host-safe suite pass: `867 passed`, `30 subtests passed`. Production source hashes remain identical to commit `7fc74d6`.
 
+Test-only child commit `e18b8ebbc26fd309d8e45bd58bef9c867948098a` was pushed with direct parent `7fc74d6`. Fail-closed rerun job `1098636` used wrapper SHA-256 `c816d92d71c772f0366aa453cf205bdeb2e0202cc27105ebd93b5b85be560979` and the same pinned L40S image. The negative probe produced immutable `5\n`; the authoritative run passed all `84` Isaac tests and produced immutable `0\n`. Slurm completed `0:0`; the saved wrapper and source identities matched, the production-source hashes remained exact, the source stayed clean, and the isolated cache was removed. Evidence was fetched under `/home/lzha/code/ego-lap/.codex_artifacts/polaris-release-ramp16-production-7fc74d6-target-gates-20260703/job_1098636/`.
+
 ## Next gate
 
-1. Preserve the independent GO and commit/push the test-only child revision without changing production source.
-2. Deploy that exact child commit and rerun the fail-closed L40S gate.
-3. Build and review a pinned replay-only child revision that observes the production v4 path without a post-setter overlay.
-4. Run and inspect the exact 2,416-apply production-core replay on L40S, including traces and video.
-5. Run fresh full-horizon official LAP-3B and reasoning-checkpoint canaries in parallel.
-6. Promote to the standard suite only after every preceding target-runtime gate passes.
+1. Build and review a pinned replay-only child revision that observes the production v4 path without a post-setter overlay.
+2. Run and inspect the exact 2,416-apply production-core replay on L40S, including traces and video.
+3. Run fresh full-horizon official LAP-3B and reasoning-checkpoint canaries in parallel.
+4. Promote to the standard suite only after every preceding target-runtime gate passes.
