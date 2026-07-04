@@ -63,7 +63,7 @@ def _dynamic_report(plan):
             )
             position += velocity * 0.01
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": NATIVE_GRIPPER_DYNAMIC_PROFILE,
         "joint_names": list(EXPECTED_DROID_JOINT_NAMES),
         "joint_indices": list(range(13)),
@@ -72,6 +72,7 @@ def _dynamic_report(plan):
         "sample_count": len(actions) * 9,
         "max_abs_joint_velocity_rad_s": max_velocity.tolist(),
         "max_abs_joint_acceleration_rad_s2": [0.0] * 13,
+        "terminal_velocity_failure": None,
         "samples": samples,
     }
 

@@ -52,10 +52,10 @@ PI05_DROID_ISAACLAB_SOURCE_SHA256 = {
     "manager_based_rl_env.py": "8ec2759541c8320ed725411d49564f5617b3ab6b9d340c860bededee13d557d4",
 }
 PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256 = {
-    "droid_cfg.py": "19ceaceeb06c06e1f708af2380d47dded2a5f7030c436e266c4efca255509287",
+    "droid_cfg.py": "2947a19d75d75229462debd0b7faddd4cce75e73ea67e2dbf41eefb3ae90467f",
     "robot_cfg.py": "d514b32e07b54f98deb6d9dbc7a5201fff5337cdc4600d9351ee2a95e5c4c4c5",
     "native_gripper_runtime.py": (
-        "8b5cd2e7c0f912418a878544fce621c00a4126551a21ab72d486686b67d70ff1"
+        "4130fd5e3e0a929627d002a002b5915f08da776f26e21a7980627d28e78e03f2"
     ),
     "manager_based_rl_splat_environment.py": (
         "9381b2704e86aae6447eb2cc229471612104c5eec2acc9d913252a09159da426"

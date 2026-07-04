@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 from pathlib import Path
@@ -49,13 +50,27 @@ SOURCE_PATHS = (
     "src/polaris/native_all_six_smoke.py",
     "src/polaris/native_gripper_runtime.py",
     "src/polaris/pi05_droid_jointvelocity_contract.py",
+    "src/polaris/pi05_droid_native_lifecycle.py",
+    "src/polaris/policy/droid_jointvelocity_client.py",
 )
 UNCHANGED_MODEL_IO_PATHS = (
     "scripts/polaris/serve_pi05_droid_native_jointvelocity.py",
-    "src/polaris/policy/droid_jointvelocity_client.py",
-    "src/polaris/pi05_droid_native_eval_contract.py",
     "scripts/polaris/pi05_droid_native_gcs_manifest.tsv",
 )
+POLICY_SEMANTIC_PATH = "src/polaris/policy/droid_jointvelocity_client.py"
+POLICY_SEMANTIC_FUNCTIONS = {
+    "_image_contract",
+    "process_native_jointvelocity_action",
+}
+POLICY_SEMANTIC_METHODS = {
+    "_validate_args",
+    "_validate_client_runtime_origin",
+    "rerender",
+    "visualize",
+    "infer",
+    "_resize_images",
+    "_extract_observation",
+}
 
 
 def _require(condition: bool, message: str) -> None:
@@ -106,6 +121,28 @@ def _git(repository: Path, *arguments: str) -> bytes:
     ).stdout
 
 
+def _policy_semantic_symbols(source: bytes) -> dict[str, str]:
+    tree = ast.parse(source)
+    symbols = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in POLICY_SEMANTIC_FUNCTIONS:
+            symbols[node.name] = ast.dump(node, include_attributes=False)
+        if isinstance(node, ast.ClassDef) and node.name == "DroidJointVelocityClient":
+            for child in node.body:
+                if (
+                    isinstance(child, ast.FunctionDef)
+                    and child.name in POLICY_SEMANTIC_METHODS
+                ):
+                    symbols[f"{node.name}.{child.name}"] = ast.dump(
+                        child, include_attributes=False
+                    )
+    expected = POLICY_SEMANTIC_FUNCTIONS | {
+        f"DroidJointVelocityClient.{name}" for name in POLICY_SEMANTIC_METHODS
+    }
+    _require(set(symbols) == expected, "official policy semantic symbol set drift")
+    return symbols
+
+
 def _source_provenance(repository: Path, expected_commit: str) -> dict[str, Any]:
     repository = repository.resolve()
     git_dir = repository / ".git"
@@ -153,6 +190,16 @@ def _source_provenance(repository: Path, expected_commit: str) -> dict[str, Any]
             "sha256": hashlib.sha256(working).hexdigest(),
             "base_commit": BASE_COMMIT,
         }
+    current_policy_semantics = _policy_semantic_symbols(
+        _git(repository, "show", f"HEAD:{POLICY_SEMANTIC_PATH}")
+    )
+    base_policy_semantics = _policy_semantic_symbols(
+        _git(repository, "show", f"{BASE_COMMIT}:{POLICY_SEMANTIC_PATH}")
+    )
+    _require(
+        current_policy_semantics == base_policy_semantics,
+        "official policy input/output semantics changed from integrated base",
+    )
     openpi = repository / "third_party/openpi"
     _require((openpi / ".git").is_file(), "OpenPI submodule is not initialized")
     _require(

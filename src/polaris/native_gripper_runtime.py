@@ -33,6 +33,9 @@ NATIVE_GRIPPER_MIMIC_PROFILE = "robotiq_2f85_source_usd_physx_mimic_joint_v1"
 NATIVE_GRIPPER_DYNAMIC_PROFILE = (
     "native_jointvelocity_all13_apply_entry_plus_post_policy_step_v1"
 )
+NATIVE_ALL_JOINT_VELOCITY_FAILURE_PROFILE = (
+    "native_jointvelocity_all13_measured_velocity_limit_failure_v1"
+)
 
 EXPECTED_DROID_JOINT_NAMES = (
     *(f"panda_joint{index}" for index in range(1, 8)),
@@ -101,6 +104,26 @@ STATIC_STATE_ATTRIBUTE = "_polaris_native_gripper_all_six_reset_state"
 # remaining orders of magnitude below the observed uncapped 55.622322 rad/s.
 PHYSX_VELOCITY_LIMIT_ABSOLUTE_TOLERANCE_RAD_S = 5e-5
 PHYSICS_DT = 1.0 / 120.0
+
+
+class NativeAllJointVelocityLimitError(FloatingPointError):
+    """Typed terminal failure carrying a durably published 13-DOF incident."""
+
+    def __init__(
+        self,
+        evidence: dict[str, Any],
+        incident_artifact: dict[str, Any] | None,
+    ) -> None:
+        validated = validate_native_all_joint_velocity_failure(evidence)
+        violating = ",".join(validated["violating_joint_names"])
+        super().__init__(
+            "measured all-joint velocity exceeded the live physical limit: "
+            f"policy_step={validated['policy_step_index']} "
+            f"physics_substep={validated['physics_substep_index']} "
+            f"joints={violating}"
+        )
+        self.evidence = validated
+        self.incident_artifact = copy.deepcopy(incident_artifact)
 
 
 def _require(condition: bool, message: str) -> None:
@@ -510,6 +533,140 @@ def native_gripper_mimic_reference_contract() -> dict[str, Any]:
     }
 
 
+def _failure_vector(value: Any, *, field: str) -> np.ndarray:
+    _require(
+        isinstance(value, list)
+        and len(value) == 13
+        and all(
+            type(item) in (int, float)
+            and not isinstance(item, bool)
+            and math.isfinite(item)
+            for item in value
+        ),
+        f"{field} must contain 13 finite numbers",
+    )
+    return np.asarray(value, dtype=np.float64)
+
+
+def validate_native_all_joint_velocity_failure(value: Any) -> dict[str, Any]:
+    """Validate and independently recompute one terminal all-DOF incident."""
+
+    required = {
+        "schema_version",
+        "profile",
+        "reason",
+        "kind",
+        "joint_names",
+        "joint_indices",
+        "policy_step_index",
+        "physics_substep_index",
+        "failed_apply_call_index",
+        "completed_apply_calls",
+        "completed_policy_steps",
+        "joint_position",
+        "joint_velocity",
+        "joint_acceleration",
+        "joint_velocity_target",
+        "joint_position_target",
+        "absolute_joint_velocity",
+        "expected_joint_velocity_limit",
+        "live_joint_velocity_limit",
+        "absolute_tolerance_rad_s",
+        "effective_joint_velocity_threshold",
+        "excess_mask",
+        "excess_rad_s",
+        "violating_joint_indices",
+        "violating_joint_names",
+    }
+    _require(
+        isinstance(value, dict) and set(value) == required,
+        "all-joint velocity failure schema drift",
+    )
+    _require(
+        value["schema_version"] == 1
+        and value["profile"] == NATIVE_ALL_JOINT_VELOCITY_FAILURE_PROFILE
+        and value["reason"] == "measured_all_joint_velocity_limit_exceeded"
+        and value["kind"] == "apply_entry"
+        and value["joint_names"] == list(EXPECTED_DROID_JOINT_NAMES)
+        and value["joint_indices"] == list(range(13)),
+        "all-joint velocity failure identity drift",
+    )
+    indices = (
+        value["policy_step_index"],
+        value["physics_substep_index"],
+        value["failed_apply_call_index"],
+        value["completed_apply_calls"],
+        value["completed_policy_steps"],
+    )
+    _require(
+        all(type(item) is int and item >= 0 for item in indices),
+        "all-joint velocity failure index drift",
+    )
+    _require(
+        value["physics_substep_index"] in range(8)
+        and value["failed_apply_call_index"] == value["completed_apply_calls"]
+        and value["completed_apply_calls"] // 8 == value["completed_policy_steps"]
+        and value["completed_apply_calls"] % 8 == value["physics_substep_index"]
+        and value["policy_step_index"] == value["completed_policy_steps"],
+        "all-joint velocity failure cadence drift",
+    )
+    vectors = {
+        field: _failure_vector(value[field], field=field)
+        for field in (
+            "joint_position",
+            "joint_velocity",
+            "joint_acceleration",
+            "joint_velocity_target",
+            "joint_position_target",
+            "absolute_joint_velocity",
+            "expected_joint_velocity_limit",
+            "live_joint_velocity_limit",
+            "effective_joint_velocity_threshold",
+            "excess_rad_s",
+        )
+    }
+    expected_limits = np.asarray(EXPECTED_FULL_LIMITS_CAPPED, dtype=np.float32).astype(
+        np.float64
+    )
+    _require(
+        np.array_equal(vectors["expected_joint_velocity_limit"], expected_limits)
+        and np.array_equal(vectors["live_joint_velocity_limit"], expected_limits),
+        "all-joint velocity failure limit drift",
+    )
+    tolerance = value["absolute_tolerance_rad_s"]
+    _require(
+        type(tolerance) is float
+        and tolerance == PHYSX_VELOCITY_LIMIT_ABSOLUTE_TOLERANCE_RAD_S,
+        "all-joint velocity failure tolerance drift",
+    )
+    absolute_velocity = np.abs(vectors["joint_velocity"])
+    thresholds = expected_limits + tolerance
+    excess = np.maximum(absolute_velocity - thresholds, 0.0)
+    mask = absolute_velocity > thresholds
+    _require(
+        np.array_equal(vectors["absolute_joint_velocity"], absolute_velocity)
+        and np.array_equal(vectors["effective_joint_velocity_threshold"], thresholds)
+        and np.array_equal(vectors["excess_rad_s"], excess),
+        "all-joint velocity failure arithmetic drift",
+    )
+    _require(
+        isinstance(value["excess_mask"], list)
+        and len(value["excess_mask"]) == 13
+        and all(type(item) is bool for item in value["excess_mask"])
+        and value["excess_mask"] == mask.tolist()
+        and bool(mask.any()),
+        "all-joint velocity failure mask drift",
+    )
+    violating_indices = np.flatnonzero(mask).tolist()
+    violating_names = [EXPECTED_DROID_JOINT_NAMES[index] for index in violating_indices]
+    _require(
+        value["violating_joint_indices"] == violating_indices
+        and value["violating_joint_names"] == violating_names,
+        "all-joint velocity failure joint identity drift",
+    )
+    return copy.deepcopy(value)
+
+
 class NativeAllJointDynamicRecorder:
     """Record all 13 articulation DOFs at each apply entry and policy boundary."""
 
@@ -523,6 +680,25 @@ class NativeAllJointDynamicRecorder:
         self._previous_velocity: np.ndarray | None = None
         self.max_abs_velocity = np.zeros(13, dtype=np.float64)
         self.max_abs_acceleration = np.zeros(13, dtype=np.float64)
+        self.terminal_velocity_failure: dict[str, Any] | None = None
+        self._failure_path: Path | None = None
+
+    def bind_failure_path(self, path: Path) -> None:
+        """Bind the non-overwriting incident destination after rollout reset."""
+
+        _require(
+            not self.samples
+            and self.apply_calls == 0
+            and self.post_policy_step_samples == 0
+            and self.terminal_velocity_failure is None,
+            "native all-joint failure path must be bound before sampling",
+        )
+        path = Path(path)
+        _require(
+            not path.exists() and not path.is_symlink(),
+            "native all-joint failure path already exists",
+        )
+        self._failure_path = path
 
     def _sample(self, asset: Any, *, kind: str) -> dict[str, Any]:
         _joint_names(asset)
@@ -543,15 +719,16 @@ class NativeAllJointDynamicRecorder:
             _require(array.shape == (1, 13), f"all-joint {field} shape drift")
         current_velocity = velocity[0].astype(np.float64)
         limits = np.asarray(EXPECTED_FULL_LIMITS_CAPPED, dtype=np.float64)
-        _require(
-            np.all(
-                np.abs(current_velocity)
-                <= limits + PHYSX_VELOCITY_LIMIT_ABSOLUTE_TOLERANCE_RAD_S
-            ),
-            "measured all-joint velocity exceeded the live physical limit",
+        live_limits, _, _ = _tensor_numpy(
+            asset.data.joint_vel_limits, field="live all-joint velocity limit"
         )
-        self.max_abs_velocity = np.maximum(
-            self.max_abs_velocity, np.abs(current_velocity)
+        _require(
+            live_limits.shape == (1, 13)
+            and np.array_equal(
+                live_limits[0],
+                np.asarray(EXPECTED_FULL_LIMITS_CAPPED, dtype=np.float32),
+            ),
+            "live all-joint velocity limit drift",
         )
         acceleration = np.zeros(13, dtype=np.float64)
         if self._previous_velocity is not None:
@@ -559,6 +736,70 @@ class NativeAllJointDynamicRecorder:
             _require(
                 np.isfinite(acceleration).all(), "non-finite all-joint acceleration"
             )
+        absolute_velocity = np.abs(current_velocity)
+        thresholds = limits + PHYSX_VELOCITY_LIMIT_ABSOLUTE_TOLERANCE_RAD_S
+        excess_mask = absolute_velocity > thresholds
+        if bool(excess_mask.any()):
+            _require(
+                self.terminal_velocity_failure is None,
+                "multiple all-joint terminal velocity failures",
+            )
+            violating_indices = np.flatnonzero(excess_mask).tolist()
+            evidence = validate_native_all_joint_velocity_failure(
+                {
+                    "schema_version": 1,
+                    "profile": NATIVE_ALL_JOINT_VELOCITY_FAILURE_PROFILE,
+                    "reason": "measured_all_joint_velocity_limit_exceeded",
+                    "kind": kind,
+                    "joint_names": list(EXPECTED_DROID_JOINT_NAMES),
+                    "joint_indices": list(range(13)),
+                    "policy_step_index": self.post_policy_step_samples,
+                    "physics_substep_index": self.apply_calls % 8,
+                    "failed_apply_call_index": self.apply_calls,
+                    "completed_apply_calls": self.apply_calls,
+                    "completed_policy_steps": self.post_policy_step_samples,
+                    "joint_position": position[0].tolist(),
+                    "joint_velocity": velocity[0].tolist(),
+                    "joint_acceleration": acceleration.tolist(),
+                    "joint_velocity_target": velocity_target[0].tolist(),
+                    "joint_position_target": position_target[0].tolist(),
+                    "absolute_joint_velocity": absolute_velocity.tolist(),
+                    "expected_joint_velocity_limit": limits.tolist(),
+                    "live_joint_velocity_limit": live_limits[0]
+                    .astype(np.float64)
+                    .tolist(),
+                    "absolute_tolerance_rad_s": (
+                        PHYSX_VELOCITY_LIMIT_ABSOLUTE_TOLERANCE_RAD_S
+                    ),
+                    "effective_joint_velocity_threshold": thresholds.tolist(),
+                    "excess_mask": excess_mask.tolist(),
+                    "excess_rad_s": np.maximum(
+                        absolute_velocity - thresholds, 0.0
+                    ).tolist(),
+                    "violating_joint_indices": violating_indices,
+                    "violating_joint_names": [
+                        EXPECTED_DROID_JOINT_NAMES[index] for index in violating_indices
+                    ],
+                }
+            )
+            # Retain the closed object before any I/O or exception construction.
+            self.terminal_velocity_failure = evidence
+            incident_artifact = None
+            if self._failure_path is not None:
+                from polaris.pi05_droid_native_eval_contract import (  # noqa: PLC0415
+                    publish_immutable_json,
+                )
+
+                incident_artifact = publish_immutable_json(self._failure_path, evidence)
+                incident_artifact = {
+                    key: incident_artifact[key]
+                    for key in ("path", "size", "sha256", "mode", "nlink")
+                }
+            raise NativeAllJointVelocityLimitError(evidence, incident_artifact)
+        self.max_abs_velocity = np.maximum(
+            self.max_abs_velocity, np.abs(current_velocity)
+        )
+        if self._previous_velocity is not None:
             self.max_abs_acceleration = np.maximum(
                 self.max_abs_acceleration, np.abs(acceleration)
             )
@@ -596,7 +837,7 @@ class NativeAllJointDynamicRecorder:
         expected_samples = self.apply_calls + self.post_policy_step_samples
         _require(len(self.samples) == expected_samples, "dynamic sample count drift")
         value = {
-            "schema_version": 1,
+            "schema_version": 2,
             "profile": NATIVE_GRIPPER_DYNAMIC_PROFILE,
             "joint_names": list(EXPECTED_DROID_JOINT_NAMES),
             "joint_indices": list(range(13)),
@@ -605,6 +846,7 @@ class NativeAllJointDynamicRecorder:
             "sample_count": len(self.samples),
             "max_abs_joint_velocity_rad_s": self.max_abs_velocity.tolist(),
             "max_abs_joint_acceleration_rad_s2": self.max_abs_acceleration.tolist(),
+            "terminal_velocity_failure": copy.deepcopy(self.terminal_velocity_failure),
             "samples": copy.deepcopy(self.samples) if include_samples else None,
         }
         return validate_native_all_joint_dynamic_report(
@@ -625,6 +867,7 @@ def validate_native_all_joint_dynamic_report(
         "sample_count",
         "max_abs_joint_velocity_rad_s",
         "max_abs_joint_acceleration_rad_s2",
+        "terminal_velocity_failure",
         "samples",
     }
     _require(
@@ -632,7 +875,7 @@ def validate_native_all_joint_dynamic_report(
         "dynamic report schema drift",
     )
     _require(
-        value["schema_version"] == 1
+        value["schema_version"] == 2
         and value["profile"] == NATIVE_GRIPPER_DYNAMIC_PROFILE
         and value["joint_names"] == list(EXPECTED_DROID_JOINT_NAMES)
         and value["joint_indices"] == list(range(13)),
@@ -646,10 +889,23 @@ def validate_native_all_joint_dynamic_report(
             type(item) is int and item >= 0
             for item in (apply_calls, policy_samples, sample_count)
         )
-        and apply_calls == policy_samples * 8
         and sample_count == apply_calls + policy_samples,
         "dynamic report cadence drift",
     )
+    terminal_failure = value["terminal_velocity_failure"]
+    if terminal_failure is None:
+        _require(
+            apply_calls == policy_samples * 8,
+            "healthy dynamic report cadence drift",
+        )
+    else:
+        failure = validate_native_all_joint_velocity_failure(terminal_failure)
+        _require(
+            apply_calls // 8 == policy_samples
+            and failure["completed_apply_calls"] == apply_calls
+            and failure["completed_policy_steps"] == policy_samples,
+            "failed dynamic report cadence drift",
+        )
     for field in (
         "max_abs_joint_velocity_rad_s",
         "max_abs_joint_acceleration_rad_s2",
@@ -687,8 +943,28 @@ def validate_native_all_joint_dynamic_report(
         isinstance(samples, list) and len(samples) == sample_count,
         "dynamic sample set drift",
     )
+    expected_cadence = []
+    for policy_step_index in range(policy_samples):
+        expected_cadence.extend(
+            ("apply_entry", policy_step_index, physics_substep_index)
+            for physics_substep_index in range(8)
+        )
+        expected_cadence.append(("post_policy_step", policy_step_index, 8))
+    if terminal_failure is not None:
+        expected_cadence.extend(
+            ("apply_entry", policy_samples, physics_substep_index)
+            for physics_substep_index in range(
+                terminal_failure["physics_substep_index"]
+            )
+        )
+    _require(
+        len(expected_cadence) == sample_count,
+        "dynamic exact sample cadence length drift",
+    )
     previous_policy = 0
-    for index, sample in enumerate(samples):
+    for index, (sample, expected_sample_cadence) in enumerate(
+        zip(samples, expected_cadence, strict=True)
+    ):
         _require(
             isinstance(sample, dict)
             and set(sample)
@@ -709,6 +985,15 @@ def validate_native_all_joint_dynamic_report(
         kind = sample["kind"]
         _require(
             kind in {"apply_entry", "post_policy_step"}, "dynamic sample kind drift"
+        )
+        _require(
+            (
+                kind,
+                sample["policy_step_index"],
+                sample["physics_substep_index"],
+            )
+            == expected_sample_cadence,
+            "dynamic exact sample cadence drift",
         )
         if kind == "apply_entry":
             _require(

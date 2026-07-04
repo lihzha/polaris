@@ -15,14 +15,20 @@ from polaris.pi05_droid_native_eval_contract import (
     PI05_DROID_NATIVE_MODEL_EVAL_CONTRACT,
     configure_native_environment_timeout,
     make_close_ready_artifact,
+    make_episode_sidecar,
     make_environment_runtime_contract,
     make_runtime_artifact,
+    publish_immutable_file_from_temporary,
     publish_immutable_json,
     should_render_expensive,
     validate_immutable_json,
     validate_native_model_eval_contract,
     validate_outer_step_flags,
     validate_terminal_rollout_evidence,
+)
+from polaris.native_gripper_runtime import (
+    EXPECTED_DROID_JOINT_NAMES,
+    NATIVE_GRIPPER_DYNAMIC_PROFILE,
 )
 
 
@@ -171,6 +177,50 @@ def test_runtime_and_close_artifacts_bind_internal_timeout_and_terminal_state(tm
         "nlink": 1,
     }
     terminal = _terminal_rollout(runtime)
+    result = {
+        "episode": 0,
+        "episode_length": 450,
+        "success": False,
+        "progress": 0.25,
+        "numerical_failure": False,
+        "numerical_failure_reason": "",
+    }
+    artifacts = {}
+    for label in ("trace", "video"):
+        temporary = tmp_path / f".{label}.partial"
+        temporary.write_bytes(label.encode("ascii"))
+        artifacts[label] = publish_immutable_file_from_temporary(
+            temporary, tmp_path / f"{label}.bin"
+        )
+    dynamic = {
+        "schema_version": 2,
+        "profile": NATIVE_GRIPPER_DYNAMIC_PROFILE,
+        "joint_names": list(EXPECTED_DROID_JOINT_NAMES),
+        "joint_indices": list(range(13)),
+        "apply_calls": 3600,
+        "post_policy_step_samples": 450,
+        "sample_count": 4050,
+        "max_abs_joint_velocity_rad_s": [0.0] * 13,
+        "max_abs_joint_acceleration_rad_s2": [0.0] * 13,
+        "terminal_velocity_failure": None,
+        "samples": None,
+    }
+    sidecar_path = tmp_path / "sidecar.json"
+    sidecar = publish_immutable_json(
+        sidecar_path,
+        make_episode_sidecar(
+            episode_result=result,
+            terminal_outcome=terminal,
+            environment_runtime_contract=runtime,
+            dynamic_report=dynamic,
+            trace_artifact=artifacts["trace"],
+            video_artifact=artifacts["video"],
+            incident_artifact=None,
+        ),
+    )
+    sidecar_identity = {
+        key: sidecar[key] for key in ("path", "size", "sha256", "mode", "nlink")
+    }
     close = make_close_ready_artifact(
         runtime_artifact=identity,
         runtime_path=runtime_path,
@@ -178,10 +228,12 @@ def test_runtime_and_close_artifacts_bind_internal_timeout_and_terminal_state(tm
         trace_path=Path(tmp_path / "trace.jsonl"),
         video_path=Path(tmp_path / "video.mp4"),
         environment_runtime_contract=runtime,
-        terminal_rollout=terminal,
+        terminal_outcome=terminal,
+        episode_sidecar=sidecar_identity,
     )
     assert close["environment_runtime_contract_sha256"] == runtime["sha256"]
-    assert close["terminal_rollout"] == terminal
+    assert close["terminal_outcome"] == terminal
+    assert close["episode_sidecar"] == sidecar_identity
 
 
 def test_immutable_json_is_canonical_single_link_mode_0444(tmp_path):

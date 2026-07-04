@@ -20,6 +20,15 @@ from polaris.pi05_droid_native_eval_contract import (
     PI05_DROID_NATIVE_CONFIGURED_EPISODE_LENGTH_SECONDS,
     PI05_DROID_NATIVE_INTERNAL_MAX_EPISODE_STEPS,
     make_environment_runtime_contract,
+    publish_immutable_json,
+)
+from polaris.native_gripper_runtime import (
+    EXPECTED_DROID_JOINT_NAMES,
+    EXPECTED_FULL_LIMITS_CAPPED,
+    NATIVE_ALL_JOINT_VELOCITY_FAILURE_PROFILE,
+    NATIVE_GRIPPER_DYNAMIC_PROFILE,
+    NativeAllJointVelocityLimitError,
+    PHYSX_VELOCITY_LIMIT_ABSOLUTE_TOLERANCE_RAD_S,
 )
 from polaris.policy.droid_jointvelocity_client import (
     DroidJointVelocityClient,
@@ -425,3 +434,89 @@ def test_sensor_frame_counter_not_image_hash_variation_is_liveness_gate(tmp_path
         client.record_execution(
             _observation(), env, terminated=[False], truncated=[False]
         )
+
+
+def test_typed_velocity_failure_finalizes_terminal_trace_and_plain_errors_do_not(
+    tmp_path,
+):
+    actions = np.zeros((15, 8), dtype=np.float64)
+    trace_path = tmp_path / "failure-trace.jsonl"
+    with mock.patch(
+        "polaris.policy.droid_jointvelocity_client.websocket_client_policy.WebsocketClientPolicy",
+        return_value=_FakePolicyServer(actions),
+    ):
+        client = DroidJointVelocityClient(_args(tmp_path, str(trace_path)))
+    env = _FakeEnv()
+    _bind_and_begin(client, env)
+    client.infer(_observation(), "typed failure")
+
+    limits = [float(value) for value in EXPECTED_FULL_LIMITS_CAPPED]
+    thresholds = [
+        value + PHYSX_VELOCITY_LIMIT_ABSOLUTE_TOLERANCE_RAD_S for value in limits
+    ]
+    velocity = [0.0] * 13
+    velocity[12] = 5.25
+    evidence = {
+        "schema_version": 1,
+        "profile": NATIVE_ALL_JOINT_VELOCITY_FAILURE_PROFILE,
+        "reason": "measured_all_joint_velocity_limit_exceeded",
+        "kind": "apply_entry",
+        "joint_names": list(EXPECTED_DROID_JOINT_NAMES),
+        "joint_indices": list(range(13)),
+        "policy_step_index": 0,
+        "physics_substep_index": 3,
+        "failed_apply_call_index": 3,
+        "completed_apply_calls": 3,
+        "completed_policy_steps": 0,
+        "joint_position": [0.0] * 13,
+        "joint_velocity": velocity,
+        "joint_acceleration": [0.0] * 13,
+        "joint_velocity_target": [0.0] * 13,
+        "joint_position_target": [0.0] * 13,
+        "absolute_joint_velocity": [abs(value) for value in velocity],
+        "expected_joint_velocity_limit": limits,
+        "live_joint_velocity_limit": limits,
+        "absolute_tolerance_rad_s": PHYSX_VELOCITY_LIMIT_ABSOLUTE_TOLERANCE_RAD_S,
+        "effective_joint_velocity_threshold": thresholds,
+        "excess_mask": [False] * 12 + [True],
+        "excess_rad_s": [
+            max(abs(value) - threshold, 0.0)
+            for value, threshold in zip(velocity, thresholds, strict=True)
+        ],
+        "violating_joint_indices": [12],
+        "violating_joint_names": [EXPECTED_DROID_JOINT_NAMES[12]],
+    }
+    incident = publish_immutable_json(tmp_path / "incident.json", evidence)
+    incident_identity = {
+        key: incident[key] for key in ("path", "size", "sha256", "mode", "nlink")
+    }
+    error = NativeAllJointVelocityLimitError(evidence, incident_identity)
+    dynamic = {
+        "schema_version": 2,
+        "profile": NATIVE_GRIPPER_DYNAMIC_PROFILE,
+        "joint_names": list(EXPECTED_DROID_JOINT_NAMES),
+        "joint_indices": list(range(13)),
+        "apply_calls": 3,
+        "post_policy_step_samples": 0,
+        "sample_count": 3,
+        "max_abs_joint_velocity_rad_s": [0.0] * 13,
+        "max_abs_joint_acceleration_rad_s2": [0.0] * 13,
+        "terminal_velocity_failure": evidence,
+        "samples": None,
+    }
+    env._sim_step_counter = 4  # noqa: SLF001
+    terminal = client.record_execution_failure(error, env, dynamic)
+    assert terminal["episode_result"]["episode_length"] == 1
+    assert terminal["environment_after_failure"]["sim_step_counter"] == 4
+    assert client.finalized_trace_artifact["path"] == str(trace_path.resolve())
+    assert trace_path.stat().st_mode & 0o777 == 0o444
+    records = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert [record["record_type"] for record in records] == [
+        "openpi_joint_velocity_rollout_start",
+        "openpi_joint_velocity_query",
+        "openpi_joint_velocity_action",
+        "openpi_joint_velocity_rollout_failure",
+    ]
+
+    with pytest.raises(TypeError, match="exact typed error"):
+        client.record_execution_failure(ValueError("not numerical"), env, dynamic)

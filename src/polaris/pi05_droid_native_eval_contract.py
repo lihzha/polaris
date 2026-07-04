@@ -35,7 +35,14 @@ PI05_DROID_NATIVE_DECIMATION = 8
 PI05_DROID_NATIVE_RESPONSE_HORIZON = 15
 PI05_DROID_NATIVE_EXECUTION_HORIZON = 8
 PI05_DROID_NATIVE_ACTION_WIDTH = 8
-PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION = 2
+PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION = 3
+PI05_DROID_NATIVE_EPISODE_SIDECAR_SCHEMA_VERSION = 1
+PI05_DROID_NATIVE_EPISODE_SIDECAR_PROFILE = (
+    "openpi_pi05_droid_native_jointvelocity_episode_transaction_v1"
+)
+PI05_DROID_NATIVE_TERMINAL_FAILURE_PROFILE = (
+    "openpi_pi05_droid_native_jointvelocity_numerical_failure_v1"
+)
 PI05_DROID_NATIVE_VIDEO_WIDTH = 448
 PI05_DROID_NATIVE_VIDEO_HEIGHT = 224
 PI05_DROID_NATIVE_CONFIGURED_EPISODE_LENGTH_SECONDS = (
@@ -258,10 +265,9 @@ PI05_DROID_CONTROLLER_CRITICAL_PATHS = (
     "src/polaris/pi05_droid_jointvelocity_contract.py",
 )
 
-# These are the exact controller/runtime sources independently exercised by
-# accepted all-six job 1098349.  A model-evaluation descendant may change its
-# evaluation-only contract/launcher, but every path below must remain byte
-# identical to this gate.
+# These are the exact controller/runtime and evaluator-lifecycle sources that
+# an accepted all-six smoke must bind.  Any repaired commit needs its own
+# completion before a model canary can pass the preflight gate.
 PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS = (
     "scripts/eval.py",
     "scripts/smoke_pi05_native_all_six_controller.py",
@@ -275,15 +281,16 @@ PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS = (
     "src/polaris/native_all_six_smoke.py",
     "src/polaris/native_gripper_runtime.py",
     "src/polaris/pi05_droid_jointvelocity_contract.py",
+    "src/polaris/pi05_droid_native_lifecycle.py",
+    "src/polaris/policy/droid_jointvelocity_client.py",
 )
 
-# The accepted smoke proved these policy-facing paths were still identical to
-# the integrated official-model base.  The evaluation contract itself is
-# intentionally excluded because this descendant changes only its pinned gate.
+# These checkpoint/server inputs remain byte-identical to the integrated
+# official-model base.  Repaired evaluator and client files are instead bound
+# in the exact source manifest above.
 PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS = (
     "scripts/polaris/pi05_droid_native_gcs_manifest.tsv",
     "scripts/polaris/serve_pi05_droid_native_jointvelocity.py",
-    "src/polaris/policy/droid_jointvelocity_client.py",
 )
 
 
@@ -400,6 +407,101 @@ def validate_immutable_json(path: Path) -> dict[str, Any]:
         "nlink": 1,
         "value": value,
     }
+
+
+def validate_immutable_file(path: Path) -> dict[str, Any]:
+    """Bind one nonempty mode-0444 regular file without following symlinks."""
+
+    path = Path(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(f"Immutable file is not readable: {path}") from error
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o444
+        ):
+            raise ValueError(f"Immutable file identity mismatch: {path}")
+        while block := os.read(descriptor, 16 * 1024 * 1024):
+            digest.update(block)
+            size += len(block)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    current = os.stat(path, follow_symlinks=False)
+    identity_fields = (
+        "st_dev",
+        "st_ino",
+        "st_size",
+        "st_mode",
+        "st_nlink",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if any(
+        getattr(before, field) != getattr(after, field)
+        or getattr(before, field) != getattr(current, field)
+        for field in identity_fields
+    ):
+        raise ValueError(f"Immutable file changed while being read: {path}")
+    if size <= 0 or size != before.st_size:
+        raise ValueError(f"Immutable file is empty or truncated: {path}")
+    return {
+        "path": str(path.resolve()),
+        "size": size,
+        "sha256": digest.hexdigest(),
+        "mode": "0444",
+        "nlink": 1,
+    }
+
+
+def publish_immutable_file_from_temporary(
+    temporary: Path, path: Path
+) -> dict[str, Any]:
+    """Fsync and non-overwriting publish one completed temporary file."""
+
+    temporary = Path(temporary)
+    path = Path(path)
+    if temporary.is_symlink() or not temporary.is_file():
+        raise ValueError("Episode temporary output must be one regular file")
+    if path.exists() or path.is_symlink():
+        raise FileExistsError(f"Refusing existing immutable output: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary.chmod(0o444)
+    with temporary.open("rb") as source:
+        os.fsync(source.fileno())
+    os.link(temporary, path)
+    temporary.unlink()
+    fsync_directory(path.parent)
+    return validate_immutable_file(path)
+
+
+def validate_bound_artifact(
+    value: Any, *, expected_path: Path | None, field: str, json_artifact: bool = False
+) -> dict[str, Any]:
+    """Reopen an artifact identity recorded inside another contract."""
+
+    required = {"path", "size", "sha256", "mode", "nlink"}
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError(f"{field} artifact schema drift")
+    path = Path(value["path"])
+    if expected_path is not None and path.resolve() != Path(expected_path).resolve():
+        raise ValueError(f"{field} artifact path drift")
+    artifact = (
+        validate_immutable_json(path)
+        if json_artifact
+        else validate_immutable_file(path)
+    )
+    identity = {key: artifact[key] for key in required}
+    if identity != value:
+        raise ValueError(f"{field} artifact identity drift")
+    return identity
 
 
 def should_render_expensive(
@@ -636,6 +738,203 @@ def validate_terminal_rollout_evidence(
     return json.loads(canonical_json_bytes(value))
 
 
+def validate_native_episode_result(value: Any) -> dict[str, Any]:
+    """Validate the single canary row shared by trace, sidecar, and CSV."""
+
+    required = {
+        "episode",
+        "episode_length",
+        "success",
+        "progress",
+        "numerical_failure",
+        "numerical_failure_reason",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("Native episode result schema mismatch")
+    if (
+        value["episode"] != 0
+        or type(value["episode_length"]) is not int
+        or not 1 <= value["episode_length"] <= PI05_DROID_NATIVE_EPISODE_STEPS
+        or type(value["success"]) is not bool
+        or type(value["progress"]) not in (int, float)
+        or isinstance(value["progress"], bool)
+        or not math.isfinite(value["progress"])
+        or not 0.0 <= value["progress"] <= 1.0
+        or type(value["numerical_failure"]) is not bool
+        or not isinstance(value["numerical_failure_reason"], str)
+    ):
+        raise ValueError("Native episode result value mismatch")
+    if value["numerical_failure"]:
+        if (
+            value["success"] is not False
+            or float(value["progress"]) != 0.0
+            or not value["numerical_failure_reason"].startswith(
+                "NativeAllJointVelocityLimitError: "
+            )
+        ):
+            raise ValueError("Native numerical-failure result mismatch")
+    elif (
+        value["episode_length"] != PI05_DROID_NATIVE_EPISODE_STEPS
+        or value["numerical_failure_reason"]
+    ):
+        raise ValueError("Native completed result mismatch")
+    return json.loads(canonical_json_bytes(value))
+
+
+def validate_terminal_numerical_failure_evidence(
+    value: Any, environment_runtime_contract: Any
+) -> dict[str, Any]:
+    """Validate the only allowed partial terminal form for native pi0.5."""
+
+    from polaris.native_gripper_runtime import (  # noqa: PLC0415
+        NativeAllJointVelocityLimitError,
+        validate_native_all_joint_dynamic_report,
+        validate_native_all_joint_velocity_failure,
+    )
+
+    runtime = validate_environment_runtime_contract(environment_runtime_contract)
+    required = {
+        "schema_version",
+        "profile",
+        "terminal_form",
+        "environment_runtime_sha256",
+        "failure_type",
+        "episode_result",
+        "actions_attempted",
+        "outer_steps_completed",
+        "failed_outer_step_index",
+        "terminated_false_count",
+        "truncated_false_count",
+        "environment_before",
+        "last_completed_environment",
+        "environment_after_failure",
+        "incident_artifact",
+        "dynamic_report",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("Native terminal numerical-failure schema mismatch")
+    result = validate_native_episode_result(value["episode_result"])
+    if (
+        value["schema_version"] != 1
+        or value["profile"] != PI05_DROID_NATIVE_TERMINAL_FAILURE_PROFILE
+        or value["terminal_form"] != "native_all_joint_velocity_limit_failure"
+        or value["environment_runtime_sha256"] != runtime["sha256"]
+        or value["failure_type"] != "NativeAllJointVelocityLimitError"
+        or result["numerical_failure"] is not True
+    ):
+        raise ValueError("Native terminal numerical-failure identity mismatch")
+    attempts = result["episode_length"]
+    completed = attempts - 1
+    if (
+        value["actions_attempted"] != attempts
+        or value["outer_steps_completed"] != completed
+        or value["failed_outer_step_index"] != completed
+        or value["terminated_false_count"] != completed
+        or value["truncated_false_count"] != completed
+    ):
+        raise ValueError("Native terminal numerical-failure count mismatch")
+
+    incident = validate_bound_artifact(
+        value["incident_artifact"],
+        expected_path=None,
+        field="native velocity incident",
+        json_artifact=True,
+    )
+    incident_value = validate_immutable_json(Path(incident["path"]))["value"]
+    failure = validate_native_all_joint_velocity_failure(incident_value)
+    dynamic = validate_native_all_joint_dynamic_report(
+        value["dynamic_report"], require_samples=False
+    )
+    if dynamic["terminal_velocity_failure"] != failure:
+        raise ValueError("Native dynamic report incident drift")
+    if (
+        failure["policy_step_index"] != completed
+        or failure["completed_policy_steps"] != completed
+        or failure["completed_apply_calls"]
+        != completed * PI05_DROID_NATIVE_DECIMATION + failure["physics_substep_index"]
+        or dynamic["apply_calls"] != failure["completed_apply_calls"]
+        or dynamic["post_policy_step_samples"] != completed
+    ):
+        raise ValueError("Native terminal numerical-failure cadence mismatch")
+    expected_reason = "NativeAllJointVelocityLimitError: " + str(
+        NativeAllJointVelocityLimitError(failure, incident)
+    )
+    if result["numerical_failure_reason"] != expected_reason:
+        raise ValueError("Native terminal numerical-failure reason mismatch")
+
+    environments = (
+        value["environment_before"],
+        value["last_completed_environment"],
+        value["environment_after_failure"],
+    )
+    environment_fields = {
+        "live_max_episode_length",
+        "episode_length",
+        "sim_step_counter",
+        "common_step_counter",
+        "sensor_frame_counters",
+    }
+    for environment in environments:
+        if (
+            not isinstance(environment, dict)
+            or set(environment) != environment_fields
+            or environment["live_max_episode_length"]
+            != PI05_DROID_NATIVE_INTERNAL_MAX_EPISODE_STEPS
+            or any(
+                type(environment[field]) is not int or environment[field] < 0
+                for field in (
+                    "episode_length",
+                    "sim_step_counter",
+                    "common_step_counter",
+                )
+            )
+            or not isinstance(environment["sensor_frame_counters"], dict)
+            or set(environment["sensor_frame_counters"])
+            != set(PI05_DROID_NATIVE_SENSOR_NAMES)
+            or any(
+                type(counter) is not int or counter < 0
+                for counter in environment["sensor_frame_counters"].values()
+            )
+        ):
+            raise ValueError("Native terminal numerical-failure environment drift")
+    before, last_completed, after_failure = environments
+    expected_last_sim = before["sim_step_counter"] + completed * 8
+    expected_failure_sim = expected_last_sim + failure["physics_substep_index"] + 1
+    if (
+        before["episode_length"] != 0
+        or last_completed["episode_length"] != completed
+        or after_failure["episode_length"] != completed
+        or last_completed["sim_step_counter"] != expected_last_sim
+        or after_failure["sim_step_counter"] != expected_failure_sim
+        or last_completed["common_step_counter"]
+        != before["common_step_counter"] + completed
+        or after_failure["common_step_counter"] != last_completed["common_step_counter"]
+    ):
+        raise ValueError("Native terminal numerical-failure simulator tail drift")
+    for sensor_name in PI05_DROID_NATIVE_SENSOR_NAMES:
+        expected_counter = before["sensor_frame_counters"][sensor_name] + completed
+        if (
+            last_completed["sensor_frame_counters"][sensor_name] != expected_counter
+            or after_failure["sensor_frame_counters"][sensor_name] != expected_counter
+        ):
+            raise ValueError("Native terminal numerical-failure camera tail drift")
+    return json.loads(canonical_json_bytes(value))
+
+
+def validate_native_terminal_outcome(
+    value: Any, environment_runtime_contract: Any
+) -> dict[str, Any]:
+    """Accept exactly the complete or typed numerical-failure terminal form."""
+
+    if isinstance(value, dict) and value.get("terminal_form") == (
+        "native_all_joint_velocity_limit_failure"
+    ):
+        return validate_terminal_numerical_failure_evidence(
+            value, environment_runtime_contract
+        )
+    return validate_terminal_rollout_evidence(value, environment_runtime_contract)
+
+
 def validate_native_model_eval_contract(value: Any) -> dict[str, Any]:
     """Reject any normalization, image, state, or action-contract substitution."""
 
@@ -716,6 +1015,119 @@ def make_runtime_artifact(
     }
 
 
+def make_episode_sidecar(
+    *,
+    episode_result: dict[str, Any],
+    terminal_outcome: dict[str, Any],
+    environment_runtime_contract: dict[str, Any],
+    dynamic_report: dict[str, Any],
+    trace_artifact: dict[str, Any],
+    video_artifact: dict[str, Any],
+    incident_artifact: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build one immutable transaction after trace/video and before CSV."""
+
+    from polaris.native_gripper_runtime import (  # noqa: PLC0415
+        validate_native_all_joint_dynamic_report,
+    )
+
+    runtime = validate_environment_runtime_contract(environment_runtime_contract)
+    result = validate_native_episode_result(episode_result)
+    terminal = validate_native_terminal_outcome(terminal_outcome, runtime)
+    dynamic = validate_native_all_joint_dynamic_report(
+        dynamic_report, require_samples=False
+    )
+    trace = validate_bound_artifact(
+        trace_artifact, expected_path=None, field="episode trace"
+    )
+    video = validate_bound_artifact(
+        video_artifact, expected_path=None, field="episode video"
+    )
+    is_failure = result["numerical_failure"]
+    if is_failure:
+        if terminal.get("episode_result") != result:
+            raise ValueError("Failure sidecar result/terminal drift")
+        incident = validate_bound_artifact(
+            incident_artifact,
+            expected_path=Path(terminal["incident_artifact"]["path"]),
+            field="episode incident",
+            json_artifact=True,
+        )
+        if incident != terminal["incident_artifact"]:
+            raise ValueError("Failure sidecar incident/terminal drift")
+        if dynamic["terminal_velocity_failure"] is None:
+            raise ValueError("Failure sidecar lacks terminal dynamic evidence")
+    else:
+        if (
+            incident_artifact is not None
+            or dynamic["terminal_velocity_failure"] is not None
+        ):
+            raise ValueError("Completed sidecar contains failure evidence")
+        if (
+            terminal["rubric"]["success"] != result["success"]
+            or terminal["rubric"]["progress"] != result["progress"]
+        ):
+            raise ValueError("Completed sidecar result/terminal drift")
+        incident = None
+    return {
+        "schema_version": PI05_DROID_NATIVE_EPISODE_SIDECAR_SCHEMA_VERSION,
+        "profile": PI05_DROID_NATIVE_EPISODE_SIDECAR_PROFILE,
+        "transaction_state": "prepared",
+        "episode_index": 0,
+        "episode_result": result,
+        "terminal_outcome": terminal,
+        "environment_runtime_sha256": runtime["sha256"],
+        "dynamic_report": dynamic,
+        "artifacts": {
+            "trace": trace,
+            "video": video,
+            "incident": incident,
+        },
+    }
+
+
+def validate_episode_sidecar(
+    path: Path, environment_runtime_contract: dict[str, Any]
+) -> dict[str, Any]:
+    artifact = validate_immutable_json(path)
+    value = artifact["value"]
+    required = {
+        "schema_version",
+        "profile",
+        "transaction_state",
+        "episode_index",
+        "episode_result",
+        "terminal_outcome",
+        "environment_runtime_sha256",
+        "dynamic_report",
+        "artifacts",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("Native episode sidecar schema mismatch")
+    artifacts = value["artifacts"]
+    if not isinstance(artifacts, dict) or set(artifacts) != {
+        "trace",
+        "video",
+        "incident",
+    }:
+        raise ValueError("Native episode sidecar artifact schema mismatch")
+    rebuilt = make_episode_sidecar(
+        episode_result=value["episode_result"],
+        terminal_outcome=value["terminal_outcome"],
+        environment_runtime_contract=environment_runtime_contract,
+        dynamic_report=value["dynamic_report"],
+        trace_artifact=artifacts["trace"],
+        video_artifact=artifacts["video"],
+        incident_artifact=artifacts["incident"],
+    )
+    if value != rebuilt:
+        raise ValueError("Native episode sidecar identity mismatch")
+    return {
+        **{key: artifact[key] for key in ("path", "size", "sha256", "mode", "nlink")},
+        "value": value,
+    }
+
+
 def make_close_ready_artifact(
     *,
     runtime_artifact: dict[str, Any],
@@ -724,18 +1136,30 @@ def make_close_ready_artifact(
     trace_path: Path,
     video_path: Path,
     environment_runtime_contract: dict[str, Any],
-    terminal_rollout: dict[str, Any],
+    terminal_outcome: dict[str, Any],
+    episode_sidecar: dict[str, Any],
 ) -> dict[str, Any]:
-    """Describe the successful child state immediately before Kit shutdown."""
+    """Describe either artifact-complete terminal form before Kit shutdown."""
 
     if runtime_artifact.get("path") != str(Path(runtime_path).resolve()):
         raise ValueError("Runtime artifact path binding mismatch")
     environment_runtime = validate_environment_runtime_contract(
         environment_runtime_contract
     )
-    terminal = validate_terminal_rollout_evidence(terminal_rollout, environment_runtime)
+    terminal = validate_native_terminal_outcome(terminal_outcome, environment_runtime)
+    sidecar = validate_bound_artifact(
+        episode_sidecar,
+        expected_path=None,
+        field="episode sidecar",
+        json_artifact=True,
+    )
+    sidecar_value = validate_episode_sidecar(
+        Path(sidecar["path"]), environment_runtime
+    )["value"]
+    if sidecar_value["terminal_outcome"] != terminal:
+        raise ValueError("Close-ready terminal/sidecar drift")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": PI05_DROID_NATIVE_CANARY_PROFILE,
         "status": "simulation_app_close_pending",
         "environment": PI05_DROID_NATIVE_TASK,
@@ -743,7 +1167,8 @@ def make_close_ready_artifact(
         "episode_steps": PI05_DROID_NATIVE_EPISODE_STEPS,
         "env_close": "complete",
         "environment_runtime_contract_sha256": environment_runtime["sha256"],
-        "terminal_rollout": terminal,
+        "terminal_outcome": terminal,
+        "episode_sidecar": sidecar,
         "runtime_artifact": {
             key: runtime_artifact[key]
             for key in ("path", "size", "sha256", "mode", "nlink")

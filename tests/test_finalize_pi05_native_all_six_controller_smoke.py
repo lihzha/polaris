@@ -28,10 +28,7 @@ def test_official_model_io_image_norm_and_manifest_paths_are_byte_unchanged():
         base = _git_show(finalizer.BASE_COMMIT, relative)
         assert accepted == base
         assert hashlib.sha256(accepted).hexdigest() == hashlib.sha256(base).hexdigest()
-        if relative == "src/polaris/pi05_droid_native_eval_contract.py":
-            assert current != accepted
-        else:
-            assert current == accepted
+        assert current == accepted
     assert (
         subprocess.run(
             ["git", "-C", ROOT, "ls-tree", "HEAD", "third_party/openpi"],
@@ -41,6 +38,15 @@ def test_official_model_io_image_norm_and_manifest_paths_are_byte_unchanged():
         ).stdout.split()[2]
         == finalizer.OPENPI_COMMIT
     )
+
+
+def test_recovery_keeps_policy_input_output_semantic_symbols_identical_to_base():
+    relative = "src/polaris/policy/droid_jointvelocity_client.py"
+    current = (ROOT / relative).read_bytes()
+    base = _git_show(finalizer.BASE_COMMIT, relative)
+    assert finalizer._policy_semantic_symbols(
+        current
+    ) == finalizer._policy_semantic_symbols(base)
 
 
 def test_controller_smoke_surface_has_no_model_checkpoint_or_network_path():
@@ -79,6 +85,8 @@ def test_finalizer_source_allowlist_binds_every_new_runtime_file():
         "src/polaris/native_all_six_smoke.py",
         "src/polaris/native_gripper_runtime.py",
         "src/polaris/pi05_droid_jointvelocity_contract.py",
+        "src/polaris/pi05_droid_native_lifecycle.py",
+        "src/polaris/policy/droid_jointvelocity_client.py",
     }
     assert required <= set(finalizer.SOURCE_PATHS)
 

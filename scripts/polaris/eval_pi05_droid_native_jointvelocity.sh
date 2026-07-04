@@ -98,6 +98,8 @@ EVAL_LOG="${TASK_DIR}/eval.log"
 TRACE_PATH="${TASK_DIR}/policy_traces.jsonl"
 RUNTIME_PATH="${TASK_DIR}/joint_velocity_runtime.json"
 LIFECYCLE_PATH="${TASK_DIR}/evaluator_close_ready.json"
+INCIDENT_PATH="${TASK_DIR}/native_failures/episode_000000.json"
+SIDECAR_PATH="${TASK_DIR}/native_runtime/episode_000000.json"
 SERVING_CONTRACT_PATH="${RUN_DIR}/ego_lap_serving_contract.json"
 MODEL_RUNTIME_CONTRACT="${RUN_DIR}/pi05_droid_native_model_runtime.json"
 CHECKPOINT_VERIFICATION="${RUN_DIR}/checkpoint_verification.json"
@@ -110,6 +112,7 @@ mkdir -p "${TASK_DIR}" "${POLARIS_CACHE_DIR}/home"
 for output in "${SERVER_LOG}" "${EVAL_LOG}" "${TRACE_PATH}" "${RUNTIME_PATH}" \
   "${LIFECYCLE_PATH}" "${SERVING_CONTRACT_PATH}" "${CHECKPOINT_VERIFICATION}" \
   "${MODEL_RUNTIME_CONTRACT}" "${INFERENCE_ENVIRONMENT}" "${RUN_RECORD}" "${COMMANDS_FILE}" \
+  "${INCIDENT_PATH}" "${SIDECAR_PATH}" \
   "${TASK_DIR}/eval_results.csv" "${TASK_DIR}/episode_0.mp4" "${RUN_DIR}/eval_success.txt"; do
   [[ ! -e "${output}" && ! -L "${output}" ]] || die "Refusing existing output: ${output}"
 done

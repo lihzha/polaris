@@ -261,6 +261,9 @@ class AuditedDroidJointVelocityAction(JointVelocityAction):
     def record_native_all_joint_post_policy_step(self):
         return self._native_all_joint_recorder.record_post_policy_step(self._asset)
 
+    def bind_native_all_joint_failure_path(self, path):
+        self._native_all_joint_recorder.bind_failure_path(path)
+
     def native_all_joint_dynamic_report(self, *, include_samples: bool):
         return self._native_all_joint_recorder.report(include_samples=include_samples)
 

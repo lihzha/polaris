@@ -27,9 +27,15 @@ from polaris.pi05_droid_native_eval_contract import (
     PI05_DROID_NATIVE_TRANSFORM_RUNTIME_CONTRACT,
     file_sha256,
     make_close_ready_artifact,
+    make_episode_sidecar,
     make_environment_runtime_contract,
     make_runtime_artifact,
+    publish_immutable_file_from_temporary,
     publish_immutable_json,
+)
+from polaris.native_gripper_runtime import (
+    EXPECTED_DROID_JOINT_NAMES,
+    NATIVE_GRIPPER_DYNAMIC_PROFILE,
 )
 
 
@@ -116,15 +122,7 @@ def test_all_six_gate_revalidates_coupling_lifecycle_runtime_and_source(
             "sha256": file_sha256(path),
         }
 
-    model_io = {
-        "src/polaris/pi05_droid_native_eval_contract.py": {
-            "base_commit": "3e9df7f605baa75848a0ad8edd2783d629d105c5",
-            "size": 27_584,
-            "sha256": (
-                "a86e8cdaf9dd4f34ea7449fda8f3c5ff4278c924b282bc12e3664dc0e5a65c9a"
-            ),
-        }
-    }
+    model_io = {}
     for relative_path in PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS:
         path = repository / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -449,6 +447,50 @@ def test_finalizer_binds_internal_timeout_terminal_state_and_close_artifact(
         },
         "rubric": {"success": False, "progress": 0.25},
     }
+    result = {
+        "episode": 0,
+        "episode_length": 450,
+        "success": False,
+        "progress": 0.25,
+        "numerical_failure": False,
+        "numerical_failure_reason": "",
+    }
+    bound = {}
+    for label in ("trace", "video"):
+        temporary = task_dir / f".{label}.partial"
+        temporary.write_bytes(label.encode("ascii"))
+        bound[label] = publish_immutable_file_from_temporary(
+            temporary, task_dir / f"{label}.bin"
+        )
+    dynamic = {
+        "schema_version": 2,
+        "profile": NATIVE_GRIPPER_DYNAMIC_PROFILE,
+        "joint_names": list(EXPECTED_DROID_JOINT_NAMES),
+        "joint_indices": list(range(13)),
+        "apply_calls": 3600,
+        "post_policy_step_samples": 450,
+        "sample_count": 4050,
+        "max_abs_joint_velocity_rad_s": [0.0] * 13,
+        "max_abs_joint_acceleration_rad_s2": [0.0] * 13,
+        "terminal_velocity_failure": None,
+        "samples": None,
+    }
+    sidecar_path = task_dir / "native_runtime" / "episode_000000.json"
+    sidecar = publish_immutable_json(
+        sidecar_path,
+        make_episode_sidecar(
+            episode_result=result,
+            terminal_outcome=terminal,
+            environment_runtime_contract=environment_runtime,
+            dynamic_report=dynamic,
+            trace_artifact=bound["trace"],
+            video_artifact=bound["video"],
+            incident_artifact=None,
+        ),
+    )
+    sidecar_identity = {
+        key: sidecar[key] for key in ("path", "size", "sha256", "mode", "nlink")
+    }
     close_path = task_dir / "evaluator_close_ready.json"
     publish_immutable_json(
         close_path,
@@ -459,14 +501,16 @@ def test_finalizer_binds_internal_timeout_terminal_state_and_close_artifact(
             trace_path=task_dir / "policy_traces.jsonl",
             video_path=task_dir / "episode_0.mp4",
             environment_runtime_contract=environment_runtime,
-            terminal_rollout=terminal,
+            terminal_outcome=terminal,
+            episode_sidecar=sidecar_identity,
         ),
     )
 
     runtime = finalizer._validate_runtime_artifact(runtime_path)
     close = finalizer._validate_close_ready(close_path, runtime, run_dir)
     assert runtime["environment_runtime_contract"] == environment_runtime
-    assert close["terminal_rollout"] == terminal
+    assert close["terminal_outcome"] == terminal
+    assert close["episode_sidecar"]["value"]["episode_result"] == result
 
     bad_runtime = make_runtime_artifact(
         valid_joint_velocity_smoke_payload["runtime_contract"], environment_runtime
@@ -503,12 +547,16 @@ def test_summary_video_is_exact_h264_yuv420p_faststart_and_fully_decodable(tmp_p
         ],
         check=True,
     )
-    source_probe = finalizer.probe_video(source, require_faststart=False)
+    source_probe = finalizer.probe_video(
+        source, require_faststart=False, expected_frame_count=450
+    )
     assert source_probe["frame_count"] == 450
     assert source_probe["full_decode"] == "pass"
 
     summary = tmp_path / "summary.mp4"
-    summary_probe = finalizer.create_summary_video(source, summary)
+    summary_probe = finalizer.create_summary_video(
+        source, summary, source_frame_count=450
+    )
     assert summary_probe["codec"] == "h264"
     assert summary_probe["pixel_format"] == "yuv420p"
     assert summary_probe["frame_count"] == 450
@@ -518,6 +566,42 @@ def test_summary_video_is_exact_h264_yuv420p_faststart_and_fully_decodable(tmp_p
         "top_level_boxes"
     ].index("mdat")
     assert (summary.stat().st_mode & 0o777) == 0o444
+
+
+@pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg tools are unavailable",
+)
+def test_short_numerical_failure_summary_is_padded_to_three_seconds(tmp_path):
+    source = tmp_path / "failure.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=black:s=448x224:r=15",
+            "-frames:v",
+            "8",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ],
+        check=True,
+    )
+    raw = finalizer.probe_video(source, require_faststart=False, expected_frame_count=8)
+    assert raw["frame_count"] == 8
+    summary = tmp_path / "failure-summary.mp4"
+    summary_probe = finalizer.create_summary_video(
+        source, summary, source_frame_count=8
+    )
+    assert summary_probe["frame_count"] == 45
+    assert summary_probe["duration_seconds"] == 3.0
+    assert summary_probe["faststart"] is True
 
 
 def test_launchers_block_before_download_or_sbatch_and_forbid_resume():
@@ -531,6 +615,9 @@ def test_launchers_block_before_download_or_sbatch_and_forbid_resume():
         ROOT / "scripts/polaris/l40s_pi05_droid_native_jointvelocity_canary.sbatch"
     ).read_text(encoding="utf-8")
     evaluator_source = (ROOT / "scripts/eval.py").read_text(encoding="utf-8")
+    lifecycle_source = (ROOT / "src/polaris/pi05_droid_native_lifecycle.py").read_text(
+        encoding="utf-8"
+    )
 
     assert eval_source.index("finalize_pi05_droid_native_jointvelocity_eval.py") < (
         eval_source.index("maybe_download")
@@ -556,7 +643,20 @@ def test_launchers_block_before_download_or_sbatch_and_forbid_resume():
     assert "PI05_DROID_NATIVE_EPISODE_STEPS" in evaluator_source
     assert "terminated=term" in evaluator_source
     assert "truncated=trunc" in evaluator_source
+    assert evaluator_source.index("bind_native_all_joint_failure_path") < (
+        evaluator_source.index("env.step(")
+    )
+    assert "except NativeAllJointVelocityLimitError as error:" in evaluator_source
+    assert evaluator_source.index("make_episode_sidecar(") < evaluator_source.index(
+        "episode_df.to_csv"
+    )
     assert evaluator_source.index("finish_rollout") < evaluator_source.index(
-        "env.close()", evaluator_source.index("finish_rollout")
+        "lifecycle.prepare_close_ready"
+    )
+    assert "finally:\n        lifecycle.close()" in evaluator_source
+    assert (
+        lifecycle_source.index("self._env.close()")
+        < lifecycle_source.index("publisher(path, payload)")
+        < lifecycle_source.index("self._simulation_app.close()")
     )
     assert "official_model_eval_contract" in finalizer.finalize.__code__.co_consts

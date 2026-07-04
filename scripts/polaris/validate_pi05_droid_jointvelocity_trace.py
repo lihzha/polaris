@@ -29,6 +29,7 @@ from polaris.pi05_droid_native_eval_contract import (
     canonical_json_bytes,
     make_environment_runtime_contract,
     publish_immutable_json,
+    validate_terminal_numerical_failure_evidence,
     validate_terminal_rollout_evidence,
 )
 
@@ -132,6 +133,17 @@ ROLLOUT_END_KEYS = {
     "reset_index",
     "terminal_rollout",
 }
+ROLLOUT_FAILURE_KEYS = {
+    "schema_version",
+    "record_type",
+    "profile",
+    *CONTRACT_KEYS,
+    "reset_index",
+    "query_index",
+    "chunk_action_index",
+    "outer_step_index",
+    "terminal_failure",
+}
 
 
 def _require(condition: bool, message: str) -> None:
@@ -205,23 +217,36 @@ def _validate_metrics(metrics_csv: Path) -> dict[str, Any]:
     _require(len(rows) == 1, "Canary metrics must contain exactly one episode")
     row = rows[0]
     _require(int(row["episode"]) == 0, "Canary episode must be zero")
+    episode_length = int(row["episode_length"])
     _require(
-        int(row["episode_length"]) == PI05_DROID_NATIVE_EPISODE_STEPS,
-        "Canary must complete all 450 policy steps",
+        1 <= episode_length <= PI05_DROID_NATIVE_EPISODE_STEPS,
+        "Canary episode length is invalid",
     )
     success = _parse_bool(row["success"], "success")
     numerical_failure = _parse_bool(row["numerical_failure"], "numerical_failure")
-    _require(not numerical_failure, "Canary contains a numerical failure")
-    _require(not row["numerical_failure_reason"].strip(), "Canary has a failure reason")
     progress = _finite_number(float(row["progress"]), "progress")
     _require(0.0 <= progress <= 1.0, "Canary progress must be in [0, 1]")
+    reason = row["numerical_failure_reason"].strip()
+    if numerical_failure:
+        _require(
+            success is False
+            and progress == 0.0
+            and reason.startswith("NativeAllJointVelocityLimitError: "),
+            "Canary numerical-failure metrics mismatch",
+        )
+    else:
+        _require(
+            episode_length == PI05_DROID_NATIVE_EPISODE_STEPS,
+            "Canary must complete all 450 policy steps",
+        )
+        _require(not reason, "Canary has a failure reason")
     return {
         "episode": 0,
-        "episode_length": PI05_DROID_NATIVE_EPISODE_STEPS,
+        "episode_length": episode_length,
         "success": success,
         "progress": progress,
-        "numerical_failure": False,
-        "numerical_failure_reason": "",
+        "numerical_failure": numerical_failure,
+        "numerical_failure_reason": reason,
     }
 
 
@@ -348,10 +373,12 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
             )
             records.append(record)
 
+    actions_attempted = metrics["episode_length"]
+    execution_records = actions_attempted - int(metrics["numerical_failure"])
     expected_queries = math.ceil(
-        PI05_DROID_NATIVE_EPISODE_STEPS / PI05_DROID_NATIVE_EXECUTION_HORIZON
+        actions_attempted / PI05_DROID_NATIVE_EXECUTION_HORIZON
     )
-    expected_records = expected_queries + 2 * PI05_DROID_NATIVE_EPISODE_STEPS + 2
+    expected_records = expected_queries + actions_attempted + execution_records + 2
     _require(len(records) == expected_records, "Trace record count mismatch")
 
     cursor = 0
@@ -378,6 +405,18 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
         environment_before["episode_length"] == 0,
         "Rollout start episode length was not reset to zero",
     )
+    environment_runtime_contract = make_environment_runtime_contract(
+        configured_episode_length_seconds=(
+            PI05_DROID_NATIVE_INTERNAL_MAX_EPISODE_STEPS / 15
+        ),
+        live_max_episode_length=PI05_DROID_NATIVE_INTERNAL_MAX_EPISODE_STEPS,
+    )
+    _require(
+        environment_runtime_contract["sha256"]
+        == contract_identity["environment_runtime_sha256"],
+        "Trace environment runtime digest mismatch",
+    )
+    environment_after = environment_before
     active_chunk: list[list[float]] | None = None
     active_query_q: list[float] | None = None
     active_query_gripper: list[float] | None = None
@@ -390,7 +429,8 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
     normalized_gripper_min = math.inf
     normalized_gripper_max = -math.inf
 
-    for step in range(PI05_DROID_NATIVE_EPISODE_STEPS):
+    terminal_outcome = None
+    for step in range(actions_attempted):
         query_index = step // PI05_DROID_NATIVE_EXECUTION_HORIZON
         action_index = step % PI05_DROID_NATIVE_EXECUTION_HORIZON
         if action_index == 0:
@@ -591,6 +631,45 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
                 "Measured gripper state continuity mismatch",
             )
 
+        if metrics["numerical_failure"] and step == actions_attempted - 1:
+            failure_record = records[cursor]
+            cursor += 1
+            _require(
+                set(failure_record) == ROLLOUT_FAILURE_KEYS,
+                "Rollout failure schema mismatch",
+            )
+            _require(
+                failure_record["schema_version"]
+                == PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION
+                and failure_record["record_type"]
+                == "openpi_joint_velocity_rollout_failure"
+                and failure_record["profile"] == PI05_DROID_JOINTVELOCITY_PROFILE
+                and failure_record["reset_index"] == 0,
+                "Rollout failure identity mismatch",
+            )
+            _validate_contract_identity(
+                failure_record, contract_identity, "rollout failure"
+            )
+            _require(
+                failure_record["query_index"] == query_index
+                and failure_record["chunk_action_index"] == action_index
+                and failure_record["outer_step_index"] == step,
+                "Rollout failure action identity mismatch",
+            )
+            terminal_outcome = validate_terminal_numerical_failure_evidence(
+                failure_record["terminal_failure"], environment_runtime_contract
+            )
+            _require(
+                terminal_outcome["episode_result"] == metrics,
+                "Terminal failure differs from metrics",
+            )
+            _require(
+                terminal_outcome["environment_before"] == environment_before
+                and terminal_outcome["last_completed_environment"] == environment_after,
+                "Terminal failure environment endpoints drift",
+            )
+            break
+
         execution = records[cursor]
         cursor += 1
         _require(set(execution) == EXECUTION_KEYS, f"Execution {step} schema mismatch")
@@ -684,47 +763,40 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
                 max_abs_measured_velocity[index], abs(value)
             )
 
-    rollout_end = records[cursor]
-    cursor += 1
-    _require(set(rollout_end) == ROLLOUT_END_KEYS, "Rollout end schema mismatch")
-    _require(
-        rollout_end["schema_version"] == PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
-        "Rollout end schema version mismatch",
-    )
-    _require(
-        rollout_end["record_type"] == "openpi_joint_velocity_rollout_end"
-        and rollout_end["profile"] == PI05_DROID_JOINTVELOCITY_PROFILE
-        and rollout_end["reset_index"] == 0,
-        "Rollout end identity mismatch",
-    )
-    _validate_contract_identity(rollout_end, contract_identity, "rollout end")
-    environment_runtime_contract = make_environment_runtime_contract(
-        configured_episode_length_seconds=(
-            PI05_DROID_NATIVE_INTERNAL_MAX_EPISODE_STEPS / 15
-        ),
-        live_max_episode_length=PI05_DROID_NATIVE_INTERNAL_MAX_EPISODE_STEPS,
-    )
-    _require(
-        environment_runtime_contract["sha256"]
-        == contract_identity["environment_runtime_sha256"],
-        "Trace environment runtime digest mismatch",
-    )
-    terminal_rollout = validate_terminal_rollout_evidence(
-        rollout_end["terminal_rollout"], environment_runtime_contract
-    )
-    _require(
-        terminal_rollout["environment_before"] == environment_before
-        and terminal_rollout["environment_after"] == environment_after,
-        "Terminal rollout counters differ from trace endpoints",
-    )
-    _require(
-        terminal_rollout["rubric"]["success"] == metrics["success"]
-        and terminal_rollout["rubric"]["progress"] == metrics["progress"],
-        "Terminal post-action rubric differs from metrics",
-    )
+    if not metrics["numerical_failure"]:
+        rollout_end = records[cursor]
+        cursor += 1
+        _require(set(rollout_end) == ROLLOUT_END_KEYS, "Rollout end schema mismatch")
+        _require(
+            rollout_end["schema_version"] == PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
+            "Rollout end schema version mismatch",
+        )
+        _require(
+            rollout_end["record_type"] == "openpi_joint_velocity_rollout_end"
+            and rollout_end["profile"] == PI05_DROID_JOINTVELOCITY_PROFILE
+            and rollout_end["reset_index"] == 0,
+            "Rollout end identity mismatch",
+        )
+        _validate_contract_identity(rollout_end, contract_identity, "rollout end")
+        terminal_outcome = validate_terminal_rollout_evidence(
+            rollout_end["terminal_rollout"], environment_runtime_contract
+        )
+        _require(
+            terminal_outcome["environment_before"] == environment_before
+            and terminal_outcome["environment_after"] == environment_after,
+            "Terminal rollout counters differ from trace endpoints",
+        )
+        _require(
+            terminal_outcome["rubric"]["success"] == metrics["success"]
+            and terminal_outcome["rubric"]["progress"] == metrics["progress"],
+            "Terminal post-action rubric differs from metrics",
+        )
 
     _require(cursor == len(records), "Trace contains trailing records")
-    _require(contract_identity is not None, "Trace contains no contract identity")
+    _require(
+        contract_identity is not None and terminal_outcome is not None,
+        "Trace contains no terminal outcome",
+    )
     return {
         "schema_version": 1,
         "status": "pass",
@@ -735,8 +807,8 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
         "trace_sha256": trace_digest.hexdigest(),
         "trace_record_count": len(records),
         "query_records": expected_queries,
-        "action_records": PI05_DROID_NATIVE_EPISODE_STEPS,
-        "execution_records": PI05_DROID_NATIVE_EPISODE_STEPS,
+        "action_records": actions_attempted,
+        "execution_records": execution_records,
         "response_shape": [
             PI05_DROID_NATIVE_RESPONSE_HORIZON,
             PI05_DROID_NATIVE_ACTION_WIDTH,
@@ -744,13 +816,13 @@ def audit_trace(trace_path: Path, metrics_csv: Path) -> dict[str, Any]:
         "execution_horizon": PI05_DROID_NATIVE_EXECUTION_HORIZON,
         "contract_identity": contract_identity,
         "environment_runtime_contract": environment_runtime_contract,
-        "terminal_rollout": terminal_rollout,
+        "terminal_outcome": terminal_outcome,
         "sensor_liveness": {
             "status": "pass",
             "profile": PI05_DROID_NATIVE_SENSOR_LIVENESS_PROFILE,
             "sensor_names": list(PI05_DROID_NATIVE_SENSOR_NAMES),
             "counter_source": "isaaclab.sensors.camera.Camera.frame",
-            "validated_outer_steps": PI05_DROID_NATIVE_EPISODE_STEPS,
+            "validated_outer_steps": execution_records,
             "required_counter_increment_per_outer_step": 1,
             "image_hash_variation_authoritative": False,
         },

@@ -19,15 +19,19 @@ from polaris.pi05_droid_jointvelocity_contract import (
     verify_openpi_git_checkout,
 )
 from polaris.pi05_droid_native_eval_contract import (
+    fsync_directory,
     PI05_DROID_NATIVE_DECIMATION,
     PI05_DROID_NATIVE_ENVIRONMENT_RUNTIME_PROFILE,
     PI05_DROID_NATIVE_EPISODE_STEPS,
     PI05_DROID_NATIVE_INTERNAL_MAX_EPISODE_STEPS,
     PI05_DROID_NATIVE_SENSOR_LIVENESS_PROFILE,
     PI05_DROID_NATIVE_SENSOR_NAMES,
+    PI05_DROID_NATIVE_TERMINAL_FAILURE_PROFILE,
     PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
     validate_environment_runtime_contract,
     validate_outer_step_flags,
+    validate_immutable_file,
+    validate_terminal_numerical_failure_evidence,
     validate_terminal_rollout_evidence,
 )
 from polaris.policy.abstract_client import InferenceClient, PolicyArgs
@@ -185,6 +189,7 @@ class DroidJointVelocityClient(InferenceClient):
         self._terminated_false_count = 0
         self._truncated_false_count = 0
         self._terminal_rollout: dict[str, Any] | None = None
+        self._finalized_trace_artifact: dict[str, Any] | None = None
 
         marker = {
             "client": "DroidJointVelocity",
@@ -352,6 +357,7 @@ class DroidJointVelocityClient(InferenceClient):
         self._terminated_false_count = 0
         self._truncated_false_count = 0
         self._terminal_rollout = None
+        self._finalized_trace_artifact = None
         if self.trace_path is not None:
             self._append_trace(
                 {
@@ -632,8 +638,112 @@ class DroidJointVelocityClient(InferenceClient):
                     "terminal_rollout": terminal,
                 }
             )
+            self._finalized_trace_artifact = self._seal_trace()
         self._terminal_rollout = terminal
         return terminal
+
+    def record_execution_failure(
+        self, error: BaseException, env: Any, dynamic_report: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Finalize the only allowed partial native rollout failure."""
+
+        from polaris.native_gripper_runtime import (  # noqa: PLC0415
+            NativeAllJointVelocityLimitError,
+        )
+
+        if type(error) is not NativeAllJointVelocityLimitError:
+            raise TypeError(
+                "Native failure finalization requires the exact typed error"
+            )
+        if self._pending_execution is None:
+            raise RuntimeError("Native failure has no pending emitted action")
+        if (
+            self._environment_runtime_contract is None
+            or self._rollout_environment_before is None
+        ):
+            raise RuntimeError("Native failure has no bound rollout runtime")
+        if error.incident_artifact is None:
+            raise RuntimeError("Native velocity failure was not durably published")
+        if dynamic_report.get("terminal_velocity_failure") != error.evidence:
+            raise RuntimeError("Native velocity failure differs from dynamic evidence")
+        pending = self._pending_execution
+        environment_after_failure = _capture_environment_state(
+            env, self._environment_runtime_contract
+        )
+        last_completed = (
+            self._last_environment_after
+            if self._last_environment_after is not None
+            else self._rollout_environment_before
+        )
+        reason = f"{type(error).__name__}: {error}"
+        episode_result = {
+            "episode": 0,
+            "episode_length": self._execution_step_index + 1,
+            "success": False,
+            "progress": 0.0,
+            "numerical_failure": True,
+            "numerical_failure_reason": reason,
+        }
+        terminal = validate_terminal_numerical_failure_evidence(
+            {
+                "schema_version": 1,
+                "profile": PI05_DROID_NATIVE_TERMINAL_FAILURE_PROFILE,
+                "terminal_form": "native_all_joint_velocity_limit_failure",
+                "environment_runtime_sha256": self._environment_runtime_contract[
+                    "sha256"
+                ],
+                "failure_type": type(error).__name__,
+                "episode_result": episode_result,
+                "actions_attempted": self._execution_step_index + 1,
+                "outer_steps_completed": self._execution_step_index,
+                "failed_outer_step_index": self._execution_step_index,
+                "terminated_false_count": self._terminated_false_count,
+                "truncated_false_count": self._truncated_false_count,
+                "environment_before": self._rollout_environment_before,
+                "last_completed_environment": last_completed,
+                "environment_after_failure": environment_after_failure,
+                "incident_artifact": error.incident_artifact,
+                "dynamic_report": dynamic_report,
+            },
+            self._environment_runtime_contract,
+        )
+        if self.trace_path is not None:
+            self._append_trace(
+                {
+                    "schema_version": PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
+                    "record_type": "openpi_joint_velocity_rollout_failure",
+                    "profile": PI05_DROID_JOINTVELOCITY_PROFILE,
+                    **self._trace_contract_identity(),
+                    "reset_index": self.reset_index,
+                    "query_index": pending["query_index"],
+                    "chunk_action_index": pending["chunk_action_index"],
+                    "outer_step_index": self._execution_step_index,
+                    "terminal_failure": terminal,
+                }
+            )
+            self._finalized_trace_artifact = self._seal_trace()
+        self._pending_execution = None
+        self._terminal_rollout = terminal
+        return terminal
+
+    @property
+    def finalized_trace_artifact(self) -> dict[str, Any] | None:
+        return (
+            None
+            if self._finalized_trace_artifact is None
+            else dict(self._finalized_trace_artifact)
+        )
+
+    def _seal_trace(self) -> dict[str, Any]:
+        if self.trace_path is None:
+            raise RuntimeError("Cannot seal an unconfigured native trace")
+        self.trace_path.chmod(0o444)
+        with self.trace_path.open("rb") as source:
+            import os  # noqa: PLC0415
+
+            os.fsync(source.fileno())
+        fsync_directory(self.trace_path.parent)
+        return validate_immutable_file(self.trace_path)
 
     def _resize_images(
         self, current: dict[str, np.ndarray]

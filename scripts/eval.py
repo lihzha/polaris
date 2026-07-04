@@ -6,6 +6,7 @@ import tqdm
 import gymnasium as gym
 import torch
 import argparse
+import os
 import pandas as pd
 
 
@@ -70,6 +71,16 @@ def main(eval_args: EvalArgs):
     simulation_app = app_launcher.app
     # >>>> Isaac Sim App Launcher <<<<
 
+    from polaris.pi05_droid_native_lifecycle import NativeEvaluatorLifecycle
+
+    lifecycle = NativeEvaluatorLifecycle(simulation_app)
+    try:
+        return _run_evaluation(eval_args, lifecycle)
+    finally:
+        lifecycle.close()
+
+
+def _run_evaluation(eval_args: EvalArgs, lifecycle):
     from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
     from polaris.environments.manager_based_rl_splat_environment import (
         ManagerBasedRLSplatEnv,
@@ -90,7 +101,9 @@ def main(eval_args: EvalArgs):
         configure_native_environment_timeout,
         make_environment_runtime_contract,
         make_close_ready_artifact,
+        make_episode_sidecar,
         make_runtime_artifact,
+        publish_immutable_file_from_temporary,
         publish_immutable_json,
         should_render_expensive,
     )
@@ -103,6 +116,7 @@ def main(eval_args: EvalArgs):
         JointVelocityObservationNumericalError,
     )
     from polaris.robust_differential_ik import DifferentialIKNumericalError
+    from polaris.native_gripper_runtime import NativeAllJointVelocityLimitError
     # from real2simeval.autoscoring import TASK_TO_SUCCESS_CHECKER
 
     env_cfg = parse_env_cfg(
@@ -129,6 +143,7 @@ def main(eval_args: EvalArgs):
     env: ManagerBasedRLSplatEnv = gym.make(  # type: ignore[assignment]
         eval_args.environment, cfg=env_cfg
     )
+    lifecycle.bind_environment(env)
     runtime_artifact = None
     environment_runtime_contract = None
     if eval_args.control_mode == "joint-velocity":
@@ -165,6 +180,8 @@ def main(eval_args: EvalArgs):
     run_folder = Path(eval_args.run_folder)
     run_folder.mkdir(parents=True, exist_ok=True)
     csv_path = run_folder / "eval_results.csv"
+    incident_path = run_folder / "native_failures" / "episode_000000.json"
+    sidecar_path = run_folder / "native_runtime" / "episode_000000.json"
     if csv_path.exists():
         episode_df = pd.read_csv(csv_path)
     else:
@@ -185,8 +202,6 @@ def main(eval_args: EvalArgs):
     episode = len(episode_df)
     if episode >= rollouts:
         print("All rollouts have been evaluated. Exiting.")
-        env.close()
-        simulation_app.close()
         return
 
     policy_client: InferenceClient = InferenceClient.get_client(eval_args.policy)
@@ -198,7 +213,8 @@ def main(eval_args: EvalArgs):
         if eval_args.control_mode == "joint-velocity"
         else env.max_episode_length
     )
-    terminal_rollout = None
+    terminal_outcome = None
+    episode_sidecar_artifact = None
     while episode < rollouts:
         # Index the initial condition with the episode being started. The old
         # loop reset before incrementing ``episode``, repeating condition zero.
@@ -206,8 +222,13 @@ def main(eval_args: EvalArgs):
         policy_client.reset()
         if eval_args.control_mode == "joint-velocity":
             policy_client.begin_rollout(env)
+            getattr(env, "unwrapped", env).action_manager._terms[
+                "arm"
+            ].bind_native_all_joint_failure_path(incident_path)
         video = []
         numerical_failure_reason = ""
+        incident_artifact = None
+        dynamic_report = None
         bar = tqdm.tqdm(total=horizon)
         print(f" >>> Starting eval job from episode {episode + 1} of {rollouts} <<< ")
 
@@ -220,6 +241,12 @@ def main(eval_args: EvalArgs):
                 JointPositionObservationNumericalError,
                 JointVelocityObservationNumericalError,
             ) as error:
+                if eval_args.control_mode == "joint-velocity" and isinstance(
+                    error, JointVelocityObservationNumericalError
+                ):
+                    # The native canary has exactly one partial terminal form.
+                    # Observation/schema failures remain fatal contract errors.
+                    raise
                 numerical_failure_reason = f"{type(error).__name__}: {error}"
                 print(
                     f"Numerical failure in episode {episode} before action "
@@ -239,6 +266,24 @@ def main(eval_args: EvalArgs):
                         needs_next_policy_render=policy_client.rerender,
                     ),
                 )
+            except NativeAllJointVelocityLimitError as error:
+                if eval_args.control_mode != "joint-velocity":
+                    raise
+                numerical_failure_reason = f"{type(error).__name__}: {error}"
+                arm_term = getattr(env, "unwrapped", env).action_manager._terms["arm"]
+                dynamic_report = arm_term.native_all_joint_dynamic_report(
+                    include_samples=False
+                )
+                terminal_outcome = policy_client.record_execution_failure(
+                    error, env, dynamic_report
+                )
+                incident_artifact = error.incident_artifact
+                print(
+                    f"Numerical failure in episode {episode} at action "
+                    f"{bar.n}: {numerical_failure_reason}"
+                )
+                bar.update(1)
+                break
             except (DifferentialIKNumericalError, torch.linalg.LinAlgError) as error:
                 numerical_failure_reason = f"{type(error).__name__}: {error}"
                 print(
@@ -269,12 +314,31 @@ def main(eval_args: EvalArgs):
             and not numerical_failure_reason
             and episode_length == PI05_DROID_NATIVE_EPISODE_STEPS
         ):
-            terminal_rollout = policy_client.finish_rollout(env, info["rubric"])
+            terminal_outcome = policy_client.finish_rollout(env, info["rubric"])
+            dynamic_report = (
+                getattr(env, "unwrapped", env)
+                .action_manager._terms["arm"]
+                .native_all_joint_dynamic_report(include_samples=False)
+            )
         bar.close()
 
+        video_artifact = None
         if video:
             filename = run_folder / f"episode_{episode}.mp4"
-            mediapy.write_video(filename, video, fps=15)
+            if eval_args.control_mode == "joint-velocity":
+                temporary_video = filename.with_name(
+                    f".{filename.stem}.partial-{os.getpid()}.mp4"
+                )
+                try:
+                    mediapy.write_video(temporary_video, video, fps=15)
+                    video_artifact = publish_immutable_file_from_temporary(
+                        temporary_video, filename
+                    )
+                finally:
+                    if temporary_video.exists() and not temporary_video.is_symlink():
+                        temporary_video.unlink()
+            else:
+                mediapy.write_video(filename, video, fps=15)
         else:
             print(
                 f"Warning: policy returned no visualization for episode {episode}; "
@@ -288,7 +352,7 @@ def main(eval_args: EvalArgs):
                 False
                 if numerical_failure_reason
                 else (
-                    terminal_rollout["rubric"]["success"]
+                    terminal_outcome["rubric"]["success"]
                     if eval_args.control_mode == "joint-velocity"
                     else info["rubric"]["success"]
                 )
@@ -297,7 +361,7 @@ def main(eval_args: EvalArgs):
                 0.0
                 if numerical_failure_reason
                 else (
-                    terminal_rollout["rubric"]["progress"]
+                    terminal_outcome["rubric"]["progress"]
                     if eval_args.control_mode == "joint-velocity"
                     else info["rubric"]["progress"]
                 )
@@ -305,23 +369,62 @@ def main(eval_args: EvalArgs):
             "numerical_failure": bool(numerical_failure_reason),
             "numerical_failure_reason": numerical_failure_reason,
         }
+        if eval_args.control_mode == "joint-velocity":
+            trace_artifact = policy_client.finalized_trace_artifact
+            if (
+                terminal_outcome is None
+                or dynamic_report is None
+                or trace_artifact is None
+                or video_artifact is None
+            ):
+                raise RuntimeError(
+                    "Native joint-velocity episode transaction is incomplete"
+                )
+            sidecar_artifact = publish_immutable_json(
+                sidecar_path,
+                make_episode_sidecar(
+                    episode_result=episode_data,
+                    terminal_outcome=terminal_outcome,
+                    environment_runtime_contract=environment_runtime_contract,
+                    dynamic_report=dynamic_report,
+                    trace_artifact=trace_artifact,
+                    video_artifact=video_artifact,
+                    incident_artifact=incident_artifact,
+                ),
+            )
+            episode_sidecar_artifact = {
+                key: sidecar_artifact[key]
+                for key in ("path", "size", "sha256", "mode", "nlink")
+            }
         episode_df = pd.concat(
             [episode_df, pd.DataFrame([episode_data])], ignore_index=True
         )
-        episode_df.to_csv(csv_path, index=False)
+        if eval_args.control_mode == "joint-velocity":
+            temporary_csv = csv_path.with_name(
+                f".{csv_path.name}.partial-{os.getpid()}"
+            )
+            try:
+                episode_df.to_csv(temporary_csv, index=False)
+                publish_immutable_file_from_temporary(temporary_csv, csv_path)
+            finally:
+                if temporary_csv.exists() and not temporary_csv.is_symlink():
+                    temporary_csv.unlink()
+        else:
+            episode_df.to_csv(csv_path, index=False)
         print(f"Episode {episode} finished. Episode length: {episode_length}")
         episode += 1
 
-    env.close()
     if eval_args.control_mode == "joint-velocity":
         if (
             runtime_artifact is None
             or environment_runtime_contract is None
-            or terminal_rollout is None
+            or terminal_outcome is None
+            or episode_sidecar_artifact is None
             or not eval_args.policy.trace_path
         ):
             raise RuntimeError("Native joint-velocity close evidence is incomplete")
-        publish_immutable_json(
+        lifecycle.prepare_close_ready(
+            publish_immutable_json,
             Path(eval_args.lifecycle_ready_path),
             make_close_ready_artifact(
                 runtime_artifact=runtime_artifact,
@@ -330,10 +433,10 @@ def main(eval_args: EvalArgs):
                 trace_path=Path(eval_args.policy.trace_path),
                 video_path=run_folder / "episode_0.mp4",
                 environment_runtime_contract=environment_runtime_contract,
-                terminal_rollout=terminal_rollout,
+                terminal_outcome=terminal_outcome,
+                episode_sidecar=episode_sidecar_artifact,
             ),
         )
-    simulation_app.close()
 
 
 if __name__ == "__main__":

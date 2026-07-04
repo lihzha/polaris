@@ -68,9 +68,10 @@ from polaris.pi05_droid_native_eval_contract import (
     fsync_directory,
     publish_immutable_json,
     validate_environment_runtime_contract,
+    validate_episode_sidecar,
     validate_immutable_json,
     validate_native_model_eval_contract,
-    validate_terminal_rollout_evidence,
+    validate_native_terminal_outcome,
 )
 
 
@@ -89,6 +90,7 @@ SOURCE_PATHS = (
     "src/polaris/joint_velocity_runtime.py",
     "src/polaris/pi05_droid_jointvelocity_contract.py",
     "src/polaris/pi05_droid_native_eval_contract.py",
+    "src/polaris/pi05_droid_native_lifecycle.py",
     "src/polaris/policy/droid_jointvelocity_client.py",
 )
 
@@ -437,10 +439,7 @@ def validate_all_six_controller_completion(
         source_files[relative_path] = record
 
     model_io = source["official_model_io_unchanged_from_base"]
-    accepted_model_io_paths = {
-        *PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS,
-        "src/polaris/pi05_droid_native_eval_contract.py",
-    }
+    accepted_model_io_paths = set(PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS)
     if not isinstance(model_io, dict) or set(model_io) != accepted_model_io_paths:
         raise ValueError("All-six official model-I/O attestation mismatch")
     for relative_path, record in model_io.items():
@@ -455,13 +454,6 @@ def validate_all_six_controller_completion(
                 f"All-six official model-I/O record mismatch: {relative_path}"
             )
         _sha256_string(record["sha256"], f"job1098349 model-I/O {relative_path}")
-    accepted_eval_contract = model_io["src/polaris/pi05_droid_native_eval_contract.py"]
-    if accepted_eval_contract != {
-        "base_commit": "3e9df7f605baa75848a0ad8edd2783d629d105c5",
-        "size": 27_584,
-        "sha256": "a86e8cdaf9dd4f34ea7449fda8f3c5ff4278c924b282bc12e3664dc0e5a65c9a",
-    }:
-        raise ValueError("Accepted pre-promotion eval-contract identity mismatch")
     policy_io_files = {}
     for relative_path in PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS:
         record = model_io[relative_path]
@@ -760,7 +752,8 @@ def _validate_close_ready(
         "episode_steps",
         "env_close",
         "environment_runtime_contract_sha256",
-        "terminal_rollout",
+        "terminal_outcome",
+        "episode_sidecar",
         "runtime_artifact",
         "metrics_path",
         "trace_path",
@@ -774,11 +767,27 @@ def _validate_close_ready(
         "trace_path": task_dir / "policy_traces.jsonl",
         "video_path": task_dir / "episode_0.mp4",
     }
-    terminal_rollout = validate_terminal_rollout_evidence(
-        value.get("terminal_rollout"), runtime["environment_runtime_contract"]
+    terminal_outcome = validate_native_terminal_outcome(
+        value.get("terminal_outcome"), runtime["environment_runtime_contract"]
     )
+    sidecar = validate_episode_sidecar(
+        task_dir / "native_runtime" / "episode_000000.json",
+        runtime["environment_runtime_contract"],
+    )
+    incident = sidecar["value"]["artifacts"]["incident"]
+    if terminal_outcome.get("terminal_form") == (
+        "native_all_joint_velocity_limit_failure"
+    ):
+        if (
+            incident is None
+            or Path(incident["path"]).resolve()
+            != (task_dir / "native_failures" / "episode_000000.json").resolve()
+        ):
+            raise ValueError("Native terminal incident path mismatch")
+    elif incident is not None:
+        raise ValueError("Completed native terminal contains an incident")
     if (
-        value["schema_version"] != 1
+        value["schema_version"] != 2
         or value["profile"] != PI05_DROID_NATIVE_CANARY_PROFILE
         or value["status"] != "simulation_app_close_pending"
         or value["environment"] != PI05_DROID_NATIVE_TASK
@@ -789,6 +798,9 @@ def _validate_close_ready(
         != runtime["environment_runtime_contract"]["sha256"]
         or value["runtime_artifact"]
         != {key: runtime[key] for key in ("path", "size", "sha256", "mode", "nlink")}
+        or value["episode_sidecar"]
+        != {key: sidecar[key] for key in ("path", "size", "sha256", "mode", "nlink")}
+        or sidecar["value"]["terminal_outcome"] != terminal_outcome
         or any(
             Path(value[key]).resolve() != expected.resolve()
             for key, expected in expected_paths.items()
@@ -800,7 +812,8 @@ def _validate_close_ready(
         "environment_runtime_contract_sha256": value[
             "environment_runtime_contract_sha256"
         ],
-        "terminal_rollout": terminal_rollout,
+        "terminal_outcome": terminal_outcome,
+        "episode_sidecar": sidecar,
     }
 
 
@@ -836,7 +849,9 @@ def _top_level_mp4_boxes(path: Path) -> list[str]:
     return boxes
 
 
-def probe_video(path: Path, *, require_faststart: bool) -> dict[str, Any]:
+def probe_video(
+    path: Path, *, require_faststart: bool, expected_frame_count: int
+) -> dict[str, Any]:
     path = Path(path)
     _regular_file(path, "video")
     command = [
@@ -878,10 +893,12 @@ def probe_video(path: Path, *, require_faststart: bool) -> dict[str, Any]:
         or not math.isclose(
             _fraction(stream["r_frame_rate"]), PI05_DROID_NATIVE_POLICY_HZ, abs_tol=1e-9
         )
-        or frame_count != PI05_DROID_NATIVE_EPISODE_STEPS
+        or type(expected_frame_count) is not int
+        or not 1 <= expected_frame_count <= PI05_DROID_NATIVE_EPISODE_STEPS
+        or frame_count != expected_frame_count
         or not math.isclose(
             duration,
-            PI05_DROID_NATIVE_EPISODE_STEPS / PI05_DROID_NATIVE_POLICY_HZ,
+            expected_frame_count / PI05_DROID_NATIVE_POLICY_HZ,
             abs_tol=1e-6,
         )
     ):
@@ -929,7 +946,9 @@ def probe_video(path: Path, *, require_faststart: bool) -> dict[str, Any]:
     }
 
 
-def create_summary_video(source: Path, output: Path) -> dict[str, Any]:
+def create_summary_video(
+    source: Path, output: Path, *, source_frame_count: int
+) -> dict[str, Any]:
     output = Path(output)
     if output.exists() or output.is_symlink():
         raise FileExistsError(f"Refusing existing summary video: {output}")
@@ -937,6 +956,7 @@ def create_summary_video(source: Path, output: Path) -> dict[str, Any]:
     if temporary.exists() or temporary.is_symlink():
         raise FileExistsError(f"Refusing existing summary temporary: {temporary}")
     try:
+        summary_frame_count = max(source_frame_count, 45)
         subprocess.run(
             [
                 "ffmpeg",
@@ -953,13 +973,21 @@ def create_summary_video(source: Path, output: Path) -> dict[str, Any]:
                 "yuv420p",
                 "-movflags",
                 "+faststart",
+                "-vf",
+                "tpad=stop_mode=clone:stop_duration=3",
+                "-frames:v",
+                str(summary_frame_count),
                 "-r",
                 str(PI05_DROID_NATIVE_POLICY_HZ),
                 str(temporary),
             ],
             check=True,
         )
-        probe = probe_video(temporary, require_faststart=True)
+        probe = probe_video(
+            temporary,
+            require_faststart=True,
+            expected_frame_count=summary_frame_count,
+        )
         temporary.chmod(0o444)
         with temporary.open("rb") as source_file:
             os.fsync(source_file.fileno())
@@ -1237,19 +1265,33 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         != runtime["environment_runtime_contract"]
     ):
         raise ValueError("Trace environment runtime differs from runtime artifact")
-    if trace_summary["terminal_rollout"] != close_ready["terminal_rollout"]:
-        raise ValueError("Trace terminal rollout differs from evaluator close evidence")
+    if trace_summary["terminal_outcome"] != close_ready["terminal_outcome"]:
+        raise ValueError("Trace terminal outcome differs from evaluator close evidence")
     trace_summary_path = task_dir / "trace_validation.json"
     trace_summary_artifact = publish_immutable_json(trace_summary_path, trace_summary)
-    raw_video_probe = probe_video(video_path, require_faststart=False)
+    raw_video_probe = probe_video(
+        video_path,
+        require_faststart=False,
+        expected_frame_count=trace_summary["metrics"]["episode_length"],
+    )
     trace_identity = _seal_file(trace_path, "policy trace")
     metrics_identity = _seal_file(metrics_path, "metrics CSV")
     video_identity = _seal_file(video_path, "rollout video")
     if trace_identity["sha256"] != trace_summary["trace_sha256"]:
         raise ValueError("Sealed trace digest differs from trace audit")
+    sidecar_artifacts = close_ready["episode_sidecar"]["value"]["artifacts"]
+    if (
+        trace_identity != sidecar_artifacts["trace"]
+        or video_identity != sidecar_artifacts["video"]
+    ):
+        raise ValueError("Sealed trace/video identity differs from episode sidecar")
 
     summary_path = run_dir / "pi05_droid_native_jointvelocity_canary.mp4"
-    summary_probe = create_summary_video(video_path, summary_path)
+    summary_probe = create_summary_video(
+        video_path,
+        summary_path,
+        source_frame_count=trace_summary["metrics"]["episode_length"],
+    )
     summary_identity = _seal_file(summary_path, "summary video")
     summary_manifest = {
         "schema_version": 1,
@@ -1270,6 +1312,11 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
         "schema_version": 1,
         "profile": PI05_DROID_NATIVE_CANARY_PROFILE,
         "status": "pass",
+        "scientific_outcome": (
+            "numerical_failure"
+            if trace_summary["metrics"]["numerical_failure"]
+            else "completed_rollout"
+        ),
         "scope": "one_rollout_wiring_canary_not_standard_success_rate",
         "job_id": args.job_id,
         "task": PI05_DROID_NATIVE_TASK,
@@ -1316,6 +1363,10 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
             "trace": trace_identity,
             "trace_validation": {
                 key: trace_summary_artifact[key]
+                for key in ("path", "size", "sha256", "mode", "nlink")
+            },
+            "episode_sidecar": {
+                key: close_ready["episode_sidecar"][key]
                 for key in ("path", "size", "sha256", "mode", "nlink")
             },
             "rollout_video": {**video_identity, "probe": raw_video_probe},
