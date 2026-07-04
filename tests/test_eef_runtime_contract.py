@@ -576,6 +576,9 @@ def _active_velocity_recovery_report(*, apply_index: int) -> dict:
             "end_apply_index": None,
             "start_reason": "measured_velocity_above_float32_envelope",
             "end_reason": None,
+            "deferred_lower_endpoint_transition_count": None,
+            "lower_endpoint_transition_overflow_context": None,
+            "recovery_completed_apply_index": None,
             "start": copy.deepcopy(snapshot),
             "last": copy.deepcopy(snapshot),
         }
@@ -664,6 +667,71 @@ def _lower_endpoint_terminal_velocity_recovery_report(*, apply_index: int) -> di
         {
             "end_apply_index": apply_index,
             "end_reason": "lower_endpoint_transition_overflow_abort",
+            "deferred_lower_endpoint_transition_count": 2,
+            "lower_endpoint_transition_overflow_context": "active_recovery",
+            "last": terminal,
+        }
+    )
+    return report
+
+
+def _post_recovery_lower_endpoint_terminal_velocity_recovery_report() -> dict:
+    report = _active_velocity_recovery_report(apply_index=0)
+    terminal = copy.deepcopy(report["events"][0]["last"])
+    position = np.asarray(
+        [0.0, 0.0, 0.0, -1.5, 0.0, 1.8, 0.0],
+        dtype=np.float32,
+    )
+    hard_limits = np.asarray(
+        report["contract"]["hard_joint_position_limits_rad"],
+        dtype=np.float32,
+    )
+    terminal.update(
+        {
+            "apply_index": 18,
+            "policy_step": 2,
+            "physics_substep": 2,
+            "joint_pos_rad": position.tolist(),
+            "joint_velocity_rad_s": [0.0] * 7,
+            "joint_velocity_limit_excess_rad_s": [0.0] * 7,
+            "velocity_to_limit_ratio": [0.0] * 7,
+            "predicted_joint_pos_rad": position.tolist(),
+            "predicted_hard_limit_clearance_rad": np.minimum(
+                position - hard_limits[:, 0],
+                hard_limits[:, 1] - position,
+            )
+            .astype(np.float32)
+            .tolist(),
+            "hold_target_rad": None,
+            "hold_position_target_readback_rad": None,
+            "hold_velocity_target_readback_rad_s": None,
+            "hold_effort_target_readback_nm": None,
+        }
+    )
+    report["state"] = {
+        "phase": "inactive",
+        "active": False,
+        "consecutive_active_substeps": 0,
+        "consecutive_clean_samples": 0,
+        "release_ramp_next_index": None,
+    }
+    report["counters"].update(
+        {
+            "recovery_active_substeps": 3,
+            "recovered_events": 1,
+            "hold_target_applies": 3,
+            "release_ramp_target_applies": 16,
+            "lower_endpoint_transition_aborts": 1,
+        }
+    )
+    report["maxima"]["consecutive_recovery_substeps"] = 3
+    report["events"][0].update(
+        {
+            "end_apply_index": 18,
+            "end_reason": "lower_endpoint_transition_overflow_abort",
+            "deferred_lower_endpoint_transition_count": 2,
+            "lower_endpoint_transition_overflow_context": "post_recovery_resume",
+            "recovery_completed_apply_index": 17,
             "last": terminal,
         }
     )
@@ -1920,6 +1988,12 @@ def test_velocity_recovery_v5_sidecar_is_schema7_and_profile_bound(
             == 7
         )
         assert (
+            payload["safety"]["current_joint_velocity_recovery"]["contract"][
+                "schema_version"
+            ]
+            == 3
+        )
+        assert (
             payload["controller_repair_candidate"]["current_joint_velocity_recovery"]
             == safety["current_joint_velocity_recovery"]
         )
@@ -2253,22 +2327,34 @@ def test_v5_terminal_recovery_binds_exact_event_digest_and_guard() -> None:
         validate_episode_safety_cadence(safety=safety, episode_result=drifted)
 
 
+@pytest.mark.parametrize("post_recovery", [False, True])
 def test_v5_lower_endpoint_overflow_survives_result_sidecar_and_runtime(
     tmp_path: Path,
     monkeypatch,
+    post_recovery: bool,
 ) -> None:
-    result = _episode_result(length=2, numerical_failure=True)
+    length = 3 if post_recovery else 2
+    result = _episode_result(length=length, numerical_failure=True)
     safety = _episode_safety(
-        length=2,
+        length=length,
         numerical_failure=True,
         failure_substeps=3,
     )
-    recovery = _lower_endpoint_terminal_velocity_recovery_report(apply_index=10)
+    recovery = (
+        _post_recovery_lower_endpoint_terminal_velocity_recovery_report()
+        if post_recovery
+        else _lower_endpoint_terminal_velocity_recovery_report(apply_index=10)
+    )
     safety["profile"] = EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE
     safety["current_joint_velocity_abort"] = None
     safety["current_joint_velocity_recovery"] = recovery
     safety["maxima"]["abs_joint_vel_rad_s"] = [
-        abs(value) for value in recovery["events"][0]["last"]["joint_velocity_rad_s"]
+        max(abs(start), abs(last))
+        for start, last in zip(
+            recovery["events"][0]["start"]["joint_velocity_rad_s"],
+            recovery["events"][0]["last"]["joint_velocity_rad_s"],
+            strict=True,
+        )
     ]
     safety["counters"]["nonfinite_aborts"] = 0
     safety["counters"]["invariant_aborts"] = 1
@@ -2296,10 +2382,11 @@ def test_v5_lower_endpoint_overflow_survives_result_sidecar_and_runtime(
         == 1
     )
 
-    safety = _attach_candidate_stub_gripper(safety, length=2)
+    safety = _attach_candidate_stub_gripper(safety, length=length)
     dynamic = safety["gripper_runtime_dynamic"]
-    dynamic["post_policy_step_samples"] = 1
-    dynamic["driver_target_slew"]["apply_calls"] = 10
+    dynamic["post_policy_step_samples"] = length - 1
+    committed_apply_calls = safety["counters"]["apply_calls"] - 1
+    dynamic["driver_target_slew"]["apply_calls"] = committed_apply_calls
     dynamic["driver_target_slew"]["endpoint_change_count"] = 2
     controller_report = _candidate_controller_report(
         safety,
@@ -2307,7 +2394,11 @@ def test_v5_lower_endpoint_overflow_survives_result_sidecar_and_runtime(
         profile=EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
     )
     controller_report["current_joint_velocity_recovery"] = copy.deepcopy(recovery)
-    all_six_trace = _all_six_trace(episode=0, length=2, apply_calls=10)
+    all_six_trace = _all_six_trace(
+        episode=0,
+        length=length,
+        apply_calls=committed_apply_calls,
+    )
     all_six_trace["numerical_failure"] = True
     terminal = _terminal_rollout(result)
     sidecar_path = tmp_path / "ik_safety" / "episode_000000.json"
@@ -2393,6 +2484,36 @@ def test_v5_lower_endpoint_overflow_survives_result_sidecar_and_runtime(
             "lower_endpoint_transition_overflow_abort"
         )
         assert runtime_recovery["counters"]["lower_endpoint_transition_aborts"] == 1
+        assert (
+            runtime_recovery["events"][0]["deferred_lower_endpoint_transition_count"]
+            == 2
+        )
+        assert runtime_recovery["events"][0][
+            "lower_endpoint_transition_overflow_context"
+        ] == ("post_recovery_resume" if post_recovery else "active_recovery")
+
+        drifted_safety = copy.deepcopy(safety)
+        drifted_safety["gripper_runtime_dynamic"]["driver_target_slew"][
+            "endpoint_change_count"
+        ] = 1
+        with pytest.raises(ValueError, match="endpoint-change cadence drift"):
+            atomic_write_episode_safety(
+                tmp_path / "endpoint-count-drift.json",
+                eef_controller_profile=(
+                    EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+                ),
+                controller_repair_candidate=controller_report,
+                arm_failure_substep_trace={},
+                all_six_gripper_trace=all_six_trace,
+                episode_index=0,
+                episode_result=result,
+                safety=drifted_safety,
+                artifact_identity=_artifact_identity_for_terminal(result, terminal),
+                terminal_rollout=terminal,
+                expected_gripper_target_slew_profile=(
+                    EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+                ),
+            )
 
 
 def test_v5_open_recovery_allows_unrelated_digest_abort_and_horizon_reset() -> None:

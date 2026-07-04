@@ -51,6 +51,15 @@ from polaris.eef_ik_safety import (
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_END_REASONS
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_HOLD_PROFILE
 from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXT_ACTIVE,
+)
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXT_POST_RECOVERY,
+)
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXTS,
+)
+from polaris.eef_ik_safety import (
     CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS,
 )
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD
@@ -219,6 +228,9 @@ CURRENT_JOINT_VELOCITY_RECOVERY_EVENT_FIELDS = {
     "end_apply_index",
     "start_reason",
     "end_reason",
+    "deferred_lower_endpoint_transition_count",
+    "lower_endpoint_transition_overflow_context",
+    "recovery_completed_apply_index",
     "start",
     "last",
 }
@@ -947,6 +959,8 @@ def validate_current_joint_velocity_recovery_report(
     }
     observed_event_max_ratio = 0.0
     observed_event_max_excess = [0.0] * 7
+    required_committed_active_substeps = 0
+    post_recovery_lower_endpoint_abort_count = 0
     for event_index, event in enumerate(events):
         if (
             not isinstance(event, dict)
@@ -980,6 +994,33 @@ def validate_current_joint_velocity_recovery_report(
         else:
             end_reason_counts[end_reason] += 1
             previous_end_index = end_index
+        deferred_endpoint_count = event.get("deferred_lower_endpoint_transition_count")
+        lower_endpoint_context = event.get("lower_endpoint_transition_overflow_context")
+        recovery_completed_apply_index = event.get("recovery_completed_apply_index")
+        if (
+            (
+                deferred_endpoint_count is not None
+                and (
+                    type(deferred_endpoint_count) is not int
+                    or deferred_endpoint_count <= 1
+                )
+            )
+            or (
+                lower_endpoint_context is not None
+                and lower_endpoint_context
+                not in CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXTS
+            )
+            or (
+                recovery_completed_apply_index is not None
+                and (
+                    type(recovery_completed_apply_index) is not int
+                    or not event["start_apply_index"]
+                    <= recovery_completed_apply_index
+                    < apply_calls
+                )
+            )
+        ):
+            raise ValueError("PolaRiS EEF recovery event lifecycle evidence drift")
         snapshot_facts: dict[str, dict[str, Any]] = {}
         for snapshot_field in ("start", "last"):
             snapshot = event.get(snapshot_field)
@@ -1149,6 +1190,119 @@ def validate_current_joint_velocity_recovery_report(
         start_reason = event["start_reason"]
         start_facts = snapshot_facts["start"]
         last_facts = snapshot_facts["last"]
+        duration = None if end_index is None else end_index - event["start_apply_index"]
+        legal_pairing = {
+            None: start_reason == "measured_velocity_above_float32_envelope",
+            "clean2_release_ramp_complete": (
+                start_reason == "measured_velocity_above_float32_envelope"
+                and duration is not None
+                and duration >= ARM_RELEASE_RAMP_SUBSTEPS + 1
+            ),
+            "sustained_recovery_abort": (
+                start_reason == "measured_velocity_above_float32_envelope"
+                and duration is not None
+                and duration >= CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS
+            ),
+            "current_hard_limit_abort": (
+                (start_reason == "current_hard_limit_violation" and duration == 0)
+                or (
+                    start_reason == "measured_velocity_above_float32_envelope"
+                    and duration is not None
+                    and duration > 0
+                )
+            ),
+            "predicted_hard_limit_abort": (
+                (start_reason == "predicted_hard_limit_crossing" and duration == 0)
+                or (
+                    start_reason == "measured_velocity_above_float32_envelope"
+                    and duration is not None
+                    and duration >= 0
+                )
+            ),
+            "transaction_abort": (
+                (start_reason == "target_transaction_failure" and duration == 0)
+                or (
+                    start_reason == "measured_velocity_above_float32_envelope"
+                    and duration is not None
+                    and duration > 0
+                )
+            ),
+            "lower_endpoint_transition_overflow_abort": (
+                start_reason == "measured_velocity_above_float32_envelope"
+                and duration is not None
+                and duration >= 0
+            ),
+        }[end_reason]
+        if not legal_pairing:
+            raise ValueError("PolaRiS EEF recovery event start/end pairing drift")
+        if end_reason is not None and duration == 0 and start_snapshot != last_snapshot:
+            raise ValueError("PolaRiS EEF same-apply recovery snapshots disagree")
+        measured_start_survived = (
+            start_reason == "measured_velocity_above_float32_envelope"
+            and (end_index is None or duration is not None and duration > 0)
+        )
+        if measured_start_survived and not (
+            start_facts["hold_target_present"] and start_facts["readbacks_present"]
+        ):
+            raise ValueError(
+                "PolaRiS EEF surviving measured recovery lacks committed start"
+            )
+
+        if end_reason == "lower_endpoint_transition_overflow_abort":
+            if (
+                deferred_endpoint_count is None
+                or lower_endpoint_context
+                not in CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXTS
+            ):
+                raise ValueError(
+                    "PolaRiS EEF lower-endpoint overflow evidence is absent"
+                )
+            if lower_endpoint_context == (
+                CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXT_ACTIVE
+            ):
+                if recovery_completed_apply_index is not None:
+                    raise ValueError(
+                        "PolaRiS EEF active lower overflow retained completion"
+                    )
+            else:
+                if (
+                    recovery_completed_apply_index != end_index - 1
+                    or duration is None
+                    or duration < ARM_RELEASE_RAMP_SUBSTEPS + 2
+                ):
+                    raise ValueError(
+                        "PolaRiS EEF post-recovery lower overflow chronology drift"
+                    )
+                post_recovery_lower_endpoint_abort_count += 1
+        elif deferred_endpoint_count is not None or lower_endpoint_context is not None:
+            raise ValueError("PolaRiS EEF non-lower event retained endpoint evidence")
+
+        if end_reason == "clean2_release_ramp_complete":
+            if recovery_completed_apply_index != end_index:
+                raise ValueError("PolaRiS EEF clean recovery completion cadence drift")
+        elif (
+            not (
+                end_reason == "lower_endpoint_transition_overflow_abort"
+                and lower_endpoint_context
+                == CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXT_POST_RECOVERY
+            )
+            and recovery_completed_apply_index is not None
+        ):
+            raise ValueError("PolaRiS EEF non-recovered event retained completion")
+
+        if start_reason == "measured_velocity_above_float32_envelope":
+            if end_reason == "clean2_release_ramp_complete" or (
+                end_reason == "lower_endpoint_transition_overflow_abort"
+                and lower_endpoint_context
+                == CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXT_POST_RECOVERY
+            ):
+                required_committed_active_substeps += 3
+            elif end_reason == "sustained_recovery_abort":
+                required_committed_active_substeps += (
+                    CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS
+                )
+            elif end_index is None or duration is not None and duration > 0:
+                required_committed_active_substeps += 1
         start_reason_valid = {
             "measured_velocity_above_float32_envelope": (
                 start_facts["velocity_over_envelope"]
@@ -1236,7 +1390,6 @@ def validate_current_joint_velocity_recovery_report(
     if active_event_count != int(active):
         raise ValueError("PolaRiS EEF velocity-recovery active event drift")
     expected_end_counts = {
-        "clean2_release_ramp_complete": counters["recovered_events"],
         "sustained_recovery_abort": counters["sustained_aborts"],
         "current_hard_limit_abort": counters["current_hard_limit_aborts"],
         "predicted_hard_limit_abort": counters["predicted_limit_aborts"],
@@ -1245,15 +1398,37 @@ def validate_current_joint_velocity_recovery_report(
             "lower_endpoint_transition_aborts"
         ],
     }
-    if any(
-        end_reason_counts[reason] != expected
-        for reason, expected in expected_end_counts.items()
-    ) or (
-        float(maxima["abs_velocity_to_limit_ratio"]) < observed_event_max_ratio
-        or any(
-            maximum < observed
-            for maximum, observed in zip(
-                residual_maxima, observed_event_max_excess, strict=True
+    if (
+        any(
+            end_reason_counts[reason] != expected
+            for reason, expected in expected_end_counts.items()
+        )
+        or (
+            end_reason_counts["clean2_release_ramp_complete"]
+            + post_recovery_lower_endpoint_abort_count
+            != counters["recovered_events"]
+            or counters["recovery_active_substeps"] < required_committed_active_substeps
+            or maxima["consecutive_recovery_substeps"]
+            > counters["recovery_active_substeps"]
+            or (counters["recovery_active_substeps"] == 0)
+            is not (maxima["consecutive_recovery_substeps"] == 0)
+            or (
+                counters["recovered_events"] > 0
+                and maxima["consecutive_recovery_substeps"] < 3
+            )
+            or (
+                counters["sustained_aborts"] > 0
+                and maxima["consecutive_recovery_substeps"]
+                != CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS
+            )
+        )
+        or (
+            float(maxima["abs_velocity_to_limit_ratio"]) < observed_event_max_ratio
+            or any(
+                maximum < observed
+                for maximum, observed in zip(
+                    residual_maxima, observed_event_max_excess, strict=True
+                )
             )
         )
     ):

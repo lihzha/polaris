@@ -413,11 +413,260 @@ def _active_recovery_report() -> dict:
                 "end_apply_index": None,
                 "start_reason": "measured_velocity_above_float32_envelope",
                 "end_reason": None,
+                "deferred_lower_endpoint_transition_count": None,
+                "lower_endpoint_transition_overflow_context": None,
+                "recovery_completed_apply_index": None,
                 "start": copy.deepcopy(snapshot),
                 "last": copy.deepcopy(snapshot),
             }
         ],
     }
+
+
+def _clean_completed_recovery_report() -> dict:
+    report = _active_recovery_report()
+    report["state"] = {
+        "phase": CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE,
+        "active": False,
+        "consecutive_active_substeps": 0,
+        "consecutive_clean_samples": 0,
+        "release_ramp_next_index": None,
+    }
+    report["counters"].update(
+        {
+            "recovery_active_substeps": 3,
+            "recovered_events": 1,
+            "hold_target_applies": 3,
+            "release_ramp_target_applies": ARM_RELEASE_RAMP_SUBSTEPS,
+        }
+    )
+    report["maxima"]["consecutive_recovery_substeps"] = 3
+    terminal = _recovery_snapshot(
+        apply_index=17,
+        joint_position=_neutral_hard_position(),
+        joint_velocity=[0.0] * 7,
+        committed=True,
+    )
+    report["events"][0].update(
+        {
+            "end_apply_index": 17,
+            "end_reason": "clean2_release_ramp_complete",
+            "recovery_completed_apply_index": 17,
+            "last": terminal,
+        }
+    )
+    return report
+
+
+def _sustained_terminal_recovery_report() -> dict:
+    report = _active_recovery_report()
+    report["state"] = {
+        "phase": CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE,
+        "active": False,
+        "consecutive_active_substeps": 0,
+        "consecutive_clean_samples": 0,
+        "release_ramp_next_index": None,
+    }
+    report["counters"].update(
+        {
+            "residual_events": 9,
+            "residual_joints": 9,
+            "recovery_active_substeps": 8,
+            "hold_target_applies": 8,
+            "sustained_aborts": 1,
+        }
+    )
+    report["maxima"]["consecutive_recovery_substeps"] = 8
+    terminal = _recovery_snapshot(
+        apply_index=8,
+        joint_position=_neutral_hard_position(),
+        joint_velocity=[_float32(11.743), *([0.0] * 6)],
+        committed=False,
+    )
+    terminal["hold_target_rad"] = None
+    report["events"][0].update(
+        {
+            "end_apply_index": 8,
+            "end_reason": "sustained_recovery_abort",
+            "last": terminal,
+        }
+    )
+    return report
+
+
+def _post_recovery_lower_endpoint_terminal_report() -> dict:
+    report = _clean_completed_recovery_report()
+    terminal = _recovery_snapshot(
+        apply_index=18,
+        joint_position=_neutral_hard_position(),
+        joint_velocity=[0.0] * 7,
+        committed=False,
+    )
+    terminal["hold_target_rad"] = None
+    report["counters"]["lower_endpoint_transition_aborts"] = 1
+    report["events"][0].update(
+        {
+            "end_apply_index": 18,
+            "end_reason": "lower_endpoint_transition_overflow_abort",
+            "deferred_lower_endpoint_transition_count": 2,
+            "lower_endpoint_transition_overflow_context": ("post_recovery_resume"),
+            "last": terminal,
+        }
+    )
+    return report
+
+
+def _immediate_current_hard_terminal_report() -> dict:
+    report = _active_recovery_report()
+    position = _neutral_hard_position()
+    position[0] = _next_float32(PANDA_PHYSX_HARD_JOINT_POS_LIMITS_RAD[0][1])
+    snapshot = _recovery_snapshot(
+        apply_index=0,
+        joint_position=position,
+        joint_velocity=[0.0] * 7,
+        committed=False,
+    )
+    snapshot["hold_target_rad"] = None
+    report["state"] = {
+        "phase": CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE,
+        "active": False,
+        "consecutive_active_substeps": 0,
+        "consecutive_clean_samples": 0,
+        "release_ramp_next_index": None,
+    }
+    report["counters"] = {field: 0 for field in report["counters"]}
+    report["counters"].update({"recovery_events": 1, "current_hard_limit_aborts": 1})
+    report["maxima"] = {
+        "abs_velocity_to_limit_ratio": 0.0,
+        "consecutive_recovery_substeps": 0,
+        "abs_velocity_residual_excess_rad_s": [0.0] * 7,
+    }
+    report["events"] = [
+        {
+            "event_index": 0,
+            "start_apply_index": 0,
+            "end_apply_index": 0,
+            "start_reason": "current_hard_limit_violation",
+            "end_reason": "current_hard_limit_abort",
+            "deferred_lower_endpoint_transition_count": None,
+            "lower_endpoint_transition_overflow_context": None,
+            "recovery_completed_apply_index": None,
+            "start": copy.deepcopy(snapshot),
+            "last": copy.deepcopy(snapshot),
+        }
+    ]
+    return report
+
+
+def _immediate_predicted_terminal_report() -> dict:
+    report = _active_recovery_report()
+    velocity = [_float32(2.0), *([0.0] * 6)]
+    delta = _float32(velocity[0] * PANDA_EEF_PHYSICS_DT_FLOAT32)
+    position = _neutral_hard_position()
+    position[0] = _float32(
+        PANDA_PHYSX_HARD_JOINT_POS_LIMITS_RAD[0][1] - _float32(delta / 2.0)
+    )
+    snapshot = _recovery_snapshot(
+        apply_index=0,
+        joint_position=position,
+        joint_velocity=velocity,
+        committed=False,
+    )
+    snapshot["hold_target_rad"] = None
+    report["state"] = {
+        "phase": CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE,
+        "active": False,
+        "consecutive_active_substeps": 0,
+        "consecutive_clean_samples": 0,
+        "release_ramp_next_index": None,
+    }
+    report["counters"] = {field: 0 for field in report["counters"]}
+    report["counters"].update({"recovery_events": 1, "predicted_limit_aborts": 1})
+    report["maxima"] = {
+        "abs_velocity_to_limit_ratio": max(snapshot["velocity_to_limit_ratio"]),
+        "consecutive_recovery_substeps": 0,
+        "abs_velocity_residual_excess_rad_s": [0.0] * 7,
+    }
+    report["events"] = [
+        {
+            "event_index": 0,
+            "start_apply_index": 0,
+            "end_apply_index": 0,
+            "start_reason": "predicted_hard_limit_crossing",
+            "end_reason": "predicted_hard_limit_abort",
+            "deferred_lower_endpoint_transition_count": None,
+            "lower_endpoint_transition_overflow_context": None,
+            "recovery_completed_apply_index": None,
+            "start": copy.deepcopy(snapshot),
+            "last": copy.deepcopy(snapshot),
+        }
+    ]
+    return report
+
+
+def _move_terminal_snapshot_to_apply(report: dict, apply_index: int) -> None:
+    event = report["events"][0]
+    snapshot = copy.deepcopy(event["last"])
+    snapshot["apply_index"] = apply_index
+    snapshot["policy_step"] = apply_index // 8
+    snapshot["physics_substep"] = apply_index % 8
+    event["end_apply_index"] = apply_index
+    event["last"] = snapshot
+
+
+def _measured_later_terminal_report(end_reason: str) -> dict:
+    report = _active_recovery_report()
+    report["state"] = {
+        "phase": CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE,
+        "active": False,
+        "consecutive_active_substeps": 0,
+        "consecutive_clean_samples": 0,
+        "release_ramp_next_index": None,
+    }
+    terminal_position = _neutral_hard_position()
+    terminal_velocity = [0.0] * 7
+    if end_reason == "current_hard_limit_abort":
+        terminal_position[0] = _next_float32(
+            PANDA_PHYSX_HARD_JOINT_POS_LIMITS_RAD[0][1]
+        )
+    elif end_reason == "predicted_hard_limit_abort":
+        terminal_velocity[0] = _float32(2.0)
+        delta = _float32(terminal_velocity[0] * PANDA_EEF_PHYSICS_DT_FLOAT32)
+        terminal_position[0] = _float32(
+            PANDA_PHYSX_HARD_JOINT_POS_LIMITS_RAD[0][1] - _float32(delta / 2.0)
+        )
+    terminal = _recovery_snapshot(
+        apply_index=1,
+        joint_position=terminal_position,
+        joint_velocity=terminal_velocity,
+        committed=False,
+    )
+    if end_reason != "transaction_abort":
+        terminal["hold_target_rad"] = None
+    counter_field = {
+        "current_hard_limit_abort": "current_hard_limit_aborts",
+        "predicted_hard_limit_abort": "predicted_limit_aborts",
+        "transaction_abort": "transaction_aborts",
+        "lower_endpoint_transition_overflow_abort": (
+            "lower_endpoint_transition_aborts"
+        ),
+    }[end_reason]
+    report["counters"][counter_field] = 1
+    report["events"][0].update(
+        {
+            "end_apply_index": 1,
+            "end_reason": end_reason,
+            "last": terminal,
+        }
+    )
+    if end_reason == "lower_endpoint_transition_overflow_abort":
+        report["events"][0].update(
+            {
+                "deferred_lower_endpoint_transition_count": 2,
+                "lower_endpoint_transition_overflow_context": "active_recovery",
+            }
+        )
+    return report
 
 
 def test_recovery_report_schema_and_open_event_are_closed() -> None:
@@ -435,6 +684,117 @@ def test_recovery_report_schema_and_open_event_are_closed() -> None:
         mutation(drifted)
         with pytest.raises(ValueError):
             validate_current_joint_velocity_recovery_report(drifted, apply_calls=1)
+
+
+def test_clean_and_sustained_terminal_reports_bind_minimum_chronology() -> None:
+    clean = _clean_completed_recovery_report()
+    sustained = _sustained_terminal_recovery_report()
+    assert (
+        validate_current_joint_velocity_recovery_report(clean, apply_calls=18) == clean
+    )
+    assert (
+        validate_current_joint_velocity_recovery_report(sustained, apply_calls=9)
+        == sustained
+    )
+
+    short_clean = copy.deepcopy(clean)
+    short_clean["events"][0]["end_apply_index"] = 1
+    short_clean["events"][0]["recovery_completed_apply_index"] = 1
+    short_clean["events"][0]["last"] = _recovery_snapshot(
+        apply_index=1,
+        joint_position=_neutral_hard_position(),
+        joint_velocity=[0.0] * 7,
+        committed=True,
+    )
+    with pytest.raises(ValueError, match="start/end pairing drift"):
+        validate_current_joint_velocity_recovery_report(short_clean, apply_calls=18)
+
+    short_sustained = copy.deepcopy(sustained)
+    short_sustained["events"][0]["end_apply_index"] = 0
+    terminal = copy.deepcopy(short_sustained["events"][0]["start"])
+    for field in (
+        "hold_target_rad",
+        "hold_position_target_readback_rad",
+        "hold_velocity_target_readback_rad_s",
+        "hold_effort_target_readback_nm",
+    ):
+        terminal[field] = None
+    short_sustained["events"][0]["last"] = terminal
+    with pytest.raises(ValueError, match="start/end pairing drift"):
+        validate_current_joint_velocity_recovery_report(
+            short_sustained,
+            apply_calls=9,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda report: report["counters"].update(
+            {"recovery_active_substeps": 2, "hold_target_applies": 2}
+        ),
+        lambda report: report["counters"].__setitem__(
+            "release_ramp_target_applies", ARM_RELEASE_RAMP_SUBSTEPS - 1
+        ),
+        lambda report: report["maxima"].__setitem__("consecutive_recovery_substeps", 2),
+    ],
+)
+def test_clean_terminal_rejects_each_minimum_history_mutation(mutation) -> None:
+    report = _clean_completed_recovery_report()
+    mutation(report)
+    with pytest.raises(ValueError, match="counter history|event history"):
+        validate_current_joint_velocity_recovery_report(report, apply_calls=18)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda report: report["counters"].update(
+            {"recovery_active_substeps": 7, "hold_target_applies": 7}
+        ),
+        lambda report: report["maxima"].__setitem__("consecutive_recovery_substeps", 7),
+    ],
+)
+def test_sustained_terminal_rejects_each_maximum_history_mutation(mutation) -> None:
+    report = _sustained_terminal_recovery_report()
+    mutation(report)
+    with pytest.raises(ValueError, match="event history"):
+        validate_current_joint_velocity_recovery_report(report, apply_calls=9)
+
+
+def test_post_recovery_lower_overflow_retains_truthful_recovered_evidence() -> None:
+    report = _post_recovery_lower_endpoint_terminal_report()
+    validated = validate_current_joint_velocity_recovery_report(
+        report,
+        apply_calls=19,
+    )
+    event = validated["events"][0]
+    assert validated["counters"]["recovered_events"] == 1
+    assert event["recovery_completed_apply_index"] == 17
+    assert event["lower_endpoint_transition_overflow_context"] == (
+        "post_recovery_resume"
+    )
+    assert event["deferred_lower_endpoint_transition_count"] == 2
+
+    for mutation in (
+        lambda value: value["events"][0].__setitem__(
+            "deferred_lower_endpoint_transition_count", 1
+        ),
+        lambda value: value["events"][0].__setitem__(
+            "lower_endpoint_transition_overflow_context", "active_recovery"
+        ),
+        lambda value: value["events"][0].__setitem__(
+            "recovery_completed_apply_index", 16
+        ),
+        lambda value: value["counters"].__setitem__("recovered_events", 0),
+    ):
+        drifted = copy.deepcopy(report)
+        mutation(drifted)
+        with pytest.raises(ValueError):
+            validate_current_joint_velocity_recovery_report(
+                drifted,
+                apply_calls=19,
+            )
 
 
 @pytest.mark.parametrize(
@@ -539,7 +899,7 @@ def test_recovery_report_schema_and_open_event_are_closed() -> None:
             lambda value: value["events"][0].__setitem__(
                 "start_reason", "predicted_hard_limit_crossing"
             ),
-            "reason predicate drift",
+            "start/end pairing drift",
         ),
     ],
 )
@@ -568,8 +928,10 @@ def test_transaction_abort_snapshot_allows_target_without_readbacks() -> None:
     }
     report["counters"].update({"recovery_active_substeps": 0, "hold_target_applies": 0})
     report["counters"]["transaction_aborts"] = 1
+    report["maxima"]["consecutive_recovery_substeps"] = 0
     event = report["events"][0]
     event["end_apply_index"] = 0
+    event["start_reason"] = "target_transaction_failure"
     event["end_reason"] = "transaction_abort"
     for snapshot_field in ("start", "last"):
         snapshot = event[snapshot_field]
@@ -587,46 +949,7 @@ def test_transaction_abort_snapshot_allows_target_without_readbacks() -> None:
 
 
 def test_current_hard_limit_abort_has_an_exact_nested_terminal_counter() -> None:
-    report = _active_recovery_report()
-    position = _neutral_hard_position()
-    position[0] = _next_float32(PANDA_PHYSX_HARD_JOINT_POS_LIMITS_RAD[0][1])
-    snapshot = _recovery_snapshot(
-        apply_index=0,
-        joint_position=position,
-        joint_velocity=[0.0] * 7,
-        committed=False,
-    )
-    snapshot["hold_target_rad"] = None
-    report["state"] = {
-        "phase": CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE,
-        "active": False,
-        "consecutive_active_substeps": 0,
-        "consecutive_clean_samples": 0,
-        "release_ramp_next_index": None,
-    }
-    report["counters"] = {field: 0 for field in report["counters"]}
-    report["counters"].update(
-        {
-            "recovery_events": 1,
-            "current_hard_limit_aborts": 1,
-        }
-    )
-    report["maxima"] = {
-        "abs_velocity_to_limit_ratio": 0.0,
-        "consecutive_recovery_substeps": 0,
-        "abs_velocity_residual_excess_rad_s": [0.0] * 7,
-    }
-    report["events"] = [
-        {
-            "event_index": 0,
-            "start_apply_index": 0,
-            "end_apply_index": 0,
-            "start_reason": "current_hard_limit_violation",
-            "end_reason": "current_hard_limit_abort",
-            "start": copy.deepcopy(snapshot),
-            "last": copy.deepcopy(snapshot),
-        }
-    ]
+    report = _immediate_current_hard_terminal_report()
     validated = validate_current_joint_velocity_recovery_report(report, apply_calls=1)
     assert validated["counters"]["current_hard_limit_aborts"] == 1
 
@@ -634,6 +957,76 @@ def test_current_hard_limit_abort_has_an_exact_nested_terminal_counter() -> None
     drifted["counters"]["current_hard_limit_aborts"] = 0
     with pytest.raises(ValueError, match="event history drift"):
         validate_current_joint_velocity_recovery_report(drifted, apply_calls=1)
+
+
+def test_immediate_predicted_abort_has_a_legal_owning_start() -> None:
+    report = _immediate_predicted_terminal_report()
+    validated = validate_current_joint_velocity_recovery_report(report, apply_calls=1)
+    assert validated["events"][0]["start_reason"] == ("predicted_hard_limit_crossing")
+
+
+@pytest.mark.parametrize(
+    "end_reason",
+    [
+        "current_hard_limit_abort",
+        "predicted_hard_limit_abort",
+        "transaction_abort",
+        "lower_endpoint_transition_overflow_abort",
+    ],
+)
+def test_measured_start_accepts_each_legal_later_terminal(end_reason: str) -> None:
+    report = _measured_later_terminal_report(end_reason)
+    validated = validate_current_joint_velocity_recovery_report(report, apply_calls=2)
+    assert validated["events"][0]["end_reason"] == end_reason
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "delayed_current_own",
+        "delayed_predicted_own",
+        "current_to_transaction",
+        "current_to_lower",
+        "current_to_open",
+        "current_to_clean",
+    ],
+)
+def test_recovery_event_rejects_illegal_start_end_pairing_matrix(case: str) -> None:
+    report = (
+        _immediate_predicted_terminal_report()
+        if case == "delayed_predicted_own"
+        else _immediate_current_hard_terminal_report()
+    )
+    apply_calls = 1
+    event = report["events"][0]
+    if case.startswith("delayed_"):
+        _move_terminal_snapshot_to_apply(report, 1)
+        apply_calls = 2
+    elif case == "current_to_open":
+        event["end_apply_index"] = None
+        event["end_reason"] = None
+    else:
+        event["end_reason"] = {
+            "current_to_transaction": "transaction_abort",
+            "current_to_lower": "lower_endpoint_transition_overflow_abort",
+            "current_to_clean": "clean2_release_ramp_complete",
+        }[case]
+    with pytest.raises(ValueError, match="start/end pairing drift"):
+        validate_current_joint_velocity_recovery_report(
+            report,
+            apply_calls=apply_calls,
+        )
+
+
+def test_surviving_measured_start_requires_committed_transaction_readbacks() -> None:
+    report = _active_recovery_report()
+    start = report["events"][0]["start"]
+    start["hold_target_rad"] = None
+    start["hold_position_target_readback_rad"] = None
+    start["hold_velocity_target_readback_rad_s"] = None
+    start["hold_effort_target_readback_nm"] = None
+    with pytest.raises(ValueError, match="committed start"):
+        validate_current_joint_velocity_recovery_report(report, apply_calls=1)
 
 
 def test_reexceed_completed_report_has_one_closed_event_and_truthful_counts() -> None:
@@ -667,6 +1060,7 @@ def test_reexceed_completed_report_has_one_closed_event_and_truthful_counts() ->
         {
             "end_apply_index": 37,
             "end_reason": "clean2_release_ramp_complete",
+            "recovery_completed_apply_index": 37,
             "last": final_snapshot,
         }
     )

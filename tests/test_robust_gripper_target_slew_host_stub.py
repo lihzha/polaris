@@ -12,6 +12,7 @@ def test_robust_action_binds_finger_target_slew_report_in_isolated_host_stub():
 import sys
 import types
 import inspect
+import copy
 
 import torch
 
@@ -725,9 +726,13 @@ lower._nominal_max_delta_joint_pos = torch.full(
 )
 lower._current_joint_velocity_recovery_enabled = True
 lower._current_joint_velocity_recovery_phase = "inactive"
+lower._current_joint_velocity_recovery_recovered_events = 1
 lower._current_joint_velocity_recovery_events = [{
     "end_reason": "clean2_release_ramp_complete",
     "end_apply_index": 27,
+    "recovery_completed_apply_index": 27,
+    "deferred_lower_endpoint_transition_count": None,
+    "lower_endpoint_transition_overflow_context": None,
 }]
 for _ in range(16):
     frozen = robust.suspend_arm_release_ramp(
@@ -786,6 +791,11 @@ one_flip._gripper_close_arm_interlock_observed_endpoint_change_count = 0
 one_flip._gripper_close_arm_interlock_endpoint_observed = True
 one_flip._gripper_close_arm_interlock_remaining = 0
 assert one_flip._deferred_gripper_endpoint_transition_count() == 1
+one_flip._abort_on_deferred_gripper_endpoint_transition_overflow(
+    lower_controller_suspended=False,
+    recovery_completed_previous_apply=True,
+    snapshot={},
+)
 frozen_interlock = robust.suspend_gripper_close_arm_interlock(
     remaining_before_apply=0,
     observed_endpoint_change_count=0,
@@ -795,6 +805,17 @@ assert frozen_interlock.observed_endpoint_change_count == 0
 resumed_interlock = one_flip._next_gripper_close_arm_interlock_transition()
 assert resumed_interlock.observed_endpoint_change_count == 1
 assert resumed_interlock.activation_count_delta == 1
+
+zero_flip = bare_action()
+zero_flip._gripper_target_slew_term = types.SimpleNamespace(
+    _gripper_target_slew_endpoint_change_count=0
+)
+zero_flip._gripper_close_arm_interlock_observed_endpoint_change_count = 0
+zero_flip._abort_on_deferred_gripper_endpoint_transition_overflow(
+    lower_controller_suspended=False,
+    recovery_completed_previous_apply=True,
+    snapshot={},
+)
 
 # A second deferred endpoint transition terminalizes the active v5 event and
 # emits a rollout diagnostic with an event digest.  The call site must remain
@@ -837,6 +858,7 @@ overflow._start_current_joint_velocity_recovery_event(
 try:
     overflow._abort_on_deferred_gripper_endpoint_transition_overflow(
         lower_controller_suspended=True,
+        recovery_completed_previous_apply=False,
         snapshot=overflow_snapshot,
     )
 except robust.DifferentialIKInvariantError as error:
@@ -852,7 +874,92 @@ assert overflow._current_joint_velocity_recovery_lower_endpoint_transition_abort
 assert overflow._current_joint_velocity_recovery_events[-1]["end_reason"] == (
     "lower_endpoint_transition_overflow_abort"
 )
+assert overflow._current_joint_velocity_recovery_events[-1][
+    "deferred_lower_endpoint_transition_count"
+] == 2
+assert overflow._current_joint_velocity_recovery_events[-1][
+    "lower_endpoint_transition_overflow_context"
+] == "active_recovery"
 assert overflow._guard_diagnostics[-1]["kind"] == (
+    "measured_velocity_recovery_lower_endpoint_transition_abort"
+)
+
+# Two flips arriving on the one stale-target resume apply must reclassify the
+# immediately completed measured-recovery event, preserve its truthful ramp
+# completion/recovered count, and raise the same typed digest-bound guard.
+stale_resume = recovery_transaction_action()
+stale_resume._apply_call_count = 18
+stale_resume._current_joint_velocity_recovery_phase = "inactive"
+stale_resume._current_joint_velocity_recovery_recovered_events = 1
+stale_resume._current_joint_velocity_recovery_events_count = 1
+start_snapshot = copy.deepcopy(overflow_snapshot)
+start_snapshot.update({"apply_index": 0, "policy_step": 0, "physics_substep": 0})
+start_snapshot["hold_target_rad"] = list(start_snapshot["joint_pos_rad"])
+start_snapshot["hold_position_target_readback_rad"] = list(
+    start_snapshot["joint_pos_rad"]
+)
+start_snapshot["hold_velocity_target_readback_rad_s"] = [0.0] * 7
+start_snapshot["hold_effort_target_readback_nm"] = [0.0] * 7
+completed_snapshot = copy.deepcopy(start_snapshot)
+completed_snapshot.update({
+    "apply_index": 17,
+    "policy_step": 2,
+    "physics_substep": 1,
+})
+stale_resume._current_joint_velocity_recovery_events = [{
+    "event_index": 0,
+    "start_apply_index": 0,
+    "end_apply_index": 17,
+    "start_reason": "measured_velocity_above_float32_envelope",
+    "end_reason": "clean2_release_ramp_complete",
+    "deferred_lower_endpoint_transition_count": None,
+    "lower_endpoint_transition_overflow_context": None,
+    "recovery_completed_apply_index": 17,
+    "start": start_snapshot,
+    "last": completed_snapshot,
+}]
+assert stale_resume._current_joint_velocity_recovery_completed_previous_apply() is True
+stale_resume._apply_call_count += 1
+stale_resume._current_joint_velocity_recovery_lower_endpoint_transition_aborts = 0
+stale_resume._gripper_close_arm_interlock_observed_endpoint_change_count = 0
+stale_resume._gripper_target_slew_term = types.SimpleNamespace(
+    _gripper_target_slew_endpoint_change_count=2
+)
+stale_snapshot = stale_resume._current_joint_velocity_recovery_snapshot(
+    joint_pos=joint_position,
+    joint_vel=torch.zeros_like(joint_velocity),
+    predicted_joint_pos=joint_position,
+    predicted_hard_limit_clearance=torch.minimum(
+        joint_position - hard_limits[..., 0],
+        hard_limits[..., 1] - joint_position,
+    ),
+)
+try:
+    stale_resume._abort_on_deferred_gripper_endpoint_transition_overflow(
+        lower_controller_suspended=False,
+        recovery_completed_previous_apply=True,
+        snapshot=stale_snapshot,
+    )
+except robust.DifferentialIKInvariantError as error:
+    stale_message = str(error)
+    assert "more than one deferred gripper endpoint transition" in stale_message
+    stale_digest = stale_message.rsplit("evidence_sha256=", 1)[1].rstrip(")")
+    assert len(stale_digest) == 64
+    int(stale_digest, 16)
+else:
+    raise AssertionError("stale-resume endpoint overflow was accepted")
+assert stale_resume._current_joint_velocity_recovery_events_count == 1
+assert stale_resume._current_joint_velocity_recovery_recovered_events == 1
+stale_event = stale_resume._current_joint_velocity_recovery_events[0]
+assert stale_event["start_reason"] == "measured_velocity_above_float32_envelope"
+assert stale_event["end_reason"] == "lower_endpoint_transition_overflow_abort"
+assert stale_event["end_apply_index"] == 18
+assert stale_event["recovery_completed_apply_index"] == 17
+assert stale_event["deferred_lower_endpoint_transition_count"] == 2
+assert stale_event["lower_endpoint_transition_overflow_context"] == (
+    "post_recovery_resume"
+)
+assert stale_resume._guard_diagnostics[-1]["kind"] == (
     "measured_velocity_recovery_lower_endpoint_transition_abort"
 )
 apply_source = inspect.getsource(
@@ -868,6 +975,11 @@ target_setter = apply_source.index(
     "self._set_targets_and_commit_gripper_close_arm_interlock("
 )
 assert overflow_guard < dls_dispatch < target_setter
+v5_next_gripper = apply_source.index(
+    "self._next_gripper_close_arm_interlock_transition()",
+    dls_dispatch,
+)
+assert overflow_guard < dls_dispatch < v5_next_gripper < target_setter
 
 print("robust_target_slew_host_stub_ok")
 """

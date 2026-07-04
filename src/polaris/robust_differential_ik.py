@@ -65,6 +65,12 @@ from polaris.eef_ik_safety import (
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_END_REASONS
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_HOLD_PROFILE
 from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXT_ACTIVE,
+)
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXT_POST_RECOVERY,
+)
+from polaris.eef_ik_safety import (
     CURRENT_JOINT_VELOCITY_RECOVERY_MAXIMUM_ACTIVE_SUBSTEPS,
 )
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD
@@ -2815,6 +2821,9 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             "end_apply_index": None,
             "start_reason": reason,
             "end_reason": None,
+            "deferred_lower_endpoint_transition_count": None,
+            "lower_endpoint_transition_overflow_context": None,
+            "recovery_completed_apply_index": None,
             "start": dict(snapshot),
             "last": dict(snapshot),
         }
@@ -2842,6 +2851,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         event["end_apply_index"] = snapshot["apply_index"]
         event["end_reason"] = reason
         event["last"] = dict(snapshot)
+        if reason == "clean2_release_ramp_complete":
+            event["recovery_completed_apply_index"] = snapshot["apply_index"]
         return event
 
     def _terminalize_current_joint_velocity_recovery_state(self) -> None:
@@ -2868,6 +2879,11 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         return bool(
             event.get("end_reason") == "clean2_release_ramp_complete"
             and event.get("end_apply_index") == self._apply_call_count - 1
+            and event.get("recovery_completed_apply_index")
+            == event.get("end_apply_index")
+            and event.get("deferred_lower_endpoint_transition_count") is None
+            and event.get("lower_endpoint_transition_overflow_context") is None
+            and self._current_joint_velocity_recovery_recovered_events > 0
         )
 
     def _deferred_gripper_endpoint_transition_count(self) -> int:
@@ -2890,19 +2906,48 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self,
         *,
         lower_controller_suspended: bool,
+        recovery_completed_previous_apply: bool,
         snapshot: dict[str, object],
     ) -> None:
         """Fail closed when recovery has deferred more than one endpoint flip."""
 
-        if type(lower_controller_suspended) is not bool:
+        if (
+            type(lower_controller_suspended) is not bool
+            or type(recovery_completed_previous_apply) is not bool
+        ):
             raise ValueError("PolaRiS EEF lower-controller suspension flag drift")
         if not isinstance(snapshot, dict):
             raise ValueError("PolaRiS EEF lower-controller abort snapshot drift")
-        if (
-            not lower_controller_suspended
-            or self._deferred_gripper_endpoint_transition_count() <= 1
-        ):
+        if not (lower_controller_suspended or recovery_completed_previous_apply):
             return
+        deferred_endpoint_count = self._deferred_gripper_endpoint_transition_count()
+        if deferred_endpoint_count <= 1:
+            return
+        lower_endpoint_context = (
+            CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXT_ACTIVE
+        )
+        if recovery_completed_previous_apply:
+            event = self._current_joint_velocity_recovery_events[-1]
+            snapshot_apply_index = snapshot.get("apply_index")
+            if (
+                event.get("end_reason") != "clean2_release_ramp_complete"
+                or type(snapshot_apply_index) is not int
+                or event.get("end_apply_index") != snapshot_apply_index - 1
+                or event.get("recovery_completed_apply_index")
+                != event.get("end_apply_index")
+                or event.get("lower_endpoint_transition_overflow_context") is not None
+                or event.get("deferred_lower_endpoint_transition_count") is not None
+            ):
+                raise ValueError("PolaRiS EEF post-recovery lower-overflow state drift")
+            # The recovery ramp really completed, so retain its completion
+            # index and recovered-event counter. Re-open only the event's
+            # terminal classification for the immediately following stale-
+            # target resume guard.
+            event["end_apply_index"] = None
+            event["end_reason"] = None
+            lower_endpoint_context = (
+                CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXT_POST_RECOVERY
+            )
         self._current_joint_velocity_recovery_lower_endpoint_transition_aborts += 1
         self._raise_current_joint_velocity_recovery_abort(
             kind="measured_velocity_recovery_lower_endpoint_transition_abort",
@@ -2912,6 +2957,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 "lower_endpoint_transition_overflow_abort"
             ],
             snapshot=snapshot,
+            deferred_lower_endpoint_transition_count=deferred_endpoint_count,
+            lower_endpoint_transition_overflow_context=lower_endpoint_context,
         )
 
     def _raise_current_joint_velocity_recovery_abort(
@@ -2923,6 +2970,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         message: str,
         snapshot: dict[str, object],
         increment_invariant: bool = True,
+        deferred_lower_endpoint_transition_count: int | None = None,
+        lower_endpoint_transition_overflow_context: str | None = None,
     ) -> None:
         expected_message = CURRENT_JOINT_VELOCITY_RECOVERY_ABORT_MESSAGES.get(
             end_reason
@@ -2942,6 +2991,28 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             reason=end_reason,
             snapshot=snapshot,
         )
+        if end_reason == "lower_endpoint_transition_overflow_abort":
+            if (
+                type(deferred_lower_endpoint_transition_count) is not int
+                or deferred_lower_endpoint_transition_count <= 1
+                or lower_endpoint_transition_overflow_context
+                not in (
+                    CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXT_ACTIVE,
+                    CURRENT_JOINT_VELOCITY_RECOVERY_LOWER_ENDPOINT_CONTEXT_POST_RECOVERY,
+                )
+            ):
+                raise ValueError("PolaRiS EEF lower-overflow abort evidence drift")
+            event["deferred_lower_endpoint_transition_count"] = (
+                deferred_lower_endpoint_transition_count
+            )
+            event["lower_endpoint_transition_overflow_context"] = (
+                lower_endpoint_transition_overflow_context
+            )
+        elif (
+            deferred_lower_endpoint_transition_count is not None
+            or lower_endpoint_transition_overflow_context is not None
+        ):
+            raise ValueError("PolaRiS EEF non-lower abort retained endpoint evidence")
         self._terminalize_current_joint_velocity_recovery_state()
         if increment_invariant:
             self._invariant_abort_count += self.num_envs
@@ -3141,6 +3212,10 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 "PolaRiS EEF arm target transaction previously failed; reset is "
                 "required before another apply"
             )
+        recovery_completed_previous_apply = bool(
+            self._current_joint_velocity_recovery_enabled
+            and self._current_joint_velocity_recovery_completed_previous_apply()
+        )
         if self._arm_release_ramp_enabled:
             self._validate_arm_release_ramp_state(
                 require_latest_target=(
@@ -3148,7 +3223,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                     or (
                         self._current_joint_velocity_recovery_phase
                         == CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE
-                        and not self._current_joint_velocity_recovery_completed_previous_apply()
+                        and not recovery_completed_previous_apply
                     )
                 )
             )
@@ -3419,6 +3494,9 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                     )
                 self._abort_on_deferred_gripper_endpoint_transition_overflow(
                     lower_controller_suspended=lower_controller_suspended,
+                    recovery_completed_previous_apply=(
+                        recovery_completed_previous_apply
+                    ),
                     snapshot=recovery_snapshot,
                 )
                 if recovery_transition.sustained_abort:

@@ -187,3 +187,65 @@ The focused suite passed `217` tests. The broad host-safe suite passed `906`
 tests plus `30` subtests. The only emitted warning was the existing Torch
 `pynvml` deprecation warning. No cluster job was launched during this review
 closure.
+
+## Final-review chronology and stale-resume closure
+
+Independent review of pushed revision
+`ebd5f9483d4bb098d3944c0faec92678ef2c7609` reproduced two additional
+pre-launch fail-open cases. First, the nested validator accepted a fabricated
+same-apply `sustained_recovery_abort` with only one committed active apply; the
+same missing lifecycle proof also allowed an impossibly short clean completion
+and illegal start/end pairings. Second, two unconsumed gripper endpoint changes
+arriving on the one post-completion stale-target resume apply bypassed the
+named lower-overflow guard because the lower controller was no longer marked
+suspended, then fell into a plain missed-transition `ValueError`.
+
+The additive final-review repair upgrades only the nested recovery evidence to
+schema 3; legacy outer sidecars/runtime contracts remain schema 6 and v5 outer
+artifacts remain schema 7. Each event now records closed lifecycle evidence:
+
+- exact deferred lower endpoint-transition count when terminal;
+- lower overflow context (`active_recovery` or `post_recovery_resume`);
+- the exact recovery-completion apply index for a completed ramp.
+
+The independent validator now applies one explicit legal start/end matrix.
+Open, clean, and sustained events require a measured-velocity start. Immediate
+current-hard, predicted-hard, and target-transaction owners may end only in
+their matching reason on the same apply; measured starts may reach only the
+runtime-reachable later/immediate terminal combinations. A measured event that
+survives its start apply must carry a fully committed start transaction. Clean
+completion requires `end-start >= 17`, at least three committed active applies,
+and sixteen recovery-ramp target applies per recovered event. Sustained abort
+requires `end-start >= 8`, at least eight committed active applies per event,
+and exact global consecutive maximum 8. The global active count must cover the
+sum of all per-event minima and remain consistent with its maximum.
+
+On the immediately following stale-target resume apply, the overflow guard is
+now active before Jacobian/DLS or any target setter. Zero or one deferred change
+retains the prior resume behavior. More than one reopens only the terminal
+classification of the just-completed measured event, preserves its truthful
+recovered-ramp count and completion apply, records the exact deferred count and
+post-recovery context, then emits the existing named diagnostic and canonical-
+event-digest-bound `DifferentialIKInvariantError`. Sidecar validation binds the
+recorded deferred count to the exact frozen-arm versus live-finger endpoint-
+count difference. Active-recovery and post-recovery variants both traverse the
+full result, sidecar, aggregate, and runtime-contract path; count drift is
+rejected.
+
+Final-review validation commands included:
+
+```bash
+PYTHONPATH=$PWD/src /home/lzha/code/ego-lap/.venv/bin/python -m pytest -q \
+  tests/test_eef_current_velocity_recovery.py \
+  tests/test_eef_runtime_contract.py \
+  tests/test_eef_controller_repair.py \
+  tests/test_eef_controller_profile.py \
+  tests/test_robust_gripper_target_slew_host_stub.py
+PYTHONPATH=$PWD/src /home/lzha/code/ego-lap/.venv/bin/python -m pytest -q \
+  tests --ignore=tests/test_robust_differential_ik.py
+```
+
+The final focused suite passed `237` tests. The broad host-safe suite passed
+`926` tests plus `30` subtests. Only the existing Torch `pynvml` deprecation
+warning was emitted. No local GPU, simulator, Slurm, evaluation, or checkpoint
+job was launched, and no canonical worktree was modified.
