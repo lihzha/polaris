@@ -118,6 +118,9 @@ def test_fixture_action_and_tail_bytes_are_exact() -> None:
 
 def test_production_v4_exact_expected_ramp_contract() -> None:
     assert replay.PRODUCTION_BASE_COMMIT == ("7fc74d648328432a7f9f06d13c0e82a03f73a0c1")
+    assert replay.REPLAY_PUBLICATION_FIX_COMMIT == (
+        "d32115d36f2dea510dee86edeaddcc58309afc2e"
+    )
     assert replay.REPLAY_VALIDATION_FIX_COMMIT == (
         "585ab6f72098fd67118fd8b33cdd90be809bed3a"
     )
@@ -151,6 +154,105 @@ def test_production_v4_exact_expected_ramp_contract() -> None:
         "ramp_limited_target_apply_count": 38,
         "ramp_limited_joint_target_count": 221,
     }
+
+
+def _mock_repository_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    drift_revision: str | None = None,
+) -> list[str]:
+    ancestry = {
+        "HEAD^": replay.REPLAY_PUBLICATION_FIX_COMMIT,
+        "HEAD^^": replay.REPLAY_VALIDATION_FIX_COMMIT,
+        "HEAD^^^": replay.REPLAY_IMPLEMENTATION_COMMIT,
+        "HEAD^^^^": replay.REPLAY_PARENT_COMMIT,
+        "HEAD^^^^^": replay.PRODUCTION_BASE_COMMIT,
+    }
+    if drift_revision is not None:
+        ancestry[drift_revision] = "0" * 40
+    calls: list[str] = []
+    monkeypatch.setattr(
+        replay.gate0,
+        "_repository_provenance",
+        lambda commit: {
+            "path": str(tmp_path),
+            "commit": commit,
+            "clean_tracked": True,
+        },
+    )
+
+    def run_git(
+        command: list[str],
+        *,
+        cwd: str,
+        check: bool,
+        capture_output: bool,
+        text: bool,
+    ) -> SimpleNamespace:
+        assert command[:2] == ["git", "rev-parse"]
+        assert cwd == str(tmp_path)
+        assert check is capture_output is text is True
+        revision = command[2]
+        calls.append(revision)
+        return SimpleNamespace(stdout=f"{ancestry[revision]}\n")
+
+    monkeypatch.setattr(replay.subprocess, "run", run_git)
+    return calls
+
+
+def test_repository_provenance_binds_full_linear_fix_chain(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = _mock_repository_provenance(monkeypatch, tmp_path)
+    expected_commit = "f" * 40
+
+    observed = replay.production_repository_provenance(expected_commit)
+
+    assert calls == ["HEAD^", "HEAD^^", "HEAD^^^", "HEAD^^^^", "HEAD^^^^^"]
+    assert observed == {
+        "path": str(tmp_path),
+        "commit": expected_commit,
+        "clean_tracked": True,
+        "replay_publication_fix_commit": replay.REPLAY_PUBLICATION_FIX_COMMIT,
+        "replay_publication_fix_relation": "exact_first_parent_v1",
+        "replay_validation_fix_commit": replay.REPLAY_VALIDATION_FIX_COMMIT,
+        "replay_validation_fix_relation": "exact_first_grandparent_v1",
+        "replay_implementation_commit": replay.REPLAY_IMPLEMENTATION_COMMIT,
+        "replay_implementation_relation": "exact_first_great_grandparent_v1",
+        "replay_parent_commit": replay.REPLAY_PARENT_COMMIT,
+        "replay_parent_relation": "exact_first_great_great_grandparent_v1",
+        "production_base_commit": replay.PRODUCTION_BASE_COMMIT,
+        "production_base_relation": "exact_first_great_great_great_grandparent_v1",
+        "source_trace_polaris_commit": replay.SOURCE_TRACE_POLARIS_COMMIT,
+    }
+
+
+@pytest.mark.parametrize(
+    ("drift_revision", "message"),
+    [
+        ("HEAD^", "publication-fix parent drift"),
+        ("HEAD^^", "validation-fix grandparent drift"),
+        ("HEAD^^^", "implementation great-grandparent drift"),
+        ("HEAD^^^^", "test great-great-grandparent drift"),
+        ("HEAD^^^^^", "core great-great-great-grandparent drift"),
+    ],
+)
+def test_repository_provenance_rejects_each_ancestry_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    drift_revision: str,
+    message: str,
+) -> None:
+    _mock_repository_provenance(
+        monkeypatch,
+        tmp_path,
+        drift_revision=drift_revision,
+    )
+
+    with pytest.raises(replay.ProductionV4ReplayError, match=message):
+        replay.production_repository_provenance("f" * 40)
 
 
 def test_arm_observer_has_no_physical_or_production_state_writes() -> None:
@@ -1328,6 +1430,9 @@ def test_srun_wrapper_is_single_variant_and_launch_only() -> None:
     assert "site-packages/isaaclab/source/isaaclab" in source
     assert "site-packages/isaaclab/source/isaaclab_tasks" in source
     assert "site-packages/isaaclab/source/isaaclab_assets" in source
+    image_mount = "${FULLTRACE_CONTAINER_IMAGE}:${FULLTRACE_CONTAINER_IMAGE}:ro"
+    assert source.count(image_mount) == 1
+    assert "${FULLTRACE_CONTAINER_IMAGE}:${FULLTRACE_CONTAINER_IMAGE}:rw" not in source
     assert "trap finish EXIT" in source
     assert 'rm -rf -- "${cache}"' in source
     assert "status --porcelain=v1 --untracked-files=all" in source
@@ -1342,10 +1447,11 @@ def test_srun_wrapper_is_single_variant_and_launch_only() -> None:
     assert "read -r success_size success_sha < <(" not in source
     assert 'rm -f "${success_marker}"' not in source
     assert 'mv -T "${success_temporary}"' not in source
-    assert 'rev-parse HEAD^)" == "${replay_validation_fix_commit}"' in source
-    assert 'rev-parse HEAD^^)" == "${replay_implementation_commit}"' in source
-    assert 'rev-parse HEAD^^^)" == "${replay_parent_commit}"' in source
-    assert 'rev-parse HEAD^^^^)" == "${production_base_commit}"' in source
+    assert 'rev-parse HEAD^)" == "${replay_publication_fix_commit}"' in source
+    assert 'rev-parse HEAD^^)" == "${replay_validation_fix_commit}"' in source
+    assert 'rev-parse HEAD^^^)" == "${replay_implementation_commit}"' in source
+    assert 'rev-parse HEAD^^^^)" == "${replay_parent_commit}"' in source
+    assert 'rev-parse HEAD^^^^^)" == "${production_base_commit}"' in source
     assert source.endswith(
         "status=0\nprintf 'FULLTRACE_PRODUCTION_V4_SUCCESS=%s\\n' "
         '"${success_marker}" || true\n'

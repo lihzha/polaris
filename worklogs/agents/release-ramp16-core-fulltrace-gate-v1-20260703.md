@@ -29,7 +29,8 @@ changes relative to `7fc74d6`. This replay branch was fast-forwarded to
 Required final first-parent ancestry is therefore:
 
 ```text
-<synchronous publication / lexical-root P2 fix commit>
+<container-image identity mount fix commit>
+  -> d32115d36f2dea510dee86edeaddcc58309afc2e
   -> 585ab6f72098fd67118fd8b33cdd90be809bed3a
   -> 2ebfe7db5b2a31887481781b214608976e8023db
   -> e18b8ebbc26fd309d8e45bd58bef9c867948098a
@@ -37,11 +38,12 @@ Required final first-parent ancestry is therefore:
   -> 0611d384f5f26ef9bd8ff114be273e875c3fe719
 ```
 
-Commit `2ebfe7d` is the original replay implementation and `585ab6f` is its
-independent validator/publication hardening child. The current P2 child is the
-launch checkout, so the runner and wrapper explicitly require `585ab6f` as
-`HEAD^`, `2ebfe7d` as `HEAD^^`, `e18b8eb` as `HEAD^^^`, and `7fc74d6` as
-`HEAD^^^^`.
+Commit `2ebfe7d` is the original replay implementation, `585ab6f` is its
+independent validator/publication hardening child, and `d32115d` is the
+synchronous publication / lexical-root P2 child. The image-mount fix child is
+the launch checkout, so the runner and wrapper explicitly require `d32115d`
+as `HEAD^`, `585ab6f` as `HEAD^^`, `2ebfe7d` as `HEAD^^^`, `e18b8eb` as
+`HEAD^^^^`, and `7fc74d6` as `HEAD^^^^^`.
 
 The four production-core SHA-256 identities remain:
 
@@ -160,7 +162,58 @@ publication, link-success-before-error cleanup, initial metadata rejection
 cleanup, directory symlink rejection with and without a trailing slash, and
 normal disjoint roots.
 
-Pinned launch component SHA-256 values for the current P2 child are:
+## First target replay and container-image identity mount fix
+
+The first exact replay attempt, Slurm job `1098637`, passed the deliberate
+Isaac exit-5 negative probe, the full `84/84` Isaac controller gate, and the
+`97/97` in-container focused replay/sidecar tests. It then failed closed before
+executing any controller action. The runner's first live provenance check
+could not see the host squashfs path from inside Pyxis:
+
+```text
+ProductionV4ReplayError: missing/linked file
+/lustre/fsw/portfolios/nvr/users/lzha/cache/polaris/
+polaris-eval-cuda13-fd00a51.sqsh
+```
+
+The failure result has `completed_replay_payload=null`,
+`controller_failure_evidence=null`, and `execution_segment=null`; therefore it
+contains no controller-behavior evidence. The wrapper published immutable
+`FAILED`, did not publish `SUCCESS`, removed the scoped cache, and left the
+detached source clean. Scheduler state is `FAILED 1:0`, as required by the
+fail-closed gate.
+
+The minimal fix adds the already host-validated squashfs to the Pyxis mount
+list at the same absolute path, read-only. This lets the runner independently
+re-open the bind as a regular file, size-check it, and hash the exact image from
+inside the container. The wrapper still passes the same image to
+`--container-image`; the new bind is read-only and does not expose the broader
+host cache directory.
+The exact ancestry gate is shifted by one commit to bind this child to
+`d32115d`.
+
+The focused gate now requires exactly one
+`${FULLTRACE_CONTAINER_IMAGE}:${FULLTRACE_CONTAINER_IMAGE}:ro` mount, rejects
+an `:rw` variant, and checks the shifted five-generation ancestry chain in
+the shell wrapper, runner, and validator. It exercises the runner's exact
+ancestry capture and independently rejects drift at each of the five parent
+depths.
+Post-fix host validation is:
+
+```text
+focused replay gate: 47 passed
+selected controller/gripper regression: 219 passed
+full host-safe suite: 914 passed, 30 subtests passed
+Ruff check / format check / Python compile: passed
+bash -n / ShellCheck / git diff --check: passed
+wrapper SHA-256: 33913db072df861e287d590004be519fbe9cc5b42cb091c10bcec77740cd473d
+runner SHA-256: 1eba3493cb43f647f1831a28d401910491f180b9b6c0733a09878ab05de9b641
+validator SHA-256: 8405d4de795e26c688578c51821357c78b7b8f5365bcb79fd1c5e8bd53305459
+focused-test SHA-256: 31678318d3ee01e82aa5269b16635fd30bddbfd5cc0f7003394708f1dd5ebe01
+```
+
+Historical component SHA-256 values used by the `d32115d` checkout and failed
+job `1098637` were:
 
 - finalizer: `74dccfeb25c9522e5741eb72510f3f7940abd64678be8a357aca102fe2038fc7`
 - wrapper: `cf5351fcc666c7fb6fa3abd0f742867f43d99bebff9e9a1000eca2e5d3316b5d`
@@ -284,15 +337,16 @@ reviewed outer `sbatch` wrapper must contain literal values for all of:
 - `FULLTRACE_WRAPPER_SHA256`
 
 No command substitution, Git lookup, or hash computation from the launch
-checkout is permitted for those values. The most recent independently reviewed
-outer wrapper SHA-256
-`343f9d2126b5549964985ba794be01c5dfce17b649b5cfb2646ff5abe841edb1`
-targets parent `585ab6f72098fd67118fd8b33cdd90be809bed3a`; it does not carry the gate-I/O
-helper literal and is intentionally invalid for this P2 child. The still older
-outer SHA-256
-`724867f6227ba4100db1c3f7d4e7f946312d9785c860499745e4f4cd519cf504`
-targets `2ebfe7d` and is likewise invalid. A new outer wrapper may be reviewed
-only after the final child commit and component hashes are frozen.
+checkout is permitted for those values. The most recent historical,
+independently reviewed outer wrapper is SHA-256
+`be8f5e12308c711d99c156ac6763ce093cf36faecac731ef88b5b58bfe3f2905`;
+it targets `d32115d` and was used by failed job `1098637`, so it is invalid for
+the new image-mount child. Older rejected wrappers are SHA-256
+`343f9d2126b5549964985ba794be01c5dfce17b649b5cfb2646ff5abe841edb1`,
+which targets `585ab6f` and omits the gate-I/O literal, and
+`724867f6227ba4100db1c3f7d4e7f946312d9785c860499745e4f4cd519cf504`,
+which targets `2ebfe7d`. A new outer wrapper may be reviewed only after the
+final child commit and component hashes are frozen.
 
 The resource contract remains one ordinary, non-array, non-requeue L40S job:
 account `nvr_lpr_rvp`, partition `batch`, one node/task/GPU, 16 CPUs, 96 GiB,

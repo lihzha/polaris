@@ -1164,19 +1164,23 @@ def validate_result(
         isinstance(repository, dict)
         and repository.get("commit") == expected_commit
         and repository.get("clean_tracked") is True
+        and repository.get("replay_publication_fix_commit")
+        == replay.REPLAY_PUBLICATION_FIX_COMMIT
+        and repository.get("replay_publication_fix_relation") == "exact_first_parent_v1"
         and repository.get("replay_validation_fix_commit")
         == replay.REPLAY_VALIDATION_FIX_COMMIT
-        and repository.get("replay_validation_fix_relation") == "exact_first_parent_v1"
+        and repository.get("replay_validation_fix_relation")
+        == "exact_first_grandparent_v1"
         and repository.get("replay_implementation_commit")
         == replay.REPLAY_IMPLEMENTATION_COMMIT
         and repository.get("replay_implementation_relation")
-        == "exact_first_grandparent_v1"
+        == "exact_first_great_grandparent_v1"
         and repository.get("replay_parent_commit") == replay.REPLAY_PARENT_COMMIT
         and repository.get("replay_parent_relation")
-        == "exact_first_great_grandparent_v1"
+        == "exact_first_great_great_grandparent_v1"
         and repository.get("production_base_commit") == replay.PRODUCTION_BASE_COMMIT
         and repository.get("production_base_relation")
-        == "exact_first_great_great_grandparent_v1"
+        == "exact_first_great_great_great_grandparent_v1"
         and repository.get("source_trace_polaris_commit")
         == replay.SOURCE_TRACE_POLARIS_COMMIT,
         "repository provenance",
@@ -1324,6 +1328,7 @@ def validate_result(
         "job_id": expected_job_id,
         "launch_id": expected_launch_id,
         "replay_commit": expected_commit,
+        "replay_publication_fix_commit": replay.REPLAY_PUBLICATION_FIX_COMMIT,
         "replay_validation_fix_commit": replay.REPLAY_VALIDATION_FIX_COMMIT,
         "replay_implementation_commit": replay.REPLAY_IMPLEMENTATION_COMMIT,
         "replay_parent_commit": replay.REPLAY_PARENT_COMMIT,

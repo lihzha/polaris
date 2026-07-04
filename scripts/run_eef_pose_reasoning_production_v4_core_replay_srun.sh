@@ -50,6 +50,7 @@ done
 
 readonly variant=production_v4_core_ramp16
 readonly production_base_commit=7fc74d648328432a7f9f06d13c0e82a03f73a0c1
+readonly replay_publication_fix_commit=d32115d36f2dea510dee86edeaddcc58309afc2e
 readonly replay_validation_fix_commit=585ab6f72098fd67118fd8b33cdd90be809bed3a
 readonly replay_implementation_commit=2ebfe7db5b2a31887481781b214608976e8023db
 readonly replay_parent_commit=e18b8ebbc26fd309d8e45bd58bef9c867948098a
@@ -76,10 +77,11 @@ wrapper="$(readlink -f "$0")"
 readonly wrapper
 
 [[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD)" == "${FULLTRACE_REPLAY_COMMIT}" ]]
-[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^)" == "${replay_validation_fix_commit}" ]]
-[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^^)" == "${replay_implementation_commit}" ]]
-[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^^^)" == "${replay_parent_commit}" ]]
-[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^^^^)" == "${production_base_commit}" ]]
+[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^)" == "${replay_publication_fix_commit}" ]]
+[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^^)" == "${replay_validation_fix_commit}" ]]
+[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^^^)" == "${replay_implementation_commit}" ]]
+[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^^^^)" == "${replay_parent_commit}" ]]
+[[ "$(git -C "${FULLTRACE_POLARIS_REPO}" rev-parse HEAD^^^^^)" == "${production_base_commit}" ]]
 [[ -z "$(git -C "${FULLTRACE_POLARIS_REPO}" branch --show-current)" ]]
 [[ -z "$(git -C "${FULLTRACE_POLARIS_REPO}" status --porcelain --untracked-files=all)" ]]
 [[ "${FULLTRACE_CONTAINER_SHA256}" == "${container_sha256}" ]]
@@ -203,10 +205,11 @@ readonly isaaclab_tasks_root=/.venv/lib/python3.11/site-packages/isaaclab/source
 readonly isaaclab_assets_root=/.venv/lib/python3.11/site-packages/isaaclab/source/isaaclab_assets
 readonly container_pythonpath="${FULLTRACE_POLARIS_REPO}/src:${FULLTRACE_POLARIS_REPO}/scripts:${isaaclab_root}:${isaaclab_tasks_root}:${isaaclab_assets_root}"
 readonly record="${attempt}/run_record.env"
-printf 'PROFILE=%s\nSLURM_JOB_ID=%s\nSLURM_RESTART_COUNT=%s\nVARIANT=%s\nLAUNCH_ID=%s\nREPLAY_COMMIT=%s\nREPLAY_VALIDATION_FIX_COMMIT=%s\nREPLAY_IMPLEMENTATION_COMMIT=%s\nREPLAY_PARENT_COMMIT=%s\nPRODUCTION_BASE_COMMIT=%s\nCONTAINER_IMAGE=%s\nCONTAINER_SHA256=%s\nCONTAINER_PYTHONPATH=%s\nRESULT_JSON=%s\nVIDEO=%s\nMANIFEST=%s\n' \
+printf 'PROFILE=%s\nSLURM_JOB_ID=%s\nSLURM_RESTART_COUNT=%s\nVARIANT=%s\nLAUNCH_ID=%s\nREPLAY_COMMIT=%s\nREPLAY_PUBLICATION_FIX_COMMIT=%s\nREPLAY_VALIDATION_FIX_COMMIT=%s\nREPLAY_IMPLEMENTATION_COMMIT=%s\nREPLAY_PARENT_COMMIT=%s\nPRODUCTION_BASE_COMMIT=%s\nCONTAINER_IMAGE=%s\nCONTAINER_SHA256=%s\nCONTAINER_PYTHONPATH=%s\nRESULT_JSON=%s\nVIDEO=%s\nMANIFEST=%s\n' \
   production_v4_core_fulltrace_srun_v1 \
   "${SLURM_JOB_ID}" "${SLURM_RESTART_COUNT:-0}" "${variant}" \
   "${FULLTRACE_LAUNCH_ID}" "${FULLTRACE_REPLAY_COMMIT}" \
+  "${replay_publication_fix_commit}" \
   "${replay_validation_fix_commit}" \
   "${replay_implementation_commit}" "${replay_parent_commit}" \
   "${production_base_commit}" "${FULLTRACE_CONTAINER_IMAGE}" \
@@ -214,7 +217,7 @@ printf 'PROFILE=%s\nSLURM_JOB_ID=%s\nSLURM_RESTART_COUNT=%s\nVARIANT=%s\nLAUNCH_
   "${manifest}" >"${record}"
 chmod 0444 "${record}"
 
-readonly mounts="/dev/shm:/dev/shm,${FULLTRACE_POLARIS_REPO}:${FULLTRACE_POLARIS_REPO}:ro,${FULLTRACE_POLARIS_DATA_PATH}:${FULLTRACE_POLARIS_DATA_PATH}:ro,${attempt}:${attempt}:rw,${cache}:/cache:rw,${host_vulkan_icd}:${container_vulkan_icd}:ro"
+readonly mounts="/dev/shm:/dev/shm,${FULLTRACE_POLARIS_REPO}:${FULLTRACE_POLARIS_REPO}:ro,${FULLTRACE_POLARIS_DATA_PATH}:${FULLTRACE_POLARIS_DATA_PATH}:ro,${FULLTRACE_CONTAINER_IMAGE}:${FULLTRACE_CONTAINER_IMAGE}:ro,${attempt}:${attempt}:rw,${cache}:/cache:rw,${host_vulkan_icd}:${container_vulkan_icd}:ro"
 container_base=(
   --nodes=1
   --ntasks=1
