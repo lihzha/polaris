@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from fractions import Fraction
 import hashlib
 import json
@@ -16,12 +17,59 @@ import subprocess
 from typing import Any
 
 import build_reasoning_fulltrace_replay_fixture as fixture_contract
+import finalize_eef_pose_smoke as safety_post_kit_contract
+import numpy as np
+from polaris import eef_controller_profile as controller_profile_contract
+from polaris import eef_gripper_failure_trace as gripper_trace_contract
+from polaris import eef_gripper_runtime as gripper_runtime_contract
+from polaris import eef_gripper_target_slew as gripper_target_slew_contract
+from polaris import eef_ik_safety as ik_safety_contract
+from polaris import eef_runtime_contract as safety_contract
 import smoke_eef_pose_reasoning_production_v4_core_replay as replay
 
 
 PROFILE = "reasoning_43075_production_v4_core_release_ramp_post_kit_v1"
+ROOT = Path(__file__).resolve().parents[1]
 CONTAINER_SIZE_BYTES = 7_183_130_624
 CONTAINER_SHA256 = "ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d556b324a"
+EXPECTED_TARGET_SLEW_PROFILE = (
+    "eef_binary_driver_target_slew_rate1p25_from_live_limit5_"
+    "per_120hz_substep_candidate_v1"
+)
+EXPECTED_GRIPPER_ENDPOINT_CHANGES = 5
+EXPECTED_POLICY_STEPS = replay.ACTION_COUNT + replay.TAIL_POLICY_STEPS
+POST_KIT_VALIDATOR_SOURCE_SHA256 = {
+    "scripts/finalize_eef_pose_smoke.py": (
+        "74dccfeb25c9522e5741eb72510f3f7940abd64678be8a357aca102fe2038fc7"
+    ),
+    "src/polaris/eef_controller_profile.py": (
+        "af5c7d73a0b1bd5bf229c1b54f3c271d46fbdaafc7b81b9a1bd2799133420ec1"
+    ),
+    "src/polaris/eef_gripper_failure_trace.py": (
+        "f66af5001f8636333f6db00948a64214909a43b7d6afd1af968397dea33280b0"
+    ),
+    "src/polaris/eef_gripper_runtime.py": (
+        "6a4f8b13ec14c3e11d3be82517bfc71c4b2fc8e4b6c4da119611ed1a4ebe16f9"
+    ),
+    "src/polaris/eef_gripper_target_slew.py": (
+        "1d2a0218d89a72a5692bf79f013fdd350addd2e75507ade5c680d180a93e57a1"
+    ),
+    "src/polaris/eef_ik_safety.py": (
+        "fb3d4f4f813c03de034c9645698b6fe8b8bbd89da0ff8d8dcf9fd8f0c95d7346"
+    ),
+    "src/polaris/eef_runtime_contract.py": (
+        "a5f868f58be6850b9b7a4f9f2c1b719d0c867ad969b2fbec26a843e25db90cef"
+    ),
+}
+POST_KIT_VALIDATOR_MODULES = {
+    "scripts/finalize_eef_pose_smoke.py": safety_post_kit_contract,
+    "src/polaris/eef_controller_profile.py": controller_profile_contract,
+    "src/polaris/eef_gripper_failure_trace.py": gripper_trace_contract,
+    "src/polaris/eef_gripper_runtime.py": gripper_runtime_contract,
+    "src/polaris/eef_gripper_target_slew.py": gripper_target_slew_contract,
+    "src/polaris/eef_ik_safety.py": ik_safety_contract,
+    "src/polaris/eef_runtime_contract.py": safety_contract,
+}
 EXPECTED_CORE_SOURCE_SHA256 = {
     "src/polaris/config.py": (
         "ea38e87ab20f204929e39454bd9edf6b321d419cb3cebb61c7a6b9487f12373a"
@@ -99,6 +147,12 @@ def reject_constant(token: str) -> None:
     raise ValidationError(f"non-standard JSON constant {token!r}")
 
 
+def checked_json_float(token: str) -> float:
+    value = float(token)
+    require(math.isfinite(value), f"non-finite JSON float {token!r}")
+    return value
+
+
 def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
@@ -107,36 +161,156 @@ def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def strict_json(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    identity = file_identity(path)
+def audit_json_numbers(value: Any, *, path: str = "$") -> None:
+    """Reject non-JSON or non-finite numeric values at every nesting depth."""
+
+    if value is None or type(value) in {bool, int, str}:
+        return
+    if type(value) is float:
+        require(math.isfinite(value), f"non-finite JSON number at {path}")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            audit_json_numbers(item, path=f"{path}[{index}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            require(type(key) is str, f"non-string JSON key at {path}")
+            audit_json_numbers(item, path=f"{path}.{key}")
+        return
+    raise ValidationError(f"non-JSON value at {path}: {type(value).__name__}")
+
+
+def strict_json_loads(text: str, *, field: str) -> Any:
     try:
         payload = json.loads(
-            path.read_text(encoding="utf-8"),
+            text,
+            parse_float=checked_json_float,
             parse_constant=reject_constant,
             object_pairs_hook=reject_duplicate_keys,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValidationError(f"invalid strict JSON {path}: {error}") from error
+    except (UnicodeDecodeError, json.JSONDecodeError, OverflowError) as error:
+        raise ValidationError(f"invalid strict JSON {field}: {error}") from error
+    audit_json_numbers(payload)
+    return payload
+
+
+def strict_json(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    data, identity = read_file_identity(path)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValidationError(f"invalid UTF-8 JSON {path}: {error}") from error
+    payload = strict_json_loads(text, field=str(path))
     require(isinstance(payload, dict), f"JSON object required: {path}")
     return payload, identity
 
 
-def file_identity(path: Path) -> dict[str, Any]:
-    path = path.resolve()
-    require(path.is_file() and not path.is_symlink(), f"missing/linked file {path}")
-    metadata = path.stat()
-    data = path.read_bytes()
-    return {
-        "path": str(path),
+def read_file_identity(path: Path) -> tuple[bytes, dict[str, Any]]:
+    original = Path(path)
+    try:
+        lexical_metadata = original.lstat()
+    except FileNotFoundError as error:
+        raise ValidationError(f"missing file {original}") from error
+    require(
+        not stat.S_ISLNK(lexical_metadata.st_mode)
+        and stat.S_ISREG(lexical_metadata.st_mode),
+        f"missing/linked file {original}",
+    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(original, flags)
+    except OSError as error:
+        raise ValidationError(
+            f"cannot open nonlinked file {original}: {error}"
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        require(
+            stat.S_ISREG(metadata.st_mode)
+            and (metadata.st_dev, metadata.st_ino)
+            == (lexical_metadata.st_dev, lexical_metadata.st_ino),
+            f"file identity changed before open: {original}",
+        )
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            data = stream.read()
+        final_metadata = os.fstat(descriptor)
+        require(
+            (final_metadata.st_dev, final_metadata.st_ino, final_metadata.st_size)
+            == (metadata.st_dev, metadata.st_ino, len(data)),
+            f"file identity changed during read: {original}",
+        )
+    finally:
+        os.close(descriptor)
+    resolved = original.resolve(strict=True)
+    resolved_metadata = resolved.stat()
+    require(
+        (resolved_metadata.st_dev, resolved_metadata.st_ino)
+        == (metadata.st_dev, metadata.st_ino),
+        f"resolved file identity drift: {original}",
+    )
+    identity = {
+        "path": str(resolved),
         "size_bytes": len(data),
         "sha256": sha256(data),
         "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
         "nlink": metadata.st_nlink,
     }
+    return data, identity
+
+
+def file_identity(path: Path) -> dict[str, Any]:
+    _data, identity = read_file_identity(path)
+    return identity
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    audit_json_numbers(value)
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode()
+
+
+def typed_equal(left: Any, right: Any) -> bool:
+    if type(left) is not type(right):
+        return False
+    if isinstance(right, dict):
+        return set(left) == set(right) and all(
+            typed_equal(left[name], expected) for name, expected in right.items()
+        )
+    if isinstance(right, list):
+        return len(left) == len(right) and all(
+            typed_equal(actual, expected)
+            for actual, expected in zip(left, right, strict=True)
+        )
+    return bool(left == right)
+
+
+def validate_post_kit_validator_sources() -> dict[str, dict[str, Any]]:
+    identities: dict[str, dict[str, Any]] = {}
+    for relative_path, expected_sha256 in POST_KIT_VALIDATOR_SOURCE_SHA256.items():
+        identity = file_identity(ROOT / relative_path)
+        require(
+            identity["sha256"] == expected_sha256,
+            f"post-Kit validator source hash: {relative_path}",
+        )
+        module_file = getattr(
+            POST_KIT_VALIDATOR_MODULES[relative_path], "__file__", None
+        )
+        require(
+            isinstance(module_file, str)
+            and os.path.samefile(module_file, identity["path"]),
+            f"post-Kit imported source identity: {relative_path}",
+        )
+        identities[relative_path] = identity
+    return identities
 
 
 def float32_equal(left: float, right: float) -> bool:
-    return struct.pack("<f", float(left)) == struct.pack("<f", float(right))
+    try:
+        return struct.pack("<f", float(left)) == struct.pack("<f", float(right))
+    except (OverflowError, TypeError, ValueError, struct.error):
+        return False
 
 
 def validate_tensor(value: Any, *, field: str) -> list[float]:
@@ -346,12 +520,8 @@ def probe_video(path: Path, *, ffprobe: str, ffmpeg: str) -> dict[str, Any]:
     ]
     result = subprocess.run(command, check=True, capture_output=True, text=True)
     try:
-        payload = json.loads(
-            result.stdout,
-            parse_constant=reject_constant,
-            object_pairs_hook=reject_duplicate_keys,
-        )
-    except (json.JSONDecodeError, ValidationError) as error:
+        payload = strict_json_loads(result.stdout, field="ffprobe stream scan")
+    except ValidationError as error:
         raise ValidationError("ffprobe returned invalid JSON") from error
     streams = payload.get("streams")
     require(isinstance(streams, list) and len(streams) == 1, "one video stream")
@@ -389,12 +559,10 @@ def probe_video(path: Path, *, ffprobe: str, ffmpeg: str) -> dict[str, Any]:
         text=True,
     )
     try:
-        frame_payload = json.loads(
-            frame_result.stdout,
-            parse_constant=reject_constant,
-            object_pairs_hook=reject_duplicate_keys,
+        frame_payload = strict_json_loads(
+            frame_result.stdout, field="ffprobe frame scan"
         )
-    except (json.JSONDecodeError, ValidationError) as error:
+    except ValidationError as error:
         raise ValidationError("ffprobe frame scan returned invalid JSON") from error
     frames = frame_payload.get("frames")
     require(
@@ -469,6 +637,496 @@ def mp4_box_layout(path: Path) -> list[dict[str, Any]]:
     return boxes
 
 
+def gripper_snapshot_from_full_trace(value: Any, *, field: str) -> dict[str, Any]:
+    require(isinstance(value, dict), f"{field} snapshot")
+    mapping = {
+        "joint_pos_rad": "all_joint_pos_rad",
+        "joint_vel_rad_s": "all_joint_vel_rad_s",
+        "joint_acc_rad_s2": "all_joint_acc_rad_s2",
+        "joint_pos_target_rad": "all_joint_pos_target_rad",
+        "joint_vel_target_rad_s": "all_joint_vel_target_rad_s",
+        "joint_effort_target_nm": "all_joint_effort_target_nm",
+    }
+    result: dict[str, Any] = {}
+    for gripper_field, full_field in mapping.items():
+        vector = value.get(full_field)
+        require(
+            isinstance(vector, list) and len(vector) == 13,
+            f"{field}.{full_field}",
+        )
+        result[gripper_field] = vector[7:]
+    return result
+
+
+def validate_production_all_six_gripper_trace(
+    value: Any,
+    *,
+    full_substep_trace: Any,
+) -> dict[str, Any]:
+    """Independently close and retain the exact production all-six evidence."""
+
+    original = copy.deepcopy(value)
+    try:
+        validated = gripper_trace_contract.validate_eef_all_six_gripper_trace(
+            value,
+            episode_index=0,
+            episode_length=EXPECTED_POLICY_STEPS,
+            numerical_failure=False,
+            expected_apply_calls=replay.TOTAL_APPLY_COUNT,
+        )
+    except (TypeError, ValueError) as error:
+        raise ValidationError(f"production all-six gripper trace: {error}") from error
+    require(
+        typed_equal(validated, original) and typed_equal(value, original),
+        "production all-six gripper canonical equality",
+    )
+    require(
+        isinstance(full_substep_trace, list)
+        and len(full_substep_trace) == replay.TOTAL_APPLY_COUNT,
+        "all-six/full-trace apply count",
+    )
+    entries = validated["entries"]
+    first_retained_apply = replay.TOTAL_APPLY_COUNT - len(entries)
+    require(
+        first_retained_apply == 2_352
+        and validated["dropped_entries"] == 2_352
+        and [entry["apply_index"] for entry in entries] == list(range(2_352, 2_416))
+        and [entry["policy_step"] for entry in entries]
+        == [policy for policy in range(294, 302) for _ in range(replay.DECIMATION)],
+        "production all-six exact retained tail",
+    )
+    _, source_actions = replay.load_actions()
+    policy_actions = [
+        *source_actions,
+        *([source_actions[-1]] * replay.TAIL_POLICY_STEPS),
+    ]
+    closed = gripper_runtime_contract.GRIPPER_CLOSED_TARGET_FLOAT32
+    opened = gripper_runtime_contract.GRIPPER_OPEN_TARGET_FLOAT32
+    for apply_index, full_entry in enumerate(full_substep_trace):
+        require(isinstance(full_entry, dict), f"full trace action {apply_index}")
+        policy_step = apply_index // replay.DECIMATION
+        expected_raw = policy_actions[policy_step][7]
+        if float32_equal(expected_raw, 0.0):
+            expected_endpoint = opened
+        elif float32_equal(expected_raw, 1.0):
+            expected_endpoint = closed
+        else:
+            raise ValidationError(
+                f"non-binary fixture gripper action at policy step {policy_step}"
+            )
+        require(
+            full_entry.get("apply_index") == apply_index
+            and full_entry.get("policy_step") == policy_step
+            and full_entry.get("physics_substep") == apply_index % replay.DECIMATION
+            and isinstance(full_entry.get("raw_action"), (int, float))
+            and not isinstance(full_entry.get("raw_action"), bool)
+            and float32_equal(full_entry["raw_action"], expected_raw)
+            and isinstance(full_entry.get("requested_endpoint_rad"), (int, float))
+            and not isinstance(full_entry.get("requested_endpoint_rad"), bool)
+            and float32_equal(full_entry["requested_endpoint_rad"], expected_endpoint),
+            f"full trace exact fixture gripper action at apply {apply_index}",
+        )
+    for entry in entries:
+        apply_index = entry["apply_index"]
+        full_entry = full_substep_trace[apply_index]
+        require(
+            isinstance(full_entry, dict)
+            and full_entry.get("apply_index") == apply_index
+            and full_entry.get("policy_step") == entry["policy_step"]
+            and full_entry.get("physics_substep") == entry["physics_substep"],
+            f"all-six/full-trace identity at apply {apply_index}",
+        )
+        command = full_entry.get("command_after_setters")
+        require(
+            isinstance(command, dict)
+            and isinstance(command.get("all_joint_pos_target_rad"), list)
+            and len(command["all_joint_pos_target_rad"]) == 13,
+            f"all-six/full-trace command at apply {apply_index}",
+        )
+        expected_raw = policy_actions[entry["policy_step"]][7]
+        require(
+            float32_equal(entry["raw_action"], expected_raw)
+            and float32_equal(full_entry.get("raw_action"), expected_raw)
+            and float32_equal(entry["requested_endpoint_rad"], closed)
+            and float32_equal(full_entry.get("requested_endpoint_rad"), closed)
+            and float32_equal(entry["target_after_setter_rad"], closed)
+            and float32_equal(full_entry.get("target_after_setter_rad"), closed)
+            and typed_equal(
+                entry["pre"],
+                gripper_snapshot_from_full_trace(
+                    full_entry.get("pre"), field=f"full trace pre {apply_index}"
+                ),
+            )
+            and typed_equal(
+                entry["post"],
+                gripper_snapshot_from_full_trace(
+                    full_entry.get("post"), field=f"full trace post {apply_index}"
+                ),
+            )
+            and float32_equal(
+                entry["target_after_setter_rad"],
+                command["all_joint_pos_target_rad"][7],
+            ),
+            f"all-six/full-trace causal binding at apply {apply_index}",
+        )
+    require(
+        typed_equal(
+            validated["initial_snapshot"],
+            gripper_snapshot_from_full_trace(
+                full_substep_trace[0].get("pre"), field="full trace initial pre"
+            ),
+        )
+        and typed_equal(
+            validated["terminal_snapshot"],
+            gripper_snapshot_from_full_trace(
+                full_substep_trace[-1].get("post"), field="full trace terminal post"
+            ),
+        )
+        and float32_equal(
+            validated["terminal_snapshot"]["joint_pos_target_rad"][0], closed
+        ),
+        "production all-six initial/terminal full-trace binding",
+    )
+    encoded = canonical_json_bytes(validated)
+    return {
+        "profile": "post_kit_exact_all_six_gripper_trace_validation_v1",
+        "episode_index": 0,
+        "episode_length": EXPECTED_POLICY_STEPS,
+        "expected_apply_calls": replay.TOTAL_APPLY_COUNT,
+        "numerical_failure": False,
+        "canonical_json_sha256": sha256(encoded),
+        "canonical_json_size_bytes": len(encoded),
+        "validated_trace": copy.deepcopy(validated),
+    }
+
+
+def derive_gripper_target_slew_evidence(
+    all_six_gripper_trace: dict[str, Any],
+) -> dict[str, Any]:
+    """Replay production float32 target slew from the retained initial anchor."""
+
+    initial = all_six_gripper_trace.get("initial_snapshot")
+    require(isinstance(initial, dict), "gripper target-slew initial snapshot")
+    initial_positions = initial.get("joint_pos_rad")
+    require(
+        isinstance(initial_positions, list) and len(initial_positions) == 6,
+        "gripper target-slew initial position vector",
+    )
+    initial_anchor = initial_positions[0]
+    require(
+        isinstance(initial_anchor, (int, float))
+        and not isinstance(initial_anchor, bool)
+        and math.isfinite(float(initial_anchor)),
+        "gripper target-slew initial anchor",
+    )
+    profile = gripper_runtime_contract.eef_gripper_target_slew_profile(
+        EXPECTED_TARGET_SLEW_PROFILE
+    )
+    previous = np.float32(initial_anchor)
+    maximum_step = np.float32(profile.max_target_step_rad_float32)
+    minimum_anchor = np.float32(
+        gripper_runtime_contract.GRIPPER_TARGET_SLEW_MIN_ANCHOR_FLOAT32
+    )
+    maximum_anchor = np.float32(
+        gripper_runtime_contract.GRIPPER_TARGET_SLEW_MAX_ANCHOR_FLOAT32
+    )
+    require(
+        bool(minimum_anchor <= previous <= maximum_anchor)
+        and float32_equal(float(previous), 0.0),
+        "gripper target-slew initial anchor bounds",
+    )
+    _, source_actions = replay.load_actions()
+    require(
+        len(source_actions) == replay.ACTION_COUNT
+        and all(
+            isinstance(action, list) and len(action) == 8 for action in source_actions
+        ),
+        "gripper target-slew source action shape",
+    )
+    policy_actions = [
+        *source_actions,
+        *([source_actions[-1]] * replay.TAIL_POLICY_STEPS),
+    ]
+    require(
+        len(policy_actions) == EXPECTED_POLICY_STEPS,
+        "gripper target-slew policy count",
+    )
+    previous_endpoint: np.float32 | None = None
+    endpoint_changes = 0
+    endpoint_change_policy_steps: list[int] = []
+    endpoint_change_apply_indices: list[int] = []
+    limited_apply_count = 0
+    apply_count = 0
+    maximum_target_step = np.float32(0.0)
+    maximum_error_before = np.float32(0.0)
+    maximum_error_after = np.float32(0.0)
+    endpoint = np.float32(0.0)
+    for policy_index, action in enumerate(policy_actions):
+        raw = float(action[7])
+        if float32_equal(raw, 0.0):
+            endpoint = np.float32(gripper_runtime_contract.GRIPPER_OPEN_TARGET_FLOAT32)
+        elif float32_equal(raw, 1.0):
+            endpoint = np.float32(
+                gripper_runtime_contract.GRIPPER_CLOSED_TARGET_FLOAT32
+            )
+        else:
+            raise ValidationError(
+                f"non-binary fixture gripper action at policy step {policy_index}"
+            )
+        if previous_endpoint is not None and endpoint != previous_endpoint:
+            endpoint_changes += 1
+            endpoint_change_policy_steps.append(policy_index)
+            endpoint_change_apply_indices.append(policy_index * replay.DECIMATION)
+        previous_endpoint = endpoint
+        for _ in range(replay.DECIMATION):
+            delta = np.subtract(endpoint, previous, dtype=np.float32)
+            error_before = np.abs(delta)
+            limited = bool(error_before > maximum_step)
+            step = np.clip(delta, -maximum_step, maximum_step).astype(np.float32)
+            candidate = np.add(previous, step, dtype=np.float32)
+            next_target = candidate if limited else endpoint
+            applied_step = np.subtract(next_target, previous, dtype=np.float32)
+            if np.abs(applied_step) > maximum_step:
+                next_target = np.nextafter(next_target, previous, dtype=np.float32)
+                applied_step = np.subtract(next_target, previous, dtype=np.float32)
+            error_after = np.abs(np.subtract(endpoint, next_target, dtype=np.float32))
+            require(
+                bool(np.isfinite(next_target))
+                and bool(np.isfinite(applied_step))
+                and bool(np.abs(applied_step) <= maximum_step)
+                and bool(minimum_anchor <= next_target <= maximum_anchor)
+                and bool(error_after <= error_before),
+                "gripper target-slew independent simulation invariant",
+            )
+            maximum_target_step = np.maximum(maximum_target_step, np.abs(applied_step))
+            maximum_error_before = np.maximum(maximum_error_before, error_before)
+            maximum_error_after = np.maximum(maximum_error_after, error_after)
+            previous = np.float32(next_target)
+            limited_apply_count += int(limited)
+            apply_count += 1
+    require(
+        apply_count == replay.TOTAL_APPLY_COUNT
+        and endpoint_changes == EXPECTED_GRIPPER_ENDPOINT_CHANGES,
+        "gripper target-slew independent fixture cadence",
+    )
+    require(
+        endpoint_change_policy_steps == [198, 200, 265, 272, 281]
+        and endpoint_change_apply_indices == [1_584, 1_600, 2_120, 2_176, 2_248]
+        and limited_apply_count == 217
+        and apply_count - limited_apply_count == 2_199
+        and float32_equal(
+            float(previous), gripper_runtime_contract.GRIPPER_CLOSED_TARGET_FLOAT32
+        ),
+        "gripper target-slew exact endpoint transition indices",
+    )
+    return {
+        "profile": "exact_fixture_float32_gripper_target_slew_replay_v1",
+        "target_slew_profile": profile.profile,
+        "process_action_calls": len(policy_actions),
+        "apply_calls": apply_count,
+        "endpoint_change_count": endpoint_changes,
+        "endpoint_change_policy_steps": endpoint_change_policy_steps,
+        "endpoint_change_apply_indices": endpoint_change_apply_indices,
+        "repeated_endpoint_process_count": (len(policy_actions) - 1 - endpoint_changes),
+        "slew_limited_apply_count": limited_apply_count,
+        "endpoint_reached_apply_count": apply_count - limited_apply_count,
+        "initial_anchor_rad": float(np.float32(initial_anchor)),
+        "last_requested_endpoint_rad": float(endpoint),
+        "last_applied_target_rad": float(previous),
+        "max_abs_target_step_rad": float(maximum_target_step),
+        "max_abs_endpoint_error_before_step_rad": float(maximum_error_before),
+        "max_abs_endpoint_error_after_step_rad": float(maximum_error_after),
+    }
+
+
+def validate_production_safety(
+    value: Any,
+    *,
+    all_six_gripper_trace: dict[str, Any],
+    controller_report: Any,
+) -> dict[str, Any]:
+    """Apply the official closed safety/profile validators after Kit exits."""
+
+    require(isinstance(value, dict), "production safety object")
+    original = copy.deepcopy(value)
+    original_controller_report = copy.deepcopy(controller_report)
+    expected_target_slew = derive_gripper_target_slew_evidence(all_six_gripper_trace)
+    episode_result = {
+        "episode": 0,
+        "episode_length": EXPECTED_POLICY_STEPS,
+        "success": False,
+        "progress": 0.0,
+        "numerical_failure": False,
+        "numerical_failure_reason": "",
+    }
+    try:
+        cadence = safety_contract.validate_episode_safety_cadence(
+            safety=value,
+            episode_result=episode_result,
+            expected_gripper_target_slew_profile=EXPECTED_TARGET_SLEW_PROFILE,
+        )
+        safety_post_kit_contract._validate_safety_report(  # noqa: SLF001
+            value,
+            field="production safety",
+            episode_index=0,
+            apply_calls=replay.TOTAL_APPLY_COUNT,
+            expect_closed_target=True,
+            expected_endpoint_change_count=EXPECTED_GRIPPER_ENDPOINT_CHANGES,
+            expected_gripper_target_slew_profile=EXPECTED_TARGET_SLEW_PROFILE,
+            expected_slew_limited_apply_count=expected_target_slew[
+                "slew_limited_apply_count"
+            ],
+        )
+        specification = (
+            controller_profile_contract.validate_eef_controller_safety_evidence(
+                value,
+                expected_profile=replay.CONTROLLER_PROFILE,
+                expected_target_slew_profile=EXPECTED_TARGET_SLEW_PROFILE,
+            )
+        )
+        apply_calls, committed_apply_calls = (
+            controller_profile_contract.eef_controller_apply_counts_from_safety(value)
+        )
+        validated_controller_report = (
+            controller_profile_contract.validate_eef_controller_repair_candidate_report(
+                controller_report,
+                expected_profile=replay.CONTROLLER_PROFILE,
+                expected_target_slew_profile=EXPECTED_TARGET_SLEW_PROFILE,
+                expected_physical_max_delta_joint_pos_rad=value.get(
+                    "max_delta_joint_pos_rad"
+                ),
+                apply_calls=apply_calls,
+                committed_apply_calls=committed_apply_calls,
+            )
+        )
+    except (TypeError, ValueError) as error:
+        raise ValidationError(
+            f"production safety closed-schema validation: {error}"
+        ) from error
+    require(
+        typed_equal(value, original)
+        and typed_equal(validated_controller_report, original_controller_report)
+        and typed_equal(controller_report, original_controller_report),
+        "production safety canonical equality",
+    )
+    require(
+        cadence
+        == {
+            "apply_calls": replay.TOTAL_APPLY_COUNT,
+            "expected_decimation": replay.DECIMATION,
+            "failed_policy_step": None,
+            "failed_physics_substep": None,
+            "abort_count": 0,
+        }
+        and apply_calls == replay.TOTAL_APPLY_COUNT
+        and committed_apply_calls == replay.TOTAL_APPLY_COUNT
+        and validated_controller_report == controller_report
+        and validated_controller_report.get("gripper_close_arm_interlock", {}).get(
+            "observed_endpoint_change_count"
+        )
+        == EXPECTED_GRIPPER_ENDPOINT_CHANGES
+        and specification.profile == replay.CONTROLLER_PROFILE
+        and specification.target_slew_profile == EXPECTED_TARGET_SLEW_PROFILE
+        and specification.all_six_gripper_trace_enabled is True
+        and specification.arm_release_ramp_enabled is True,
+        "production safety v4 profile binding",
+    )
+    counters = value.get("counters")
+    require(
+        isinstance(counters, dict)
+        and counters.get("apply_calls") == replay.TOTAL_APPLY_COUNT
+        and counters.get("environment_substeps") == replay.TOTAL_APPLY_COUNT
+        and all(
+            counters.get(field) == 0
+            for field in (
+                "current_joint_limit_aborts",
+                "invariant_aborts",
+                "nonfinite_aborts",
+                "dls_fallbacks",
+                "post_clamp_target_violations",
+                "guard_diagnostics_dropped",
+            )
+        )
+        and value.get("episode_index") == 0
+        and value.get("current_joint_velocity_abort") is None,
+        "production safety exact success cadence",
+    )
+    dynamic = value.get("gripper_runtime_dynamic")
+    require(isinstance(dynamic, dict), "production safety gripper dynamic")
+    target_slew = dynamic.get("driver_target_slew")
+    require(isinstance(target_slew, dict), "production safety target-slew dynamic")
+    exact_integer_fields = (
+        "process_action_calls",
+        "apply_calls",
+        "endpoint_change_count",
+        "repeated_endpoint_process_count",
+        "slew_limited_apply_count",
+        "endpoint_reached_apply_count",
+    )
+    exact_float32_fields = (
+        "initial_anchor_rad",
+        "last_requested_endpoint_rad",
+        "last_applied_target_rad",
+        "max_abs_target_step_rad",
+        "max_abs_endpoint_error_before_step_rad",
+        "max_abs_endpoint_error_after_step_rad",
+    )
+    require(
+        dynamic.get("apply_entry_samples") == replay.TOTAL_APPLY_COUNT
+        and dynamic.get("post_policy_step_samples") == EXPECTED_POLICY_STEPS
+        and dynamic.get("nonfinite_samples") == 0
+        and dynamic.get("dropped_diagnostics") == 0
+        and target_slew.get("profile") == EXPECTED_TARGET_SLEW_PROFILE
+        and target_slew.get("initialization_count") == 1
+        and target_slew.get("live_limit_validation_count") == replay.TOTAL_APPLY_COUNT
+        and all(
+            target_slew.get(field) == expected_target_slew[field]
+            for field in exact_integer_fields
+        )
+        and all(
+            isinstance(target_slew.get(field), (int, float))
+            and not isinstance(target_slew.get(field), bool)
+            and float32_equal(target_slew[field], expected_target_slew[field])
+            for field in exact_float32_fields
+        ),
+        "production safety exact fixture target-slew binding",
+    )
+    terminal = dynamic.get("terminal_state")
+    closed = gripper_runtime_contract.GRIPPER_CLOSED_TARGET_FLOAT32
+    require(
+        isinstance(terminal, dict)
+        and terminal.get("sample_index") == 2_717
+        and isinstance(terminal.get("joint_position_target_rad"), list)
+        and len(terminal["joint_position_target_rad"]) == 6
+        and float32_equal(terminal["joint_position_target_rad"][0], closed)
+        and float32_equal(target_slew.get("last_requested_endpoint_rad"), closed)
+        and float32_equal(target_slew.get("last_applied_target_rad"), closed)
+        and float32_equal(
+            all_six_gripper_trace["terminal_snapshot"]["joint_pos_target_rad"][0],
+            closed,
+        ),
+        "production safety terminal all-six binding",
+    )
+    encoded = canonical_json_bytes(value)
+    controller_encoded = canonical_json_bytes(validated_controller_report)
+    return {
+        "profile": "post_kit_closed_production_safety_validation_v1",
+        "episode_index": 0,
+        "policy_steps": EXPECTED_POLICY_STEPS,
+        "apply_calls": replay.TOTAL_APPLY_COUNT,
+        "controller_profile": replay.CONTROLLER_PROFILE,
+        "target_slew_profile": EXPECTED_TARGET_SLEW_PROFILE,
+        "canonical_json_sha256": sha256(encoded),
+        "canonical_json_size_bytes": len(encoded),
+        "controller_report_canonical_json_sha256": sha256(controller_encoded),
+        "controller_report_canonical_json_size_bytes": len(controller_encoded),
+        "episode_safety_cadence": cadence,
+        "independent_target_slew_replay": expected_target_slew,
+        "validated_safety": copy.deepcopy(value),
+        "validated_controller_report": copy.deepcopy(validated_controller_report),
+    }
+
+
 def validate_result(
     payload: dict[str, Any],
     *,
@@ -491,15 +1149,29 @@ def validate_result(
         and payload.get("controller_profile") == replay.CONTROLLER_PROFILE,
         "result profile",
     )
+    validator_sources = validate_post_kit_validator_sources()
+    gripper_validation = validate_production_all_six_gripper_trace(
+        payload.get("production_all_six_gripper_trace"),
+        full_substep_trace=payload.get("full_substep_trace"),
+    )
+    safety_validation = validate_production_safety(
+        payload.get("production_safety"),
+        all_six_gripper_trace=gripper_validation["validated_trace"],
+        controller_report=payload.get("production_controller_report"),
+    )
     repository = payload.get("repository")
     require(
         isinstance(repository, dict)
         and repository.get("commit") == expected_commit
         and repository.get("clean_tracked") is True
+        and repository.get("replay_implementation_commit")
+        == replay.REPLAY_IMPLEMENTATION_COMMIT
+        and repository.get("replay_implementation_relation") == "exact_first_parent_v1"
         and repository.get("replay_parent_commit") == replay.REPLAY_PARENT_COMMIT
-        and repository.get("replay_parent_relation") == "exact_first_parent_v1"
+        and repository.get("replay_parent_relation") == "exact_first_grandparent_v1"
         and repository.get("production_base_commit") == replay.PRODUCTION_BASE_COMMIT
-        and repository.get("production_base_relation") == "exact_first_grandparent_v1"
+        and repository.get("production_base_relation")
+        == "exact_first_great_grandparent_v1"
         and repository.get("source_trace_polaris_commit")
         == replay.SOURCE_TRACE_POLARIS_COMMIT,
         "repository provenance",
@@ -604,18 +1276,6 @@ def validate_result(
         payload.get("full_substep_summary") == expected_summary,
         "full-trace derived summary",
     )
-    safety = payload.get("production_safety")
-    require(
-        isinstance(safety, dict)
-        and safety.get("counters", {}).get("apply_calls") == replay.TOTAL_APPLY_COUNT
-        and safety.get("counters", {}).get("current_joint_limit_aborts") == 0
-        and safety.get("counters", {}).get("invariant_aborts") == 0
-        and safety.get("counters", {}).get("nonfinite_aborts") == 0
-        and safety.get("counters", {}).get("dls_fallbacks") == 0
-        and safety.get("counters", {}).get("post_clamp_target_violations") == 0
-        and safety.get("counters", {}).get("guard_diagnostics_dropped") == 0,
-        "production safety zero-failure counters",
-    )
     close = payload.get("runtime_close")
     require(
         close
@@ -659,6 +1319,7 @@ def validate_result(
         "job_id": expected_job_id,
         "launch_id": expected_launch_id,
         "replay_commit": expected_commit,
+        "replay_implementation_commit": replay.REPLAY_IMPLEMENTATION_COMMIT,
         "replay_parent_commit": replay.REPLAY_PARENT_COMMIT,
         "production_base_commit": replay.PRODUCTION_BASE_COMMIT,
         "source_trace_polaris_commit": replay.SOURCE_TRACE_POLARIS_COMMIT,
@@ -672,6 +1333,9 @@ def validate_result(
         "full_substep_trace_cadence": expected_cadence,
         "tail_contract": expected_tail,
         "runtime_close": close,
+        "post_kit_validator_sources": validator_sources,
+        "production_all_six_gripper_trace_validation": gripper_validation,
+        "production_safety_validation": safety_validation,
         "runtime_exit": {
             "profile": "zero_simulator_srun_after_terminal_simulation_app_close_v1",
             "simulator_srun_exit_code": simulator_srun_exit_code,
@@ -684,20 +1348,45 @@ def atomic_write(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
     data = (
         json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
     ).encode()
-    path = path.resolve()
-    require(not path.exists(), f"refusing to overwrite {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    original = Path(path)
+    require(
+        not original.exists() and not original.is_symlink(),
+        f"refusing to overwrite {original}",
+    )
+    original.parent.mkdir(parents=True, exist_ok=True)
+    parent = original.parent.resolve(strict=True)
+    require(
+        parent.is_dir() and not parent.is_symlink(), f"invalid output parent {parent}"
+    )
+    path = parent / original.name
+    require(
+        not path.exists() and not path.is_symlink(), f"refusing to overwrite {path}"
+    )
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         with temporary.open("xb") as stream:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
+            os.fchmod(stream.fileno(), 0o444)
+            os.fsync(stream.fileno())
         os.link(temporary, path)
-        path.chmod(0o444)
     finally:
         temporary.unlink(missing_ok=True)
-    return file_identity(path)
+    directory_descriptor = os.open(
+        parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+    identity = file_identity(path)
+    require(
+        identity["mode"] == "0444" and identity["nlink"] == 1,
+        "published manifest mode/link",
+    )
+    return identity
 
 
 def main() -> int:

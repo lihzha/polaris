@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import ast
 import copy
+from functools import lru_cache
 import importlib.util
 import inspect
 import json
+import math
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -20,6 +23,15 @@ sys.path.insert(0, str(SCRIPTS))
 
 def load_module(name: str, filename: str) -> Any:
     spec = importlib.util.spec_from_file_location(name, SCRIPTS / filename)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_path_module(name: str, path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
@@ -99,6 +111,9 @@ def test_fixture_action_and_tail_bytes_are_exact() -> None:
 
 def test_production_v4_exact_expected_ramp_contract() -> None:
     assert replay.PRODUCTION_BASE_COMMIT == ("7fc74d648328432a7f9f06d13c0e82a03f73a0c1")
+    assert replay.REPLAY_IMPLEMENTATION_COMMIT == (
+        "2ebfe7db5b2a31887481781b214608976e8023db"
+    )
     assert replay.REPLAY_PARENT_COMMIT == ("e18b8ebbc26fd309d8e45bd58bef9c867948098a")
     assert replay.SOURCE_TRACE_POLARIS_COMMIT == (
         "0611d384f5f26ef9bd8ff114be273e875c3fe719"
@@ -564,6 +579,449 @@ def test_mp4_faststart_layout_parser(tmp_path: Path) -> None:
     ]
 
 
+def _gripper_snapshot(*, closed_target: bool) -> dict[str, Any]:
+    target = [0.0] * 6
+    if closed_target:
+        target[0] = validator.gripper_runtime_contract.GRIPPER_CLOSED_TARGET_FLOAT32
+    return {
+        "joint_pos_rad": [0.0] * 6,
+        "joint_vel_rad_s": [0.0] * 6,
+        "joint_acc_rad_s2": [0.0] * 6,
+        "joint_pos_target_rad": target,
+        "joint_vel_target_rad_s": [0.0] * 6,
+        "joint_effort_target_nm": [0.0] * 6,
+    }
+
+
+def _full_snapshot(gripper: dict[str, Any]) -> dict[str, Any]:
+    mapping = {
+        "joint_pos_rad": "all_joint_pos_rad",
+        "joint_vel_rad_s": "all_joint_vel_rad_s",
+        "joint_acc_rad_s2": "all_joint_acc_rad_s2",
+        "joint_pos_target_rad": "all_joint_pos_target_rad",
+        "joint_vel_target_rad_s": "all_joint_vel_target_rad_s",
+        "joint_effort_target_nm": "all_joint_effort_target_nm",
+    }
+    return {
+        full_field: [0.0] * 7 + list(gripper[gripper_field])
+        for gripper_field, full_field in mapping.items()
+    }
+
+
+@lru_cache(maxsize=1)
+def _synthetic_all_six_and_full_trace() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    _identity, source_actions = replay.load_actions()
+    policy_actions = [
+        *source_actions,
+        *([source_actions[-1]] * replay.TAIL_POLICY_STEPS),
+    ]
+    initial = _gripper_snapshot(closed_target=False)
+    terminal = _gripper_snapshot(closed_target=True)
+    full_trace: list[dict[str, Any]] = []
+    for apply_index in range(replay.TOTAL_APPLY_COUNT):
+        policy_step = apply_index // replay.DECIMATION
+        raw = policy_actions[policy_step][7]
+        retained = apply_index >= 2_352
+        requested_endpoint = (
+            validator.gripper_runtime_contract.GRIPPER_CLOSED_TARGET_FLOAT32
+            if validator.float32_equal(raw, 1.0)
+            else validator.gripper_runtime_contract.GRIPPER_OPEN_TARGET_FLOAT32
+        )
+        snapshot = terminal if retained else initial
+        full_trace.append(
+            {
+                "apply_index": apply_index,
+                "policy_step": policy_step,
+                "physics_substep": apply_index % replay.DECIMATION,
+                "raw_action": raw,
+                "requested_endpoint_rad": requested_endpoint,
+                "target_after_setter_rad": (
+                    validator.gripper_runtime_contract.GRIPPER_CLOSED_TARGET_FLOAT32
+                    if retained
+                    else 0.0
+                ),
+                "pre": _full_snapshot(snapshot),
+                "command_after_setters": _full_snapshot(snapshot),
+                "post": _full_snapshot(snapshot),
+            }
+        )
+    entries = [
+        {
+            "apply_index": apply_index,
+            "policy_step": apply_index // replay.DECIMATION,
+            "physics_substep": apply_index % replay.DECIMATION,
+            "raw_action": 1.0,
+            "requested_endpoint_rad": (
+                validator.gripper_runtime_contract.GRIPPER_CLOSED_TARGET_FLOAT32
+            ),
+            "pre": copy.deepcopy(terminal),
+            "target_after_setter_rad": (
+                validator.gripper_runtime_contract.GRIPPER_CLOSED_TARGET_FLOAT32
+            ),
+            "post": copy.deepcopy(terminal),
+        }
+        for apply_index in range(2_352, 2_416)
+    ]
+    trace = {
+        "schema_version": 1,
+        "profile": validator.gripper_trace_contract.EEF_ALL_SIX_GRIPPER_TRACE_PROFILE,
+        "episode_index": 0,
+        "capacity": 64,
+        "decimation": replay.DECIMATION,
+        "joint_names": list(validator.gripper_runtime_contract.GRIPPER_JOINT_NAMES),
+        "joint_indices": list(validator.gripper_runtime_contract.GRIPPER_JOINT_INDICES),
+        "process_action_calls": 302,
+        "total_apply_entries": 2_416,
+        "dropped_entries": 2_352,
+        "initial_snapshot": copy.deepcopy(initial),
+        "entries": entries,
+        "terminal_snapshot": copy.deepcopy(terminal),
+        "numerical_failure": False,
+    }
+    return trace, full_trace
+
+
+def test_post_kit_all_six_gate_accepts_and_retains_canonical_evidence() -> None:
+    trace, full_trace = _synthetic_all_six_and_full_trace()
+    result = validator.validate_production_all_six_gripper_trace(
+        copy.deepcopy(trace),
+        full_substep_trace=copy.deepcopy(full_trace),
+    )
+
+    assert result["episode_length"] == 302
+    assert result["expected_apply_calls"] == 2_416
+    assert result["validated_trace"] == trace
+    assert result["canonical_json_sha256"] == validator.sha256(
+        validator.canonical_json_bytes(trace)
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda trace, _full: trace.__setitem__("hidden", True),
+        lambda trace, _full: trace.__setitem__("dropped_entries", 2_351),
+        lambda trace, _full: trace["entries"][0].__setitem__("raw_action", 0.0),
+        lambda trace, _full: trace["entries"][1]["pre"]["joint_pos_rad"].__setitem__(
+            0, 1.0
+        ),
+        lambda _trace, full: full[2_352]["post"][
+            "all_joint_pos_target_rad"
+        ].__setitem__(7, 0.0),
+        lambda _trace, full: full[100].__setitem__("raw_action", 1.0),
+    ],
+)
+def test_post_kit_all_six_gate_rejects_malformed_and_cross_trace_tamper(
+    mutation: Any,
+) -> None:
+    trace, full_trace = _synthetic_all_six_and_full_trace()
+    trace = copy.deepcopy(trace)
+    full_trace = copy.deepcopy(full_trace)
+    mutation(trace, full_trace)
+
+    with pytest.raises(validator.ValidationError, match="all-six|full trace"):
+        validator.validate_production_all_six_gripper_trace(
+            trace,
+            full_substep_trace=full_trace,
+        )
+
+
+@lru_cache(maxsize=1)
+def _production_safety_fixture() -> tuple[dict[str, Any], dict[str, Any]]:
+    runtime_support = load_path_module(
+        "_fulltrace_runtime_contract_test_support",
+        ROOT / "tests/test_eef_runtime_contract.py",
+    )
+    gripper_support = load_path_module(
+        "_fulltrace_gripper_runtime_test_support",
+        ROOT / "tests/test_eef_gripper_runtime.py",
+    )
+    safety = runtime_support._episode_safety(episode=0, length=302)  # noqa: SLF001
+    safety["joint_velocity_limits_rad_s"] = list(
+        validator.safety_post_kit_contract.EXPECTED_VELOCITY_LIMITS
+    )
+    source, stage, root, _followers = gripper_support._fake_live_mimic_stage()  # noqa: SLF001
+    _, followers = gripper_support.runtime._write_spawned_mimic_compliance(  # noqa: SLF001
+        stage=stage,
+        roots=[root],
+        source_contract=source,
+    )
+    static = gripper_support._static_contract()  # noqa: SLF001
+    static["driver_target_slew"] = gripper_support._candidate_target_slew_static()  # noqa: SLF001
+    static["mimic_compliance"] = gripper_support._candidate_compliance_contract(  # noqa: SLF001
+        followers
+    )
+    trace, _full_trace = _synthetic_all_six_and_full_trace()
+    expected = validator.derive_gripper_target_slew_evidence(trace)
+    dynamic = gripper_support._dynamic_evidence()  # noqa: SLF001
+    dynamic["apply_entry_samples"] = 2_416
+    dynamic["post_policy_step_samples"] = 302
+    dynamic["terminal_state"]["sample_index"] = 2_717
+    dynamic["terminal_state"]["joint_position_target_rad"][0] = (
+        gripper_support.runtime.GRIPPER_CLOSED_TARGET_FLOAT32
+    )
+    dynamic["driver_target_slew"] = {
+        "profile": validator.EXPECTED_TARGET_SLEW_PROFILE,
+        "process_action_calls": expected["process_action_calls"],
+        "apply_calls": expected["apply_calls"],
+        "initialization_count": 1,
+        "endpoint_change_count": expected["endpoint_change_count"],
+        "repeated_endpoint_process_count": expected["repeated_endpoint_process_count"],
+        "slew_limited_apply_count": expected["slew_limited_apply_count"],
+        "endpoint_reached_apply_count": expected["endpoint_reached_apply_count"],
+        "live_limit_validation_count": expected["apply_calls"],
+        "max_abs_target_step_rad": expected["max_abs_target_step_rad"],
+        "max_abs_endpoint_error_before_step_rad": expected[
+            "max_abs_endpoint_error_before_step_rad"
+        ],
+        "max_abs_endpoint_error_after_step_rad": expected[
+            "max_abs_endpoint_error_after_step_rad"
+        ],
+        "initial_anchor_rad": expected["initial_anchor_rad"],
+        "last_requested_endpoint_rad": expected["last_requested_endpoint_rad"],
+        "last_applied_target_rad": expected["last_applied_target_rad"],
+    }
+    safety["gripper_runtime_static"] = static
+    safety["gripper_runtime_dynamic"] = dynamic
+    report = runtime_support._candidate_controller_report(  # noqa: SLF001
+        safety,
+        initial=False,
+        profile=replay.CONTROLLER_PROFILE,
+    )
+    report["gripper_close_arm_interlock"]["observed_endpoint_change_count"] = 5
+    return safety, report
+
+
+def test_post_kit_safety_gate_uses_exact_cumulative_target_slew_override() -> None:
+    safety, report = _production_safety_fixture()
+    trace, _full_trace = _synthetic_all_six_and_full_trace()
+
+    with pytest.raises(ValueError, match="closed transition"):
+        validator.safety_post_kit_contract._validate_safety_report(  # noqa: SLF001
+            copy.deepcopy(safety),
+            field="without cumulative override",
+            episode_index=0,
+            apply_calls=2_416,
+            expect_closed_target=True,
+            expected_endpoint_change_count=5,
+            expected_gripper_target_slew_profile=(
+                validator.EXPECTED_TARGET_SLEW_PROFILE
+            ),
+        )
+    result = validator.validate_production_safety(
+        copy.deepcopy(safety),
+        all_six_gripper_trace=copy.deepcopy(trace),
+        controller_report=copy.deepcopy(report),
+    )
+
+    assert result["episode_safety_cadence"] == {
+        "apply_calls": 2_416,
+        "expected_decimation": 8,
+        "failed_policy_step": None,
+        "failed_physics_substep": None,
+        "abort_count": 0,
+    }
+    assert result["independent_target_slew_replay"][
+        "endpoint_change_apply_indices"
+    ] == [1_584, 1_600, 2_120, 2_176, 2_248]
+    assert result["independent_target_slew_replay"]["slew_limited_apply_count"] == 217
+    assert result["validated_safety"] == safety
+    assert result["validated_controller_report"] == report
+
+
+def _dictionary_field_paths(
+    value: Any, path: tuple[Any, ...] = ()
+) -> list[tuple[Any, ...]]:
+    paths: list[tuple[Any, ...]] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            child_path = (*path, key)
+            paths.append(child_path)
+            paths.extend(_dictionary_field_paths(child, child_path))
+    elif isinstance(value, list) and value and isinstance(value[0], dict):
+        paths.extend(_dictionary_field_paths(value[0], (*path, 0)))
+    return paths
+
+
+def _remove_path(value: Any, path: tuple[Any, ...]) -> None:
+    parent = value
+    for item in path[:-1]:
+        parent = parent[item]
+    del parent[path[-1]]
+
+
+def test_post_kit_safety_gate_rejects_every_closed_schema_field_removal() -> None:
+    safety, report = _production_safety_fixture()
+    trace, _full_trace = _synthetic_all_six_and_full_trace()
+    paths = _dictionary_field_paths(safety)
+    assert len(paths) > 200
+    for path in paths:
+        candidate = copy.deepcopy(safety)
+        _remove_path(candidate, path)
+        with pytest.raises(
+            validator.ValidationError,
+            match="production safety",
+        ):
+            validator.validate_production_safety(
+                candidate,
+                all_six_gripper_trace=copy.deepcopy(trace),
+                controller_report=copy.deepcopy(report),
+            )
+
+
+def test_post_kit_safety_gate_rejects_category_and_exact_counter_tamper() -> None:
+    safety, report = _production_safety_fixture()
+    trace, _full_trace = _synthetic_all_six_and_full_trace()
+    mutations = [
+        lambda value: value.__setitem__("unexpected", True),
+        lambda value: value.__setitem__("physics_dt", 1.0 / 60.0),
+        lambda value: value.__setitem__("profile", "wrong"),
+        lambda value: value.__setitem__(
+            "target_joint_pos_limits_float32_sha256", "0" * 64
+        ),
+        lambda value: value["counters"].__setitem__("apply_calls", 2_415),
+        lambda value: value["gripper_runtime_static"]["driver_target_slew"].__setitem__(
+            "profile", "wrong"
+        ),
+        lambda value: value["gripper_runtime_dynamic"].__setitem__(
+            "post_policy_step_samples", 301
+        ),
+        lambda value: value["gripper_runtime_dynamic"][
+            "driver_target_slew"
+        ].__setitem__("process_action_calls", 301),
+        lambda value: value["gripper_runtime_dynamic"][
+            "driver_target_slew"
+        ].__setitem__("apply_calls", 2_415),
+        lambda value: value["gripper_runtime_dynamic"][
+            "driver_target_slew"
+        ].__setitem__("endpoint_change_count", 4),
+        lambda value: value["gripper_runtime_dynamic"][
+            "driver_target_slew"
+        ].__setitem__("repeated_endpoint_process_count", 295),
+        lambda value: value["gripper_runtime_dynamic"][
+            "driver_target_slew"
+        ].__setitem__("slew_limited_apply_count", 216),
+        lambda value: value["gripper_runtime_dynamic"][
+            "driver_target_slew"
+        ].__setitem__("endpoint_reached_apply_count", 2_198),
+        lambda value: value["gripper_runtime_dynamic"][
+            "driver_target_slew"
+        ].__setitem__("live_limit_validation_count", 2_415),
+        lambda value: value["gripper_runtime_dynamic"]["terminal_state"][
+            "joint_position_target_rad"
+        ].__setitem__(0, 0.0),
+        lambda value: value["gripper_runtime_dynamic"][
+            "driver_target_slew"
+        ].__setitem__("last_applied_target_rad", 0.0),
+    ]
+    for mutation in mutations:
+        candidate = copy.deepcopy(safety)
+        mutation(candidate)
+        with pytest.raises(validator.ValidationError, match="production safety"):
+            validator.validate_production_safety(
+                candidate,
+                all_six_gripper_trace=copy.deepcopy(trace),
+                controller_report=copy.deepcopy(report),
+            )
+
+
+@pytest.mark.parametrize("overflow", ["1e999", "-1e999"])
+def test_strict_json_rejects_deep_exponent_overflow_and_recursive_nonfinite(
+    tmp_path: Path,
+    overflow: str,
+) -> None:
+    path = tmp_path / "overflow.json"
+    path.write_text(
+        f'{{"ignored":{{"deep":[0,{overflow}]}}}}',
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o444)
+
+    with pytest.raises(validator.ValidationError, match="non-finite JSON float"):
+        validator.strict_json(path)
+    with pytest.raises(validator.ValidationError, match="non-finite JSON number"):
+        validator.audit_json_numbers({"ignored": {"deep": [True, math.inf]}})
+    validator.audit_json_numbers({"bool_is_not_numeric": True, "integer": 1})
+
+
+def test_file_identity_rejects_lexical_symlink_before_resolution(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target.json"
+    target.write_text("{}", encoding="utf-8")
+    link = tmp_path / "linked.json"
+    link.symlink_to(target)
+
+    with pytest.raises(validator.ValidationError, match="linked file"):
+        validator.file_identity(link)
+    dangling = tmp_path / "dangling.json"
+    dangling.symlink_to(tmp_path / "absent.json")
+    with pytest.raises(validator.ValidationError, match="linked file"):
+        validator.file_identity(dangling)
+    manifest_link = tmp_path / "manifest.json"
+    manifest_link.symlink_to(tmp_path / "absent-manifest.json")
+    with pytest.raises(validator.ValidationError, match="refusing to overwrite"):
+        validator.atomic_write(manifest_link, {"passed": True})
+
+
+def test_full_result_routes_all_six_then_closed_safety_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {field: None for field in validator.RESULT_FIELDS}
+    payload.update(
+        {
+            "schema_version": 1,
+            "profile": replay.PROFILE,
+            "passed": True,
+            "controller_replay_only": True,
+            "variant": replay.VARIANT,
+            "controller_profile": replay.CONTROLLER_PROFILE,
+            "production_all_six_gripper_trace": {"trace": True},
+            "full_substep_trace": [{"full": True}],
+            "production_safety": {"safety": True},
+            "production_controller_report": {"controller": True},
+        }
+    )
+    observed: list[tuple[str, Any]] = []
+    monkeypatch.setattr(validator, "validate_post_kit_validator_sources", lambda: {})
+
+    def validate_gripper(value: Any, *, full_substep_trace: Any) -> dict[str, Any]:
+        observed.append(("gripper", (value, full_substep_trace)))
+        return {"validated_trace": {"validated": True}}
+
+    def validate_safety(
+        value: Any,
+        *,
+        all_six_gripper_trace: Any,
+        controller_report: Any,
+    ) -> dict[str, Any]:
+        observed.append(("safety", (value, all_six_gripper_trace, controller_report)))
+        raise validator.ValidationError("closed-safety-sentinel")
+
+    monkeypatch.setattr(
+        validator,
+        "validate_production_all_six_gripper_trace",
+        validate_gripper,
+    )
+    monkeypatch.setattr(validator, "validate_production_safety", validate_safety)
+    with pytest.raises(validator.ValidationError, match="closed-safety-sentinel"):
+        validator.validate_result(
+            payload,
+            expected_commit="0" * 40,
+            expected_job_id=1,
+            expected_launch_id="0" * 64,
+            result_identity={},
+            video_path=Path("unused.mp4"),
+            ffprobe="unused",
+            ffmpeg="unused",
+            simulator_srun_exit_code=0,
+        )
+    assert observed == [
+        ("gripper", ({"trace": True}, [{"full": True}])),
+        ("safety", ({"safety": True}, {"validated": True}, {"controller": True})),
+    ]
+
+
 def test_validator_result_schema_matches_runner_contract() -> None:
     assert validator.RESULT_FIELDS == {
         "schema_version",
@@ -629,6 +1087,22 @@ def test_srun_wrapper_is_single_variant_and_launch_only() -> None:
     assert "trap finish EXIT" in source
     assert 'rm -rf -- "${cache}"' in source
     assert "status --porcelain=v1 --untracked-files=all" in source
+    assert "FULLTRACE_SAFETY_VALIDATOR_SHA256" in source
+    assert 'realpath -e -- "${FULLTRACE_OUTPUT_ROOT}"' in source
+    assert 'realpath -e -- "${FULLTRACE_HOST_CACHE_ROOT}"' in source
+    assert 'paths_overlap "${output_root}" "${cache_root}"' in source
+    assert 'mkdir -- "${attempt}"' in source
+    assert 'mkdir -- "${cache}"' in source
+    assert "os.O_EXCL" in source
+    assert "os.O_NOFOLLOW" in source
+    assert "os.link(temporary, marker, follow_symlinks=False)" in source
+    assert "os.fsync(directory_descriptor)" in source
+    assert "published.st_nlink == 1" in source
+    assert 'rm -f "${success_marker}"' not in source
+    assert 'mv -T "${success_temporary}"' not in source
+    assert 'rev-parse HEAD^)" == "${replay_implementation_commit}"' in source
+    assert 'rev-parse HEAD^^)" == "${replay_parent_commit}"' in source
+    assert 'rev-parse HEAD^^^)" == "${production_base_commit}"' in source
 
 
 def test_fixture_builder_still_reproduces_pinned_action_payload() -> None:

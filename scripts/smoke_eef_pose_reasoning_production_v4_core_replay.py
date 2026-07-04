@@ -37,6 +37,7 @@ MODULE_IDENTITY = "smoke_eef_pose_reasoning_production_v4_core_replay"
 VARIANT = "production_v4_core_ramp16"
 SOURCE_TRACE_POLARIS_COMMIT = "0611d384f5f26ef9bd8ff114be273e875c3fe719"
 PRODUCTION_BASE_COMMIT = "7fc74d648328432a7f9f06d13c0e82a03f73a0c1"
+REPLAY_IMPLEMENTATION_COMMIT = "2ebfe7db5b2a31887481781b214608976e8023db"
 REPLAY_PARENT_COMMIT = "e18b8ebbc26fd309d8e45bd58bef9c867948098a"
 CONTROLLER_PROFILE = (
     "arm_slew_0p95_gripper_rate0p25_fixed_anchor86_release_ramp16_"
@@ -2006,31 +2007,44 @@ def production_repository_provenance(expected_commit: str) -> dict[str, Any]:
     """Require a clean launch child atop the target-tested production core."""
 
     repository = gate0._repository_provenance(expected_commit)  # noqa: SLF001
-    parent = subprocess.run(
+    implementation = subprocess.run(
         ["git", "rev-parse", "HEAD^"],
         cwd=repository["path"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
-    production_base = subprocess.run(
+    parent = subprocess.run(
         ["git", "rev-parse", "HEAD^^"],
         cwd=repository["path"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
-    require(parent == REPLAY_PARENT_COMMIT, "production replay parent drift")
+    production_base = subprocess.run(
+        ["git", "rev-parse", "HEAD^^^"],
+        cwd=repository["path"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    require(
+        implementation == REPLAY_IMPLEMENTATION_COMMIT,
+        "production replay implementation parent drift",
+    )
+    require(parent == REPLAY_PARENT_COMMIT, "production replay test parent drift")
     require(
         production_base == PRODUCTION_BASE_COMMIT,
-        "production replay core grandparent drift",
+        "production replay core great-grandparent drift",
     )
     return {
         **repository,
+        "replay_implementation_commit": REPLAY_IMPLEMENTATION_COMMIT,
+        "replay_implementation_relation": "exact_first_parent_v1",
         "replay_parent_commit": REPLAY_PARENT_COMMIT,
-        "replay_parent_relation": "exact_first_parent_v1",
+        "replay_parent_relation": "exact_first_grandparent_v1",
         "production_base_commit": PRODUCTION_BASE_COMMIT,
-        "production_base_relation": "exact_first_grandparent_v1",
+        "production_base_relation": "exact_first_great_grandparent_v1",
         "source_trace_polaris_commit": SOURCE_TRACE_POLARIS_COMMIT,
     }
 

@@ -1218,9 +1218,18 @@ def _validate_gripper_target_slew_dynamic(
     expect_closed_target: bool,
     expected_endpoint_change_count: int = 0,
     expected_profile: str = GRIPPER_TARGET_SLEW_PROFILE,
+    expected_slew_limited_apply_count: int | None = None,
 ) -> None:
     report = _object(value, field)
     profile = _gripper_target_slew_profile(expected_profile)
+    _require(
+        expected_slew_limited_apply_count is None
+        or (
+            type(expected_slew_limited_apply_count) is int
+            and 0 <= expected_slew_limited_apply_count <= apply_calls
+        ),
+        f"{field}.expected_slew_limited_apply_count",
+    )
     _require(
         set(report) == GRIPPER_TARGET_SLEW_DYNAMIC_FIELDS,
         f"{field} schema drift",
@@ -1296,12 +1305,16 @@ def _validate_gripper_target_slew_dynamic(
             f"{field}.state",
         )
         if expect_closed_target:
+            expected_limited = (
+                profile["close_limited_applies"]
+                if expected_slew_limited_apply_count is None
+                else expected_slew_limited_apply_count
+            )
             _require(
                 apply_calls >= profile["close_transition_applies"]
-                and counters["slew_limited_apply_count"]
-                == profile["close_limited_applies"]
+                and counters["slew_limited_apply_count"] == expected_limited
                 and counters["endpoint_reached_apply_count"]
-                == apply_calls - profile["close_limited_applies"]
+                == apply_calls - expected_limited
                 and _same_float32(maxima[0], profile["max_target_step_rad"])
                 and _same_float32(maxima[1], GRIPPER_CLOSED_TARGET)
                 and _same_float32(anchor, 0.0)
@@ -1327,6 +1340,7 @@ def _validate_gripper_dynamic(
     expect_closed_target: bool,
     expected_endpoint_change_count: int = 0,
     expected_target_slew_profile: str = GRIPPER_TARGET_SLEW_PROFILE,
+    expected_slew_limited_apply_count: int | None = None,
 ) -> None:
     report = _object(value, field)
     _require(set(report) == GRIPPER_RUNTIME_DYNAMIC_FIELDS, f"{field} schema drift")
@@ -1414,6 +1428,7 @@ def _validate_gripper_dynamic(
         expect_closed_target=expect_closed_target,
         expected_endpoint_change_count=expected_endpoint_change_count,
         expected_profile=expected_target_slew_profile,
+        expected_slew_limited_apply_count=expected_slew_limited_apply_count,
     )
 
 
@@ -1426,6 +1441,7 @@ def _validate_safety_report(
     expect_closed_target: bool = False,
     expected_endpoint_change_count: int = 0,
     expected_gripper_target_slew_profile: str = GRIPPER_TARGET_SLEW_PROFILE,
+    expected_slew_limited_apply_count: int | None = None,
 ) -> tuple[dict[str, int], dict[str, list[float]]]:
     report = _object(value, field)
     _require(set(report) == SAFETY_FIELDS, f"{field} schema drift")
@@ -1445,6 +1461,7 @@ def _validate_safety_report(
         expect_closed_target=expect_closed_target,
         expected_endpoint_change_count=expected_endpoint_change_count,
         expected_target_slew_profile=expected_gripper_target_slew_profile,
+        expected_slew_limited_apply_count=expected_slew_limited_apply_count,
     )
     if episode_index is None:
         _require(report.get("episode_index") is None, f"{field}.episode_index")

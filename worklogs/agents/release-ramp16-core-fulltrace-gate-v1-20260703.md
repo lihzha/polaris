@@ -29,11 +29,16 @@ changes relative to `7fc74d6`. This replay branch was fast-forwarded to
 Required final first-parent ancestry is therefore:
 
 ```text
-<replay implementation commit>
+<independent validation fix commit>
+  -> 2ebfe7db5b2a31887481781b214608976e8023db
   -> e18b8ebbc26fd309d8e45bd58bef9c867948098a
   -> 7fc74d648328432a7f9f06d13c0e82a03f73a0c1
   -> 0611d384f5f26ef9bd8ff114be273e875c3fe719
 ```
+
+Commit `2ebfe7d` is the original replay implementation. The fix child is the
+launch checkout, so the runner and wrapper explicitly require `2ebfe7d` as
+`HEAD^`, `e18b8eb` as `HEAD^^`, and `7fc74d6` as `HEAD^^^`.
 
 The four production-core SHA-256 identities remain:
 
@@ -85,6 +90,50 @@ target/state writes. Static AST tests reject any such write.
 The production all-six gripper trace remains in the inheritance chain. The
 full-trace subclass only finalizes both observational traces before the next
 arm command and adds synchronized 13-DOF snapshots.
+
+## Independent post-Kit hardening
+
+The fix child closes the independent validation and publication gaps without
+changing `src/polaris`:
+
+- The post-Kit validator calls the exact pure
+  `validate_eef_all_six_gripper_trace` contract for episode 0, 302 policy
+  steps, 2,416 applies, and no numerical failure. It retains the validated
+  object and canonical digest in the manifest and cross-binds retained applies
+  `2352..2415` to the full 13-DOF trace.
+- Every full-trace gripper action/request is independently compared with the
+  immutable 294-action fixture plus eight repeated tail actions. Exact endpoint
+  changes are policy steps `198, 200, 265, 272, 281`, or applies
+  `1584, 1600, 2120, 2176, 2248`.
+- The official public episode-cadence validator, controller safety/profile
+  validator, apply-count validator, and controller-report validator all run in
+  the post-Kit process. The established finalizer validates every safety field,
+  nested schema, digest, counter, maximum, diagnostic, gripper static contract,
+  and gripper dynamic contract.
+- The finalizer gained one optional cumulative limited-apply expectation. Its
+  default remains the original single-close value; this replay passes the
+  independently derived exact `217` limited / `2199` reached counts for five
+  endpoint changes.
+- Strict JSON uses a checked float parser and a recursive numeric audit, so
+  nested exponent overflow and non-finite values fail even in otherwise unused
+  fields. Lexical paths are `lstat`-checked before resolution and opened with
+  `O_NOFOLLOW`.
+- Output and cache roots must resolve to disjoint trees. Attempt and cache
+  namespaces are created exclusively, cache cleanup is exact-path scoped, and
+  failure handling never deletes a pre-existing success object.
+- `SUCCESS` uses exclusive temp creation, file fsync, mode sealing, a
+  non-replacing hard-link publication, temp unlink, directory fsync, and
+  independent reread/hash/mode/link-count checks.
+
+Pinned launch component SHA-256 values for the fix are:
+
+- finalizer: `74dccfeb25c9522e5741eb72510f3f7940abd64678be8a357aca102fe2038fc7`
+- wrapper: `a39ce5fe83ec382ab451c248efae687ef0a11908e119d6a05f2b8002dde2ffe0`
+- runner: `6e0d18e73cde9c76a257feb093e5226e8a3ea99df213edc5f2bfffa2596993b7`
+- validator: `4349d07521094ea6e458b5eca9946ed5446ddb3faad56f37e76767510e04e58f`
+- fixture: `daf2aa682f2296a93170f842a5adb13a4fbc6b2694fa5dca28de7ac7ad83d7cb`
+- fixture builder: `d9151df864a447fc5e18a900188125f89a49fcd04e0bf703f1b7dc2e8a5872e4`
+- focused test: `810ad9a317cb8f1cfa233b342cb83c8a3ca57c0b039b72297c01a9e619c89533`
 
 ## Frozen replay contract
 
@@ -139,6 +188,20 @@ PYTHONPATH=$PWD:$PWD/scripts:$PWD/src \
 # 886 passed, 30 subtests passed
 ```
 
+The independent hardening child then passed:
+
+```text
+focused adversarial gate: 33 passed
+selected safety/controller/gripper regression: 366 passed
+full host-safe suite: 900 passed, 30 subtests passed
+Ruff check: passed
+Ruff format --check: passed
+Python compile: passed
+bash -n: passed
+ShellCheck: passed
+git diff --check: passed
+```
+
 The unrestricted host suite stops during collection only because the local
 environment lacks `isaaclab`. The launch wrapper runs the omitted
 `tests/test_robust_differential_ik.py` first in the pinned Isaac image. It
@@ -151,37 +214,36 @@ source roots under `/.venv/lib/python3.11/site-packages/isaaclab/source`.
 That same path is used by both `run_isaac_pytest.py` and the direct replay
 runner.
 
-## Exact launch design (not executed)
+## Exact launch design (not executed; independent literals required)
 
-First deploy the pushed replay commit as a clean detached Git checkout on
-Lustre. Resolve the source hashes from that checkout and submit one ordinary
-L40S job:
+This repository must not derive its own commit, component hashes, or launch ID
+at submission time. The prior dynamic example was removed because a checkout
+can otherwise attest to itself after an unreviewed change. The independently
+reviewed outer `sbatch` wrapper must contain literal values for all of:
 
-```bash
-POLARIS_REPO=/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-release-ramp16-core-fulltrace-gate-v1-20260703
-COMMIT=$(git -C "$POLARIS_REPO" rev-parse HEAD)
-RUNNER_SHA=$(sha256sum "$POLARIS_REPO/scripts/smoke_eef_pose_reasoning_production_v4_core_replay.py" | awk '{print $1}')
-VALIDATOR_SHA=$(sha256sum "$POLARIS_REPO/scripts/validate_eef_pose_reasoning_production_v4_core_replay.py" | awk '{print $1}')
-FIXTURE_SHA=$(sha256sum "$POLARIS_REPO/scripts/fixtures/reasoning_43075_job1098523_fulltrace_actions.json" | awk '{print $1}')
-BUILDER_SHA=$(sha256sum "$POLARIS_REPO/scripts/build_reasoning_fulltrace_replay_fixture.py" | awk '{print $1}')
-TEST_SHA=$(sha256sum "$POLARIS_REPO/tests/test_smoke_eef_pose_reasoning_production_v4_core_replay.py" | awk '{print $1}')
-WRAPPER_SHA=$(sha256sum "$POLARIS_REPO/scripts/run_eef_pose_reasoning_production_v4_core_replay_srun.sh" | awk '{print $1}')
-LAUNCH_ID=$(printf '%s\n' "$COMMIT|production_v4_core_ramp16|294x8+64" | sha256sum | awk '{print $1}')
+- `FULLTRACE_REPLAY_COMMIT`
+- `FULLTRACE_LAUNCH_ID`
+- `FULLTRACE_RUNNER_SHA256`
+- `FULLTRACE_VALIDATOR_SHA256`
+- `FULLTRACE_SAFETY_VALIDATOR_SHA256`
+- `FULLTRACE_FIXTURE_SHA256`
+- `FULLTRACE_FIXTURE_BUILDER_SHA256`
+- `FULLTRACE_TEST_SHA256`
+- `FULLTRACE_WRAPPER_SHA256`
 
-sbatch --parsable \
-  --account=nvr_lpr_rvp \
-  --partition=batch \
-  --nodes=1 \
-  --ntasks=1 \
-  --gpus-per-node=1 \
-  --cpus-per-task=16 \
-  --mem=96G \
-  --time=00:45:00 \
-  --job-name=pol_v4_core_fulltrace \
-  --output=/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris/%j.out \
-  --export=ALL,FULLTRACE_POLARIS_REPO="$POLARIS_REPO",FULLTRACE_REPLAY_COMMIT="$COMMIT",FULLTRACE_CONTAINER_IMAGE=/lustre/fsw/portfolios/nvr/users/lzha/cache/polaris/polaris-eval-cuda13-fd00a51.sqsh,FULLTRACE_CONTAINER_SHA256=ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d556b324a,FULLTRACE_POLARIS_DATA_PATH=/lustre/fsw/portfolios/nvr/users/lzha/data/PolaRiS-Hub,FULLTRACE_OUTPUT_ROOT=/lustre/fsw/portfolios/nvr/users/lzha/results/polaris_eval/release_ramp16_core_fulltrace_gate_v1,FULLTRACE_HOST_CACHE_ROOT=/lustre/fsw/portfolios/nvr/users/lzha/cache/polaris/release_ramp16_core_fulltrace_gate_v1,FULLTRACE_LAUNCH_ID="$LAUNCH_ID",FULLTRACE_RUNNER_SHA256="$RUNNER_SHA",FULLTRACE_VALIDATOR_SHA256="$VALIDATOR_SHA",FULLTRACE_FIXTURE_SHA256="$FIXTURE_SHA",FULLTRACE_FIXTURE_BUILDER_SHA256="$BUILDER_SHA",FULLTRACE_TEST_SHA256="$TEST_SHA",FULLTRACE_WRAPPER_SHA256="$WRAPPER_SHA" \
-  --wrap="bash $POLARIS_REPO/scripts/run_eef_pose_reasoning_production_v4_core_replay_srun.sh"
-```
+No command substitution, Git lookup, or hash computation from the launch
+checkout is permitted for those values. The prior outer wrapper SHA-256
+`724867f6227ba4100db1c3f7d4e7f946312d9785c860499745e4f4cd519cf504`
+was reviewed for commit `2ebfe7db5b2a31887481781b214608976e8023db`; it is intentionally invalid
+for this fix child and must not be used. A new outer wrapper may be reviewed
+only after the final child commit and component hashes are frozen.
+
+The resource contract remains one ordinary, non-array, non-requeue L40S job:
+account `nvr_lpr_rvp`, partition `batch`, one node/task/GPU, 16 CPUs, 96 GiB,
+and 45 minutes. The source must be a clean detached checkout. Output and cache
+roots must already exist as distinct non-symlink directories. The wrapper
+requires a fresh exclusive attempt namespace and a separate fresh exclusive
+cache namespace.
 
 The wrapper pins image SHA-256
 `ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d556b324a`,
