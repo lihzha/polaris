@@ -175,7 +175,7 @@ def test_cluster_smoke_forces_one_removal_and_requires_one_recovery() -> None:
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "RemovePrim"
+        and node.func.attr == "RemoveRootPrim"
     ]
     guard_calls = [
         node
@@ -188,6 +188,110 @@ def test_cluster_smoke_forces_one_removal_and_requires_one_recovery() -> None:
     assert len(guard_calls) == 1
     assert '"camera_valid_after_recovery": camera_valid' in source
     assert "len(recovery_messages) != 1" in source
+    assert ".RemovePrim(" not in source
+    assert "forced composed viewport-camera removal did not persist" in source
+
+
+def test_cluster_smoke_removes_every_composed_root_prim_spec() -> None:
+    source_path = (
+        Path(__file__).parents[1]
+        / "scripts"
+        / "smoke_headless_viewport_camera_recovery.py"
+    )
+    tree = ast.parse(source_path.read_text())
+    remove = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_remove_composed_root_prim"
+    )
+    namespace: dict[str, object] = {}
+    exec(
+        compile(ast.Module(body=[remove], type_ignores=[]), source_path, "exec"),
+        namespace,
+    )
+
+    class Stage:
+        def __init__(self):
+            self.specs: list[PrimSpec] = []
+
+        def GetPrimAtPath(self, _path: str):
+            return Prim(self)
+
+    class Prim:
+        def __init__(self, stage: Stage):
+            self.stage = stage
+
+        def IsValid(self):
+            return bool(self.stage.specs)
+
+        def GetPrimStack(self):
+            return list(self.stage.specs)
+
+    class Layer:
+        def __init__(self, stage: Stage):
+            self.stage = stage
+            self.removed: list[PrimSpec] = []
+
+        def RemoveRootPrim(self, spec):
+            self.removed.append(spec)
+            self.stage.specs.remove(spec)
+
+    class PrimSpec:
+        def __init__(self, stage: Stage, path: str):
+            self.path = path
+            self.layer = Layer(stage)
+
+    path = "/OmniverseKit_Persp"
+    stage = Stage()
+    stage.specs = [PrimSpec(stage, path), PrimSpec(stage, path)]
+    specs = list(stage.specs)
+
+    assert namespace["_remove_composed_root_prim"](stage, path) == 2
+    assert stage.specs == []
+    assert all(spec.layer.removed == [spec] for spec in specs)
+
+
+def test_cluster_smoke_composed_removal_rejects_unremoved_opinion() -> None:
+    source_path = (
+        Path(__file__).parents[1]
+        / "scripts"
+        / "smoke_headless_viewport_camera_recovery.py"
+    )
+    tree = ast.parse(source_path.read_text())
+    remove = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_remove_composed_root_prim"
+    )
+    namespace: dict[str, object] = {}
+    exec(
+        compile(ast.Module(body=[remove], type_ignores=[]), source_path, "exec"),
+        namespace,
+    )
+
+    class Prim:
+        def IsValid(self):
+            return True
+
+        def GetPrimStack(self):
+            return [PrimSpec()]
+
+    class Stage:
+        def GetPrimAtPath(self, _path: str):
+            return Prim()
+
+    class Layer:
+        def RemoveRootPrim(self, _spec):
+            pass
+
+    class PrimSpec:
+        path = "/OmniverseKit_Persp"
+        layer = Layer()
+
+    with pytest.raises(RuntimeError, match="composed viewport-camera removal"):
+        namespace["_remove_composed_root_prim"](Stage(), "/OmniverseKit_Persp")
 
 
 def test_cluster_smoke_seals_ready_marker_before_simulation_close() -> None:
