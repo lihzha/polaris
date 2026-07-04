@@ -300,6 +300,74 @@ protocol identities. The resulting authorization is deliberately narrow:
 
 This revision carries evidence only and does not alter controller semantics.
 
+### Repaired smoke-suite standard promotion
+
+The next evidence-only gate is
+`polaris.eef_velocity_recovery_standard_promotion`. It is a direct descendant
+of sealed runtime `9ab844b3fcaac6d29b51bc9fb2c2758c125201f3` (tree
+`2063a7d091ee9d1c6e0646a60ee501a8abd395e8`) and preserves the predecessor
+promotion at `0142e8518769d386c0a8227778767800b30c7e83` unchanged. It changes no
+controller, evaluator, environment, or policy-client behavior.
+
+The gate pins both repaired one-rollout-per-task suites produced by Ego-LAP
+`5ad7da3057829d5a90cb5da78197bb3bd21f969f` and PolaRiS `9ab844b...`:
+
+- reasoning checkpoint watcher `1098870`, workers `1098871`, `1098872`,
+  `1098878`, `1098879`, `1098882`, and `1098884`, rooted at
+  `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris_eval/reasoning-full-43075-main-5ad7da3-polaris-9ab844b-smoke6-rerun-20260704`;
+- official LAP-3B watcher `1098873`, workers `1098874`, `1098875`, `1098876`,
+  `1098877`, `1098881`, and `1098883`, rooted at
+  `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris_eval/official-lap3b-601db9c1-main-5ad7da3-polaris-9ab844b-smoke6-rerun-20260704`.
+
+All workers and watchers completed with exit `0:0`. Each rollout completed 450
+policy steps and 3,600 physics applies with zero numerical failure, controller
+abort, dropped diagnostic, or DLS fallback. A fresh full-content
+`task-complete` replay passed for all 12 attempts. The closed manifest binds
+the exact suite marker, suite summary, combined registry candidates,
+authoritative-attempt marker, verified-task marker, completion audit, task
+candidate, runtime contract, episode sidecar, finalized trace, raw video,
+summary sidecar, and summary video SHA-256 values.
+
+All 12 raw/summary pairs (24 MP4 files) were fully decoded. Raw videos are H.264
+yuv420p at 448x224; summary videos are H.264 yuv420p at 960x608. Every file is
+450 frames, 15 fps, and 30 seconds. Nine-frame contact sheets for every rollout
+show the correct task and camera views, stable physically plausible motion, no
+blank/corrupt view, and no physics explosion. There were no raw-positive
+rollouts requiring task-valid adjudication. Task-specific failure observations
+are embedded in the closed evidence object.
+
+The smoke outcome was raw/task-valid `0/6` for both checkpoints. Mean progress
+was `3/28` for reasoning and `5/36` for official LAP-3B. These 12 rollouts are
+promotion evidence only and do not establish a benchmark success rate.
+
+Standard authorization is deliberately an online content check, not a boolean
+constant. On l401, the launch-side consumer must invoke:
+
+```python
+from polaris import eef_velocity_recovery_standard_promotion as promotion
+
+evidence = promotion.canonical_eef_velocity_recovery_v5_standard_promotion_evidence()
+authorization = promotion.validate_and_authorize_eef_velocity_recovery_v5_standard(
+    evidence
+)
+```
+
+That call first validates the closed manifest and predecessor evidence, then
+walks all 138 pinned artifacts at the two exact NFS roots. The walk opens the
+resolved roots and every descendant descriptor-relatively with `O_NOFOLLOW`,
+requires regular files with exactly one hard link, hashes file contents,
+rejects path/schema/duplicate drift, and detects mutation during hashing. It
+returns canonical artifact-inventory and verification SHA-256 values. Missing,
+tampered, symlinked, hard-linked, non-regular, moved, or schema-drifted evidence
+fails closed before standard authorization.
+
+The authorized standard scale remains exactly the six-task
+`polaris_droid_suite_v1`, 50 initial conditions per task, 450 policy steps at
+15 Hz, one environment, absolute end-effector pose control, and physical
+`panda_link8` relative to `panda_link0`. Any other rollout count, task set,
+horizon, controller, or frame is a separate protocol and is not authorized by
+this evidence.
+
 ## Controller smoke and focused tests
 
 The headless controller smoke checks hold, both signs of XYZ translation, and

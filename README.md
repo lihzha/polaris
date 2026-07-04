@@ -107,9 +107,12 @@ the serving-metadata contract, flow and AR commands, controller smoke, traces,
 and artifact requirements.
 
 The measured-velocity recovery v5 controller has passed two exact 450-step,
-3,600-apply full-horizon canaries. The immutable promotion evidence authorizes
-only the next six-task, one-rollout smoke suite; standard 50-rollout evaluation
-remains blocked until that smoke suite and its videos are inspected.
+3,600-apply full-horizon canaries and repaired six-task, one-rollout smoke
+suites for both official LAP-3B and the reasoning checkpoint. The immutable
+standard-promotion evidence authorizes the canonical 50-rollout-per-task stage
+only after a fresh descriptor-relative SHA-256 walk verifies all 138 pinned
+suite/task artifacts at the exact NFS roots. The smoke results remain wiring
+and promotion evidence, not a standard success-rate estimate.
 
 ### Off-the-shelf Evaluation Environments
 | Environment Name | Prompt | Image |
