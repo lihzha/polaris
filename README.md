@@ -106,6 +106,11 @@ default. See [the Ego-LAP evaluation guide](docs/ego_lap_eef_pose_eval.md) for
 the serving-metadata contract, flow and AR commands, controller smoke, traces,
 and artifact requirements.
 
+The measured-velocity recovery v5 controller has passed two exact 450-step,
+3,600-apply full-horizon canaries. The immutable promotion evidence authorizes
+only the next six-task, one-rollout smoke suite; standard 50-rollout evaluation
+remains blocked until that smoke suite and its videos are inspected.
+
 ### Off-the-shelf Evaluation Environments
 | Environment Name | Prompt | Image |
 | :--- | :--- | :--- | 

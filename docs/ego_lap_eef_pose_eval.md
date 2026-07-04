@@ -272,6 +272,34 @@ sidecar, trace, CSV, complete video, 3600-call cadence, all-six gripper maxima,
 and wall time before
 scaling out.
 
+### Measured-velocity recovery v5 promotion
+
+The evidence-only v5 promotion is bound to controller producer
+`f11ae45a64b2f839dcb3325459ab06776d1dd81a` (tree
+`7d68beea046e485dfe622a4a41c9e03d3a423ef2`) and Ego-LAP
+`74bb225d07ccdd2408bc568fe900709e633047e6`. It pins two inspected
+FoodBussing canaries: official LAP-3B jobs `1098707`/`1098708` and reasoning
+checkpoint jobs `1098709`/`1098710`. Both completed 450 policy steps and 3,600
+controller applies without a numerical failure. The reasoning trajectory
+entered recovery at apply 2386, held for four applies, completed all 16 release
+ramp targets at apply 2404, and finished the horizon without an abort. Its
+closed recovery counters record two residual samples across two joint
+exceedances, one recovery event, and one recovered event.
+
+`polaris.eef_velocity_recovery_promotion` closes the runtime, episode-sidecar,
+finalized-trace, raw-video, completion-audit, registry-candidate, suite-summary,
+and summary-video hashes for both jobs. It also pins the seven unchanged v5
+production-source hashes and the distinct public-R6-row and manifest-R6-column
+protocol identities. The resulting authorization is deliberately narrow:
+
+- `canary` remains allowed;
+- `smoke_suite` is the next authorized scale and means one rollout on each of
+  the six canonical DROID tasks;
+- `standard` remains blocked until the complete smoke suite, artifacts, and
+  videos have been independently inspected and promoted.
+
+This revision carries evidence only and does not alter controller semantics.
+
 ## Controller smoke and focused tests
 
 The headless controller smoke checks hold, both signs of XYZ translation, and
