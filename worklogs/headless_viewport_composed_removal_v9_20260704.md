@@ -29,3 +29,10 @@ Owner: `codex-root-polaris-composed-removal-v9`
 ## Next gate
 
 Commit this exact-container-compatible follow-up, update the exact Ego-LAP provenance pins/result namespace, obtain independent review, deploy both commits through verified Git bundles, and rerun one fresh model-free L40S smoke. No checkpoint rollout is authorized.
+
+## Terminal runtime evidence
+
+- Independent review returned GO for one model-free smoke. Job `1098834` ran the exact producer commit on one L40S and all Slurm components plus inner `srun` completed `0:0`.
+- The bound namespace-edit path removed exactly one contributing `/OmniverseKit_Persp` spec. The production guard recovered it exactly once, and the sealed raw records forced absence plus a valid camera afterward.
+- Finalize and replay verification returned the identical mode-`0444` attestation SHA-256 `efded6682bce983a4d773b038990f9e9fd5968cd05efe42b204063c6b4c7b0c5`, status `sealed_validated_forced_l40s_recovery_v1`.
+- Checkpoint rollout still requires a separate reviewed Ego-LAP integration commit that pins this exact evidence.
