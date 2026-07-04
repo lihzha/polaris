@@ -12,6 +12,9 @@ from pxr import Semantics
 
 from polaris.splat_renderer import SplatRenderer
 from polaris.environments.rubrics import Rubric
+from polaris.headless_viewport import (
+    install_isaaclab_headless_viewport_camera_guard,
+)
 
 
 class ManagerBasedRLSplatEnv(ManagerBasedRLEnv):
@@ -26,6 +29,10 @@ class ManagerBasedRLSplatEnv(ManagerBasedRLEnv):
         usd_file: str | None = None,
         **kwargs,
     ):
+        # Camera rendering makes Isaac Lab construct its viewport controller
+        # even in headless mode.  Install the missing-default-camera guard
+        # immediately before the base class creates SimulationContext.
+        install_isaaclab_headless_viewport_camera_guard()
         # do dynamic setup here maybe
         if usd_file is not None:
             self.usd_file = usd_file
