@@ -424,3 +424,57 @@ inspection used only login-host read operations.
   `1079080`; this work launched nothing. The subsequent enclosing
   documentation-only commit records the replay and does not alter executable
   source or tests.
+
+## Exact-type bootstrap evidence rebind
+
+- The independently authorized no-model all-six bootstrap ran from exact
+  executable commit `b2dd7dc0e97e6ee6dae6abbc92015e653f52c91d`, tree
+  `1d08782ff6981c40eae4df648aeaa2f63deaa8ff`, with OpenPI commit
+  `bd70b8f4011e85b3f3b0f039f12113f78718e7bf`. Slurm job `1098723`
+  completed `0:0` in 3 minutes 12 seconds on one L40S.
+- A read-only producer replay on `l401` reran the exact `b2dd7dc` finalizer
+  against the source checkout, all immutable job artifacts, the pinned
+  7,183,130,624-byte image, and pinned PolaRiS-Hub assets. Its rebuilt
+  canonical completion object exactly equaled the published completion. The
+  completion is 7,902 bytes, mode `0444`, one link, SHA-256
+  `e3b0847cdc71d1ffc3a38478202516f84dc98f349ab508dbc79543ccd5b9cac0`;
+  smoke SHA-256 is
+  `cb27138330bdcbc67e5166bcd1fbab48e9237e72327abd99ec41985fecc198d7`;
+  runtime SHA-256 is
+  `f5dabf3bcb6b16bf1e8d10100bef1cc717751241cf36af600fc468336149dc43`.
+  Child raw/ready SHA-256 values are respectively
+  `97a43e18fcb88a94f4437892b81e70933a059a547a8e732e83f75617b832fa90`
+  and
+  `dfac61142851aa26f193251676ede9df5a60f5d2911bb5b46cbe29630f14f65c`.
+- All four `immediate_close`, `delayed_close`, `immediate_open`, and
+  `delayed_open` scenarios completed 12 policy steps, 96 apply calls, and 12
+  post-policy samples each. None terminated, truncated, or produced a terminal
+  velocity failure. The completion binds all 14 critical source files, the
+  unchanged checkpoint manifest, and the reviewed serve validator whose model
+  semantics digest exactly equals its integrated-base digest.
+- The evidence-only consumer rebind changes only the accepted job, completion
+  path/SHA/size, source commit, runtime SHA, and the one test expectation that
+  the newly accepted `b2dd7dc` serve file is the reviewed current source rather
+  than the pre-validator base source. Executable rebind commit:
+  `0034d86973b2eefe31ae3235ad7ab64a765d5768`; tree:
+  `1ddbd8cf19d78c5856d4107a5af352b0ac809e2e`.
+- Focused finalizer/all-six/native-contract/trace tests passed `147`; the broad
+  host suite passed `273` tests plus 5 subtests with three external dependency
+  warnings. The unfiltered host collection additionally contains one Isaac Lab
+  import-only test and cannot collect it without Isaac Lab; excluding that
+  simulator-only file is the recorded host boundary. Targeted Ruff lint with
+  the repository's pre-existing import/private-test exemptions, AST parsing,
+  Bash syntax, ShellCheck, and `git diff --check` passed. Ruff 0.15.16's global
+  formatter would reformat both pre-existing files, so no unrelated mechanical
+  formatting was applied.
+- A second read-only replay used a detached, clean, filesystem-read-only `l401`
+  checkout of exact executable commit `0034d869...`. The model-canary consumer
+  accepted job `1098723`, completion/source/runtime/smoke identities, all 14
+  critical files, one unchanged model-I/O file, and one reviewed serve file,
+  and returned promotion scope
+  `prerequisite_only_for_one_checkpoint_canary`. This authorizes preparation of
+  one official checkpoint canary only; it is not model-canary success and does
+  not authorize a standard evaluation.
+- No new Slurm job, allocation, GPU process, simulator, model server,
+  evaluator, registry mutation, or shared-document write was performed during
+  the rebind or replay.
