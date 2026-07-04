@@ -15,7 +15,7 @@ POLARIS_DATA_DIR="${POLARIS_DATA_DIR:-${NFS_ROOT}/data/PolaRiS-Hub}"
 
 : "${CONTROLLER_COMPLETION:?Set job1098174 completion path}"
 : "${EXPECTED_CONTROLLER_COMPLETION_SHA256:?Set exact job1098174 completion SHA-256}"
-: "${ALL_SIX_CONTROLLER_COMPLETION:?Set accepted job1098349 all-six completion path}"
+: "${ALL_SIX_CONTROLLER_COMPLETION:?Set accepted job1098682 all-six completion path}"
 : "${EXPECTED_ALL_SIX_COMPLETION_SHA256:?Set exact all-six completion SHA-256}"
 : "${EXPECTED_ALL_SIX_PROFILE:?Set independently reviewed all-six profile}"
 
@@ -51,7 +51,7 @@ POLARIS_COMMIT="$(git -C "${POLARIS_DIR}" rev-parse HEAD)"
   || die "Missing exact checkout-local OpenPI venv"
 
 # Block submission before any allocation until both external controller gates
-# validate, including job1098349 all-six coupling and child lifecycle.
+# validate, including job1098682 all-six coupling and child lifecycle.
 PYTHONPATH="${POLARIS_DIR}/src:${SCRIPT_DIR}" \
   "${POLARIS_DIR}/third_party/openpi/.venv/bin/python" \
   "${SCRIPT_DIR}/finalize_pi05_droid_native_jointvelocity_eval.py" preflight \

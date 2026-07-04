@@ -19,7 +19,7 @@ NFS_ROOT="${NFS_ROOT:-/lustre/fsw/portfolios/nvr/users/lzha}"
 : "${RUN_DIR:?Set one fresh canary attempt directory}"
 : "${CONTROLLER_COMPLETION:?Set job1098174 completion path}"
 : "${EXPECTED_CONTROLLER_COMPLETION_SHA256:?Set job1098174 completion digest}"
-: "${ALL_SIX_CONTROLLER_COMPLETION:?Set accepted job1098349 all-six completion path}"
+: "${ALL_SIX_CONTROLLER_COMPLETION:?Set accepted job1098682 all-six completion path}"
 : "${EXPECTED_ALL_SIX_COMPLETION_SHA256:?Set accepted all-six completion digest}"
 : "${EXPECTED_ALL_SIX_PROFILE:?Set accepted all-six completion profile}"
 

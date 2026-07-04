@@ -16,6 +16,7 @@ from polaris.pi05_droid_jointvelocity_contract import (
 )
 from polaris.pi05_droid_native_eval_contract import (
     PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS,
+    PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID,
     PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS,
     PI05_DROID_CONTROLLER_CRITICAL_PATHS,
     PI05_DROID_NATIVE_CANARY_PROFILE,
@@ -101,7 +102,10 @@ def test_base_controller_gate_binds_job1098174_runtime_image_and_sources(
     assert set(result["critical_source_files"]) == set(
         PI05_DROID_CONTROLLER_CRITICAL_PATHS
     )
-    assert result["descendant_source_authority"] == "required_job1098349_all_six_gate"
+    assert result["descendant_source_authority"] == (
+        f"required_job{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}_all_six_gate"
+    )
+    assert result["descendant_source_authority"] != ("required_job1098349_all_six_gate")
     with pytest.raises(ValueError, match="Unexpected job1098174 completion SHA"):
         finalizer.validate_base_controller_completion(
             completion_path, "0" * 64, repository
@@ -116,7 +120,10 @@ def test_all_six_gate_revalidates_coupling_lifecycle_runtime_and_source(
     for relative_path in PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS:
         path = repository / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(f"job1098349:{relative_path}\n", encoding="utf-8")
+        path.write_text(
+            f"job{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}:{relative_path}\n",
+            encoding="utf-8",
+        )
         source_files[relative_path] = {
             "size": path.stat().st_size,
             "sha256": file_sha256(path),
@@ -135,7 +142,10 @@ def test_all_six_gate_revalidates_coupling_lifecycle_runtime_and_source(
 
     runtime_sha256 = "9" * 64
     smoke = {
-        "path": str(tmp_path / "native-all-six-smoke-1098349.json"),
+        "path": str(
+            tmp_path
+            / f"native-all-six-smoke-{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}.json"
+        ),
         "size": 559_362,
         "sha256": "2" * 64,
         "mode": "0444",
@@ -150,14 +160,14 @@ def test_all_six_gate_revalidates_coupling_lifecycle_runtime_and_source(
         },
     }
     srun_status = publish_immutable_json(
-        tmp_path / "srun-1098349.status.json",
-        {"job_id": 1098349, "srun_exit_code": 0},
+        tmp_path / f"srun-{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}.status.json",
+        {"job_id": PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID, "srun_exit_code": 0},
     )
     gpu_inventory = publish_immutable_json(
-        tmp_path / "gpu-1098349.json",
+        tmp_path / f"gpu-{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}.json",
         {
             "schema_version": 1,
-            "job_id": 1098349,
+            "job_id": PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID,
             "gpus": [
                 {
                     "uuid": "GPU-8688921b-a641-2ae1-1dc9-494501f1f422",
@@ -187,21 +197,26 @@ def test_all_six_gate_revalidates_coupling_lifecycle_runtime_and_source(
         }
         for relative_path, expected in finalizer.PI05_DROID_CANARY_ASSETS.items()
     }
-    completion_path = tmp_path / "native-all-six-smoke-1098349.completion.json"
+    completion_path = (
+        tmp_path
+        / f"native-all-six-smoke-{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}.completion.json"
+    )
     completion = publish_immutable_json(
         completion_path,
         {
             "schema_version": 1,
             "profile": finalizer.PI05_DROID_ALL_SIX_CONTROLLER_PROFILE,
             "status": "pass",
-            "job_id": 1098349,
+            "job_id": PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID,
             "scope": "controller_only_no_model_no_checkpoint",
             "task": "DROID-FoodBussing",
             "official_policy_io_changed": False,
             "checkpoint_loaded": False,
             "model_server_started": False,
             "source": {
-                "repository": "/immutable/job1098349/source",
+                "repository": (
+                    f"/immutable/job{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}/source"
+                ),
                 "commit": finalizer.PI05_DROID_ALL_SIX_CONTROLLER_SOURCE_COMMIT,
                 "detached_and_clean": True,
                 "openpi_commit": PI05_DROID_OPENPI_INFERENCE_COMPATIBILITY_COMMIT,
@@ -210,7 +225,7 @@ def test_all_six_gate_revalidates_coupling_lifecycle_runtime_and_source(
             },
             "smoke": smoke,
             "saved_wrapper": {
-                "path": "/immutable/job-1098349.sbatch",
+                "path": f"/immutable/job-{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}.sbatch",
                 "size": 8_146,
                 "sha256": "c" * 64,
                 "mode": "0444",
@@ -265,7 +280,7 @@ def test_all_six_gate_revalidates_coupling_lifecycle_runtime_and_source(
         finalizer.PI05_DROID_ALL_SIX_CONTROLLER_PROFILE,
         repository,
     )
-    assert result["job_id"] == 1098349
+    assert result["job_id"] == PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID
     assert result["runtime_sha256"] == runtime_sha256
     assert result["smoke"] == smoke
     assert smoke_calls == [Path(smoke["path"])]
@@ -276,9 +291,48 @@ def test_all_six_gate_revalidates_coupling_lifecycle_runtime_and_source(
         PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS
     )
 
+    stale_path = tmp_path / "stale-job1098349.completion.json"
+    stale_value = copy.deepcopy(completion["value"])
+    stale_value["job_id"] = 1098349
+    stale = publish_immutable_json(stale_path, stale_value)
+    monkeypatch.setattr(
+        finalizer, "PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_PATH", str(stale_path)
+    )
+    monkeypatch.setattr(
+        finalizer,
+        "PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SHA256",
+        stale["sha256"],
+    )
+    monkeypatch.setattr(
+        finalizer, "PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SIZE", stale["size"]
+    )
+    with pytest.raises(ValueError, match="schema or identity mismatch"):
+        finalizer.validate_all_six_controller_completion(
+            stale_path,
+            stale["sha256"],
+            finalizer.PI05_DROID_ALL_SIX_CONTROLLER_PROFILE,
+            repository,
+        )
+
+    monkeypatch.setattr(
+        finalizer, "PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_PATH", str(completion_path)
+    )
+    monkeypatch.setattr(
+        finalizer,
+        "PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SHA256",
+        completion["sha256"],
+    )
+    monkeypatch.setattr(
+        finalizer,
+        "PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SIZE",
+        completion["size"],
+    )
     changed = repository / PI05_DROID_ALL_SIX_CONTROLLER_CRITICAL_PATHS[0]
     changed.write_text("changed\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="differs from job1098349"):
+    with pytest.raises(
+        ValueError,
+        match=f"differs from job{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}",
+    ):
         finalizer.validate_all_six_controller_completion(
             completion_path,
             completion["sha256"],
@@ -411,6 +465,9 @@ def test_finalizer_binds_internal_timeout_terminal_state_and_close_artifact(
     run_dir = tmp_path / "run"
     task_dir = run_dir / "DROID-FoodBussing"
     task_dir.mkdir(parents=True)
+    alias_run_dir = tmp_path / "run_alias"
+    alias_run_dir.symlink_to(run_dir, target_is_directory=True)
+    alias_task_dir = alias_run_dir / "DROID-FoodBussing"
     runtime_path = task_dir / "joint_velocity_runtime.json"
     runtime_identity = publish_immutable_json(
         runtime_path,
@@ -462,6 +519,7 @@ def test_finalizer_binds_internal_timeout_terminal_state_and_close_artifact(
         bound[label] = publish_immutable_file_from_temporary(
             temporary, task_dir / f"{label}.bin"
         )
+        bound[label]["path"] = str(alias_task_dir / f"{label}.bin")
     dynamic = {
         "schema_version": 3,
         "profile": NATIVE_GRIPPER_DYNAMIC_PROFILE,
@@ -491,19 +549,29 @@ def test_finalizer_binds_internal_timeout_terminal_state_and_close_artifact(
     sidecar_identity = {
         key: sidecar[key] for key in ("path", "size", "sha256", "mode", "nlink")
     }
+    sidecar_identity["path"] = str(
+        alias_task_dir / "native_runtime" / "episode_000000.json"
+    )
     close_path = task_dir / "evaluator_close_ready.json"
+    close_payload = make_close_ready_artifact(
+        runtime_artifact={
+            **runtime_identity,
+            "path": str(alias_task_dir / "joint_velocity_runtime.json"),
+        },
+        runtime_path=alias_task_dir / "joint_velocity_runtime.json",
+        metrics_path=task_dir / "eval_results.csv",
+        trace_path=task_dir / "policy_traces.jsonl",
+        video_path=task_dir / "episode_0.mp4",
+        environment_runtime_contract=environment_runtime,
+        terminal_outcome=terminal,
+        episode_sidecar=sidecar_identity,
+    )
+    close_payload["metrics_path"] = str(alias_task_dir / "eval_results.csv")
+    close_payload["trace_path"] = str(alias_task_dir / "policy_traces.jsonl")
+    close_payload["video_path"] = str(alias_task_dir / "episode_0.mp4")
     publish_immutable_json(
         close_path,
-        make_close_ready_artifact(
-            runtime_artifact=runtime_identity,
-            runtime_path=runtime_path,
-            metrics_path=task_dir / "eval_results.csv",
-            trace_path=task_dir / "policy_traces.jsonl",
-            video_path=task_dir / "episode_0.mp4",
-            environment_runtime_contract=environment_runtime,
-            terminal_outcome=terminal,
-            episode_sidecar=sidecar_identity,
-        ),
+        close_payload,
     )
 
     runtime = finalizer._validate_runtime_artifact(runtime_path)
@@ -511,6 +579,13 @@ def test_finalizer_binds_internal_timeout_terminal_state_and_close_artifact(
     assert runtime["environment_runtime_contract"] == environment_runtime
     assert close["terminal_outcome"] == terminal
     assert close["episode_sidecar"]["value"]["episode_result"] == result
+
+    wrong_close = copy.deepcopy(close_payload)
+    wrong_close["runtime_artifact"]["path"] = str(tmp_path / "wrong-runtime.json")
+    wrong_close_path = task_dir / "wrong-close.json"
+    publish_immutable_json(wrong_close_path, wrong_close)
+    with pytest.raises(ValueError, match="artifact path drift"):
+        finalizer._validate_close_ready(wrong_close_path, runtime, run_dir)
 
     bad_runtime = make_runtime_artifact(
         valid_joint_velocity_smoke_payload["runtime_contract"], environment_runtime

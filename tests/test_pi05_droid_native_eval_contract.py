@@ -21,6 +21,7 @@ from polaris.pi05_droid_native_eval_contract import (
     publish_immutable_file_from_temporary,
     publish_immutable_json,
     should_render_expensive,
+    validate_bound_artifact,
     validate_immutable_json,
     validate_native_model_eval_contract,
     validate_outer_step_flags,
@@ -271,6 +272,60 @@ def test_immutable_json_rejects_noncanonical_links_and_symlinks(tmp_path):
     symlink.symlink_to(target)
     with pytest.raises(ValueError, match="not readable"):
         validate_immutable_json(symlink)
+
+
+def test_bound_artifact_accepts_parent_alias_but_rejects_target_and_hash_drift(
+    tmp_path,
+):
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    alias_root = tmp_path / "alias"
+    alias_root.symlink_to(real_root, target_is_directory=True)
+    artifact_path = real_root / "incident.json"
+    identity = publish_immutable_json(artifact_path, {"incident": "typed"})
+    recorded = {
+        key: identity[key] for key in ("path", "size", "sha256", "mode", "nlink")
+    }
+    recorded["path"] = str(alias_root / artifact_path.name)
+
+    assert (
+        validate_bound_artifact(
+            recorded,
+            expected_path=artifact_path,
+            field="native velocity incident",
+            json_artifact=True,
+        )
+        == recorded
+    )
+
+    wrong_root = tmp_path / "wrong"
+    wrong_root.mkdir()
+    wrong_path = wrong_root / "incident.json"
+    publish_immutable_json(wrong_path, {"incident": "typed"})
+    wrong_target = {**recorded, "path": str(wrong_path)}
+    with pytest.raises(ValueError, match="artifact path drift"):
+        validate_bound_artifact(
+            wrong_target,
+            expected_path=artifact_path,
+            field="native velocity incident",
+            json_artifact=True,
+        )
+
+    identity_mutations = {
+        "size": recorded["size"] + 1,
+        "sha256": "0" * 64,
+        "mode": "0644",
+        "nlink": recorded["nlink"] + 1,
+    }
+    for key, wrong_value in identity_mutations.items():
+        drifted = {**recorded, key: wrong_value}
+        with pytest.raises(ValueError, match="artifact identity drift"):
+            validate_bound_artifact(
+                drifted,
+                expected_path=artifact_path,
+                field="native velocity incident",
+                json_artifact=True,
+            )
 
 
 def test_exact_official_model_eval_contract_binds_all_train_eval_semantics():

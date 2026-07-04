@@ -487,8 +487,8 @@ def validate_bound_artifact(
 ) -> dict[str, Any]:
     """Reopen an artifact identity recorded inside another contract."""
 
-    required = {"path", "size", "sha256", "mode", "nlink"}
-    if not isinstance(value, dict) or set(value) != required:
+    identity_keys = ("path", "size", "sha256", "mode", "nlink")
+    if not isinstance(value, dict) or set(value) != set(identity_keys):
         raise ValueError(f"{field} artifact schema drift")
     path = Path(value["path"])
     if expected_path is not None and path.resolve() != Path(expected_path).resolve():
@@ -498,10 +498,17 @@ def validate_bound_artifact(
         if json_artifact
         else validate_immutable_file(path)
     )
-    identity = {key: artifact[key] for key in required}
-    if identity != value:
+    # Container publication sees the stable ``/lustre/fsw`` mount as a regular
+    # path, while the login-host finalizer resolves the same inode through its
+    # ``/lustre/fs11`` parent alias.  The resolved target is already bound
+    # above; compare every non-path identity field exactly, then preserve the
+    # recorded lexical path so enclosing immutable contracts rebuild byte-for-
+    # byte.  A different target, digest, size, mode, or link count still fails.
+    if Path(artifact["path"]).resolve() != path.resolve() or any(
+        artifact[key] != value[key] for key in ("size", "sha256", "mode", "nlink")
+    ):
         raise ValueError(f"{field} artifact identity drift")
-    return identity
+    return {key: value[key] for key in identity_keys}
 
 
 def should_render_expensive(
@@ -1154,7 +1161,10 @@ def make_close_ready_artifact(
 ) -> dict[str, Any]:
     """Describe either artifact-complete terminal form before Kit shutdown."""
 
-    if runtime_artifact.get("path") != str(Path(runtime_path).resolve()):
+    if (
+        not isinstance(runtime_artifact.get("path"), str)
+        or Path(runtime_artifact["path"]).resolve() != Path(runtime_path).resolve()
+    ):
         raise ValueError("Runtime artifact path binding mismatch")
     environment_runtime = validate_environment_runtime_contract(
         environment_runtime_contract

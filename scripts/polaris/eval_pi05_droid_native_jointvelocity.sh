@@ -27,7 +27,7 @@ SERVER_START_TIMEOUT_SECS="${SERVER_START_TIMEOUT_SECS:-2400}"
 : "${EXPECTED_POLARIS_COMMIT:?Set EXPECTED_POLARIS_COMMIT to the immutable launch commit}"
 : "${CONTROLLER_COMPLETION:?Set CONTROLLER_COMPLETION to job1098174 completion JSON}"
 : "${EXPECTED_CONTROLLER_COMPLETION_SHA256:?Set exact job1098174 completion SHA-256}"
-: "${ALL_SIX_CONTROLLER_COMPLETION:?Set accepted job1098349 all-six completion JSON}"
+: "${ALL_SIX_CONTROLLER_COMPLETION:?Set accepted job1098682 all-six completion JSON}"
 : "${EXPECTED_ALL_SIX_COMPLETION_SHA256:?Set exact all-six completion SHA-256}"
 : "${EXPECTED_ALL_SIX_PROFILE:?Set the independently reviewed all-six profile}"
 
@@ -82,7 +82,7 @@ git_common_dir="$(git -C "${POLARIS_DIR}" rev-parse --path-format=absolute --git
 
 # This is intentionally the first Python action.  It blocks before checkpoint
 # download or GPU work until both independently reviewed controller captures
-# validate, including job1098349 all-six coupling and child lifecycle.
+# validate, including job1098682 all-six coupling and child lifecycle.
 PYTHONPATH="${POLARIS_DIR}/src:${SCRIPT_DIR}" "${OPENPI_DIR}/.venv/bin/python" \
   "${SCRIPT_DIR}/finalize_pi05_droid_native_jointvelocity_eval.py" preflight \
   --polaris-repo "${POLARIS_DIR}" \

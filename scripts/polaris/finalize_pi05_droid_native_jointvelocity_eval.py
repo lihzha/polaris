@@ -67,6 +67,7 @@ from polaris.pi05_droid_native_eval_contract import (
     file_sha256,
     fsync_directory,
     publish_immutable_json,
+    validate_bound_artifact,
     validate_environment_runtime_contract,
     validate_episode_sidecar,
     validate_immutable_json,
@@ -246,8 +247,9 @@ def validate_base_controller_completion(
     """Bind the exact pre-cap arm/controller gate from job 1098174.
 
     Its controller bytes are intentionally not compared with the integrated
-    checkout: job 1098349 is the descendant gate that reattests the complete
-    all-six coupled controller.  Both immutable completions remain mandatory.
+    checkout: the current accepted all-six job is the descendant gate that
+    reattests the complete coupled controller.  Both immutable completions
+    remain mandatory.
     """
 
     expected_sha256 = _sha256_string(expected_sha256, "controller completion SHA-256")
@@ -319,7 +321,9 @@ def validate_base_controller_completion(
         "profile": CONTROLLER_PROFILE,
         "runtime_sha256": runtime["runtime_sha256"],
         "critical_source_files": attested,
-        "descendant_source_authority": "required_job1098349_all_six_gate",
+        "descendant_source_authority": (
+            f"required_job{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}_all_six_gate"
+        ),
     }
 
 
@@ -344,7 +348,7 @@ def validate_all_six_controller_completion(
     expected_profile: str,
     repository: Path,
 ) -> dict[str, Any]:
-    """Reverify accepted all-six controller job 1098349 and its full lifecycle."""
+    """Reverify the accepted all-six controller job and its full lifecycle."""
 
     expected_sha256 = _sha256_string(expected_sha256, "all-six completion SHA-256")
     if expected_sha256 != PI05_DROID_ALL_SIX_CONTROLLER_COMPLETION_SHA256:
@@ -433,9 +437,13 @@ def validate_all_six_controller_completion(
             or file_sha256(path) != record["sha256"]
         ):
             raise ValueError(
-                f"Integrated source differs from job1098349: {relative_path}"
+                "Integrated source differs from "
+                f"job{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}: {relative_path}"
             )
-        _sha256_string(record["sha256"], f"job1098349 {relative_path}")
+        _sha256_string(
+            record["sha256"],
+            f"job{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID} {relative_path}",
+        )
         source_files[relative_path] = record
 
     model_io = source["official_model_io_unchanged_from_base"]
@@ -453,7 +461,10 @@ def validate_all_six_controller_completion(
             raise ValueError(
                 f"All-six official model-I/O record mismatch: {relative_path}"
             )
-        _sha256_string(record["sha256"], f"job1098349 model-I/O {relative_path}")
+        _sha256_string(
+            record["sha256"],
+            f"job{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID} model-I/O {relative_path}",
+        )
     policy_io_files = {}
     for relative_path in PI05_DROID_ALL_SIX_UNCHANGED_POLICY_IO_PATHS:
         record = model_io[relative_path]
@@ -463,7 +474,8 @@ def validate_all_six_controller_completion(
             or file_sha256(path) != record["sha256"]
         ):
             raise ValueError(
-                f"Official policy I/O differs from job1098349: {relative_path}"
+                "Official policy I/O differs from "
+                f"job{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID}: {relative_path}"
             )
         policy_io_files[relative_path] = record
 
@@ -774,6 +786,23 @@ def _validate_close_ready(
         task_dir / "native_runtime" / "episode_000000.json",
         runtime["environment_runtime_contract"],
     )
+    # The evaluator publishes descriptors from the container-visible fsw
+    # namespace, while the host finalizer may reopen the same files through
+    # fs11.  Revalidate the recorded lexical descriptors against the exact
+    # resolved runtime and sidecar targets instead of requiring path strings to
+    # be byte-identical across mount namespaces.
+    validate_bound_artifact(
+        value["runtime_artifact"],
+        expected_path=Path(runtime["path"]),
+        field="close-ready runtime",
+        json_artifact=True,
+    )
+    validate_bound_artifact(
+        value["episode_sidecar"],
+        expected_path=Path(sidecar["path"]),
+        field="close-ready episode sidecar",
+        json_artifact=True,
+    )
     incident = sidecar["value"]["artifacts"]["incident"]
     if terminal_outcome.get("terminal_form") == (
         "native_all_joint_velocity_limit_failure"
@@ -796,10 +825,6 @@ def _validate_close_ready(
         or value["env_close"] != "complete"
         or value["environment_runtime_contract_sha256"]
         != runtime["environment_runtime_contract"]["sha256"]
-        or value["runtime_artifact"]
-        != {key: runtime[key] for key in ("path", "size", "sha256", "mode", "nlink")}
-        or value["episode_sidecar"]
-        != {key: sidecar[key] for key in ("path", "size", "sha256", "mode", "nlink")}
         or sidecar["value"]["terminal_outcome"] != terminal_outcome
         or any(
             Path(value[key]).resolve() != expected.resolve()
@@ -1208,7 +1233,8 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
     runtime = _validate_runtime_artifact(task_dir / "joint_velocity_runtime.json")
     if runtime["runtime_sha256"] != all_six_controller["runtime_sha256"]:
         raise ValueError(
-            "Canary runtime differs from the job1098349 all-six-attested runtime"
+            "Canary runtime differs from the "
+            f"job{PI05_DROID_ALL_SIX_CONTROLLER_JOB_ID} all-six-attested runtime"
         )
     close_ready = _validate_close_ready(
         task_dir / "evaluator_close_ready.json", runtime, run_dir
