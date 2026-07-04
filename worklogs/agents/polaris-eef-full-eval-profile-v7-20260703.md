@@ -197,3 +197,8 @@ SHA-256
 The implementation commit is the exact producer identity for Ego-LAP and the
 cluster smoke. This following worklog-only evidence commit is not a substitute
 for that source identity.
+
+The agent branch was pushed to `lihzha` as
+`codex/eef-full-eval-profile-v7-20260703`; its first worklog-only evidence head
+was `f9847215734bec3ca2c003945cfa13cf4ebefd1b`. No simulator or checkpoint job
+had been launched at that point.
