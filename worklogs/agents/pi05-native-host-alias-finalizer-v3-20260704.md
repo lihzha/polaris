@@ -390,3 +390,37 @@ inspection used only login-host read operations.
   direct Python equality on the frozen fixed-metadata fields. Ruff lint/format,
   Python byte compilation, and `git diff --check` pass. Exact-implementation
   read-only replay of preserved job `1098704` remains the final freeze gate.
+
+### Fixed-metadata closure freeze identity and replay
+
+- Final fixed-metadata implementation commit:
+  `b2dd7dc0e97e6ee6dae6abbc92015e653f52c91d`; tree:
+  `1d08782ff6981c40eae4df648aeaa2f63deaa8ff`.
+- The agent-owned `l401` review checkout moved detached and clean to that exact
+  commit. A login-host-only replay used `/usr/bin/env` with OpenBLAS, OMP, and
+  MKL each pinned to one thread. No Slurm submission/allocation, GPU process,
+  simulator, evaluator, model server, or artifact write was performed.
+- The stricter trace and host close-ready validators passed preserved job
+  `1098704`: 199 trace records, episode length 93, terminal form
+  `native_all_joint_velocity_limit_failure`, trace SHA-256
+  `8d9d893c002953bd10dd6375520196ca5a3f22e2ec0eccb6088b4d662fba49a2`,
+  incident SHA-256
+  `0ba6c6728b1a7fc3a82addd4158b4ba362be3c47df2aad47b5db77305739aacb`,
+  close-ready SHA-256
+  `8772fb1cf40206413ca89d43c7c56c90a375ddeadc9733529f71f9af9ee5d6b6`,
+  sidecar SHA-256
+  `bdad15d14d12fc44a475861d39fc049b7a950b2f06899f1add25047e2fc63f8d`,
+  and normalized gripper range
+  `[-1.701161989053901e-09, 8.525632438249886e-06]`.
+- The preserved runtime artifact SHA-256 is
+  `c2eaf797bc72dcf9ff15294031fd6f13c5330c0eeb36c290f3249a6697a71f92`.
+  As in earlier reviews, it predates the exact current runtime schema and the
+  full runtime validator correctly rejects its missing current fields. Replay
+  therefore remained explicitly selective: immutable canonical runtime JSON,
+  exact environment-runtime contract, complete trace, sidecar, and close-ready
+  cross-binding. This is not a promotion claim for the historical runtime.
+- The remote checkout remained clean at the exact implementation tree. Queue
+  inspection before and after showed only pre-existing jobs `1098706` and
+  `1079080`; this work launched nothing. The subsequent enclosing
+  documentation-only commit records the replay and does not alter executable
+  source or tests.
