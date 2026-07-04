@@ -680,6 +680,19 @@ def test_typed_partial_failure_trace_passes_and_binds_incident(tmp_path):
     sidecar = validate_episode_sidecar(sidecar_path, ENVIRONMENT_RUNTIME)
     assert sidecar["value"]["episode_result"] == result
     assert sidecar["value"]["artifacts"]["incident"] == terminal["incident_artifact"]
+    type_drifted_dynamic = copy.deepcopy(terminal["dynamic_report"])
+    type_drifted_dynamic["terminal_velocity_failure"]["joint_position"][0] = 0
+    assert type_drifted_dynamic == terminal["dynamic_report"]
+    with pytest.raises(ValueError, match="Failure sidecar dynamic/terminal drift"):
+        make_episode_sidecar(
+            episode_result=result,
+            terminal_outcome=terminal,
+            environment_runtime_contract=ENVIRONMENT_RUNTIME,
+            dynamic_report=type_drifted_dynamic,
+            trace_artifact=trace_artifact,
+            video_artifact=video_artifact,
+            incident_artifact=terminal["incident_artifact"],
+        )
 
 
 def test_terminal_failure_consumes_incident_from_stable_bound_read(
@@ -729,6 +742,50 @@ def test_terminal_failure_consumes_incident_from_stable_bound_read(
         )
     assert retargeted is True
     assert (alias_root / filename).resolve() == wrong_root / filename
+
+
+def test_terminal_failure_requires_canonical_incident_dynamic_identity(tmp_path):
+    records, _ = _failure_records(tmp_path)
+    terminal = records[-1]["terminal_failure"]
+    incident = validate_immutable_json(Path(terminal["incident_artifact"]["path"]))[
+        "value"
+    ]
+    dynamic_failure = terminal["dynamic_report"]["terminal_velocity_failure"]
+    assert incident["joint_position"][0] == 0.0
+    dynamic_failure["joint_position"][0] = 0
+    assert dynamic_failure == incident
+    assert native_eval_contract.canonical_json_bytes(dynamic_failure) != (
+        native_eval_contract.canonical_json_bytes(incident)
+    )
+
+    with pytest.raises(ValueError, match="dynamic report incident drift"):
+        native_eval_contract.validate_terminal_numerical_failure_evidence(
+            terminal, ENVIRONMENT_RUNTIME
+        )
+
+
+@pytest.mark.parametrize("sample_kind", ["apply_entry", "post_policy_step"])
+def test_full_trace_audit_rejects_canonical_incident_dynamic_type_drift(
+    tmp_path, sample_kind
+):
+    records, result = _failure_records(
+        tmp_path,
+        sample_kind=sample_kind,
+        substep=0 if sample_kind == "apply_entry" else 8,
+    )
+    terminal = records[-1]["terminal_failure"]
+    terminal["dynamic_report"]["terminal_velocity_failure"]["joint_position"][0] = 0
+    trace, metrics = _write_case(
+        tmp_path,
+        records,
+        episode_length=result["episode_length"],
+        numerical_failure=True,
+        numerical_failure_reason=result["numerical_failure_reason"],
+        progress=0.0,
+    )
+
+    with pytest.raises(ValueError, match="dynamic report incident drift"):
+        validator.audit_trace(trace, metrics)
 
 
 @pytest.mark.parametrize("sample_kind", ["apply_entry", "post_policy_step"])

@@ -43,6 +43,23 @@ from polaris.native_gripper_runtime import (
 ROOT = Path(__file__).parents[1]
 
 
+def test_bound_json_record_expected_value_requires_canonical_identity(tmp_path):
+    artifact = publish_immutable_json(tmp_path / "record.json", {"job_id": 1.0})
+    record = {key: artifact[key] for key in ("path", "size", "sha256", "mode", "nlink")}
+    assert artifact["value"] == {"job_id": 1}
+    assert finalizer._validate_bound_json_record(
+        record,
+        field="typed record",
+        expected_value={"job_id": 1.0},
+    )["value"] == {"job_id": 1.0}
+    with pytest.raises(ValueError, match="typed record identity mismatch"):
+        finalizer._validate_bound_json_record(
+            record,
+            field="typed record",
+            expected_value={"job_id": 1},
+        )
+
+
 def test_base_controller_gate_binds_job1098174_runtime_image_and_sources(
     tmp_path, monkeypatch, valid_joint_velocity_smoke_payload
 ):
@@ -502,13 +519,13 @@ def test_finalizer_binds_internal_timeout_terminal_state_and_close_artifact(
                 "wrist_cam": 1 + PI05_DROID_NATIVE_EPISODE_STEPS,
             },
         },
-        "rubric": {"success": False, "progress": 0.25},
+        "rubric": {"success": False, "progress": 0.0},
     }
     result = {
         "episode": 0,
         "episode_length": 450,
         "success": False,
-        "progress": 0.25,
+        "progress": 0.0,
         "numerical_failure": False,
         "numerical_failure_reason": "",
     }
@@ -579,6 +596,17 @@ def test_finalizer_binds_internal_timeout_terminal_state_and_close_artifact(
     assert runtime["environment_runtime_contract"] == environment_runtime
     assert close["terminal_outcome"] == terminal
     assert close["episode_sidecar"]["value"]["episode_result"] == result
+
+    type_drifted_close = copy.deepcopy(close_payload)
+    type_drifted_close["terminal_outcome"]["rubric"]["progress"] = 0
+    assert type_drifted_close["terminal_outcome"] == terminal
+    assert finalizer.canonical_json_bytes(type_drifted_close["terminal_outcome"]) != (
+        finalizer.canonical_json_bytes(terminal)
+    )
+    type_drifted_close_path = task_dir / "type-drifted-close.json"
+    publish_immutable_json(type_drifted_close_path, type_drifted_close)
+    with pytest.raises(ValueError, match="Evaluator close-ready identity mismatch"):
+        finalizer._validate_close_ready(type_drifted_close_path, runtime, run_dir)
 
     wrong_close = copy.deepcopy(close_payload)
     wrong_close["runtime_artifact"]["path"] = str(tmp_path / "wrong-runtime.json")

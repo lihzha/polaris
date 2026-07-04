@@ -1,3 +1,4 @@
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -568,6 +569,11 @@ def test_typed_velocity_failure_finalizes_terminal_trace_and_plain_errors_do_not
         "samples": None,
     }
     env._sim_step_counter = 4  # noqa: SLF001
+    type_drifted_dynamic = copy.deepcopy(dynamic)
+    type_drifted_dynamic["terminal_velocity_failure"]["joint_position"][0] = 0
+    assert type_drifted_dynamic["terminal_velocity_failure"] == error.evidence
+    with pytest.raises(RuntimeError, match="differs from dynamic evidence"):
+        client.record_execution_failure(error, env, type_drifted_dynamic)
     terminal = client.record_execution_failure(error, env, dynamic)
     assert terminal["episode_result"]["episode_length"] == 1
     assert terminal["failure_sample_kind"] == "apply_entry"

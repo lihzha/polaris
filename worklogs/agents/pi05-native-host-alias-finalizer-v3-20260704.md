@@ -272,3 +272,45 @@ inspection used only login-host read operations.
   registry operation, or canonical/shared checkout mutation was performed.
   The subsequent enclosing documentation-only commit records this evidence and
   does not alter executable source or tests.
+
+## Additive canonical-byte cross-binding closure
+
+- Parent branch tip:
+  `f59e511998bb36eb790c090b02fbb69c17e3f4e8`; parent executable
+  implementation: `c0df3645f21ddfb227213613ee8daef3afbda99f`.
+  Work remains isolated on the same agent branch and all GPU, simulator,
+  evaluator, model-server, registry, shared-document, integration, and
+  canonical-checkout operations remain frozen.
+- A reviewer reproduced a JSON numeric-type bypass: the immutable incident
+  contained `joint_position[0]` as JSON `0.0`, while the terminal dynamic report
+  used JSON `0`. Python dict equality treats those values as equal even though
+  their canonical bytes and SHA-256 values differ. The full trace audit then
+  consumed the type-drifted dynamic report.
+- `validate_terminal_numerical_failure_evidence` now compares
+  `canonical_json_bytes` for the bound incident value and terminal dynamic
+  failure. The returned terminal can therefore be consumed downstream only
+  when its dynamic evidence has the exact canonical JSON representation read
+  from the immutable incident.
+- The directly analogous exact-cross-bind sites now also compare canonical
+  bytes: producer close-ready terminal versus bound sidecar terminal; host
+  finalizer sidecar terminal versus close-ready terminal; bound JSON record
+  versus fixed expected value; failure-sidecar result and dynamic report;
+  completed-sidecar rubric and result; sidecar value versus its rebuilt form;
+  client typed-error evidence versus dynamic evidence; final trace environment
+  and terminal versus runtime/close evidence; srun status versus its fixed
+  object; and the exact official model-eval contract.
+- Numeric q/dq continuity, arm-state values after the canonical incident /
+  dynamic closure, and cross-format CSV metric values remain semantic numeric
+  comparisons. Identity records retain their existing exact field-type gates.
+- Deterministic regressions prove Python equality remains true while canonical
+  bytes differ for `0.0` versus `0`, then require rejection in the terminal
+  validator and complete `audit_trace` for both apply-entry substep 0 and
+  post-policy substep 8. Additional regressions cover producer/host close-ready,
+  bound JSON expected values, sidecar result/dynamic cross-binding, policy
+  client evidence, and model-contract numeric type drift.
+- Focused trace/contract/finalizer/client suite: `103 passed`. Broad pinned-
+  OpenPI pi0.5/native host suite: `166 passed`, with only three external
+  dependency deprecation warnings. Ruff 0.15.16 lint/format, Python byte
+  compilation, Bash syntax, ShellCheck, and `git diff --check`: pass.
+  Exact-commit read-only replay of preserved job `1098704` remains the final
+  gate before freeze.

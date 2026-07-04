@@ -359,7 +359,11 @@ def _validate_bound_json_record(
     _require(
         set(record) == set(identity_keys)
         and all(record[key] == artifact[key] for key in identity_keys)
-        and (expected_value is None or artifact["value"] == expected_value),
+        and (
+            expected_value is None
+            or canonical_json_bytes(artifact["value"])
+            == canonical_json_bytes(expected_value)
+        ),
         f"{field} identity mismatch",
     )
     return artifact
@@ -863,7 +867,8 @@ def _validate_close_ready(
         or value["env_close"] != "complete"
         or value["environment_runtime_contract_sha256"]
         != runtime["environment_runtime_contract"]["sha256"]
-        or sidecar["value"]["terminal_outcome"] != terminal_outcome
+        or canonical_json_bytes(sidecar["value"]["terminal_outcome"])
+        != canonical_json_bytes(terminal_outcome)
         or any(
             Path(value[key]).resolve() != expected.resolve()
             for key, expected in expected_paths.items()
@@ -1293,7 +1298,9 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
     status_artifact = validate_immutable_json(
         run_dir / f"srun-{args.job_id}.status.json"
     )
-    if status_artifact["value"] != {"job_id": args.job_id, "srun_exit_code": 0}:
+    if canonical_json_bytes(status_artifact["value"]) != canonical_json_bytes(
+        {"job_id": args.job_id, "srun_exit_code": 0}
+    ):
         raise ValueError("Evaluator srun status mismatch")
     gpu = _gpu_inventory(run_dir / f"gpu-{args.job_id}.json")
     gpu_value = validate_immutable_json(run_dir / f"gpu-{args.job_id}.json")["value"]
@@ -1324,12 +1331,13 @@ def finalize(args: argparse.Namespace) -> dict[str, Any]:
     metrics_path = task_dir / "eval_results.csv"
     video_path = task_dir / "episode_0.mp4"
     trace_summary = audit_trace(trace_path, metrics_path)
-    if (
-        trace_summary["environment_runtime_contract"]
-        != runtime["environment_runtime_contract"]
+    if canonical_json_bytes(trace_summary["environment_runtime_contract"]) != (
+        canonical_json_bytes(runtime["environment_runtime_contract"])
     ):
         raise ValueError("Trace environment runtime differs from runtime artifact")
-    if trace_summary["terminal_outcome"] != close_ready["terminal_outcome"]:
+    if canonical_json_bytes(trace_summary["terminal_outcome"]) != canonical_json_bytes(
+        close_ready["terminal_outcome"]
+    ):
         raise ValueError("Trace terminal outcome differs from evaluator close evidence")
     trace_summary_path = task_dir / "trace_validation.json"
     trace_summary_artifact = publish_immutable_json(trace_summary_path, trace_summary)

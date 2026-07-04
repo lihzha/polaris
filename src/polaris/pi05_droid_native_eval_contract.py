@@ -1103,7 +1103,9 @@ def validate_terminal_numerical_failure_evidence(
     dynamic = validate_native_all_joint_dynamic_report(
         value["dynamic_report"], require_samples=False
     )
-    if dynamic["terminal_velocity_failure"] != failure:
+    if canonical_json_bytes(dynamic["terminal_velocity_failure"]) != (
+        canonical_json_bytes(failure)
+    ):
         raise ValueError("Native dynamic report incident drift")
     sample_kind = failure["sample_kind"]
     attempts = result["episode_length"]
@@ -1219,7 +1221,9 @@ def validate_native_terminal_outcome(
 def validate_native_model_eval_contract(value: Any) -> dict[str, Any]:
     """Reject any normalization, image, state, or action-contract substitution."""
 
-    if value != PI05_DROID_NATIVE_MODEL_EVAL_CONTRACT:
+    if not isinstance(value, dict) or canonical_json_bytes(value) != (
+        canonical_json_bytes(PI05_DROID_NATIVE_MODEL_EVAL_CONTRACT)
+    ):
         raise ValueError("Official pi05_droid model eval contract mismatch")
     # JSON round-tripping gives callers an isolated, JSON-compatible deep copy.
     return json.loads(canonical_json_bytes(value))
@@ -1326,7 +1330,9 @@ def make_episode_sidecar(
     )
     is_failure = result["numerical_failure"]
     if is_failure:
-        if terminal.get("episode_result") != result:
+        if canonical_json_bytes(terminal.get("episode_result")) != (
+            canonical_json_bytes(result)
+        ):
             raise ValueError("Failure sidecar result/terminal drift")
         incident = validate_bound_artifact(
             incident_artifact,
@@ -1338,15 +1344,18 @@ def make_episode_sidecar(
             raise ValueError("Failure sidecar incident/terminal drift")
         if dynamic["terminal_velocity_failure"] is None:
             raise ValueError("Failure sidecar lacks terminal dynamic evidence")
+        if canonical_json_bytes(dynamic) != canonical_json_bytes(
+            terminal["dynamic_report"]
+        ):
+            raise ValueError("Failure sidecar dynamic/terminal drift")
     else:
         if (
             incident_artifact is not None
             or dynamic["terminal_velocity_failure"] is not None
         ):
             raise ValueError("Completed sidecar contains failure evidence")
-        if (
-            terminal["rubric"]["success"] != result["success"]
-            or terminal["rubric"]["progress"] != result["progress"]
+        if canonical_json_bytes(terminal["rubric"]) != canonical_json_bytes(
+            {"success": result["success"], "progress": result["progress"]}
         ):
             raise ValueError("Completed sidecar result/terminal drift")
         incident = None
@@ -1401,7 +1410,7 @@ def validate_episode_sidecar_value(
         video_artifact=artifacts["video"],
         incident_artifact=artifacts["incident"],
     )
-    if value != rebuilt:
+    if canonical_json_bytes(value) != canonical_json_bytes(rebuilt):
         raise ValueError("Native episode sidecar identity mismatch")
     return json.loads(canonical_json_bytes(value))
 
@@ -1453,7 +1462,9 @@ def make_close_ready_artifact(
     sidecar_value = validate_episode_sidecar_value(
         sidecar_artifact["value"], environment_runtime
     )
-    if sidecar_value["terminal_outcome"] != terminal:
+    if canonical_json_bytes(sidecar_value["terminal_outcome"]) != (
+        canonical_json_bytes(terminal)
+    ):
         raise ValueError("Close-ready terminal/sidecar drift")
     return {
         "schema_version": 2,

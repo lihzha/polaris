@@ -183,11 +183,12 @@ def test_runtime_and_close_artifacts_bind_internal_timeout_and_terminal_state(tm
         "nlink": 1,
     }
     terminal = _terminal_rollout(runtime)
+    terminal["rubric"]["progress"] = 0.0
     result = {
         "episode": 0,
         "episode_length": 450,
         "success": False,
-        "progress": 0.25,
+        "progress": 0.0,
         "numerical_failure": False,
         "numerical_failure_reason": "",
     }
@@ -227,6 +228,18 @@ def test_runtime_and_close_artifacts_bind_internal_timeout_and_terminal_state(tm
     sidecar_identity = {
         key: sidecar[key] for key in ("path", "size", "sha256", "mode", "nlink")
     }
+    type_drifted_result = {**result, "progress": 0}
+    assert type_drifted_result == result
+    with pytest.raises(ValueError, match="Completed sidecar result/terminal drift"):
+        make_episode_sidecar(
+            episode_result=type_drifted_result,
+            terminal_outcome=terminal,
+            environment_runtime_contract=runtime,
+            dynamic_report=dynamic,
+            trace_artifact=artifacts["trace"],
+            video_artifact=artifacts["video"],
+            incident_artifact=None,
+        )
     close = make_close_ready_artifact(
         runtime_artifact=identity,
         runtime_path=runtime_path,
@@ -240,6 +253,24 @@ def test_runtime_and_close_artifacts_bind_internal_timeout_and_terminal_state(tm
     assert close["environment_runtime_contract_sha256"] == runtime["sha256"]
     assert close["terminal_outcome"] == terminal
     assert close["episode_sidecar"] == sidecar_identity
+
+    type_drifted_terminal = copy.deepcopy(terminal)
+    type_drifted_terminal["rubric"]["progress"] = 0
+    assert type_drifted_terminal == terminal
+    assert native_eval_contract.canonical_json_bytes(type_drifted_terminal) != (
+        native_eval_contract.canonical_json_bytes(terminal)
+    )
+    with pytest.raises(ValueError, match="Close-ready terminal/sidecar drift"):
+        make_close_ready_artifact(
+            runtime_artifact=identity,
+            runtime_path=runtime_path,
+            metrics_path=tmp_path / "metrics.csv",
+            trace_path=tmp_path / "trace.jsonl",
+            video_path=tmp_path / "video.mp4",
+            environment_runtime_contract=runtime,
+            terminal_outcome=type_drifted_terminal,
+            episode_sidecar=sidecar_identity,
+        )
 
 
 def test_close_ready_consumes_sidecar_from_stable_bound_read(tmp_path, monkeypatch):
@@ -630,6 +661,7 @@ def test_exact_official_model_eval_contract_binds_all_train_eval_semantics():
         lambda value: value["policy_input"]["images"][2].update(
             {"shape": [256, 256, 3]}
         ),
+        lambda value: value["policy_input"]["images"][0]["shape"].__setitem__(0, 224.0),
         lambda value: value["policy_input"].update({"state_width": 7}),
         lambda value: value["policy_input"]["gripper_observation"].update(
             {"boundary_audit_tolerance": 1e-3}

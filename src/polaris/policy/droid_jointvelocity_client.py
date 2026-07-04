@@ -20,6 +20,7 @@ from polaris.pi05_droid_jointvelocity_contract import (
     verify_openpi_git_checkout,
 )
 from polaris.pi05_droid_native_eval_contract import (
+    canonical_json_bytes,
     fsync_directory,
     PI05_DROID_NATIVE_DECIMATION,
     PI05_DROID_NATIVE_ENVIRONMENT_RUNTIME_PROFILE,
@@ -670,7 +671,9 @@ class DroidJointVelocityClient(InferenceClient):
             raise RuntimeError("Native failure has no bound rollout runtime")
         if error.incident_artifact is None:
             raise RuntimeError("Native velocity failure was not durably published")
-        if dynamic_report.get("terminal_velocity_failure") != error.evidence:
+        if canonical_json_bytes(dynamic_report.get("terminal_velocity_failure")) != (
+            canonical_json_bytes(error.evidence)
+        ):
             raise RuntimeError("Native velocity failure differs from dynamic evidence")
         sample_kind = error.evidence["sample_kind"]
         if sample_kind == "apply_entry":
