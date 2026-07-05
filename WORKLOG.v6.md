@@ -209,3 +209,95 @@ above. Ruff lint/format, Python compilation, and `git diff --check` pass. The
 separate promotion manifest and any checkpoint-canary authorization remain
 blocked until this committed finalizer is run and its immutable output is
 verified.
+
+## Controller-smoke promotion to paired checkpoint canaries
+
+The committed finalizer at evidence commit
+`f4a27ce2bdbbaf2b87a38b4850390f9697ce8f9e`, tree
+`4c4ce225bdfd57564e2e90db7657f9dc807a93f8`, was run against producer
+`6e4b7c5be5ff6db670970774be3250c5d5ffa4d2`. Its finalizer source is exactly
+106,246 bytes with SHA-256
+`f9ab24398286d5e4db2af816cfa86c9b0b355c13eeb246e307331b5e14720c4c`.
+The resulting promotion attestation is exactly 10,423 bytes, mode `0444`, one
+hard link, and SHA-256
+`c359e978bf4aede7555fd3d6118a2abf5f7f4c2e5cf058326d7c3304bda2305a`.
+
+`src/polaris/eef_concurrent_arm_gripper_v6_promotion.py` is a separate,
+stdlib-only, v6 evidence gate. It embeds those exact attestation bytes, parses
+them with duplicate-key/non-finite rejection, and freshly checks a regular,
+single-link, mode-0444 attestation through lstat/open/fstat/read/fstat/lstat.
+Production validation requires the literal pinned result path. An offline
+content-addressed mirror is allowed only through an explicit opt-in and is
+reported in the authorization result. The gate also freshly binds the ten
+producer/controller source hashes, the Commit-A finalizer bytes, and both v5
+promotion modules. The v5 bytes remain:
+
+- canary promotion:
+  `f98f6d3ae6eb06f0127e3ec686fa70e3bb524ea892582b0ee3461b0dd6d84df4`;
+- standard promotion:
+  `8cb836645dde741876ff5d10b285761bc8f47c822732e9a2e1c469fb79ee0e06`.
+
+The sealed provenance identities remain mode `0444`: `sacct.json` is 1,823
+bytes / `13ec9313b8a593463e23a649798871338ca59e672a530c43849dd9125938996c`;
+the saved job script is 9,548 bytes /
+`a74f46d5e6d1e359b8df9bc02209e1b08c10b400cfd710826c6203fdeec55669`;
+the Slurm log is 44,136 bytes /
+`64179ecdc1ae32b51fe12a88b11987df955e7053a03e2b26cfad30c08a0621f6`;
+and source identity is 800 bytes /
+`52c9a5c00506886e68dd394950fb84e80cbd9bfb18c91290e3abd201162561ad`.
+
+The closed validation summary is 17 safety reports, 5,856 total controller
+applies, 732 post-policy samples, 6,003 total open-endpoint samples, 13
+ordinary pose cases / 4,680 ordinary applies, 1,000 delayed-close applies, 168
+concurrent applies, 80 fresh-DLS closed applies, 10 distinct closed desired
+poses, 99 discriminator open samples, and eight adversarial applies with eight
+slew events. Maximum position error is 0.001071291510015726 m, maximum rotation
+error is 0.4384913281711513 degrees, and maximum follower velocity is
+0.7730712294578552 rad/s. Controller aborts, coupled-impulse failure samples,
+and recovery events are all zero.
+
+The only authorized next request is a paired canary on `DROID-FoodBussing`,
+one rollout per checkpoint (two total):
+
+- official LAP-3B at HF revision
+  `601db9c1ab4bcaf6dddb160c7b2dec589a67b730`, content manifest
+  `567cc3ff7d20f3f03913a6f11c3fa151f789e1c0118ed5af0eea24d9cc48f20e`,
+  public two-image `[external, wrist]` legacy order and train-matched rows-R6;
+- reasoning checkpoint
+  `gs://v6_east1d/checkpoints/lap_oxe_magic_soup_reasoning_full/oxe_magic_soup_reasoning_full_v2_flow_pred0_cf0_ckpt25_v6_32_b512_s42_20260630/43075`,
+  inference subset
+  `bb9ea5bb041f689a08f914cac7dfe5d061c822ddbe87e292f9c7878a9d3bfc4d`,
+  three-image `[wrist, external, blank]` order and train-matched columns-R6.
+
+Both requests are pinned to FLOW with ten integration steps, response horizon
+16 / execution horizon 8, 224x224 RGB uint8 input, wrist resize-with-pad then
+180-degree rotation, and train-matched float32 global-Q99 formulas. The
+checkpoint metadata may say `single_arm`, but effective category selection is
+null because global statistics are required. The v6 absolute EEF controller
+and IK profiles are exact.
+
+These are required prelaunch identities, not claims produced by the standalone
+controller smoke. The attestation and promotion gate still say checkpoint
+loaded `false`, policy serving validated `false`, camera/image contract
+validated `false`, image order/resolution validated `false`, normalization
+validated `false`, and task-success metric validated `false`. No smoke-suite
+or standard evaluation is authorized. The scene digest was not logged by the
+smoke job; only its post-job digest plus pre-srun metadata were validated. No
+live recovery event or follower-threshold crossing was observed.
+
+Host-safe promotion-gate validation before commit:
+
+```text
+focused promotion gate: 69 passed
+promotion gate + committed finalizer regression: 116 passed
+broad host-safe: 1153 passed, 1 skipped, 8 deselected, 1 warning, 30 subtests passed
+Ruff lint/format: passed
+Python byte compilation: passed
+git diff --check: passed
+promotion evidence SHA-256:
+714b22a185ff06135cdc84d03a17347943c405b3d782f3a0141455f0194eb937
+```
+
+No GPU, simulator, Slurm, checkpoint, canary, smoke-suite, or standard job was
+launched by this evidence-only change. The paired canary is merely the next
+permitted stage and still requires a separate exact launch review.
