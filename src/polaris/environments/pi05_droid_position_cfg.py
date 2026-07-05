@@ -19,6 +19,7 @@ from polaris.native_gripper_runtime import NativeAllJointDynamicRecorder
 from polaris.pi05_droid_position_adapter import (
     PositionActionTargetLimitError,
     PositionTargetHoldRecorder,
+    evaluate_position_target_guard,
 )
 from polaris.pi05_droid_position_contract import PANDA_ARM_JOINT_NAMES
 
@@ -49,14 +50,21 @@ class AuditedDroidDeltaJointPositionAction(JointPositionAction):
     def process_actions(self, actions):
         super().process_actions(actions)
         processed = _numpy_float32(self.processed_actions)
-        limits = _numpy_float32(
-            self._asset.data.soft_joint_pos_limits[:, self._joint_ids]
+        guarded_target, _, violation = evaluate_position_target_guard(
+            processed,
+            _numpy_float32(
+                self._asset.data.joint_pos_limits[:, self._joint_ids]
+            ),
+            _numpy_float32(
+                self._asset.data.soft_joint_pos_limits[:, self._joint_ids]
+            ),
         )
-        if limits.shape != (1, 7, 2) or bool(
-            (processed < limits[:, :, 0]).any()
-        ) or bool((processed > limits[:, :, 1]).any()):
+        if not np.array_equal(processed, guarded_target):
+            raise ValueError("processed position target differs from float32 guard target")
+        if bool(violation.any()):
             raise PositionActionTargetLimitError(
-                "absolute position target exceeds live soft limits before setter"
+                "absolute position target exceeds exact zero-inset live hard/soft "
+                "intersection guard before setter"
             )
         self._position_target_hold.begin_policy_step(processed)
 

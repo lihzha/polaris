@@ -61,6 +61,7 @@ from polaris.pi05_droid_position_adapter import (
     PI05_DROID_POSITION_ADAPTER_PROFILE,
     PI05_DROID_RESPONSE_HORIZON,
     canonical_json_bytes,
+    expected_position_limit_contract,
     official_droid_source_contract,
 )
 
@@ -145,6 +146,7 @@ PI05_DROID_POSITION_MODEL_EVAL_CONTRACT = {
         ],
         "simulator_command": "absolute_joint_position_target",
         "target_hold_physics_substeps": 8,
+        "simulator_target_guard": expected_position_limit_contract(),
     },
 }
 
@@ -228,6 +230,7 @@ def expected_pi05_droid_position_contract(
             "effort_limit_sim": list(PANDA_ARM_EFFORT_LIMITS),
             "velocity_limit_sim": list(PANDA_ARM_VELOCITY_LIMITS),
         },
+        "position_limits": expected_position_limit_contract(),
         "gripper_drive": copy.deepcopy(inherited_gripper),
     }
     contract["contract_sha256"] = contract_sha256(contract)

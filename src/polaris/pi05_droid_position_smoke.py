@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ from polaris.pi05_droid_position_adapter import (
     PI05_DROID_POSITION_ADAPTER_PROFILE,
     canonical_json_bytes,
     validate_position_adapter_evidence,
+    validate_position_limit_contract,
     validate_position_target_hold_report,
 )
 from polaris.pi05_droid_position_contract import PANDA_ARM_JOINT_NAMES
@@ -59,6 +61,68 @@ def build_position_smoke_cases(command_magnitude: float = 1.5) -> list[dict[str,
             }
         )
     return cases
+
+
+def validate_position_limit_guard_probe(guard: Any) -> dict[str, Any]:
+    required = {
+        "position_limit_contract",
+        "joint_index",
+        "controlling_bound_source",
+        "hard_upper_limit_rad",
+        "soft_upper_limit_rad",
+        "intersection_guard_upper_limit_rad",
+        "adversarial_target_rad",
+        "adversarial_is_one_float32_step_above_guard",
+        "adversarial_inside_soft_limit",
+        "adversarial_outside_hard_limit",
+        "articulation_target_before",
+        "articulation_target_after",
+        "exception_type",
+        "exception_message",
+        "setter_unchanged",
+    }
+    if not isinstance(guard, dict) or set(guard) != required:
+        raise ValueError("position smoke limit guard schema mismatch")
+    limit_contract = validate_position_limit_contract(
+        guard["position_limit_contract"]
+    )
+    hard_limits = np.asarray(
+        limit_contract["hard_limits"]["values_rad"], dtype=np.float32
+    )
+    soft_limits = np.asarray(
+        limit_contract["isaaclab_soft_limits"]["values_rad"], dtype=np.float32
+    )
+    target_guard_limits = np.asarray(
+        limit_contract["target_guard"]["values_rad"], dtype=np.float32
+    )
+    joint_index = 3
+    expected_adversarial = np.nextafter(
+        target_guard_limits[0, joint_index, 1],
+        np.float32(np.inf),
+        dtype=np.float32,
+    )
+    if (
+        guard["joint_index"] != joint_index
+        or guard["controlling_bound_source"] != "live_joint_pos_limits"
+        or guard["hard_upper_limit_rad"]
+        != float(hard_limits[0, joint_index, 1])
+        or guard["soft_upper_limit_rad"]
+        != float(soft_limits[0, joint_index, 1])
+        or guard["intersection_guard_upper_limit_rad"]
+        != float(target_guard_limits[0, joint_index, 1])
+        or guard["adversarial_target_rad"] != float(expected_adversarial)
+        or guard["adversarial_is_one_float32_step_above_guard"] is not True
+        or guard["adversarial_inside_soft_limit"] is not True
+        or guard["adversarial_outside_hard_limit"] is not True
+        or not expected_adversarial <= soft_limits[0, joint_index, 1]
+        or not expected_adversarial > hard_limits[0, joint_index, 1]
+        or guard["articulation_target_before"] != guard["articulation_target_after"]
+        or guard["exception_type"] != "PositionActionTargetLimitError"
+        or "before setter" not in guard["exception_message"]
+        or guard["setter_unchanged"] is not True
+    ):
+        raise ValueError("position smoke limit guard did not fail before setter")
+    return copy.deepcopy(guard)
 
 
 def validate_position_smoke(value: Any, *, require_parent_completion: bool) -> dict[str, Any]:
@@ -158,27 +222,7 @@ def validate_position_smoke(value: Any, *, require_parent_completion: bool) -> d
             raise ValueError("position smoke terminal flags mismatch")
         if case["terminated"] or case["truncated"]:
             raise ValueError("position smoke case terminated")
-    guard = value["limit_guard_probe"]
-    if not isinstance(guard, dict) or set(guard) != {
-        "joint_index",
-        "upper_limit_rad",
-        "adversarial_target_rad",
-        "articulation_target_before",
-        "articulation_target_after",
-        "exception_type",
-        "exception_message",
-        "setter_unchanged",
-    }:
-        raise ValueError("position smoke limit guard schema mismatch")
-    if (
-        guard["joint_index"] != 0
-        or not guard["adversarial_target_rad"] > guard["upper_limit_rad"]
-        or guard["articulation_target_before"] != guard["articulation_target_after"]
-        or guard["exception_type"] != "PositionActionTargetLimitError"
-        or "before setter" not in guard["exception_message"]
-        or guard["setter_unchanged"] is not True
-    ):
-        raise ValueError("position smoke limit guard did not fail before setter")
+    validate_position_limit_guard_probe(value["limit_guard_probe"])
     reanchor = value["fresh_reanchor_probe"]
     required_reanchor = {
         "raw_action",
@@ -298,5 +342,6 @@ __all__ = [
     "POSITION_SMOKE_PROFILE",
     "build_position_smoke_cases",
     "publish_position_smoke",
+    "validate_position_limit_guard_probe",
     "validate_position_smoke",
 ]

@@ -31,6 +31,47 @@ PI05_DROID_RESPONSE_HORIZON = 15
 PI05_DROID_EXECUTION_HORIZON = 8
 PI05_DROID_ACTION_DIM = 8
 PI05_DROID_ARM_DIM = 7
+PI05_DROID_POSITION_LIMIT_CONTRACT_PROFILE = (
+    "openpi_pi05_droid_position_limits_factor1_hard_soft_intersection_v1"
+)
+PI05_DROID_SOFT_JOINT_POSITION_LIMIT_FACTOR = 1.0
+PI05_DROID_TARGET_GUARD_INSET_RAD = 0.0
+PI05_DROID_PHYSX_HARD_LIMITS_LE_F32_SHA256 = (
+    "d7ec7ea6108d670f910c43a9fba370e5023c7a5b9aa31df06b89ffc172529e00"
+)
+PI05_DROID_ISAACLAB_SOFT_LIMITS_LE_F32_SHA256 = (
+    "fbf7535901c042fea5d901812ecd02c5fd81ade06c23c1499c32d66a859104de"
+)
+PI05_DROID_TARGET_GUARD_LIMITS_LE_F32_SHA256 = (
+    "558f0c01f992abe1e6c60559665047d115b4891d25cd627c7bd68d9e9cbcfedb"
+)
+PI05_DROID_PHYSX_HARD_LIMITS_RAD = (
+    (-2.8973000049591064, 2.8973000049591064),
+    (-1.7627999782562256, 1.7627999782562256),
+    (-2.8973000049591064, 2.8973000049591064),
+    (-3.0717999935150146, -0.0697999969124794),
+    (-2.8973000049591064, 2.8973000049591064),
+    (-0.017500000074505806, 3.752500057220459),
+    (-2.8973000049591064, 2.8973000049591064),
+)
+PI05_DROID_ISAACLAB_SOFT_LIMITS_RAD = (
+    (-2.8973000049591064, 2.8973000049591064),
+    (-1.7627999782562256, 1.7627999782562256),
+    (-2.8973000049591064, 2.8973000049591064),
+    (-3.0717999935150146, -0.06979990005493164),
+    (-2.8973000049591064, 2.8973000049591064),
+    (-0.017499923706054688, 3.752500057220459),
+    (-2.8973000049591064, 2.8973000049591064),
+)
+PI05_DROID_TARGET_GUARD_LIMITS_RAD = (
+    (-2.8973000049591064, 2.8973000049591064),
+    (-1.7627999782562256, 1.7627999782562256),
+    (-2.8973000049591064, 2.8973000049591064),
+    (-3.0717999935150146, -0.0697999969124794),
+    (-2.8973000049591064, 2.8973000049591064),
+    (-0.017499923706054688, 3.752500057220459),
+    (-2.8973000049591064, 2.8973000049591064),
+)
 
 OFFICIAL_DROID_REPOSITORY = "https://github.com/droid-dataset/droid.git"
 OFFICIAL_DROID_COMMIT = "33ae6a67274f36d2e29525b86f23a56616ef43a7"
@@ -73,6 +114,184 @@ def canonical_json_bytes(value: Any) -> bytes:
         ensure_ascii=True,
         allow_nan=False,
     ).encode("ascii")
+
+
+def _one_env_float32_limits(value: Any, *, field: str) -> np.ndarray:
+    array = np.asarray(value)
+    if array.shape == (7, 2):
+        array = array[None, ...]
+    if (
+        array.shape != (1, 7, 2)
+        or array.dtype != np.float32
+        or not np.isfinite(array).all()
+        or bool((array[:, :, 0] >= array[:, :, 1]).any())
+    ):
+        raise ValueError(f"{field} must be finite float32 [1,7,2] lower/upper limits")
+    return np.ascontiguousarray(array)
+
+
+def position_limits_le_float32_sha256(value: Any) -> str:
+    limits = _one_env_float32_limits(
+        np.asarray(value, dtype=np.float32), field="position limits"
+    )
+    return hashlib.sha256(limits.astype("<f4", copy=False).tobytes()).hexdigest()
+
+
+def derive_isaaclab_factor1_soft_limits(hard_limits: Any) -> np.ndarray:
+    """Reproduce Isaac Lab's float32 center/range soft-limit arithmetic."""
+
+    hard = _one_env_float32_limits(hard_limits, field="PhysX hard limits")
+    center = (hard[:, :, 0] + hard[:, :, 1]) / np.float32(2.0)
+    extent = hard[:, :, 1] - hard[:, :, 0]
+    soft_extent = np.float32(0.5) * extent
+    soft_extent = soft_extent * np.float32(
+        PI05_DROID_SOFT_JOINT_POSITION_LIMIT_FACTOR
+    )
+    return np.ascontiguousarray(
+        np.stack(
+            [center - soft_extent, center + soft_extent], axis=-1
+        ),
+        dtype=np.float32,
+    )
+
+
+def exact_position_target_guard_from_live_limits(
+    live_hard_limits: Any, live_soft_limits: Any
+) -> np.ndarray:
+    """Return the inclusive hard/soft intersection used by both guards."""
+
+    live_hard = _one_env_float32_limits(
+        live_hard_limits, field="live buffered PhysX hard limits"
+    )
+    live_soft = _one_env_float32_limits(
+        live_soft_limits, field="live Isaac Lab soft limits"
+    )
+    expected_hard = np.asarray(
+        [PI05_DROID_PHYSX_HARD_LIMITS_RAD], dtype=np.float32
+    )
+    expected_soft = np.asarray(
+        [PI05_DROID_ISAACLAB_SOFT_LIMITS_RAD], dtype=np.float32
+    )
+    if not np.array_equal(live_hard, expected_hard):
+        raise ValueError("live buffered hard limits differ from exact PhysX contract")
+    if not np.array_equal(live_soft, expected_soft):
+        raise ValueError("live Isaac Lab soft limits differ from exact factor-1 contract")
+    guard = np.stack(
+        [
+            np.maximum(live_hard[:, :, 0], live_soft[:, :, 0])
+            + np.float32(PI05_DROID_TARGET_GUARD_INSET_RAD),
+            np.minimum(live_hard[:, :, 1], live_soft[:, :, 1])
+            - np.float32(PI05_DROID_TARGET_GUARD_INSET_RAD),
+        ],
+        axis=-1,
+    )
+    expected_guard = np.asarray(
+        [PI05_DROID_TARGET_GUARD_LIMITS_RAD], dtype=np.float32
+    )
+    if not np.array_equal(guard, expected_guard):
+        raise ValueError("hard/soft position target intersection drifted")
+    return np.ascontiguousarray(guard, dtype=np.float32)
+
+
+def evaluate_position_target_guard(
+    target: Any, live_hard_limits: Any, live_soft_limits: Any
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Cast as the action buffer does and apply one inclusive exact guard."""
+
+    target_array = np.asarray(target)
+    if target_array.shape == (7,):
+        target_array = target_array[None, :]
+    if target_array.shape != (1, 7) or not np.issubdtype(
+        target_array.dtype, np.number
+    ):
+        raise ValueError("position target guard requires one numeric [1,7] target")
+    target_float32 = np.ascontiguousarray(target_array, dtype=np.float32)
+    if not np.isfinite(target_float32).all():
+        raise ValueError("position target is non-finite after float32 actuator cast")
+    guard = exact_position_target_guard_from_live_limits(
+        live_hard_limits, live_soft_limits
+    )
+    violation = (target_float32 < guard[:, :, 0]) | (
+        target_float32 > guard[:, :, 1]
+    )
+    return target_float32, guard, violation
+
+
+def expected_position_limit_contract() -> dict[str, Any]:
+    hard = np.asarray([PI05_DROID_PHYSX_HARD_LIMITS_RAD], dtype=np.float32)
+    derived_soft = derive_isaaclab_factor1_soft_limits(hard)
+    expected_soft = np.asarray(
+        [PI05_DROID_ISAACLAB_SOFT_LIMITS_RAD], dtype=np.float32
+    )
+    if not np.array_equal(derived_soft, expected_soft):
+        raise RuntimeError("position-limit constants do not reproduce Isaac Lab")
+    guard = exact_position_target_guard_from_live_limits(hard, derived_soft)
+    value = {
+        "schema_version": 1,
+        "profile": PI05_DROID_POSITION_LIMIT_CONTRACT_PROFILE,
+        "hard_limits": {
+            "source": "Articulation.root_physx_view.get_dof_limits",
+            "shape": [1, 7, 2],
+            "dtype": "float32",
+            "values_rad": hard.tolist(),
+            "little_endian_float32_sha256": (
+                PI05_DROID_PHYSX_HARD_LIMITS_LE_F32_SHA256
+            ),
+        },
+        "isaaclab_soft_limits": {
+            "source": "Articulation.data.soft_joint_pos_limits",
+            "shape": [1, 7, 2],
+            "dtype": "float32",
+            "soft_joint_pos_limit_factor": (
+                PI05_DROID_SOFT_JOINT_POSITION_LIMIT_FACTOR
+            ),
+            "derivation": (
+                "float32_center_equals_lower_plus_upper_over_2_then_"
+                "center_plus_or_minus_0p5_times_range_times_factor_v1"
+            ),
+            "rounding_note": (
+                "factor_1_is_not_raw_copy_and_shifts_joint4_upper_and_"
+                "joint6_lower_by_float32_center_range_rounding"
+            ),
+            "values_rad": derived_soft.tolist(),
+            "little_endian_float32_sha256": (
+                PI05_DROID_ISAACLAB_SOFT_LIMITS_LE_F32_SHA256
+            ),
+        },
+        "target_guard": {
+            "guard_source": (
+                "intersection(live_joint_pos_limits,live_soft_joint_pos_limits)"
+            ),
+            "guard_inset_rad": PI05_DROID_TARGET_GUARD_INSET_RAD,
+            "derivation": "lower_max_and_upper_min_float32_v1",
+            "comparison": "inclusive_elementwise_zero_tolerance_no_allclose",
+            "shape": [1, 7, 2],
+            "dtype": "float32",
+            "values_rad": guard.tolist(),
+            "little_endian_float32_sha256": (
+                PI05_DROID_TARGET_GUARD_LIMITS_LE_F32_SHA256
+            ),
+        },
+    }
+    value["contract_sha256"] = hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+    return value
+
+
+def validate_position_limit_contract(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("position-limit contract must be an object")
+    expected = expected_position_limit_contract()
+    if value != expected:
+        raise ValueError("position-limit contract mismatch")
+    for field, expected_digest in (
+        ("hard_limits", PI05_DROID_PHYSX_HARD_LIMITS_LE_F32_SHA256),
+        ("isaaclab_soft_limits", PI05_DROID_ISAACLAB_SOFT_LIMITS_LE_F32_SHA256),
+        ("target_guard", PI05_DROID_TARGET_GUARD_LIMITS_LE_F32_SHA256),
+    ):
+        digest = position_limits_le_float32_sha256(value[field]["values_rad"])
+        if digest != expected_digest:
+            raise ValueError(f"position-limit {field} digest mismatch")
+    return copy.deepcopy(value)
 
 
 def _numeric_vector(value: Any, *, size: int, field: str) -> np.ndarray:

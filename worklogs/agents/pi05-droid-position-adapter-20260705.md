@@ -123,3 +123,77 @@
   Monitor through immutable final attestation and inspect the controller
   artifacts; only then launch the separately governed official-checkpoint
   canary/evaluation wrapper.
+
+## 2026-07-05 — job 1099012 hard/soft limit diagnosis and correction
+
+- Inherited failure evidence (the job was launched by the orchestrator, not by
+  this implementation agent): controller smoke job `1099012`, source commit
+  `921a3e25999cfedd337411e1e7d63f5864bd2316`, node `pool0-00020`, state
+  `FAILED`, exit `1:0`, runtime `00:02:49`. Log:
+  `/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris-pi05-position/pi05_pos_smoke-1099012.out`.
+- The smoke failed closed before any controller case in
+  `capture_position_adapter_runtime`. It incorrectly required direct PhysX
+  hard limits to equal `robot.data.soft_joint_pos_limits`.
+- Exact diagnosis from the pinned image's Isaac Lab 2.3
+  `articulation.py`: the buffered soft matrix is computed in float32 as
+  `center=(lower+upper)/2`, `range=upper-lower`, then
+  `soft=center +/- 0.5*range*factor`. With factor exactly 1, this is not a raw
+  copy. Float32 center/range reconstruction changes q4 upper from raw hard
+  `-0.0697999969124794` to soft `-0.06979990005493164`, and q6 lower from raw
+  hard `-0.017500000074505806` to soft `-0.017499923706054688`. This is
+  arithmetic rounding, not a comparison tolerance. In particular, q4's soft
+  upper is outside the raw hard upper.
+- The corrected closed contract binds three separate exact float32 layers:
+
+  - buffered and direct PhysX hard limits, exact digest
+    `d7ec7ea6108d670f910c43a9fba370e5023c7a5b9aa31df06b89ffc172529e00`;
+  - factor-1 Isaac soft derivation and live buffered result, exact digest
+    `fbf7535901c042fea5d901812ecd02c5fd81ade06c23c1499c32d66a859104de`;
+  - inclusive zero-inset elementwise intersection guard
+    `intersection(live_joint_pos_limits,live_soft_joint_pos_limits)`, exact
+    digest
+    `558f0c01f992abe1e6c60559665047d115b4891d25cd627c7bd68d9e9cbcfedb`.
+
+- No `allclose`, epsilon, clipping, or new 1e-5 behavior was introduced.
+  Runtime validation requires exact serialized float32 values, exact CUDA
+  buffered-hard equality with CPU direct-hard values, exact soft derivation,
+  factor 1, and the closed guard contract.
+- Client and action-term guards now call the same pure helper. The client first
+  casts the float64 reference formula target to the exact float32 actuator
+  command, then performs the same inclusive zero-tolerance intersection check
+  as the action term. Traces/incidents preserve both the float64 reference and
+  float32 guarded target plus hard, soft, guard, source, inset, and contract
+  digest.
+- The actual controller smoke adversarial probe now targets q4 exactly one
+  float32 step above the hard/intersection upper bound while remaining inside
+  Isaac's rounded soft bound. It must raise before the setter and leave the
+  articulation target unchanged. CPU tests also cover exact inclusive q4/q6
+  boundaries, one-float32-step violations, and sub-ULP serialized evidence
+  tampering.
+
+### Correction validation
+
+- Focused command:
+
+  ```bash
+  PYTHONPATH="$PWD/src:$PWD/third_party/openpi/packages/openpi-client/src:$PWD/third_party/openpi/src" \
+    /home/lzha/code/ego-lap/.venv/bin/python -m pytest -q \
+    tests/test_pi05_droid_position_adapter.py
+  ```
+
+  Result: `11 passed in 0.36s`.
+- CPU-safe repository command:
+
+  ```bash
+  PYTHONPATH="$PWD/src:$PWD/third_party/openpi/packages/openpi-client/src:$PWD/third_party/openpi/src" \
+    /home/lzha/code/ego-lap/.venv/bin/python -m pytest -q tests \
+    --ignore=tests/test_robust_differential_ik.py
+  ```
+
+  Result: `325 passed, 5 subtests passed, 3 warnings in 14.02s`.
+- All owned Python files passed `python -m py_compile` and Ruff; both launch
+  shell files passed `bash -n`; `git diff --check` passed.
+- This correction launched no job and changed no registry, shared document,
+  main branch, canonical checkout, or remote cluster checkout. A fresh
+  controller smoke is still required from the corrected committed descendant;
+  job `1099012` remains preserved as failed diagnostic evidence.

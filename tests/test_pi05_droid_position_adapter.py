@@ -21,9 +21,19 @@ from polaris.pi05_droid_native_eval_contract import (
 from polaris.pi05_droid_position_adapter import (
     OFFICIAL_DROID_COMMIT,
     OFFICIAL_DROID_CONTROL_SOURCES,
+    PI05_DROID_ISAACLAB_SOFT_LIMITS_LE_F32_SHA256,
+    PI05_DROID_ISAACLAB_SOFT_LIMITS_RAD,
+    PI05_DROID_PHYSX_HARD_LIMITS_LE_F32_SHA256,
+    PI05_DROID_PHYSX_HARD_LIMITS_RAD,
+    PI05_DROID_TARGET_GUARD_LIMITS_LE_F32_SHA256,
+    PI05_DROID_TARGET_GUARD_LIMITS_RAD,
     PositionTargetHoldRecorder,
     adapt_official_droid_action,
+    derive_isaaclab_factor1_soft_limits,
+    evaluate_position_target_guard,
+    expected_position_limit_contract,
     validate_position_adapter_evidence,
+    validate_position_limit_contract,
 )
 from polaris.native_gripper_runtime import (
     EXPECTED_DROID_JOINT_NAMES,
@@ -53,9 +63,11 @@ from polaris.pi05_droid_position_runtime import (
     make_position_failure_sidecar,
     validate_position_adapter_runtime_report,
 )
+from polaris.pi05_droid_position_smoke import validate_position_limit_guard_probe
 
 
 ROOT = Path(__file__).parents[1]
+VALID_PANDA_Q = np.asarray([0.0, -0.5, 0.0, -2.0, 0.0, 1.5, 0.0], dtype=np.float32)
 
 
 def _array_report(values, *, device="cuda:0"):
@@ -70,9 +82,8 @@ def _array_report(values, *, device="cuda:0"):
 
 def _reference_position_runtime_report():
     inherited = make_joint_velocity_runtime_report()
-    soft_limits = np.broadcast_to(
-        np.asarray([-3.0, 3.0], dtype=np.float32), (1, 7, 2)
-    ).copy()
+    hard_limits = np.asarray([PI05_DROID_PHYSX_HARD_LIMITS_RAD], dtype=np.float32)
+    soft_limits = np.asarray([PI05_DROID_ISAACLAB_SOFT_LIMITS_RAD], dtype=np.float32)
     stiffness = np.full((1, 7), PI05_DROID_POSITION_DRIVE_STIFFNESS, np.float32)
     damping = np.full((1, 7), PI05_DROID_POSITION_DRIVE_DAMPING, np.float32)
     effort = np.asarray([PANDA_ARM_EFFORT_LIMITS], dtype=np.float32)
@@ -186,8 +197,11 @@ def _reference_position_runtime_report():
         "live_position_drive": live_arrays,
         "direct_position_drive": direct_arrays,
         "position_limit_readback": {
-            "buffered_soft": _array_report(soft_limits),
-            "direct_physx": _array_report(soft_limits, device="cpu"),
+            "contract": expected_position_limit_contract(),
+            "configured_soft_joint_pos_limit_factor": 1.0,
+            "buffered_hard": _array_report(hard_limits),
+            "buffered_isaaclab_soft": _array_report(soft_limits),
+            "direct_physx_hard": _array_report(hard_limits, device="cpu"),
         },
         "gripper": {
             "action_term_class": (
@@ -269,6 +283,98 @@ def test_adapter_evidence_and_eight_substep_hold_fail_closed():
         recorder.finish_policy_step()
 
 
+def test_position_limits_separate_raw_factor1_rounding_and_intersection_guard():
+    hard = np.asarray([PI05_DROID_PHYSX_HARD_LIMITS_RAD], dtype=np.float32)
+    expected_soft = np.asarray(
+        [PI05_DROID_ISAACLAB_SOFT_LIMITS_RAD], dtype=np.float32
+    )
+    derived_soft = derive_isaaclab_factor1_soft_limits(hard)
+    np.testing.assert_array_equal(derived_soft, expected_soft)
+    assert derived_soft[0, 3, 1] > hard[0, 3, 1]
+    assert derived_soft[0, 5, 0] > hard[0, 5, 0]
+
+    contract = validate_position_limit_contract(expected_position_limit_contract())
+    assert (
+        contract["hard_limits"]["little_endian_float32_sha256"]
+        == PI05_DROID_PHYSX_HARD_LIMITS_LE_F32_SHA256
+    )
+    assert (
+        contract["isaaclab_soft_limits"]["little_endian_float32_sha256"]
+        == PI05_DROID_ISAACLAB_SOFT_LIMITS_LE_F32_SHA256
+    )
+    assert (
+        contract["target_guard"]["little_endian_float32_sha256"]
+        == PI05_DROID_TARGET_GUARD_LIMITS_LE_F32_SHA256
+    )
+    guard = np.asarray([PI05_DROID_TARGET_GUARD_LIMITS_RAD], dtype=np.float32)
+    assert guard[0, 3, 1] == hard[0, 3, 1]
+    assert guard[0, 5, 0] == derived_soft[0, 5, 0]
+    assert contract["target_guard"]["guard_inset_rad"] == 0.0
+
+    target = np.mean(guard, axis=-1, dtype=np.float32).astype(np.float64)
+    target[0, 3] = np.nextafter(np.float64(guard[0, 3, 1]), np.inf)
+    cast_target, recomputed_guard, violation = evaluate_position_target_guard(
+        target, hard, derived_soft
+    )
+    assert cast_target[0, 3] == guard[0, 3, 1]
+    assert not violation.any()
+    np.testing.assert_array_equal(recomputed_guard, guard)
+
+    target[0, 3] = np.nextafter(guard[0, 3, 1], np.float32(np.inf), dtype=np.float32)
+    cast_target, _, violation = evaluate_position_target_guard(
+        target, hard, derived_soft
+    )
+    assert cast_target[0, 3] > guard[0, 3, 1]
+    assert np.flatnonzero(violation[0]).tolist() == [3]
+
+    target = np.mean(guard, axis=-1, dtype=np.float32).astype(np.float64)
+    target[0, 5] = guard[0, 5, 0]
+    _, _, violation = evaluate_position_target_guard(target, hard, derived_soft)
+    assert not violation.any()
+    target[0, 5] = np.nextafter(
+        guard[0, 5, 0], np.float32(-np.inf), dtype=np.float32
+    )
+    _, _, violation = evaluate_position_target_guard(target, hard, derived_soft)
+    assert np.flatnonzero(violation[0]).tolist() == [5]
+
+
+def test_position_smoke_guard_probe_is_one_ulp_outside_hard_but_inside_soft():
+    contract = expected_position_limit_contract()
+    hard = np.asarray(contract["hard_limits"]["values_rad"], dtype=np.float32)
+    soft = np.asarray(
+        contract["isaaclab_soft_limits"]["values_rad"], dtype=np.float32
+    )
+    guard = np.asarray(contract["target_guard"]["values_rad"], dtype=np.float32)
+    joint_index = 3
+    adversarial = np.nextafter(
+        guard[0, joint_index, 1], np.float32(np.inf), dtype=np.float32
+    )
+    probe = {
+        "position_limit_contract": contract,
+        "joint_index": joint_index,
+        "controlling_bound_source": "live_joint_pos_limits",
+        "hard_upper_limit_rad": float(hard[0, joint_index, 1]),
+        "soft_upper_limit_rad": float(soft[0, joint_index, 1]),
+        "intersection_guard_upper_limit_rad": float(guard[0, joint_index, 1]),
+        "adversarial_target_rad": float(adversarial),
+        "adversarial_is_one_float32_step_above_guard": True,
+        "adversarial_inside_soft_limit": True,
+        "adversarial_outside_hard_limit": True,
+        "articulation_target_before": VALID_PANDA_Q.tolist(),
+        "articulation_target_after": VALID_PANDA_Q.tolist(),
+        "exception_type": "PositionActionTargetLimitError",
+        "exception_message": "intersection guard rejected target before setter",
+        "setter_unchanged": True,
+    }
+    assert validate_position_limit_guard_probe(probe) == probe
+    tampered = copy.deepcopy(probe)
+    tampered["adversarial_target_rad"] = float(
+        np.nextafter(adversarial, np.float32(np.inf), dtype=np.float32)
+    )
+    with pytest.raises(ValueError, match="did not fail before setter"):
+        validate_position_limit_guard_probe(tampered)
+
+
 def test_position_contract_preserves_model_inputs_but_removes_velocity_actuation():
     old = expected_pi05_droid_jointvelocity_contract()
     new = expected_pi05_droid_position_contract()
@@ -288,6 +394,7 @@ def test_position_contract_preserves_model_inputs_but_removes_velocity_actuation
     assert new["control"]["target_mode"] == "absolute_joint_position"
     assert new["control"]["command_anchor"].startswith("fresh_measured")
     assert new["control"]["position_drive"]["claims_exact_hardware_controller_gains"] is False
+    assert new["control"]["position_limits"] == expected_position_limit_contract()
     assert new["official_droid"]["revision"] == OFFICIAL_DROID_COMMIT
     assert new["official_droid"]["control_sources"] == OFFICIAL_DROID_CONTROL_SOURCES
 
@@ -325,6 +432,24 @@ def test_position_runtime_round_trip_closes_direct_drive_and_gripper_fields():
     with pytest.raises(ValueError, match="policy_observation"):
         validate_position_adapter_runtime_report(bad_observation)
 
+    bad_hard = copy.deepcopy(report)
+    bad_hard["position_limit_readback"]["buffered_hard"]["values"][0][3][1] = (
+        PI05_DROID_ISAACLAB_SOFT_LIMITS_RAD[3][1]
+    )
+    bad_hard["runtime_sha256"] = position_runtime._runtime_sha256(bad_hard)
+    with pytest.raises(ValueError, match="buffered PhysX hard limits"):
+        validate_position_adapter_runtime_report(bad_hard)
+
+    bad_serialization = copy.deepcopy(report)
+    bad_serialization["position_limit_readback"]["buffered_hard"]["values"][0][0][
+        0
+    ] += 1e-12
+    bad_serialization["runtime_sha256"] = position_runtime._runtime_sha256(
+        bad_serialization
+    )
+    with pytest.raises(ValueError, match="exact serialized float32"):
+        validate_position_adapter_runtime_report(bad_serialization)
+
 
 def test_position_serving_contract_is_immutable_and_exact(tmp_path):
     metadata = expected_pi05_droid_position_server_metadata()
@@ -357,13 +482,24 @@ class _Sensor:
 
 class _Robot:
     def __init__(self):
+        hard_limits = np.broadcast_to(
+            np.asarray([-3.0, 3.0], dtype=np.float32), (1, 13, 2)
+        ).copy()
+        hard_limits[:, :7] = np.asarray(
+            [PI05_DROID_PHYSX_HARD_LIMITS_RAD], dtype=np.float32
+        )
+        soft_limits = hard_limits.copy()
+        soft_limits[:, :7] = np.asarray(
+            [PI05_DROID_ISAACLAB_SOFT_LIMITS_RAD], dtype=np.float32
+        )
+        joint_pos = np.zeros((1, 13), dtype=np.float32)
+        joint_pos[:, :7] = VALID_PANDA_Q
         self.data = SimpleNamespace(
-            joint_pos=np.zeros((1, 13), dtype=np.float32),
+            joint_pos=joint_pos,
             joint_vel=np.zeros((1, 13), dtype=np.float32),
             joint_pos_target=np.zeros((1, 13), dtype=np.float32),
-            soft_joint_pos_limits=np.broadcast_to(
-                np.asarray([-3.0, 3.0], dtype=np.float32), (1, 13, 2)
-            ).copy(),
+            joint_pos_limits=hard_limits,
+            soft_joint_pos_limits=soft_limits,
         )
 
     def find_joints(self, names, preserve_order=False):
@@ -485,9 +621,10 @@ def test_client_reanchors_second_open_loop_action_to_fresh_live_q(tmp_path):
         client = DroidDeltaJointPositionClient(_args(tmp_path))
     _bind(client, env)
 
-    first, _ = client.infer(_observation(np.zeros(7)), "move")
+    first, _ = client.infer(_observation(VALID_PANDA_Q), "move")
     assert first[0] == pytest.approx(0.2)
-    actual_after = np.asarray([0.04, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+    actual_after = VALID_PANDA_Q.copy()
+    actual_after[0] = np.float32(0.04)
     env.apply(first, actual_after)
     client.record_execution(
         _observation(actual_after), env, terminated=[False], truncated=[False]
@@ -514,6 +651,10 @@ def test_client_reanchors_second_open_loop_action_to_fresh_live_q(tmp_path):
     assert len(query["images"]["native_external"]["sha256"]) == 64
     assert actions_in_trace[1]["live_pre_step_joint_position"][0] == pytest.approx(0.04)
     assert actions_in_trace[1]["adapter"]["absolute_joint_position_target_rad"][0] == pytest.approx(0.24)
+    tampered_action = copy.deepcopy(actions_in_trace[0])
+    tampered_action["guarded_float32_joint_position_target"][0] += 1e-12
+    with pytest.raises(ValueError, match="exact serialized float32"):
+        validate_position_trace_record(tampered_action)
 
 
 def test_client_rejects_camera_resolution_dtype_and_state_dtype_drift():
@@ -544,7 +685,7 @@ def test_client_rejects_target_beyond_live_limit_before_setter(tmp_path):
     actions[0, 0] = 1.0
     server = _FakeServer(actions)
     env = _Env()
-    q = np.zeros(7, dtype=np.float32)
+    q = VALID_PANDA_Q.copy()
     q[0] = np.float32(2.95)
     env.robot.data.joint_pos[:, :7] = q
     with mock.patch(

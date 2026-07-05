@@ -23,6 +23,8 @@ def _run_capture(args, env, runtime_contract):
     from polaris.pi05_droid_position_adapter import (
         PositionActionTargetLimitError,
         adapt_official_droid_action,
+        exact_position_target_guard_from_live_limits,
+        expected_position_limit_contract,
     )
     from polaris.pi05_droid_position_contract import PANDA_ARM_JOINT_NAMES
     from polaris.pi05_droid_position_runtime import make_position_safety_report
@@ -151,9 +153,23 @@ def _run_capture(args, env, runtime_contract):
     # Articulation.set_joint_position_target call.
     env.reset(expensive=False)
     arm_term = root.action_manager._terms["arm"]
-    live_limits = _numpy(robot.data.soft_joint_pos_limits[:, arm_ids])
+    live_hard_limits = _numpy(robot.data.joint_pos_limits[:, arm_ids])
+    live_soft_limits = _numpy(robot.data.soft_joint_pos_limits[:, arm_ids])
+    target_guard_limits = exact_position_target_guard_from_live_limits(
+        live_hard_limits, live_soft_limits
+    )
     target = _numpy(robot.data.joint_pos[:, arm_ids]).copy()
-    target[0, 0] = live_limits[0, 0, 1] + np.float32(0.01)
+    joint_index = 3
+    target[0, joint_index] = np.nextafter(
+        target_guard_limits[0, joint_index, 1],
+        np.float32(np.inf),
+        dtype=np.float32,
+    )
+    if not (
+        target[0, joint_index] > live_hard_limits[0, joint_index, 1]
+        and target[0, joint_index] <= live_soft_limits[0, joint_index, 1]
+    ):
+        raise ValueError("adversarial q4 target did not isolate hard/soft intersection")
     before_target = _numpy(robot.data.joint_pos_target[:, arm_ids]).copy()
     try:
         arm_term.process_actions(torch.as_tensor(target, device=env.device))
@@ -164,9 +180,22 @@ def _run_capture(args, env, runtime_contract):
         raise RuntimeError("adversarial position target reached the setter path")
     after_target = _numpy(robot.data.joint_pos_target[:, arm_ids]).copy()
     guard = {
-        "joint_index": 0,
-        "upper_limit_rad": float(live_limits[0, 0, 1]),
-        "adversarial_target_rad": float(target[0, 0]),
+        "position_limit_contract": expected_position_limit_contract(),
+        "joint_index": joint_index,
+        "controlling_bound_source": "live_joint_pos_limits",
+        "hard_upper_limit_rad": float(
+            live_hard_limits[0, joint_index, 1]
+        ),
+        "soft_upper_limit_rad": float(
+            live_soft_limits[0, joint_index, 1]
+        ),
+        "intersection_guard_upper_limit_rad": float(
+            target_guard_limits[0, joint_index, 1]
+        ),
+        "adversarial_target_rad": float(target[0, joint_index]),
+        "adversarial_is_one_float32_step_above_guard": True,
+        "adversarial_inside_soft_limit": True,
+        "adversarial_outside_hard_limit": True,
         "articulation_target_before": before_target[0].tolist(),
         "articulation_target_after": after_target[0].tolist(),
         "exception_type": exception_type,

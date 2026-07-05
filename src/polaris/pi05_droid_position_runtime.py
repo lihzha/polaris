@@ -13,11 +13,16 @@ from typing import Any
 import numpy as np
 
 from polaris.pi05_droid_position_adapter import (
+    PI05_DROID_ISAACLAB_SOFT_LIMITS_RAD,
     PI05_DROID_PHYSICS_FREQUENCY_HZ,
     PI05_DROID_PHYSICS_SUBSTEPS,
+    PI05_DROID_PHYSX_HARD_LIMITS_RAD,
     PI05_DROID_POLICY_FREQUENCY_HZ,
     PI05_DROID_POSITION_ADAPTER_PROFILE,
     canonical_json_bytes,
+    exact_position_target_guard_from_live_limits,
+    expected_position_limit_contract,
+    validate_position_limit_contract,
 )
 from polaris.pi05_droid_position_contract import (
     NATIVE_GRIPPER_DRIVE_PROFILE,
@@ -101,6 +106,18 @@ def _runtime_sha256(report: dict[str, Any]) -> str:
     payload = copy.deepcopy(report)
     payload.pop("runtime_sha256", None)
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def _validate_exact_float32_array_report(
+    report: Any, expected: np.ndarray, *, field: str, expected_device: str
+) -> None:
+    _validate_array_report(
+        report, expected, field=field, expected_device=expected_device
+    )
+    serialized = np.asarray(report["values"])
+    expected_float64 = np.asarray(expected, dtype=np.float32).astype(np.float64)
+    if not np.array_equal(serialized.astype(np.float64), expected_float64):
+        raise ValueError(f"{field} values are not exact serialized float32")
 
 
 def _source_sha256(source_object: Any, *, field: str) -> str:
@@ -301,19 +318,40 @@ def capture_position_adapter_runtime(env: Any) -> dict[str, Any]:
             expected_device="cuda:0",
         ),
     }
+    expected_hard_limits = np.asarray(
+        [PI05_DROID_PHYSX_HARD_LIMITS_RAD], dtype=np.float32
+    )
+    expected_soft_limits = np.asarray(
+        [PI05_DROID_ISAACLAB_SOFT_LIMITS_RAD], dtype=np.float32
+    )
+    buffered_hard_limits = robot.data.joint_pos_limits[:, joint_ids]
     buffered_soft_limits = robot.data.soft_joint_pos_limits[:, joint_ids]
-    buffered_soft_numpy = buffered_soft_limits.detach().cpu().numpy()
+    exact_position_target_guard_from_live_limits(
+        buffered_hard_limits.detach().cpu().numpy(),
+        buffered_soft_limits.detach().cpu().numpy()
+    )
     position_limit_readback = {
-        "buffered_soft": _require_float32_array(
-            buffered_soft_limits,
-            buffered_soft_numpy,
-            field="buffered soft joint-position limits",
+        "contract": expected_position_limit_contract(),
+        "configured_soft_joint_pos_limit_factor": _scalar(
+            scene_robot_cfg.soft_joint_pos_limit_factor,
+            field="configured soft joint-position limit factor",
+        ),
+        "buffered_hard": _require_float32_array(
+            buffered_hard_limits,
+            expected_hard_limits,
+            field="buffered PhysX hard joint-position limits",
             expected_device="cuda:0",
         ),
-        "direct_physx": _require_float32_array(
+        "buffered_isaaclab_soft": _require_float32_array(
+            buffered_soft_limits,
+            expected_soft_limits,
+            field="buffered Isaac Lab factor-1 soft joint-position limits",
+            expected_device="cuda:0",
+        ),
+        "direct_physx_hard": _require_float32_array(
             view.get_dof_limits()[:, joint_ids],
-            buffered_soft_numpy,
-            field="direct PhysX joint-position limits",
+            expected_hard_limits,
+            field="direct PhysX hard joint-position limits",
             expected_device="cpu",
         ),
     }
@@ -745,23 +783,43 @@ def validate_position_adapter_runtime_report(value: Any) -> dict[str, Any]:
             direct[field], expected_array, field=f"direct {field}", expected_device="cpu"
         )
     limits = value["position_limit_readback"]
-    if not isinstance(limits, dict) or set(limits) != {"buffered_soft", "direct_physx"}:
+    if not isinstance(limits, dict) or set(limits) != {
+        "contract",
+        "configured_soft_joint_pos_limit_factor",
+        "buffered_hard",
+        "buffered_isaaclab_soft",
+        "direct_physx_hard",
+    }:
         raise ValueError("position runtime limit readback schema mismatch")
-    buffered_limit_values = np.asarray(limits["buffered_soft"].get("values"), dtype=np.float32)
-    if buffered_limit_values.shape != (1, 7, 2):
-        raise ValueError("position runtime buffered limit shape mismatch")
-    _validate_array_report(
-        limits["buffered_soft"],
-        buffered_limit_values,
-        field="position buffered soft limits",
+    limit_contract = validate_position_limit_contract(limits["contract"])
+    if limits["configured_soft_joint_pos_limit_factor"] != 1.0:
+        raise ValueError("position runtime soft joint-position limit factor mismatch")
+    hard_values = np.asarray(
+        limit_contract["hard_limits"]["values_rad"], dtype=np.float32
+    )
+    soft_values = np.asarray(
+        limit_contract["isaaclab_soft_limits"]["values_rad"], dtype=np.float32
+    )
+    _validate_exact_float32_array_report(
+        limits["buffered_hard"],
+        hard_values,
+        field="position buffered PhysX hard limits",
         expected_device="cuda:0",
     )
-    _validate_array_report(
-        limits["direct_physx"],
-        buffered_limit_values,
-        field="position direct PhysX limits",
+    _validate_exact_float32_array_report(
+        limits["buffered_isaaclab_soft"],
+        soft_values,
+        field="position buffered Isaac Lab soft limits",
+        expected_device="cuda:0",
+    )
+    _validate_exact_float32_array_report(
+        limits["direct_physx_hard"],
+        hard_values,
+        field="position direct PhysX hard limits",
         expected_device="cpu",
     )
+    if limits["buffered_hard"]["values"] != limits["direct_physx_hard"]["values"]:
+        raise ValueError("position buffered/direct PhysX hard limits differ")
     gripper = value["gripper"]
     if not isinstance(gripper, dict) or set(gripper) != {
         "action_term_class",

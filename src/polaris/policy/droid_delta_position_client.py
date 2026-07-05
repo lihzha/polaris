@@ -20,7 +20,10 @@ from polaris.pi05_droid_position_adapter import (
     PI05_DROID_RESPONSE_HORIZON,
     adapt_official_droid_action,
     canonical_json_bytes,
+    evaluate_position_target_guard,
+    expected_position_limit_contract,
     validate_position_adapter_evidence,
+    validate_position_limit_contract,
     validate_position_target_hold_report,
 )
 from polaris.pi05_droid_position_contract import (
@@ -62,10 +65,25 @@ class PositionTargetLimitError(RuntimeError):
 
     def __init__(self, evidence: dict[str, Any], incident_artifact: dict[str, Any]):
         super().__init__(
-            "adapted absolute joint target exceeds live soft limits before setter"
+            "adapted absolute joint target exceeds exact zero-inset live hard/soft "
+            "intersection guard before setter"
         )
         self.evidence = copy.deepcopy(evidence)
         self.incident_artifact = copy.deepcopy(incident_artifact)
+
+
+def _serialized_float32(value: Any, *, shape: tuple[int, ...], field: str) -> np.ndarray:
+    serialized = np.asarray(value)
+    if (
+        serialized.shape != shape
+        or not np.issubdtype(serialized.dtype, np.number)
+        or not np.isfinite(serialized).all()
+    ):
+        raise ValueError(f"{field} must be one finite numeric {shape} value")
+    as_float32 = serialized.astype(np.float32)
+    if not np.array_equal(serialized.astype(np.float64), as_float32.astype(np.float64)):
+        raise ValueError(f"{field} is not an exact serialized float32 value")
+    return as_float32
 
 
 def validate_position_target_limit_incident(value: Any) -> dict[str, Any]:
@@ -78,21 +96,59 @@ def validate_position_target_limit_incident(value: Any) -> dict[str, Any]:
         "chunk_action_index",
         "measured_joint_position",
         "clipped_arm_command",
-        "absolute_joint_position_target",
-        "live_soft_joint_position_limits",
+        "reference_float64_absolute_joint_position_target",
+        "guarded_float32_joint_position_target",
+        "position_limit_contract_sha256",
+        "live_buffered_hard_joint_position_limits",
+        "live_isaaclab_soft_joint_position_limits",
+        "derived_target_guard_joint_position_limits",
+        "guard_source",
+        "guard_inset_rad",
         "violating_joint_indices",
         "setter_calls_for_rejected_target",
     }:
         raise ValueError("position target-limit incident schema mismatch")
-    target = np.asarray(value["absolute_joint_position_target"])
-    limits = np.asarray(value["live_soft_joint_position_limits"])
-    mask = (target < limits[:, 0]) | (target > limits[:, 1])
+    reference_target = np.asarray(
+        value["reference_float64_absolute_joint_position_target"]
+    )
+    guarded_target = _serialized_float32(
+        value["guarded_float32_joint_position_target"],
+        shape=(7,),
+        field="incident guarded target",
+    )
+    live_hard = _serialized_float32(
+        value["live_buffered_hard_joint_position_limits"],
+        shape=(7, 2),
+        field="incident live hard limits",
+    )
+    live_soft = _serialized_float32(
+        value["live_isaaclab_soft_joint_position_limits"],
+        shape=(7, 2),
+        field="incident live soft limits",
+    )
+    recomputed_target, guard, mask = evaluate_position_target_guard(
+        reference_target, live_hard, live_soft
+    )
+    recorded_guard = _serialized_float32(
+        value["derived_target_guard_joint_position_limits"],
+        shape=(7, 2),
+        field="incident derived target guard",
+    )
+    expected_limit_contract = expected_position_limit_contract()
     if (
         value["schema_version"] != 1
         or value["profile"] != "openpi_pi05_droid_position_target_limit_failure_v1"
-        or value["reason"] != "absolute_target_outside_live_soft_joint_limits"
-        or target.shape != (7,)
-        or limits.shape != (7, 2)
+        or value["reason"]
+        != "absolute_target_outside_zero_inset_live_hard_soft_guard"
+        or reference_target.shape != (7,)
+        or reference_target.dtype != np.float64
+        or not np.array_equal(guarded_target, recomputed_target[0])
+        or not np.array_equal(recorded_guard, guard[0])
+        or value["position_limit_contract_sha256"]
+        != expected_limit_contract["contract_sha256"]
+        or value["guard_source"]
+        != "intersection(live_joint_pos_limits,live_soft_joint_pos_limits)"
+        or value["guard_inset_rad"] != 0.0
         or value["violating_joint_indices"] != np.flatnonzero(mask).tolist()
         or not bool(mask.any())
         or value["setter_calls_for_rejected_target"] != 0
@@ -264,7 +320,13 @@ def validate_position_trace_record(value: Any) -> dict[str, Any]:
             "chunk_action_index",
             "live_pre_step_joint_position",
             "policy_observation_joint_position",
-            "live_soft_joint_position_limits",
+            "guarded_float32_joint_position_target",
+            "position_limit_contract_sha256",
+            "live_buffered_hard_joint_position_limits",
+            "live_isaaclab_soft_joint_position_limits",
+            "derived_target_guard_joint_position_limits",
+            "guard_source",
+            "guard_inset_rad",
             "target_limit_guard",
             "adapter",
         },
@@ -379,14 +441,47 @@ def validate_position_trace_record(value: Any) -> dict[str, Any]:
             np.asarray(value["adapter"]["measured_joint_position"]),
         ):
             raise ValueError("position action fresh live anchor mismatch")
-        limits = np.asarray(value["live_soft_joint_position_limits"])
-        target = np.asarray(value["adapter"]["absolute_joint_position_target_rad"])
+        limit_contract = expected_position_limit_contract()
+        live_hard = _serialized_float32(
+            value["live_buffered_hard_joint_position_limits"],
+            shape=(7, 2),
+            field="position action live hard limits",
+        )
+        live_soft = _serialized_float32(
+            value["live_isaaclab_soft_joint_position_limits"],
+            shape=(7, 2),
+            field="position action live soft limits",
+        )
+        reference_target = np.asarray(
+            value["adapter"]["absolute_joint_position_target_rad"], dtype=np.float64
+        )
+        guarded_target, guard, violation = evaluate_position_target_guard(
+            reference_target, live_hard, live_soft
+        )
+        recorded_guard = _serialized_float32(
+            value["derived_target_guard_joint_position_limits"],
+            shape=(7, 2),
+            field="position action derived target guard",
+        )
+        recorded_target = _serialized_float32(
+            value["guarded_float32_joint_position_target"],
+            shape=(7,),
+            field="position action guarded target",
+        )
         if (
-            limits.shape != (7, 2)
-            or not np.isfinite(limits).all()
-            or value["target_limit_guard"] != "passed_before_env_step_and_setter"
-            or bool((target < limits[:, 0]).any())
-            or bool((target > limits[:, 1]).any())
+            not np.array_equal(recorded_target, guarded_target[0])
+            or not np.array_equal(recorded_guard, guard[0])
+            or value["position_limit_contract_sha256"]
+            != limit_contract["contract_sha256"]
+            or value["guard_source"]
+            != "intersection(live_joint_pos_limits,live_soft_joint_pos_limits)"
+            or value["guard_inset_rad"] != 0.0
+            or value["target_limit_guard"]
+            != (
+                "passed_exact_zero_inset_live_hard_soft_intersection_guard_"
+                "before_env_step_and_setter"
+            )
+            or bool(violation.any())
         ):
             raise ValueError("position action target-limit guard mismatch")
     elif record_type == "openpi_droid_position_execution":
@@ -631,6 +726,9 @@ class DroidDeltaJointPositionClient(InferenceClient):
         self.serving_contract = validate_pi05_droid_position_server_metadata(
             server_metadata
         )
+        self.position_limit_contract = validate_position_limit_contract(
+            self.serving_contract["control"]["position_limits"]
+        )
         if not isinstance(args.serving_contract_path, str) or not args.serving_contract_path:
             raise ValueError("DroidDeltaJointPosition requires serving_contract_path")
         self.serving_contract_artifact = validate_persisted_position_serving_contract(
@@ -670,6 +768,9 @@ class DroidDeltaJointPositionClient(InferenceClient):
             "execution_horizon": 8,
             "fresh_measurement_anchor": True,
             "wrist_rotation_degrees": 0,
+            "position_limit_contract_sha256": self.position_limit_contract[
+                "contract_sha256"
+            ],
         }
         print(
             PI05_DROID_POSITION_CLIENT_MARKER
@@ -857,15 +958,28 @@ class DroidDeltaJointPositionClient(InferenceClient):
         adapter = adapt_official_droid_action(
             self.pred_action_chunk[action_index].copy(), live_q[0]
         )
-        live_limits = _tensor_numpy(
-            self._live_robot.data.soft_joint_pos_limits[:, self._live_arm_joint_ids],
-            field="live soft joint-position limits",
+        live_hard_limits = _tensor_numpy(
+            self._live_robot.data.joint_pos_limits[:, self._live_arm_joint_ids],
+            field="live buffered hard joint-position limits",
         )
-        if live_limits.dtype != np.float32 or live_limits.shape != (1, 7, 2):
-            raise ValueError("live soft joint limits must be float32 [1,7,2]")
-        target = np.asarray(adapter["absolute_joint_position_target_rad"])
-        violation = (target < live_limits[0, :, 0]) | (
-            target > live_limits[0, :, 1]
+        live_soft_limits = _tensor_numpy(
+            self._live_robot.data.soft_joint_pos_limits[:, self._live_arm_joint_ids],
+            field="live Isaac Lab soft joint-position limits",
+        )
+        if (
+            live_hard_limits.dtype != np.float32
+            or live_hard_limits.shape != (1, 7, 2)
+            or live_soft_limits.dtype != np.float32
+            or live_soft_limits.shape != (1, 7, 2)
+        ):
+            raise ValueError("live hard/soft joint limits must be float32 [1,7,2]")
+        reference_target = np.asarray(
+            adapter["absolute_joint_position_target_rad"], dtype=np.float64
+        )
+        guarded_target, target_guard_limits, violation = (
+            evaluate_position_target_guard(
+                reference_target, live_hard_limits, live_soft_limits
+            )
         )
         if bool(violation.any()):
             incident = validate_position_target_limit_incident(
@@ -874,15 +988,38 @@ class DroidDeltaJointPositionClient(InferenceClient):
                     "profile": (
                         "openpi_pi05_droid_position_target_limit_failure_v1"
                     ),
-                    "reason": "absolute_target_outside_live_soft_joint_limits",
+                    "reason": (
+                        "absolute_target_outside_zero_inset_live_hard_soft_guard"
+                    ),
                     "outer_step_index": self.outer_step_index,
                     "query_index": self.active_query_index,
                     "chunk_action_index": action_index,
                     "measured_joint_position": live_q[0].tolist(),
                     "clipped_arm_command": adapter["clipped_action"][:7],
-                    "absolute_joint_position_target": target.tolist(),
-                    "live_soft_joint_position_limits": live_limits[0].tolist(),
-                    "violating_joint_indices": np.flatnonzero(violation).tolist(),
+                    "reference_float64_absolute_joint_position_target": (
+                        reference_target.tolist()
+                    ),
+                    "guarded_float32_joint_position_target": (
+                        guarded_target[0].tolist()
+                    ),
+                    "position_limit_contract_sha256": self.position_limit_contract[
+                        "contract_sha256"
+                    ],
+                    "live_buffered_hard_joint_position_limits": (
+                        live_hard_limits[0].tolist()
+                    ),
+                    "live_isaaclab_soft_joint_position_limits": (
+                        live_soft_limits[0].tolist()
+                    ),
+                    "derived_target_guard_joint_position_limits": (
+                        target_guard_limits[0].tolist()
+                    ),
+                    "guard_source": (
+                        "intersection(live_joint_pos_limits,"
+                        "live_soft_joint_pos_limits)"
+                    ),
+                    "guard_inset_rad": 0.0,
+                    "violating_joint_indices": np.flatnonzero(violation[0]).tolist(),
                     "setter_calls_for_rejected_target": 0,
                 }
             )
@@ -899,7 +1036,14 @@ class DroidDeltaJointPositionClient(InferenceClient):
                 for key in ("path", "size", "sha256", "mode", "nlink")
             }
             raise PositionTargetLimitError(incident, identity)
-        emitted = np.asarray(adapter["emitted_absolute_action"], dtype=np.float64)
+        emitted = np.concatenate(
+            [
+                guarded_target[0].astype(np.float64),
+                np.asarray(
+                    [adapter["absolute_closed_positive_gripper"]], dtype=np.float64
+                ),
+            ]
+        )
         self._pending_execution = {
             "query_index": self.active_query_index,
             "chunk_action_index": action_index,
@@ -915,8 +1059,27 @@ class DroidDeltaJointPositionClient(InferenceClient):
                 "policy_observation_joint_position": current[
                     "joint_position"
                 ].tolist(),
-                "live_soft_joint_position_limits": live_limits[0].tolist(),
-                "target_limit_guard": "passed_before_env_step_and_setter",
+                "guarded_float32_joint_position_target": guarded_target[0].tolist(),
+                "position_limit_contract_sha256": self.position_limit_contract[
+                    "contract_sha256"
+                ],
+                "live_buffered_hard_joint_position_limits": (
+                    live_hard_limits[0].tolist()
+                ),
+                "live_isaaclab_soft_joint_position_limits": (
+                    live_soft_limits[0].tolist()
+                ),
+                "derived_target_guard_joint_position_limits": (
+                    target_guard_limits[0].tolist()
+                ),
+                "guard_source": (
+                    "intersection(live_joint_pos_limits,live_soft_joint_pos_limits)"
+                ),
+                "guard_inset_rad": 0.0,
+                "target_limit_guard": (
+                    "passed_exact_zero_inset_live_hard_soft_intersection_guard_"
+                    "before_env_step_and_setter"
+                ),
                 "adapter": adapter,
             }
         )

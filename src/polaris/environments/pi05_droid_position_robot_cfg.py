@@ -20,6 +20,7 @@ def make_nvidia_droid_position_adapter_cfg() -> ArticulationCfg:
     """Copy the shared robot and bind explicit position-drive limits."""
 
     config = NVIDIA_DROID.copy()
+    config.soft_joint_pos_limit_factor = 1.0
     config.actuators = dict(config.actuators)
     config.actuators["panda_shoulder"] = ImplicitActuatorCfg(
         joint_names_expr=["panda_joint[1-4]"],
