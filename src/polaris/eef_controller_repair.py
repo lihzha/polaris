@@ -237,6 +237,62 @@ def advance_current_joint_velocity_recovery(
     )
 
 
+def advance_concurrent_arm_current_joint_velocity_recovery(
+    *,
+    enabled: bool,
+    phase_before_apply: str,
+    consecutive_active_substeps_before_apply: int,
+    consecutive_clean_samples_before_apply: int,
+    next_release_ramp_index_before_apply: int | None,
+    measured_velocity_over_envelope: bool,
+) -> CurrentJointVelocityRecoveryTransition:
+    """Stage the v6 hold/clean-2 transition without a release ramp.
+
+    The abnormal-velocity transaction remains fail-closed and identical to
+    v5 while active.  The second clean sample is one final current-position
+    hold.  It atomically closes recovery, and the following apply is therefore
+    a fresh ordinary DLS/slew apply.  No lower-controller target is stored or
+    replayed.
+    """
+
+    if phase_before_apply == CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_RELEASE_RAMP:
+        raise ValueError("PolaRiS EEF concurrent recovery retained release-ramp state")
+    if next_release_ramp_index_before_apply is not None:
+        raise ValueError("PolaRiS EEF concurrent recovery retained a ramp index")
+    transition = advance_current_joint_velocity_recovery(
+        enabled=enabled,
+        phase_before_apply=phase_before_apply,
+        consecutive_active_substeps_before_apply=(
+            consecutive_active_substeps_before_apply
+        ),
+        consecutive_clean_samples_before_apply=(consecutive_clean_samples_before_apply),
+        next_release_ramp_index_before_apply=None,
+        measured_velocity_over_envelope=measured_velocity_over_envelope,
+    )
+    clean_resume = (
+        phase_before_apply == CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD
+        and not measured_velocity_over_envelope
+        and transition.release_ramp_index_to_apply == 0
+        and not transition.sustained_abort
+    )
+    if not clean_resume:
+        return transition
+    return CurrentJointVelocityRecoveryTransition(
+        phase_after_successful_apply=(CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE),
+        consecutive_active_substeps_after_successful_apply=0,
+        consecutive_clean_samples_after_successful_apply=0,
+        release_ramp_index_to_apply=None,
+        next_release_ramp_index_after_successful_apply=None,
+        skip_dls=True,
+        hold_current_position=True,
+        recovery_event_delta=0,
+        active_substep_delta=1,
+        recovered_event_delta=1,
+        release_ramp_completed_delta=0,
+        sustained_abort=False,
+    )
+
+
 def arm_release_ramp_fraction(index: int) -> float:
     """Return one closed float32-linear fraction from zero through one."""
 

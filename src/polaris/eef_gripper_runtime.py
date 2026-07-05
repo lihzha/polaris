@@ -537,6 +537,41 @@ DYNAMIC_EVIDENCE_FIELDS = {
     "nonfinite_samples",
     "dropped_diagnostics",
 }
+OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD = "open_endpoint_contact_mimic_impulse"
+OPEN_ENDPOINT_COUPLED_IMPULSE_PROFILE = (
+    "open_endpoint_follower5p001_and_arm_float32_recovery_envelope_v1"
+)
+OPEN_ENDPOINT_FOLLOWER_TELEMETRY_THRESHOLD_RAD_S_FLOAT32 = float(np.float32(5.001))
+OPEN_ENDPOINT_COUPLED_IMPULSE_FIELDS = {
+    "enabled",
+    "profile",
+    "endpoint",
+    "follower_threshold_rad_s_float32",
+    "follower_threshold_semantics",
+    "arm_threshold_profile",
+    "arm_velocity_envelopes_rad_s",
+    "failure_predicate",
+    "open_endpoint_samples",
+    "nonfinite_open_endpoint_samples",
+    "follower_threshold_crossing_samples",
+    "coupled_impulse_failure_samples",
+    "max_abs_arm_joint_velocity_rad_s",
+    "max_abs_follower_joint_velocity_rad_s",
+    "max_abs_follower_joint_acceleration_rad_s2",
+    "maximum_follower_diagnostic",
+    "first_coupled_impulse_failure_diagnostic",
+    "passed",
+}
+OPEN_ENDPOINT_COUPLED_IMPULSE_DIAGNOSTIC_FIELDS = {
+    "sample_phase",
+    "sample_index",
+    "arm_joint_velocity_rad_s",
+    "follower_joint_velocity_rad_s",
+    "follower_joint_acceleration_rad_s2",
+    "follower_threshold_crossed",
+    "arm_recovery_envelope_crossed",
+    "coupled_impulse_failure",
+}
 TARGET_SLEW_STATIC_FIELDS = {
     "profile",
     "scope",
@@ -2178,9 +2213,13 @@ def validate_eef_gripper_dynamic_evidence(
     value: Any,
     *,
     expected_target_slew_profile: str = EEF_GRIPPER_TARGET_SLEW_PROFILE,
+    expect_open_endpoint_coupled_impulse: bool = False,
 ) -> dict[str, Any]:
+    expected_fields = set(DYNAMIC_EVIDENCE_FIELDS)
+    if expect_open_endpoint_coupled_impulse:
+        expected_fields.add(OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD)
     _require(
-        isinstance(value, dict) and set(value) == DYNAMIC_EVIDENCE_FIELDS,
+        isinstance(value, dict) and set(value) == expected_fields,
         "gripper dynamic schema",
     )
     _require(
@@ -2193,6 +2232,193 @@ def validate_eef_gripper_dynamic_evidence(
         value.get("driver_target_slew"),
         expected_profile=expected_target_slew_profile,
     )
+    coupled = value.get(OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD)
+    if expect_open_endpoint_coupled_impulse:
+        _require(
+            isinstance(coupled, dict)
+            and set(coupled) == OPEN_ENDPOINT_COUPLED_IMPULSE_FIELDS
+            and coupled.get("enabled") is True
+            and coupled.get("profile") == OPEN_ENDPOINT_COUPLED_IMPULSE_PROFILE
+            and coupled.get("endpoint") == "open"
+            and _same_float32(
+                coupled.get("follower_threshold_rad_s_float32"),
+                OPEN_ENDPOINT_FOLLOWER_TELEMETRY_THRESHOLD_RAD_S_FLOAT32,
+            )
+            and coupled.get("follower_threshold_semantics")
+            == "passive_follower_crossing_is_telemetry_only_v1"
+            and coupled.get("arm_threshold_profile")
+            == "per_joint_float32_physical_limit_plus_limit_times_float32_1e_4_v1"
+            and coupled.get("failure_predicate")
+            == "open_and_follower_gt_5p001_and_any_arm_gt_its_recovery_envelope_v1",
+            "open-endpoint coupled-impulse identity",
+        )
+        for field in (
+            "open_endpoint_samples",
+            "nonfinite_open_endpoint_samples",
+            "follower_threshold_crossing_samples",
+            "coupled_impulse_failure_samples",
+        ):
+            _require(
+                type(coupled.get(field)) is int and coupled[field] >= 0,
+                f"open-endpoint coupled-impulse {field}",
+            )
+        _require(
+            coupled["nonfinite_open_endpoint_samples"]
+            <= coupled["open_endpoint_samples"]
+            and coupled["follower_threshold_crossing_samples"]
+            <= coupled["open_endpoint_samples"]
+            - coupled["nonfinite_open_endpoint_samples"]
+            and coupled["coupled_impulse_failure_samples"]
+            <= coupled["follower_threshold_crossing_samples"]
+            and type(coupled.get("passed")) is bool
+            and coupled["passed"]
+            is (
+                coupled["nonfinite_open_endpoint_samples"] == 0
+                and coupled["coupled_impulse_failure_samples"] == 0
+            ),
+            "open-endpoint coupled-impulse gate",
+        )
+        for field, width in (
+            ("arm_velocity_envelopes_rad_s", 7),
+            ("max_abs_arm_joint_velocity_rad_s", 7),
+            ("max_abs_follower_joint_velocity_rad_s", 5),
+            ("max_abs_follower_joint_acceleration_rad_s2", 5),
+        ):
+            vector = coupled.get(field)
+            _require(
+                isinstance(vector, list)
+                and len(vector) == width
+                and all(
+                    isinstance(item, (int, float))
+                    and not isinstance(item, bool)
+                    and math.isfinite(float(item))
+                    and float(item) >= 0.0
+                    for item in vector
+                ),
+                f"open-endpoint coupled-impulse {field}",
+            )
+        diagnostic = coupled.get("maximum_follower_diagnostic")
+        if (
+            coupled["open_endpoint_samples"]
+            == coupled["nonfinite_open_endpoint_samples"]
+        ):
+            _require(diagnostic is None, "empty open-endpoint diagnostic")
+        else:
+            _require(
+                isinstance(diagnostic, dict)
+                and set(diagnostic) == OPEN_ENDPOINT_COUPLED_IMPULSE_DIAGNOSTIC_FIELDS
+                and diagnostic.get("sample_phase")
+                in {"apply_entry", "post_policy_step"}
+                and type(diagnostic.get("sample_index")) is int
+                and 0
+                <= diagnostic["sample_index"]
+                < value["apply_entry_samples"] + value["post_policy_step_samples"],
+                "open-endpoint coupled-impulse diagnostic identity",
+            )
+            for field, width in (
+                ("arm_joint_velocity_rad_s", 7),
+                ("follower_joint_velocity_rad_s", 5),
+                ("follower_joint_acceleration_rad_s2", 5),
+            ):
+                vector = diagnostic.get(field)
+                _require(
+                    isinstance(vector, list)
+                    and len(vector) == width
+                    and all(
+                        isinstance(item, (int, float))
+                        and not isinstance(item, bool)
+                        and math.isfinite(float(item))
+                        for item in vector
+                    ),
+                    f"open-endpoint diagnostic {field}",
+                )
+            follower_crossed = any(
+                abs(float(item))
+                > OPEN_ENDPOINT_FOLLOWER_TELEMETRY_THRESHOLD_RAD_S_FLOAT32
+                for item in diagnostic["follower_joint_velocity_rad_s"]
+            )
+            arm_crossed = any(
+                abs(float(item)) > float(envelope)
+                for item, envelope in zip(
+                    diagnostic["arm_joint_velocity_rad_s"],
+                    coupled["arm_velocity_envelopes_rad_s"],
+                    strict=True,
+                )
+            )
+            _require(
+                diagnostic.get("follower_threshold_crossed") is follower_crossed
+                and diagnostic.get("arm_recovery_envelope_crossed") is arm_crossed
+                and diagnostic.get("coupled_impulse_failure")
+                is (follower_crossed and arm_crossed),
+                "open-endpoint diagnostic predicate binding",
+            )
+            _require(
+                _same_float32(
+                    max(
+                        abs(float(item))
+                        for item in diagnostic["follower_joint_velocity_rad_s"]
+                    ),
+                    max(coupled["max_abs_follower_joint_velocity_rad_s"]),
+                ),
+                "open-endpoint maximum follower diagnostic/aggregate drift",
+            )
+        failure_diagnostic = coupled.get("first_coupled_impulse_failure_diagnostic")
+        if coupled["coupled_impulse_failure_samples"] == 0:
+            _require(
+                failure_diagnostic is None,
+                "unexpected open-endpoint coupled failure diagnostic",
+            )
+        else:
+            _require(
+                isinstance(failure_diagnostic, dict)
+                and set(failure_diagnostic)
+                == OPEN_ENDPOINT_COUPLED_IMPULSE_DIAGNOSTIC_FIELDS
+                and failure_diagnostic.get("sample_phase")
+                in {"apply_entry", "post_policy_step"}
+                and type(failure_diagnostic.get("sample_index")) is int
+                and 0
+                <= failure_diagnostic["sample_index"]
+                < value["apply_entry_samples"] + value["post_policy_step_samples"]
+                and failure_diagnostic.get("follower_threshold_crossed") is True
+                and failure_diagnostic.get("arm_recovery_envelope_crossed") is True
+                and failure_diagnostic.get("coupled_impulse_failure") is True,
+                "open-endpoint coupled failure diagnostic",
+            )
+            for field, width in (
+                ("arm_joint_velocity_rad_s", 7),
+                ("follower_joint_velocity_rad_s", 5),
+                ("follower_joint_acceleration_rad_s2", 5),
+            ):
+                vector = failure_diagnostic.get(field)
+                _require(
+                    isinstance(vector, list)
+                    and len(vector) == width
+                    and all(
+                        isinstance(item, (int, float))
+                        and not isinstance(item, bool)
+                        and math.isfinite(float(item))
+                        for item in vector
+                    ),
+                    f"open-endpoint coupled failure {field}",
+                )
+            _require(
+                any(
+                    abs(float(item))
+                    > OPEN_ENDPOINT_FOLLOWER_TELEMETRY_THRESHOLD_RAD_S_FLOAT32
+                    for item in failure_diagnostic["follower_joint_velocity_rad_s"]
+                )
+                and any(
+                    abs(float(item)) > float(envelope)
+                    for item, envelope in zip(
+                        failure_diagnostic["arm_joint_velocity_rad_s"],
+                        coupled["arm_velocity_envelopes_rad_s"],
+                        strict=True,
+                    )
+                ),
+                "open-endpoint coupled failure predicate binding",
+            )
+    else:
+        _require(coupled is None, "unexpected open-endpoint coupled-impulse evidence")
     for field in (
         "apply_entry_samples",
         "post_policy_step_samples",

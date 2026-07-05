@@ -34,6 +34,9 @@ from pxr import PhysxSchema
 from pxr import UsdPhysics
 
 from polaris.eef_controller_repair import advance_arm_release_ramp
+from polaris.eef_controller_repair import (
+    advance_concurrent_arm_current_joint_velocity_recovery,
+)
 from polaris.eef_controller_repair import advance_current_joint_velocity_recovery
 from polaris.eef_controller_repair import advance_gripper_close_arm_interlock
 from polaris.eef_controller_repair import apply_arm_release_ramp_target
@@ -86,6 +89,18 @@ from polaris.eef_ik_safety import (
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_START_REASONS
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_TRANSACTION_PROFILE
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_END_REASON,
+)
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_PROFILE,
+)
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_SCHEMA_VERSION,
+)
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_TRANSACTION_PROFILE,
+)
 from polaris.eef_ik_safety import current_joint_velocity_recovery_envelope
 from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
 from polaris.eef_ik_safety import ARM_SLEW_HEADROOM_CANDIDATE_PROFILE
@@ -96,6 +111,9 @@ from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import (
     EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+)
+from polaris.eef_ik_safety import (
+    EEF_IK_CONCURRENT_ARM_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
 )
 from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
@@ -124,12 +142,19 @@ from polaris.eef_gripper_runtime import GRIPPER_JOINT_NAMES
 from polaris.eef_gripper_runtime import GRIPPER_OPEN_TARGET_FLOAT32
 from polaris.eef_gripper_runtime import PINNED_DYNAMIC_DEVICE
 from polaris.eef_gripper_runtime import PINNED_TENSOR_DTYPE
+from polaris.eef_gripper_runtime import OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD
+from polaris.eef_gripper_runtime import OPEN_ENDPOINT_COUPLED_IMPULSE_PROFILE
+from polaris.eef_gripper_runtime import (
+    OPEN_ENDPOINT_FOLLOWER_TELEMETRY_THRESHOLD_RAD_S_FLOAT32,
+)
 from polaris.eef_gripper_runtime import eef_gripper_target_slew_profile
 from polaris.eef_gripper_runtime import validate_eef_gripper_dynamic_evidence
 from polaris.eef_gripper_runtime import (
     validate_eef_gripper_close_arm_interlock_binding,
 )
 from polaris.eef_gripper_runtime import validate_eef_gripper_static_contract
+from polaris.eef_controller_profile import CONCURRENT_ARM_GRIPPER_PROFILE
+from polaris.eef_controller_profile import CONCURRENT_ARM_NO_CLOSE_INTERLOCK_PROFILE
 
 
 FAILURE_SUBSTEP_TRACE_CAPACITY = 64
@@ -759,15 +784,28 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._current_joint_velocity_recovery_enabled = (
             current_velocity_recovery_enabled
         )
+        self._concurrent_arm_gripper_enabled = bool(
+            self._current_joint_velocity_recovery_enabled
+            and not self._gripper_close_arm_interlock_enabled
+            and not self._arm_release_ramp_enabled
+        )
         if self._current_joint_velocity_recovery_enabled and (
             self._wrist_energy_brake_enabled
-            or not self._arm_release_ramp_enabled
             or not self._failure_substep_trace_enabled
+            or not self._arm_slew_headroom_enabled
             or self.num_envs != 1
+            or (
+                not self._concurrent_arm_gripper_enabled
+                and (
+                    not self._arm_release_ramp_enabled
+                    or not self._gripper_close_arm_interlock_enabled
+                )
+            )
         ):
             raise ValueError(
                 "PolaRiS EEF current-velocity recovery requires one environment "
-                "with the transactional arm release ramp and failure trace enabled, "
+                "with arm-slew headroom and failure trace enabled, plus either the "
+                "legacy transactional close/ramp stack or the concurrent v6 stack, "
                 "without the wrist-energy-brake candidate"
             )
         if (
@@ -783,12 +821,16 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 "PolaRiS EEF arm release ramp and wrist-energy brake cannot be combined"
             )
         self._safety_profile = (
-            EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE
-            if self._current_joint_velocity_recovery_enabled
+            EEF_IK_CONCURRENT_ARM_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+            if self._concurrent_arm_gripper_enabled
             else (
-                EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
-                if self._wrist_energy_brake_enabled
-                else EEF_IK_SAFETY_PROFILE
+                EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+                if self._current_joint_velocity_recovery_enabled
+                else (
+                    EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+                    if self._wrist_energy_brake_enabled
+                    else EEF_IK_SAFETY_PROFILE
+                )
             )
         )
         self._gripper_runtime_static: dict[str, object] | None = None
@@ -1326,6 +1368,18 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._current_joint_velocity_recovery_max_consecutive_substeps = 0
         self._current_joint_velocity_recovery_events: list[dict[str, object]] = []
 
+    def _reset_concurrent_arm_gripper_state(self) -> None:
+        """Clear v6-only proof counters; no target is retained across applies."""
+
+        self._concurrent_arm_fresh_dls_target_applies = 0
+        self._concurrent_arm_normal_target_setter_applies = 0
+        self._concurrent_arm_closed_endpoint_fresh_dls_target_applies = 0
+        self._concurrent_arm_closed_endpoint_distinct_desired_pose_count = 0
+        self._concurrent_arm_recovery_owned_target_applies = 0
+        self._concurrent_arm_deferred_endpoint_transition_count = 0
+        self._concurrent_arm_stored_target_replay_count = 0
+        self._concurrent_arm_last_closed_desired_pose: torch.Tensor | None = None
+
     def _reset_episode_safety_state(self, episode_index: int | None) -> None:
         counter_dtype = torch.int64
         self._active_episode_index = episode_index
@@ -1333,6 +1387,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._reset_arm_release_ramp_state()
         if self._current_joint_velocity_recovery_enabled:
             self._reset_current_joint_velocity_recovery_state()
+        if self._concurrent_arm_gripper_enabled:
+            self._reset_concurrent_arm_gripper_state()
         self._apply_call_count = 0
         self._slew_limit_event_count = torch.zeros(
             (), dtype=counter_dtype, device=self.device
@@ -1438,6 +1494,19 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
     ) -> None:
         """Bind the one-call production follower write to this action term."""
 
+        close_interlock_enabled = getattr(
+            self, "_gripper_close_arm_interlock_enabled", False
+        )
+        concurrent_arm_gripper_enabled = getattr(
+            self, "_concurrent_arm_gripper_enabled", False
+        )
+        if (
+            type(close_interlock_enabled) is not bool
+            or type(concurrent_arm_gripper_enabled) is not bool
+        ):
+            raise ValueError("PolaRiS EEF installed controller mode flag drift")
+        self._concurrent_arm_gripper_enabled = concurrent_arm_gripper_enabled
+
         if getattr(self, "_gripper_runtime_static", None) is not None:
             raise ValueError(
                 "PolaRiS EEF gripper runtime contract is already installed"
@@ -1467,11 +1536,19 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             )
         if target_slew_static() != validated["driver_target_slew"]:
             raise ValueError("PolaRiS EEF gripper target-slew static evidence drifted")
-        bound_interlock_spec = validate_eef_gripper_close_arm_interlock_binding(
-            target_slew_profile=target_slew_spec.profile,
-            interlock_profile=target_slew_spec.close_interlock_profile,
-            configured_substeps=target_slew_spec.close_interlock_substeps,
-        )
+        bound_interlock_spec = None
+        if close_interlock_enabled:
+            bound_interlock_spec = validate_eef_gripper_close_arm_interlock_binding(
+                target_slew_profile=target_slew_spec.profile,
+                interlock_profile=target_slew_spec.close_interlock_profile,
+                configured_substeps=target_slew_spec.close_interlock_substeps,
+            )
+        elif not concurrent_arm_gripper_enabled:
+            bound_interlock_spec = validate_eef_gripper_close_arm_interlock_binding(
+                target_slew_profile=target_slew_spec.profile,
+                interlock_profile=target_slew_spec.close_interlock_profile,
+                configured_substeps=target_slew_spec.close_interlock_substeps,
+            )
         for field in (
             "joint_pos",
             "joint_vel",
@@ -1495,16 +1572,68 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._gripper_runtime_static = validated
         self._gripper_target_slew_term = finger_term
         self._gripper_target_slew_profile = target_slew_spec.profile
-        self._gripper_close_arm_interlock_profile = (
-            bound_interlock_spec.close_interlock_profile
-        )
-        self._gripper_close_arm_interlock_configured_substeps = (
-            bound_interlock_spec.close_interlock_substeps
-        )
-        self._gripper_close_arm_interlock_fixed_activation_anchor = (
-            bound_interlock_spec.fixed_activation_anchor
-        )
+        if concurrent_arm_gripper_enabled:
+            self._gripper_close_arm_interlock_profile = (
+                CONCURRENT_ARM_NO_CLOSE_INTERLOCK_PROFILE
+            )
+            self._gripper_close_arm_interlock_configured_substeps = 0
+            self._gripper_close_arm_interlock_fixed_activation_anchor = False
+        else:
+            if bound_interlock_spec is None:
+                raise ValueError("PolaRiS EEF interlock profile binding is absent")
+            self._gripper_close_arm_interlock_profile = (
+                bound_interlock_spec.close_interlock_profile
+            )
+            self._gripper_close_arm_interlock_configured_substeps = (
+                bound_interlock_spec.close_interlock_substeps
+            )
+            self._gripper_close_arm_interlock_fixed_activation_anchor = (
+                bound_interlock_spec.fixed_activation_anchor
+            )
         self._reset_gripper_runtime_evidence()
+
+    def _validated_concurrent_gripper_endpoint_is_closed(self) -> bool:
+        """Read the v6 binary endpoint without owning or deferring arm state."""
+
+        if not self._concurrent_arm_gripper_enabled:
+            raise ValueError("PolaRiS EEF concurrent endpoint reader is disabled")
+        finger_term = getattr(self, "_gripper_target_slew_term", None)
+        if finger_term is None:
+            raise ValueError("PolaRiS EEF concurrent arm lacks the gripper term")
+        endpoint = getattr(finger_term, "_gripper_target_slew_endpoint", None)
+        endpoint_seen = getattr(finger_term, "_gripper_target_slew_endpoint_seen", None)
+        close_command = getattr(finger_term, "_close_command", None)
+        open_command = getattr(finger_term, "_open_command", None)
+        if (
+            endpoint_seen is not True
+            or not isinstance(endpoint, torch.Tensor)
+            or not isinstance(close_command, torch.Tensor)
+            or not isinstance(open_command, torch.Tensor)
+            or endpoint.shape != (self.num_envs, 1)
+            or close_command.shape != (1,)
+            or open_command.shape != (1,)
+            or endpoint.dtype != self._asset.data.joint_pos.dtype
+            or close_command.dtype != endpoint.dtype
+            or open_command.dtype != endpoint.dtype
+            or endpoint.device != torch.device(self.device)
+            or close_command.device != endpoint.device
+            or open_command.device != endpoint.device
+            or not bool(torch.isfinite(endpoint).all().item())
+            or not bool(torch.isfinite(close_command).all().item())
+            or not bool(torch.isfinite(open_command).all().item())
+        ):
+            raise ValueError("PolaRiS EEF concurrent gripper endpoint state drift")
+        expected_close = torch.full_like(close_command, GRIPPER_CLOSED_TARGET_FLOAT32)
+        expected_open = torch.full_like(open_command, GRIPPER_OPEN_TARGET_FLOAT32)
+        if not torch.equal(close_command, expected_close) or not torch.equal(
+            open_command, expected_open
+        ):
+            raise ValueError("PolaRiS EEF concurrent gripper endpoint constants drift")
+        endpoint_is_closed = torch.equal(endpoint, close_command.reshape(1, 1))
+        endpoint_is_open = torch.equal(endpoint, open_command.reshape(1, 1))
+        if endpoint_is_closed is endpoint_is_open:
+            raise ValueError("PolaRiS EEF concurrent gripper endpoint is not binary")
+        return endpoint_is_closed
 
     def _next_gripper_close_arm_interlock_transition(
         self,
@@ -1815,14 +1944,22 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
     ) -> None:
         """Set/read back, stage the final trace target, then commit lifecycle."""
 
-        if not self._arm_release_ramp_enabled:
+        concurrent_arm_gripper_enabled = getattr(
+            self, "_concurrent_arm_gripper_enabled", False
+        )
+        if type(concurrent_arm_gripper_enabled) is not bool:
+            raise ValueError("PolaRiS EEF concurrent transaction mode flag drift")
+        live_velocity_target = None
+        live_position_target = None
+        live_effort_target = None
+        if not self._arm_release_ramp_enabled and not concurrent_arm_gripper_enabled:
             self._asset.set_joint_velocity_target(
                 self._zero_joint_velocity_target,
                 self._joint_ids,
             )
             self._asset.set_joint_position_target(safe_target, self._joint_ids)
         else:
-            if staged_release_ramp is None:
+            if self._arm_release_ramp_enabled and staged_release_ramp is None:
                 raise ValueError("PolaRiS EEF arm release-ramp staged state is absent")
             try:
                 if recovery_owns_target:
@@ -1945,6 +2082,34 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                         f"(evidence_sha256={digest})"
                     ) from error
                 raise
+        if concurrent_arm_gripper_enabled:
+            if recovery_owns_target:
+                self._concurrent_arm_recovery_owned_target_applies += 1
+            else:
+                self._concurrent_arm_fresh_dls_target_applies += 1
+                self._concurrent_arm_normal_target_setter_applies += 1
+                if self._validated_concurrent_gripper_endpoint_is_closed():
+                    self._concurrent_arm_closed_endpoint_fresh_dls_target_applies += 1
+                    desired_pose = (
+                        torch.cat(
+                            (
+                                self._ik_controller.ee_pos_des,
+                                self._ik_controller.ee_quat_des,
+                            ),
+                            dim=-1,
+                        )[0]
+                        .detach()
+                        .clone()
+                    )
+                    if (
+                        self._concurrent_arm_last_closed_desired_pose is None
+                        or not torch.equal(
+                            desired_pose,
+                            self._concurrent_arm_last_closed_desired_pose,
+                        )
+                    ):
+                        self._concurrent_arm_closed_endpoint_distinct_desired_pose_count += 1
+                    self._concurrent_arm_last_closed_desired_pose = desired_pose
         # Tensor references come first.  The remaining operations are plain
         # assignments of prevalidated Python scalars/references and cannot
         # split a staged activation from its anchor.
@@ -2103,7 +2268,15 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 self._current_joint_velocity_recovery_max_consecutive_substeps,
                 observed_consecutive,
             )
-            if recovery_transition.release_ramp_completed_delta:
+            if (
+                concurrent_arm_gripper_enabled
+                and recovery_transition.recovered_event_delta
+            ):
+                self._close_current_joint_velocity_recovery_event(
+                    reason=CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_END_REASON,
+                    snapshot=snapshot,
+                )
+            elif recovery_transition.release_ramp_completed_delta:
                 self._close_current_joint_velocity_recovery_event(
                     reason="clean2_release_ramp_complete",
                     snapshot=snapshot,
@@ -2166,6 +2339,27 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 "joint_velocity_target_rad_s",
             )
         }
+        if self._concurrent_arm_gripper_enabled:
+            self._open_endpoint_samples = 0
+            self._open_endpoint_nonfinite_samples = 0
+            self._open_endpoint_follower_threshold_crossing_samples = 0
+            self._open_endpoint_coupled_impulse_failure_samples = 0
+            self._open_endpoint_max_abs_arm_joint_velocity = torch.zeros(
+                self._num_joints, dtype=dtype, device=self.device
+            )
+            self._open_endpoint_max_abs_follower_joint_velocity = torch.zeros(
+                5, dtype=dtype, device=self.device
+            )
+            self._open_endpoint_max_abs_follower_joint_acceleration = torch.zeros(
+                5, dtype=dtype, device=self.device
+            )
+            self._open_endpoint_max_follower_value = torch.tensor(
+                -1.0, dtype=dtype, device=self.device
+            )
+            self._open_endpoint_max_follower_diagnostic: dict[str, object] | None = None
+            self._open_endpoint_first_coupled_failure_diagnostic: (
+                dict[str, object] | None
+            ) = None
 
     def _record_gripper_runtime_sample(self, *, phase: str) -> None:
         if getattr(self, "_gripper_runtime_static", None) is None:
@@ -2190,7 +2384,15 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         else:
             self._gripper_post_policy_step_samples += 1
         combined = torch.cat(tuple(vectors.values()), dim=-1)
+        concurrent_open_endpoint = bool(
+            self._concurrent_arm_gripper_enabled
+            and not self._validated_concurrent_gripper_endpoint_is_closed()
+        )
+        if concurrent_open_endpoint:
+            self._open_endpoint_samples += 1
         if not torch.isfinite(combined).all():
+            if concurrent_open_endpoint:
+                self._open_endpoint_nonfinite_samples += 1
             self._gripper_nonfinite_samples += 1
             try:
                 _require_finite(combined, field="all-six gripper runtime state")
@@ -2204,6 +2406,71 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 raise
         velocity = vectors["joint_velocity_rad_s"]
         acceleration = vectors["joint_acceleration_rad_s2"]
+        if concurrent_open_endpoint:
+            arm_velocity = self._asset.data.joint_vel[:, self._joint_ids]
+            if not bool(torch.isfinite(arm_velocity).all().item()):
+                self._open_endpoint_nonfinite_samples += 1
+                _require_finite(
+                    arm_velocity,
+                    field="open-endpoint coupled arm velocity state",
+                )
+            follower_velocity = velocity[:, 1:]
+            follower_acceleration = acceleration[:, 1:]
+            follower_crossed = bool(
+                (
+                    follower_velocity.abs()
+                    > OPEN_ENDPOINT_FOLLOWER_TELEMETRY_THRESHOLD_RAD_S_FLOAT32
+                )
+                .any()
+                .item()
+            )
+            arm_crossed = bool(
+                (arm_velocity.abs() > self._current_joint_velocity_recovery_envelopes)
+                .any()
+                .item()
+            )
+            coupled_failure = follower_crossed and arm_crossed
+            self._open_endpoint_follower_threshold_crossing_samples += int(
+                follower_crossed
+            )
+            self._open_endpoint_coupled_impulse_failure_samples += int(coupled_failure)
+            self._open_endpoint_max_abs_arm_joint_velocity = torch.maximum(
+                self._open_endpoint_max_abs_arm_joint_velocity,
+                arm_velocity.abs().amax(dim=0),
+            )
+            self._open_endpoint_max_abs_follower_joint_velocity = torch.maximum(
+                self._open_endpoint_max_abs_follower_joint_velocity,
+                follower_velocity.abs().amax(dim=0),
+            )
+            self._open_endpoint_max_abs_follower_joint_acceleration = torch.maximum(
+                self._open_endpoint_max_abs_follower_joint_acceleration,
+                follower_acceleration.abs().amax(dim=0),
+            )
+            follower_candidate = follower_velocity[0].abs().amax()
+            diagnostic = {
+                "sample_phase": phase,
+                "sample_index": sample_index,
+                "arm_joint_velocity_rad_s": (arm_velocity[0].detach().cpu().tolist()),
+                "follower_joint_velocity_rad_s": (
+                    follower_velocity[0].detach().cpu().tolist()
+                ),
+                "follower_joint_acceleration_rad_s2": (
+                    follower_acceleration[0].detach().cpu().tolist()
+                ),
+                "follower_threshold_crossed": follower_crossed,
+                "arm_recovery_envelope_crossed": arm_crossed,
+                "coupled_impulse_failure": coupled_failure,
+            }
+            if (
+                coupled_failure
+                and self._open_endpoint_first_coupled_failure_diagnostic is None
+            ):
+                self._open_endpoint_first_coupled_failure_diagnostic = dict(diagnostic)
+            if bool(
+                (follower_candidate > self._open_endpoint_max_follower_value).item()
+            ):
+                self._open_endpoint_max_follower_value.copy_(follower_candidate)
+                self._open_endpoint_max_follower_diagnostic = diagnostic
         self._gripper_max_abs_joint_velocity = torch.maximum(
             self._gripper_max_abs_joint_velocity,
             velocity.abs().amax(dim=0),
@@ -2295,26 +2562,87 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         )
         if not callable(target_slew_reporter):
             raise ValueError("PolaRiS EEF gripper target-slew reporter is absent")
+        dynamic_report = {
+            "profile": EEF_GRIPPER_RUNTIME_PROFILE,
+            "joint_names": list(GRIPPER_JOINT_NAMES),
+            "joint_indices": list(GRIPPER_JOINT_INDICES),
+            "apply_entry_samples": self._gripper_apply_entry_samples,
+            "post_policy_step_samples": self._gripper_post_policy_step_samples,
+            "max_abs_joint_velocity_rad_s": self._gripper_max_abs_joint_velocity.detach()
+            .cpu()
+            .tolist(),
+            "max_abs_joint_acceleration_rad_s2": self._gripper_max_abs_joint_acceleration.detach()
+            .cpu()
+            .tolist(),
+            "max_velocity_diagnostic": maximum,
+            "terminal_state": terminal,
+            "driver_target_slew": target_slew_reporter(),
+            "nonfinite_samples": self._gripper_nonfinite_samples,
+            "dropped_diagnostics": self._gripper_dropped_diagnostics,
+        }
+        if self._concurrent_arm_gripper_enabled:
+            dynamic_report[OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD] = {
+                "enabled": True,
+                "profile": OPEN_ENDPOINT_COUPLED_IMPULSE_PROFILE,
+                "endpoint": "open",
+                "follower_threshold_rad_s_float32": (
+                    OPEN_ENDPOINT_FOLLOWER_TELEMETRY_THRESHOLD_RAD_S_FLOAT32
+                ),
+                "follower_threshold_semantics": (
+                    "passive_follower_crossing_is_telemetry_only_v1"
+                ),
+                "arm_threshold_profile": (
+                    "per_joint_float32_physical_limit_plus_limit_times_float32_1e_4_v1"
+                ),
+                "arm_velocity_envelopes_rad_s": (
+                    self._current_joint_velocity_recovery_envelopes[0]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ),
+                "failure_predicate": (
+                    "open_and_follower_gt_5p001_and_any_arm_gt_its_recovery_envelope_v1"
+                ),
+                "open_endpoint_samples": self._open_endpoint_samples,
+                "nonfinite_open_endpoint_samples": (
+                    self._open_endpoint_nonfinite_samples
+                ),
+                "follower_threshold_crossing_samples": (
+                    self._open_endpoint_follower_threshold_crossing_samples
+                ),
+                "coupled_impulse_failure_samples": (
+                    self._open_endpoint_coupled_impulse_failure_samples
+                ),
+                "max_abs_arm_joint_velocity_rad_s": (
+                    self._open_endpoint_max_abs_arm_joint_velocity.detach()
+                    .cpu()
+                    .tolist()
+                ),
+                "max_abs_follower_joint_velocity_rad_s": (
+                    self._open_endpoint_max_abs_follower_joint_velocity.detach()
+                    .cpu()
+                    .tolist()
+                ),
+                "max_abs_follower_joint_acceleration_rad_s2": (
+                    self._open_endpoint_max_abs_follower_joint_acceleration.detach()
+                    .cpu()
+                    .tolist()
+                ),
+                "maximum_follower_diagnostic": (
+                    self._open_endpoint_max_follower_diagnostic
+                ),
+                "first_coupled_impulse_failure_diagnostic": (
+                    self._open_endpoint_first_coupled_failure_diagnostic
+                ),
+                "passed": (
+                    self._open_endpoint_nonfinite_samples == 0
+                    and self._open_endpoint_coupled_impulse_failure_samples == 0
+                ),
+            }
         return validate_eef_gripper_dynamic_evidence(
-            {
-                "profile": EEF_GRIPPER_RUNTIME_PROFILE,
-                "joint_names": list(GRIPPER_JOINT_NAMES),
-                "joint_indices": list(GRIPPER_JOINT_INDICES),
-                "apply_entry_samples": self._gripper_apply_entry_samples,
-                "post_policy_step_samples": self._gripper_post_policy_step_samples,
-                "max_abs_joint_velocity_rad_s": self._gripper_max_abs_joint_velocity.detach()
-                .cpu()
-                .tolist(),
-                "max_abs_joint_acceleration_rad_s2": self._gripper_max_abs_joint_acceleration.detach()
-                .cpu()
-                .tolist(),
-                "max_velocity_diagnostic": maximum,
-                "terminal_state": terminal,
-                "driver_target_slew": target_slew_reporter(),
-                "nonfinite_samples": self._gripper_nonfinite_samples,
-                "dropped_diagnostics": self._gripper_dropped_diagnostics,
-            },
+            dynamic_report,
             expected_target_slew_profile=target_slew_profile,
+            expect_open_endpoint_coupled_impulse=(self._concurrent_arm_gripper_enabled),
         )
 
     def begin_safety_episode(self, episode_index: int) -> None:
@@ -2334,6 +2662,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         self._reset_arm_release_ramp_state()
         if self._current_joint_velocity_recovery_enabled:
             self._reset_current_joint_velocity_recovery_state()
+        if self._concurrent_arm_gripper_enabled:
+            self._reset_concurrent_arm_gripper_state()
 
     def _soft_joint_pos_limits(self) -> torch.Tensor:
         return self._asset.data.soft_joint_pos_limits[:, self._joint_ids, :]
@@ -2845,13 +3175,21 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         reason: str,
         snapshot: dict[str, object],
     ) -> dict[str, object]:
-        if reason not in CURRENT_JOINT_VELOCITY_RECOVERY_END_REASONS:
+        allowed_reasons = CURRENT_JOINT_VELOCITY_RECOVERY_END_REASONS + (
+            (CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_END_REASON,)
+            if getattr(self, "_concurrent_arm_gripper_enabled", False)
+            else ()
+        )
+        if reason not in allowed_reasons:
             raise ValueError("PolaRiS EEF velocity-recovery end reason drift")
         event = self._active_current_joint_velocity_recovery_event()
         event["end_apply_index"] = snapshot["apply_index"]
         event["end_reason"] = reason
         event["last"] = dict(snapshot)
-        if reason == "clean2_release_ramp_complete":
+        if reason in (
+            "clean2_release_ramp_complete",
+            CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_END_REASON,
+        ):
             event["recovery_completed_apply_index"] = snapshot["apply_index"]
         return event
 
@@ -2867,6 +3205,9 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
 
     def _current_joint_velocity_recovery_completed_previous_apply(self) -> bool:
         """Return whether one just-completed event owns the stale lower target."""
+
+        if getattr(self, "_concurrent_arm_gripper_enabled", False):
+            return False
 
         if (
             not self._current_joint_velocity_recovery_enabled
@@ -2888,6 +3229,9 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
 
     def _deferred_gripper_endpoint_transition_count(self) -> int:
         """Observe, but do not consume, endpoint flips during v5 ownership."""
+
+        if getattr(self, "_concurrent_arm_gripper_enabled", False):
+            return 0
 
         finger_term = getattr(self, "_gripper_target_slew_term", None)
         current = getattr(
@@ -2916,6 +3260,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             or type(recovery_completed_previous_apply) is not bool
         ):
             raise ValueError("PolaRiS EEF lower-controller collision flag drift")
+        if getattr(self, "_concurrent_arm_gripper_enabled", False):
+            return None, None, None
         if not (lower_controller_suspended or recovery_completed_previous_apply):
             return None, None, None
         deferred_endpoint_count = self._deferred_gripper_endpoint_transition_count()
@@ -2963,6 +3309,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             raise ValueError("PolaRiS EEF lower-controller suspension flag drift")
         if not isinstance(snapshot, dict):
             raise ValueError("PolaRiS EEF lower-controller abort snapshot drift")
+        if getattr(self, "_concurrent_arm_gripper_enabled", False):
+            return
         snapshot_apply_index = snapshot.get("apply_index")
         (
             deferred_endpoint_count,
@@ -3265,10 +3613,20 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
     def apply_actions(self):
         """Apply finite, velocity-slewed, soft-limited EEF IK joint targets."""
 
+        concurrent_arm_gripper_enabled = getattr(
+            self, "_concurrent_arm_gripper_enabled", False
+        )
+        if type(concurrent_arm_gripper_enabled) is not bool:
+            raise ValueError("PolaRiS EEF concurrent apply mode flag drift")
         if self._arm_release_ramp_enabled and self._arm_target_transaction_failed:
             raise ValueError(
                 "PolaRiS EEF arm target transaction previously failed; reset is "
                 "required before another apply"
+            )
+        if concurrent_arm_gripper_enabled and self._arm_target_transaction_failed:
+            raise ValueError(
+                "PolaRiS EEF concurrent arm target transaction previously failed; "
+                "reset is required before another apply"
             )
         recovery_completed_previous_apply = bool(
             self._current_joint_velocity_recovery_enabled
@@ -3494,7 +3852,12 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                     )
                 )
                 phase_before_recovery = self._current_joint_velocity_recovery_phase
-                recovery_transition = advance_current_joint_velocity_recovery(
+                recovery_transition_function = (
+                    advance_concurrent_arm_current_joint_velocity_recovery
+                    if concurrent_arm_gripper_enabled
+                    else advance_current_joint_velocity_recovery
+                )
+                recovery_transition = recovery_transition_function(
                     enabled=True,
                     phase_before_apply=phase_before_recovery,
                     consecutive_active_substeps_before_apply=(
@@ -4329,7 +4692,9 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             )
         )
         failure_trace = None
-        if self._failure_substep_trace_enabled and self._arm_release_ramp_enabled:
+        if self._failure_substep_trace_enabled and (
+            self._arm_release_ramp_enabled or concurrent_arm_gripper_enabled
+        ):
             if previous_joint_pos_target is None or pose_error is None:
                 raise ValueError(
                     "PolaRiS EEF failure substep trace command evidence is absent"
@@ -4404,7 +4769,11 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             self._wrist_energy_brake_reversal_detection_armed.copy_(
                 ~wrist_energy_brake_result.active_environment_mask
             )
-        if self._failure_substep_trace_enabled and not self._arm_release_ramp_enabled:
+        if (
+            self._failure_substep_trace_enabled
+            and not self._arm_release_ramp_enabled
+            and not concurrent_arm_gripper_enabled
+        ):
             if previous_joint_pos_target is None or pose_error is None:
                 raise ValueError(
                     "PolaRiS EEF failure substep trace command evidence is absent"
@@ -4427,7 +4796,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             )
 
     def _current_joint_velocity_recovery_report(self) -> dict[str, object]:
-        """Return the closed v5 recovery identity, lifecycle, and evidence."""
+        """Return the selected closed recovery identity, lifecycle, and evidence."""
 
         phase = self._current_joint_velocity_recovery_phase
         next_index = self._current_joint_velocity_recovery_next_release_ramp_index
@@ -4439,6 +4808,14 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             next_index is None
         ):
             raise ValueError("PolaRiS EEF velocity-recovery state drift")
+        if self._concurrent_arm_gripper_enabled and (
+            phase == CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_RELEASE_RAMP
+            or next_index is not None
+            or self._current_joint_velocity_recovery_release_ramp_target_applies != 0
+            or self._current_joint_velocity_recovery_lower_endpoint_transition_aborts
+            != 0
+        ):
+            raise ValueError("PolaRiS EEF concurrent recovery retained lower state")
         if (
             self._current_joint_velocity_recovery_events_count
             != len(self._current_joint_velocity_recovery_events)
@@ -4473,8 +4850,16 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             raise ValueError("PolaRiS EEF velocity-recovery hard-limit digest drift")
         return {
             "contract": {
-                "schema_version": CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION,
-                "profile": CURRENT_JOINT_VELOCITY_RECOVERY_PROFILE,
+                "schema_version": (
+                    CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_SCHEMA_VERSION
+                    if self._concurrent_arm_gripper_enabled
+                    else CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION
+                ),
+                "profile": (
+                    CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_PROFILE
+                    if self._concurrent_arm_gripper_enabled
+                    else CURRENT_JOINT_VELOCITY_RECOVERY_PROFILE
+                ),
                 "envelope_formula_profile": (
                     CURRENT_JOINT_VELOCITY_RECOVERY_ENVELOPE_FORMULA_PROFILE
                 ),
@@ -4492,9 +4877,15 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                     CURRENT_JOINT_VELOCITY_RECOVERY_PREDICTED_POSITION_PROFILE
                 ),
                 "hard_limit_profile": PHYSX_HARD_LIMIT_PROFILE,
-                "release_ramp_profile": ARM_RELEASE_RAMP_PROFILE,
+                "release_ramp_profile": (
+                    None
+                    if self._concurrent_arm_gripper_enabled
+                    else ARM_RELEASE_RAMP_PROFILE
+                ),
                 "transaction_profile": (
-                    CURRENT_JOINT_VELOCITY_RECOVERY_TRANSACTION_PROFILE
+                    CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_TRANSACTION_PROFILE
+                    if self._concurrent_arm_gripper_enabled
+                    else CURRENT_JOINT_VELOCITY_RECOVERY_TRANSACTION_PROFILE
                 ),
                 "joint_names": list(self._joint_names),
                 "velocity_limits_rad_s": (
@@ -4593,16 +4984,33 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         target_slew_profile = self._gripper_target_slew_profile
         interlock_profile = self._gripper_close_arm_interlock_profile
         configured_substeps = self._gripper_close_arm_interlock_configured_substeps
-        bound_profile = validate_eef_gripper_close_arm_interlock_binding(
-            target_slew_profile=target_slew_profile,
-            interlock_profile=interlock_profile,
-            configured_substeps=configured_substeps,
-        )
-        if (
-            bound_profile.fixed_activation_anchor
-            is not self._gripper_close_arm_interlock_fixed_activation_anchor
-        ):
-            raise ValueError("PolaRiS EEF close-interlock anchor profile drift")
+        if self._concurrent_arm_gripper_enabled:
+            if (
+                eef_gripper_target_slew_profile(target_slew_profile).profile
+                != target_slew_profile
+                or interlock_profile != CONCURRENT_ARM_NO_CLOSE_INTERLOCK_PROFILE
+                or configured_substeps != 0
+                or self._gripper_close_arm_interlock_fixed_activation_anchor
+                is not False
+            ):
+                raise ValueError("PolaRiS EEF concurrent disabled-interlock drift")
+            report_interlock_profile = CONCURRENT_ARM_NO_CLOSE_INTERLOCK_PROFILE
+            report_interlock_substeps = 0
+            report_fixed_activation_anchor = False
+        else:
+            bound_profile = validate_eef_gripper_close_arm_interlock_binding(
+                target_slew_profile=target_slew_profile,
+                interlock_profile=interlock_profile,
+                configured_substeps=configured_substeps,
+            )
+            report_interlock_profile = bound_profile.close_interlock_profile
+            report_interlock_substeps = bound_profile.close_interlock_substeps
+            report_fixed_activation_anchor = bound_profile.fixed_activation_anchor
+            if (
+                report_fixed_activation_anchor
+                is not self._gripper_close_arm_interlock_fixed_activation_anchor
+            ):
+                raise ValueError("PolaRiS EEF close-interlock anchor profile drift")
         self._validate_gripper_close_arm_interlock_anchor_state()
         anchor_scalar_evidence = (
             self._gripper_close_arm_interlock_anchor_capture_count,
@@ -4639,7 +5047,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 for value in anchor_tensor_evidence
             )
         )
-        if not bound_profile.fixed_activation_anchor and not anchor_evidence_is_empty:
+        if not report_fixed_activation_anchor and not anchor_evidence_is_empty:
             raise ValueError("Non-anchor PolaRiS EEF interlock has anchor evidence")
         if not self._gripper_close_arm_interlock_enabled and (
             self._gripper_close_arm_interlock_remaining != 0
@@ -4692,8 +5100,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             },
             "gripper_close_arm_interlock": {
                 "enabled": self._gripper_close_arm_interlock_enabled,
-                "profile": bound_profile.close_interlock_profile,
-                "configured_substeps": bound_profile.close_interlock_substeps,
+                "profile": report_interlock_profile,
+                "configured_substeps": report_interlock_substeps,
                 "remaining_substeps": self._gripper_close_arm_interlock_remaining,
                 "observed_endpoint_change_count": (
                     self._gripper_close_arm_interlock_observed_endpoint_change_count
@@ -4815,6 +5223,32 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                     .tolist()
                 ),
                 "gripper_target_or_state_write_count": 0,
+            }
+        if self._concurrent_arm_gripper_enabled:
+            report["concurrent_arm_gripper"] = {
+                "enabled": True,
+                "profile": CONCURRENT_ARM_GRIPPER_PROFILE,
+                "fresh_dls_target_applies": (
+                    self._concurrent_arm_fresh_dls_target_applies
+                ),
+                "normal_target_setter_applies": (
+                    self._concurrent_arm_normal_target_setter_applies
+                ),
+                "closed_endpoint_fresh_dls_target_applies": (
+                    self._concurrent_arm_closed_endpoint_fresh_dls_target_applies
+                ),
+                "closed_endpoint_distinct_desired_pose_count": (
+                    self._concurrent_arm_closed_endpoint_distinct_desired_pose_count
+                ),
+                "recovery_owned_target_applies": (
+                    self._concurrent_arm_recovery_owned_target_applies
+                ),
+                "deferred_endpoint_transition_count": (
+                    self._concurrent_arm_deferred_endpoint_transition_count
+                ),
+                "stored_target_replay_count": (
+                    self._concurrent_arm_stored_target_replay_count
+                ),
             }
         if self._current_joint_velocity_recovery_enabled:
             report["current_joint_velocity_recovery"] = (

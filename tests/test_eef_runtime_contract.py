@@ -4108,3 +4108,26 @@ def test_runtime_frame_rejects_controller_semantics_drift(field, value, match):
 
     with pytest.raises(ValueError, match=match):
         validate_eef_runtime_frame(env, observation)
+
+
+def test_open_endpoint_coupled_impulse_completion_gate_distinguishes_telemetry():
+    telemetry_only = {
+        "open_endpoint_contact_mimic_impulse": {
+            "follower_threshold_crossing_samples": 1,
+            "coupled_impulse_failure_samples": 0,
+            "passed": True,
+        }
+    }
+    runtime_contract_module._require_open_endpoint_coupled_impulse_gate(  # noqa: SLF001
+        telemetry_only,
+        enabled=True,
+    )
+    failed = copy.deepcopy(telemetry_only)
+    failed["open_endpoint_contact_mimic_impulse"].update(
+        {"coupled_impulse_failure_samples": 1, "passed": False}
+    )
+    with pytest.raises(ValueError, match="completion gate failed"):
+        runtime_contract_module._require_open_endpoint_coupled_impulse_gate(  # noqa: SLF001
+            failed,
+            enabled=True,
+        )

@@ -8,11 +8,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from polaris import eef_controller_profile as controller_profile_module
 from polaris.config import EEF_CONTROLLER_BASELINE_PROFILE
+from polaris.config import EEF_CONTROLLER_CONCURRENT_ARM_GRIPPER_CANDIDATE_PROFILE
 from polaris.config import EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
 from polaris.config import EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE
 from polaris.config import EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE
 from polaris.eef_controller_profile import configure_eef_controller_profile
+from polaris.eef_controller_profile import CONCURRENT_ARM_NO_CLOSE_INTERLOCK_PROFILE
 from polaris.eef_controller_profile import eef_controller_apply_counts_from_safety
 from polaris.eef_controller_profile import eef_controller_profile
 from polaris.eef_controller_profile import (
@@ -222,6 +225,39 @@ def test_velocity_recovery_profile_adds_only_the_versioned_v5_flag(
     validate_eef_controller_profile_config(
         cfg,
         expected_profile=EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+    )
+
+
+def test_concurrent_v6_configures_recovery_without_interlock_or_release_ramp(
+    monkeypatch,
+) -> None:
+    cfg = _env_cfg()
+    monkeypatch.setattr(
+        "polaris.eef_gripper_runtime._expected_original_spawn_func",
+        lambda: _original_spawn,
+    )
+    spec = configure_eef_controller_profile(
+        cfg,
+        profile=EEF_CONTROLLER_CONCURRENT_ARM_GRIPPER_CANDIDATE_PROFILE,
+    )
+    assert spec.profile.endswith(
+        "concurrent_arm_velocity_recovery8_clean2_mimic100_damping1p2_v6"
+    )
+    assert spec.concurrent_arm_gripper_enabled is True
+    assert spec.open_endpoint_coupled_impulse_telemetry_enabled is True
+    assert spec.current_joint_velocity_recovery_enabled is True
+    assert spec.gripper_close_arm_interlock_enabled is False
+    assert spec.arm_release_ramp_enabled is False
+    assert spec.close_interlock_profile == CONCURRENT_ARM_NO_CLOSE_INTERLOCK_PROFILE
+    assert spec.close_interlock_substeps == 0
+    assert spec.fixed_activation_anchor is False
+    assert cfg.actions.arm.enable_gripper_close_arm_interlock is False
+    assert cfg.actions.arm.enable_arm_release_ramp is False
+    assert cfg.actions.arm.enable_current_joint_velocity_recovery is True
+    assert cfg.actions.finger_joint.enable_target_slew_rate_0p25_candidate is True
+    validate_eef_controller_profile_config(
+        cfg,
+        expected_profile=EEF_CONTROLLER_CONCURRENT_ARM_GRIPPER_CANDIDATE_PROFILE,
     )
 
 
@@ -531,6 +567,81 @@ def _candidate_report() -> dict:
             "max_abs_released_delta_joint_pos_rad": [0.0] * 7,
         },
     }
+
+
+def _concurrent_v6_report(*, apply_calls: int) -> dict:
+    report = _candidate_report()
+    interlock = report["gripper_close_arm_interlock"]
+    interlock.update(
+        {
+            "enabled": False,
+            "profile": CONCURRENT_ARM_NO_CLOSE_INTERLOCK_PROFILE,
+            "configured_substeps": 0,
+        }
+    )
+    report["concurrent_arm_gripper"] = {
+        "enabled": True,
+        "profile": "fresh_dls_every_normal_apply_no_gripper_target_replay_v1",
+        "fresh_dls_target_applies": apply_calls,
+        "normal_target_setter_applies": apply_calls,
+        "closed_endpoint_fresh_dls_target_applies": apply_calls,
+        "closed_endpoint_distinct_desired_pose_count": min(apply_calls, 3),
+        "recovery_owned_target_applies": 0,
+        "deferred_endpoint_transition_count": 0,
+        "stored_target_replay_count": 0,
+    }
+    report["current_joint_velocity_recovery"] = {}
+    return report
+
+
+def test_concurrent_v6_report_has_explicit_disabled_interlock_and_fresh_dls_cadence(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        controller_profile_module,
+        "validate_current_joint_velocity_recovery_report",
+        lambda value, *, apply_calls: value,
+    )
+    report = _concurrent_v6_report(apply_calls=80)
+    validated = validate_eef_controller_repair_candidate_report(
+        report,
+        expected_profile=EEF_CONTROLLER_CONCURRENT_ARM_GRIPPER_CANDIDATE_PROFILE,
+        expected_target_slew_profile=(
+            EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+        ),
+        expected_physical_max_delta_joint_pos_rad=[0.01] * 7,
+        apply_calls=80,
+    )
+    assert validated["gripper_close_arm_interlock"]["configured_substeps"] == 0
+    assert "arm_release_ramp" not in validated
+    drifted = copy.deepcopy(report)
+    drifted["concurrent_arm_gripper"]["stored_target_replay_count"] = 1
+    with pytest.raises(ValueError, match="concurrent-arm cadence"):
+        validate_eef_controller_repair_candidate_report(
+            drifted,
+            expected_profile=(EEF_CONTROLLER_CONCURRENT_ARM_GRIPPER_CANDIDATE_PROFILE),
+            expected_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+            expected_physical_max_delta_joint_pos_rad=[0.01] * 7,
+            apply_calls=80,
+        )
+
+
+def test_controller_smoke_has_v6_moving_close_reopen_target_surface_gate() -> None:
+    source = (
+        Path(__file__).parents[1] / "scripts" / "smoke_eef_pose_controller.py"
+    ).read_text(encoding="utf-8")
+    assert '"--eef-controller-profile"' in source
+    assert source.index("configure_eef_controller_profile(") < source.index(
+        "env = gym.make("
+    )
+    assert "moving EEF through close and reopen transitions" in source
+    assert '"fresh_dls_target_applies"' in source
+    assert '"closed_endpoint_distinct_desired_pose_count"' in source
+    assert '"stored_target_replay_count"' in source
+    assert '"open_endpoint_contact_mimic_impulse"' in source
+    assert '"arm_release_ramp" not in concurrent_report' in source
 
 
 def _release_ramp_candidate_report() -> dict:

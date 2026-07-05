@@ -17,6 +17,10 @@ EEF_IK_SAFETY_PROFILE = "panda_velocity_physxlimit_solveriter1_v4"
 EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE = (
     "panda_velocity_physxlimit_solveriter1_residual_recovery8_clean2_v5"
 )
+EEF_IK_CONCURRENT_ARM_VELOCITY_RECOVERY_CANDIDATE_PROFILE = (
+    "panda_velocity_physxlimit_solveriter1_residual_recovery8_clean2_"
+    "concurrent_arm_gripper_v6"
+)
 EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE = (
     "panda_velocity_physxlimit_solveriter1_wristenergybrake_candidate_v1"
 )
@@ -60,6 +64,10 @@ CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION = 3
 CURRENT_JOINT_VELOCITY_RECOVERY_PROFILE = (
     "current_joint_velocity_residual_hold_recovery_v1"
 )
+CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_SCHEMA_VERSION = 4
+CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_PROFILE = (
+    "current_joint_velocity_residual_hold_concurrent_resume_v2"
+)
 CURRENT_JOINT_VELOCITY_RECOVERY_ENVELOPE_FORMULA_PROFILE = (
     "float32_limit_plus_float32_limit_times_float32_1e_4_v1"
 )
@@ -77,6 +85,9 @@ CURRENT_JOINT_VELOCITY_RECOVERY_PREDICTED_POSITION_PROFILE = (
 )
 CURRENT_JOINT_VELOCITY_RECOVERY_TRANSACTION_PROFILE = (
     "position_velocity_effort_setter_readback_trace_then_state_commit_v1"
+)
+CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_TRANSACTION_PROFILE = (
+    "position_velocity_effort_setter_readback_trace_then_concurrent_state_commit_v2"
 )
 CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE = "inactive"
 CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD = "hold"
@@ -107,6 +118,14 @@ CURRENT_JOINT_VELOCITY_RECOVERY_END_REASONS = (
     "predicted_hard_limit_abort",
     "transaction_abort",
     "lower_endpoint_transition_overflow_abort",
+)
+CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_END_REASON = "clean2_concurrent_resume"
+CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_END_REASONS = (
+    CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_END_REASON,
+    "sustained_recovery_abort",
+    "current_hard_limit_abort",
+    "predicted_hard_limit_abort",
+    "transaction_abort",
 )
 CURRENT_JOINT_VELOCITY_RECOVERY_ABORT_MESSAGES = {
     "sustained_recovery_abort": (

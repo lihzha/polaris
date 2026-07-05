@@ -38,10 +38,14 @@ from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_ABORT_EVIDENCE_PROFILE
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_ABORT_MESSAGES
+from polaris.eef_ik_safety import current_joint_velocity_recovery_envelope
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import (
     EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+)
+from polaris.eef_ik_safety import (
+    EEF_IK_CONCURRENT_ARM_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
 )
 from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
@@ -72,6 +76,11 @@ from polaris.gripper_semantics import GRIPPER_THRESHOLD_PROFILE
 from polaris.eef_gripper_runtime import validate_eef_gripper_dynamic_evidence
 from polaris.eef_gripper_runtime import validate_eef_gripper_static_contract
 from polaris.eef_gripper_runtime import EEF_GRIPPER_TARGET_SLEW_PROFILE
+from polaris.eef_gripper_runtime import OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD
+from polaris.eef_gripper_runtime import OPEN_ENDPOINT_COUPLED_IMPULSE_PROFILE
+from polaris.eef_gripper_runtime import (
+    OPEN_ENDPOINT_FOLLOWER_TELEMETRY_THRESHOLD_RAD_S_FLOAT32,
+)
 from polaris.eval_artifacts import EVAL_RESULT_COLUMNS
 from polaris.eval_artifacts import canonical_episode_result
 from polaris.eval_artifacts import probe_episode_video
@@ -92,6 +101,8 @@ EEF_SAFETY_SIDECAR_SCHEMA_VERSION = 6
 EEF_RUNTIME_CONTRACT_SCHEMA_VERSION = 6
 EEF_SAFETY_SIDECAR_VELOCITY_RECOVERY_SCHEMA_VERSION = 7
 EEF_RUNTIME_CONTRACT_VELOCITY_RECOVERY_SCHEMA_VERSION = 7
+EEF_SAFETY_SIDECAR_CONCURRENT_ARM_GRIPPER_SCHEMA_VERSION = 8
+EEF_RUNTIME_CONTRACT_CONCURRENT_ARM_GRIPPER_SCHEMA_VERSION = 8
 EGO_LAP_ENVIRONMENT_RUNTIME_PROFILE = "ego_lap_eef_outer450_internal451_no_autoreset_v1"
 EGO_LAP_ENVIRONMENT_STATE_PROFILE = (
     "isaaclab_single_env_episode_sim_common_camera_counters_v1"
@@ -174,6 +185,23 @@ GRIPPER_RUNTIME_EPISODE_FIELDS = {
 GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS = {
     "max_abs_joint_velocity_rad_s",
     "max_abs_joint_acceleration_rad_s2",
+}
+GRIPPER_RUNTIME_CONCURRENT_AGGREGATE_FIELD = "open_endpoint_contact_mimic_impulse"
+GRIPPER_RUNTIME_CONCURRENT_AGGREGATE_FIELDS = {
+    "profile",
+    "follower_threshold_rad_s_float32",
+    "follower_threshold_semantics",
+    "arm_threshold_profile",
+    "arm_velocity_envelopes_rad_s",
+    "failure_predicate",
+    "open_endpoint_samples",
+    "nonfinite_open_endpoint_samples",
+    "follower_threshold_crossing_samples",
+    "coupled_impulse_failure_samples",
+    "max_abs_arm_joint_velocity_rad_s",
+    "max_abs_follower_joint_velocity_rad_s",
+    "max_abs_follower_joint_acceleration_rad_s2",
+    "passed",
 }
 CURRENT_JOINT_VELOCITY_ABORT_FIELDS = {
     "profile",
@@ -906,12 +934,26 @@ def _current_joint_velocity_recovery_enabled(arm_term: Any) -> bool:
     return enabled
 
 
+def _concurrent_arm_gripper_enabled(arm_term: Any) -> bool:
+    """Return the exact v6 runtime mode selected by the arm action."""
+
+    enabled = getattr(arm_term, "_concurrent_arm_gripper_enabled", False)
+    if type(enabled) is not bool:
+        raise ValueError("Live EEF IK concurrent-arm/gripper flag must be exactly bool")
+    return enabled
+
+
 def _selected_safety_profile(
     candidate_enabled: bool,
     velocity_recovery_enabled: bool = False,
+    concurrent_arm_gripper_enabled: bool = False,
 ) -> str:
     if candidate_enabled and velocity_recovery_enabled:
         raise ValueError("EEF IK wrist brake and velocity recovery cannot be combined")
+    if concurrent_arm_gripper_enabled:
+        if not velocity_recovery_enabled:
+            raise ValueError("Concurrent arm/gripper requires velocity recovery")
+        return EEF_IK_CONCURRENT_ARM_VELOCITY_RECOVERY_CANDIDATE_PROFILE
     if velocity_recovery_enabled:
         return EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE
     return (
@@ -1001,6 +1043,8 @@ def _candidate_enabled_from_safety(safety: Mapping[str, Any]) -> bool:
         return False
     if profile == EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE:
         return False
+    if profile == EEF_IK_CONCURRENT_ARM_VELOCITY_RECOVERY_CANDIDATE_PROFILE:
+        return False
     if profile == EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE:
         return True
     raise ValueError(f"Unknown EEF IK safety profile: {profile!r}")
@@ -1009,7 +1053,10 @@ def _candidate_enabled_from_safety(safety: Mapping[str, Any]) -> bool:
 def _velocity_recovery_enabled_from_safety(safety: Mapping[str, Any]) -> bool:
     profile = safety.get("profile")
     present = "current_joint_velocity_recovery" in safety
-    if profile == EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE:
+    if profile in (
+        EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+        EEF_IK_CONCURRENT_ARM_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+    ):
         aggregate_present = "episodes" in safety
         if not present and not aggregate_present:
             raise ValueError("Velocity-recovery safety profile lacks its report")
@@ -1017,6 +1064,15 @@ def _velocity_recovery_enabled_from_safety(safety: Mapping[str, Any]) -> bool:
     if present:
         raise ValueError("Non-v5 EEF IK safety report has velocity-recovery evidence")
     return False
+
+
+def _concurrent_arm_gripper_enabled_from_safety(
+    safety: Mapping[str, Any],
+) -> bool:
+    return (
+        safety.get("profile")
+        == EEF_IK_CONCURRENT_ARM_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+    )
 
 
 def _gripper_runtime_enabled_from_safety(safety: Mapping[str, Any]) -> bool:
@@ -1043,6 +1099,63 @@ def _gripper_target_slew_profile_from_safety(safety: Mapping[str, Any]) -> str:
     if type(profile) is not str or not profile:
         raise ValueError("Gripper target-slew profile is invalid")
     return profile
+
+
+def _require_open_endpoint_coupled_impulse_gate(
+    dynamic: Mapping[str, Any],
+    *,
+    enabled: bool,
+) -> None:
+    if type(enabled) is not bool:
+        raise ValueError("Open-endpoint coupled-impulse gate flag drift")
+    if not enabled:
+        return
+    telemetry = dynamic.get(OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD)
+    if not isinstance(telemetry, Mapping) or telemetry.get("passed") is not True:
+        raise ValueError(
+            "Open-endpoint contact/mimic coupled-impulse completion gate failed"
+        )
+
+
+def _validate_gripper_dynamic_for_profile(
+    value: Any,
+    *,
+    expected_target_slew_profile: str,
+    concurrent_arm_gripper_enabled: bool,
+) -> dict[str, Any]:
+    """Keep the legacy validator call signature bit-for-bit when v6 is off."""
+
+    if concurrent_arm_gripper_enabled:
+        return validate_eef_gripper_dynamic_evidence(
+            value,
+            expected_target_slew_profile=expected_target_slew_profile,
+            expect_open_endpoint_coupled_impulse=True,
+        )
+    return validate_eef_gripper_dynamic_evidence(
+        value,
+        expected_target_slew_profile=expected_target_slew_profile,
+    )
+
+
+def _validate_open_endpoint_recovery_envelope_binding(
+    dynamic: Mapping[str, Any],
+    recovery: Mapping[str, Any] | None,
+    *,
+    enabled: bool,
+) -> None:
+    if not enabled:
+        return
+    telemetry = dynamic.get(OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD)
+    contract = recovery.get("contract") if isinstance(recovery, Mapping) else None
+    if (
+        not isinstance(telemetry, Mapping)
+        or not isinstance(contract, Mapping)
+        or telemetry.get("arm_velocity_envelopes_rad_s")
+        != contract.get("velocity_envelopes_rad_s")
+    ):
+        raise ValueError(
+            "Open-endpoint coupled-impulse/recovery-envelope binding drift"
+        )
 
 
 ARM_FAILURE_SUBSTEP_TRACE_PROFILE = "eef_applied_substep_ring_last64_v1"
@@ -2082,6 +2195,7 @@ def _validate_eef_runtime_safety_report(
     arm_term = _arm_action_term(runtime)
     candidate_enabled = _wrist_energy_brake_enabled(arm_term)
     velocity_recovery_enabled = _current_joint_velocity_recovery_enabled(arm_term)
+    concurrent_arm_gripper_enabled = _concurrent_arm_gripper_enabled(arm_term)
     if not isinstance(report, dict):
         raise ValueError("Live Ego-LAP EEF IK safety reporter returned no object")
     gripper_runtime_enabled = _gripper_runtime_enabled_from_safety(report)
@@ -2100,7 +2214,9 @@ def _validate_eef_runtime_safety_report(
         )
     exact_fields = {
         "profile": _selected_safety_profile(
-            candidate_enabled, velocity_recovery_enabled
+            candidate_enabled,
+            velocity_recovery_enabled,
+            concurrent_arm_gripper_enabled,
         ),
         "apply_actions_cadence": EEF_IK_APPLY_CADENCE,
         "target_soft_limit_guard_band_profile": TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE,
@@ -2524,6 +2640,7 @@ def _validate_eef_runtime_safety_report(
         field="Live EEF IK",
         allow_v5_velocity_residual=velocity_recovery_enabled,
     )
+    validated_recovery = None
     if velocity_recovery_enabled:
         if report.get("current_joint_velocity_abort") is not None:
             raise ValueError("Live v5 EEF IK retained a legacy velocity abort")
@@ -2565,9 +2682,19 @@ def _validate_eef_runtime_safety_report(
             report["gripper_runtime_static"],
             expected_target_slew_profile=expected_gripper_target_slew_profile,
         )
-        dynamic = validate_eef_gripper_dynamic_evidence(
+        dynamic = _validate_gripper_dynamic_for_profile(
             report["gripper_runtime_dynamic"],
             expected_target_slew_profile=expected_gripper_target_slew_profile,
+            concurrent_arm_gripper_enabled=concurrent_arm_gripper_enabled,
+        )
+        _require_open_endpoint_coupled_impulse_gate(
+            dynamic,
+            enabled=concurrent_arm_gripper_enabled,
+        )
+        _validate_open_endpoint_recovery_envelope_binding(
+            dynamic,
+            validated_recovery,
+            enabled=concurrent_arm_gripper_enabled,
         )
         if dynamic["apply_entry_samples"] != counters["apply_calls"]:
             raise ValueError("All-six gripper/apply sample counts disagree")
@@ -2686,6 +2813,7 @@ def validate_eef_runtime_frame(
         )
     candidate_enabled = _wrist_energy_brake_enabled(arm_term)
     velocity_recovery_enabled = _current_joint_velocity_recovery_enabled(arm_term)
+    concurrent_arm_gripper_enabled = _concurrent_arm_gripper_enabled(arm_term)
     if not _identity_offset(getattr(arm_cfg, "body_offset", None)):
         raise ValueError("Live Ego-LAP controller body offset is not identity")
     controller_cfg = getattr(arm_cfg, "controller", None)
@@ -2760,7 +2888,9 @@ def validate_eef_runtime_frame(
         "arm_joint_names": list(CANONICAL_ARM_JOINTS),
         "gripper_threshold_profile": GRIPPER_THRESHOLD_PROFILE,
         "ik_safety_profile": _selected_safety_profile(
-            candidate_enabled, velocity_recovery_enabled
+            candidate_enabled,
+            velocity_recovery_enabled,
+            concurrent_arm_gripper_enabled,
         ),
         "action_dim": 7,
     }
@@ -2953,6 +3083,7 @@ def _validate_episode_controller_artifacts(
         committed_apply_calls=committed_apply_calls,
     )
     terminal_deferred_endpoint_transition_count = None
+    recovery = None
     if spec.current_joint_velocity_recovery_enabled:
         recovery = validate_current_joint_velocity_recovery_report(
             safety.get("current_joint_velocity_recovery"),
@@ -2984,9 +3115,21 @@ def _validate_episode_controller_artifacts(
         raw_dynamic = safety.get("gripper_runtime_dynamic")
         if not isinstance(raw_dynamic, Mapping):
             raise ValueError("Candidate episode lacks gripper dynamic evidence")
-        dynamic = validate_eef_gripper_dynamic_evidence(
+        dynamic = _validate_gripper_dynamic_for_profile(
             raw_dynamic,
             expected_target_slew_profile=target_profile,
+            concurrent_arm_gripper_enabled=(
+                spec.open_endpoint_coupled_impulse_telemetry_enabled
+            ),
+        )
+        _require_open_endpoint_coupled_impulse_gate(
+            dynamic,
+            enabled=spec.open_endpoint_coupled_impulse_telemetry_enabled,
+        )
+        _validate_open_endpoint_recovery_envelope_binding(
+            dynamic,
+            recovery,
+            enabled=spec.open_endpoint_coupled_impulse_telemetry_enabled,
         )
         target_slew = dynamic.get("driver_target_slew")
         if not isinstance(target_slew, Mapping):
@@ -3087,9 +3230,13 @@ def atomic_write_episode_safety(
     _validate_terminal_apply_binding(terminal, cadence_evidence)
     payload = {
         "schema_version": (
-            EEF_SAFETY_SIDECAR_VELOCITY_RECOVERY_SCHEMA_VERSION
-            if spec.current_joint_velocity_recovery_enabled
-            else EEF_SAFETY_SIDECAR_SCHEMA_VERSION
+            EEF_SAFETY_SIDECAR_CONCURRENT_ARM_GRIPPER_SCHEMA_VERSION
+            if spec.concurrent_arm_gripper_enabled
+            else (
+                EEF_SAFETY_SIDECAR_VELOCITY_RECOVERY_SCHEMA_VERSION
+                if spec.current_joint_velocity_recovery_enabled
+                else EEF_SAFETY_SIDECAR_SCHEMA_VERSION
+            )
         ),
         "transaction_state": "prepared",
         "eef_controller_profile": spec.profile,
@@ -3130,6 +3277,7 @@ def _validate_episode_safety_evidence_shape(
 
     candidate_enabled = _candidate_enabled_from_safety(safety)
     velocity_recovery_enabled = _velocity_recovery_enabled_from_safety(safety)
+    concurrent_arm_gripper_enabled = _concurrent_arm_gripper_enabled_from_safety(safety)
     gripper_runtime_enabled = _gripper_runtime_enabled_from_safety(safety)
     if set(safety) != _episode_safety_fields(
         candidate_enabled,
@@ -3148,6 +3296,7 @@ def _validate_episode_safety_evidence_shape(
     if counters["environment_substeps"] != counters["apply_calls"]:
         raise ValueError("Episode safety environment/apply substeps disagree")
     apply_calls = counters["apply_calls"]
+    validated_recovery = None
     if velocity_recovery_enabled:
         if safety.get("current_joint_velocity_abort") is not None:
             raise ValueError("Episode v5 EEF IK retained a legacy velocity abort")
@@ -3178,9 +3327,19 @@ def _validate_episode_safety_evidence_shape(
             safety["gripper_runtime_static"],
             expected_target_slew_profile=gripper_target_slew_profile,
         )
-        gripper_dynamic = validate_eef_gripper_dynamic_evidence(
+        gripper_dynamic = _validate_gripper_dynamic_for_profile(
             safety["gripper_runtime_dynamic"],
             expected_target_slew_profile=gripper_target_slew_profile,
+            concurrent_arm_gripper_enabled=concurrent_arm_gripper_enabled,
+        )
+        _require_open_endpoint_coupled_impulse_gate(
+            gripper_dynamic,
+            enabled=concurrent_arm_gripper_enabled,
+        )
+        _validate_open_endpoint_recovery_envelope_binding(
+            gripper_dynamic,
+            validated_recovery,
+            enabled=concurrent_arm_gripper_enabled,
         )
         if gripper_dynamic["apply_entry_samples"] != apply_calls:
             raise ValueError("Episode gripper/apply sample counts disagree")
@@ -3426,9 +3585,16 @@ def validate_episode_safety_cadence(
         )
         if actual_target_slew_profile != gripper_target_slew_profile:
             raise ValueError("Episode target-slew expectation drift")
-        gripper_dynamic = validate_eef_gripper_dynamic_evidence(
+        gripper_dynamic = _validate_gripper_dynamic_for_profile(
             safety["gripper_runtime_dynamic"],
             expected_target_slew_profile=gripper_target_slew_profile,
+            concurrent_arm_gripper_enabled=(
+                _concurrent_arm_gripper_enabled_from_safety(safety)
+            ),
+        )
+        _require_open_endpoint_coupled_impulse_gate(
+            gripper_dynamic,
+            enabled=_concurrent_arm_gripper_enabled_from_safety(safety),
         )
         expected_post_samples = (
             episode_length - 1 if numerical_failure else episode_length
@@ -3616,9 +3782,13 @@ def load_episode_safety_sidecars(
         expected_eef_controller_profile
     )
     expected_sidecar_schema = (
-        EEF_SAFETY_SIDECAR_VELOCITY_RECOVERY_SCHEMA_VERSION
-        if expected_controller_spec.current_joint_velocity_recovery_enabled
-        else EEF_SAFETY_SIDECAR_SCHEMA_VERSION
+        EEF_SAFETY_SIDECAR_CONCURRENT_ARM_GRIPPER_SCHEMA_VERSION
+        if expected_controller_spec.concurrent_arm_gripper_enabled
+        else (
+            EEF_SAFETY_SIDECAR_VELOCITY_RECOVERY_SCHEMA_VERSION
+            if expected_controller_spec.current_joint_velocity_recovery_enabled
+            else EEF_SAFETY_SIDECAR_SCHEMA_VERSION
+        )
     )
     if committed_episode_indices != list(range(len(committed_episode_indices))):
         raise ValueError(
@@ -3714,9 +3884,13 @@ def reconcile_episode_safety_transactions(
         expected_eef_controller_profile
     )
     expected_sidecar_schema = (
-        EEF_SAFETY_SIDECAR_VELOCITY_RECOVERY_SCHEMA_VERSION
-        if expected_controller_spec.current_joint_velocity_recovery_enabled
-        else EEF_SAFETY_SIDECAR_SCHEMA_VERSION
+        EEF_SAFETY_SIDECAR_CONCURRENT_ARM_GRIPPER_SCHEMA_VERSION
+        if expected_controller_spec.concurrent_arm_gripper_enabled
+        else (
+            EEF_SAFETY_SIDECAR_VELOCITY_RECOVERY_SCHEMA_VERSION
+            if expected_controller_spec.current_joint_velocity_recovery_enabled
+            else EEF_SAFETY_SIDECAR_SCHEMA_VERSION
+        )
     )
 
     rows = [
@@ -3886,6 +4060,38 @@ def aggregate_episode_safety(
     gripper_maxima = {
         field: [0.0] * 6 for field in GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS
     }
+    if controller_spec is not None and controller_spec.concurrent_arm_gripper_enabled:
+        recovery = validate_current_joint_velocity_recovery_report(
+            live_template.get("current_joint_velocity_recovery"),
+            apply_calls=int(live_template["counters"]["apply_calls"]),
+        )
+        recovery_contract = recovery["contract"]
+        gripper_maxima[GRIPPER_RUNTIME_CONCURRENT_AGGREGATE_FIELD] = {
+            "profile": OPEN_ENDPOINT_COUPLED_IMPULSE_PROFILE,
+            "follower_threshold_rad_s_float32": (
+                OPEN_ENDPOINT_FOLLOWER_TELEMETRY_THRESHOLD_RAD_S_FLOAT32
+            ),
+            "follower_threshold_semantics": (
+                "passive_follower_crossing_is_telemetry_only_v1"
+            ),
+            "arm_threshold_profile": (
+                "per_joint_float32_physical_limit_plus_limit_times_float32_1e_4_v1"
+            ),
+            "arm_velocity_envelopes_rad_s": recovery_contract[
+                "velocity_envelopes_rad_s"
+            ],
+            "failure_predicate": (
+                "open_and_follower_gt_5p001_and_any_arm_gt_its_recovery_envelope_v1"
+            ),
+            "open_endpoint_samples": 0,
+            "nonfinite_open_endpoint_samples": 0,
+            "follower_threshold_crossing_samples": 0,
+            "coupled_impulse_failure_samples": 0,
+            "max_abs_arm_joint_velocity_rad_s": [0.0] * 7,
+            "max_abs_follower_joint_velocity_rad_s": [0.0] * 5,
+            "max_abs_follower_joint_acceleration_rad_s2": [0.0] * 5,
+            "passed": True,
+        }
     gripper_target_slew_profile = (
         expected_target_profile if gripper_runtime_enabled else None
     )
@@ -3921,10 +4127,13 @@ def aggregate_episode_safety(
                     f"Episode safety static field drift for {field}: "
                     f"expected={expected!r}, actual={safety.get(field)!r}"
                 )
+        validated_episode_recovery = None
         if velocity_recovery_enabled:
-            validate_current_joint_velocity_recovery_report(
-                safety.get("current_joint_velocity_recovery"),
-                apply_calls=int(safety["counters"]["apply_calls"]),
+            validated_episode_recovery = (
+                validate_current_joint_velocity_recovery_report(
+                    safety.get("current_joint_velocity_recovery"),
+                    apply_calls=int(safety["counters"]["apply_calls"]),
+                )
             )
         if (
             set(safety.get("counters", {})) != counter_names
@@ -3941,9 +4150,25 @@ def aggregate_episode_safety(
                 )
             ]
         if gripper_runtime_enabled:
-            dynamic = validate_eef_gripper_dynamic_evidence(
+            dynamic = _validate_gripper_dynamic_for_profile(
                 safety.get("gripper_runtime_dynamic"),
                 expected_target_slew_profile=gripper_target_slew_profile,
+                concurrent_arm_gripper_enabled=(
+                    controller_spec.open_endpoint_coupled_impulse_telemetry_enabled
+                ),
+            )
+            _require_open_endpoint_coupled_impulse_gate(
+                dynamic,
+                enabled=(
+                    controller_spec.open_endpoint_coupled_impulse_telemetry_enabled
+                ),
+            )
+            _validate_open_endpoint_recovery_envelope_binding(
+                dynamic,
+                validated_episode_recovery,
+                enabled=(
+                    controller_spec.open_endpoint_coupled_impulse_telemetry_enabled
+                ),
             )
             for field in GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS:
                 gripper_maxima[field] = [
@@ -3952,6 +4177,33 @@ def aggregate_episode_safety(
                         gripper_maxima[field], dynamic[field], strict=True
                     )
                 ]
+            if controller_spec.concurrent_arm_gripper_enabled:
+                telemetry = dynamic[OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD]
+                aggregate_telemetry = gripper_maxima[
+                    GRIPPER_RUNTIME_CONCURRENT_AGGREGATE_FIELD
+                ]
+                for field in (
+                    "open_endpoint_samples",
+                    "nonfinite_open_endpoint_samples",
+                    "follower_threshold_crossing_samples",
+                    "coupled_impulse_failure_samples",
+                ):
+                    aggregate_telemetry[field] += telemetry[field]
+                for field in (
+                    "max_abs_arm_joint_velocity_rad_s",
+                    "max_abs_follower_joint_velocity_rad_s",
+                    "max_abs_follower_joint_acceleration_rad_s2",
+                ):
+                    aggregate_telemetry[field] = [
+                        max(previous, float(current))
+                        for previous, current in zip(
+                            aggregate_telemetry[field], telemetry[field], strict=True
+                        )
+                    ]
+                aggregate_telemetry["passed"] = (
+                    aggregate_telemetry["nonfinite_open_endpoint_samples"] == 0
+                    and aggregate_telemetry["coupled_impulse_failure_samples"] == 0
+                )
         episode = {
             "episode_index": sidecar["episode_index"],
             "episode_result": sidecar["episode_result"],
@@ -4199,6 +4451,80 @@ def _validate_runtime_aggregate_consistency(
     expected_gripper_maxima = {
         field: [0.0] * 6 for field in GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS
     }
+    concurrent_arm_gripper_enabled = _concurrent_arm_gripper_enabled_from_safety(
+        ik_safety
+    )
+    if concurrent_arm_gripper_enabled:
+        actual_gripper_maxima = ik_safety.get("gripper_runtime_maxima")
+        actual_telemetry = (
+            actual_gripper_maxima.get(GRIPPER_RUNTIME_CONCURRENT_AGGREGATE_FIELD)
+            if isinstance(actual_gripper_maxima, Mapping)
+            else None
+        )
+        if (
+            not isinstance(actual_telemetry, Mapping)
+            or set(actual_telemetry) != GRIPPER_RUNTIME_CONCURRENT_AGGREGATE_FIELDS
+        ):
+            raise ValueError("Runtime concurrent gripper aggregate schema drift")
+        expected_envelopes = [
+            current_joint_velocity_recovery_envelope(limit)
+            for limit in ik_safety["joint_velocity_limits_rad_s"]
+        ]
+        if (
+            actual_telemetry.get("profile") != OPEN_ENDPOINT_COUPLED_IMPULSE_PROFILE
+            or actual_telemetry.get("follower_threshold_rad_s_float32")
+            != OPEN_ENDPOINT_FOLLOWER_TELEMETRY_THRESHOLD_RAD_S_FLOAT32
+            or actual_telemetry.get("follower_threshold_semantics")
+            != "passive_follower_crossing_is_telemetry_only_v1"
+            or actual_telemetry.get("arm_threshold_profile")
+            != "per_joint_float32_physical_limit_plus_limit_times_float32_1e_4_v1"
+            or actual_telemetry.get("arm_velocity_envelopes_rad_s")
+            != expected_envelopes
+            or actual_telemetry.get("failure_predicate")
+            != "open_and_follower_gt_5p001_and_any_arm_gt_its_recovery_envelope_v1"
+            or any(
+                type(actual_telemetry.get(field)) is not int
+                or actual_telemetry[field] < 0
+                for field in (
+                    "open_endpoint_samples",
+                    "nonfinite_open_endpoint_samples",
+                    "follower_threshold_crossing_samples",
+                    "coupled_impulse_failure_samples",
+                )
+            )
+            or actual_telemetry.get("passed")
+            is not (
+                actual_telemetry["nonfinite_open_endpoint_samples"] == 0
+                and actual_telemetry["coupled_impulse_failure_samples"] == 0
+            )
+        ):
+            raise ValueError("Runtime concurrent gripper aggregate identity drift")
+        expected_gripper_maxima[GRIPPER_RUNTIME_CONCURRENT_AGGREGATE_FIELD] = {
+            field: actual_telemetry[field]
+            for field in (
+                "profile",
+                "follower_threshold_rad_s_float32",
+                "follower_threshold_semantics",
+                "arm_threshold_profile",
+                "arm_velocity_envelopes_rad_s",
+                "failure_predicate",
+            )
+        }
+        expected_telemetry = expected_gripper_maxima[
+            GRIPPER_RUNTIME_CONCURRENT_AGGREGATE_FIELD
+        ]
+        expected_telemetry.update(
+            {
+                "open_endpoint_samples": 0,
+                "nonfinite_open_endpoint_samples": 0,
+                "follower_threshold_crossing_samples": 0,
+                "coupled_impulse_failure_samples": 0,
+                "max_abs_arm_joint_velocity_rad_s": [0.0] * 7,
+                "max_abs_follower_joint_velocity_rad_s": [0.0] * 5,
+                "max_abs_follower_joint_acceleration_rad_s2": [0.0] * 5,
+                "passed": True,
+            }
+        )
     gripper_target_slew_profile = (
         _gripper_target_slew_profile_from_safety(ik_safety)
         if gripper_runtime_enabled
@@ -4289,9 +4615,21 @@ def _validate_runtime_aggregate_consistency(
             )
 
         if gripper_runtime_enabled:
-            dynamic = validate_eef_gripper_dynamic_evidence(
+            dynamic = _validate_gripper_dynamic_for_profile(
                 episode["gripper_runtime_dynamic"],
                 expected_target_slew_profile=gripper_target_slew_profile,
+                concurrent_arm_gripper_enabled=(
+                    _concurrent_arm_gripper_enabled_from_safety(ik_safety)
+                ),
+            )
+            _require_open_endpoint_coupled_impulse_gate(
+                dynamic,
+                enabled=concurrent_arm_gripper_enabled,
+            )
+            _validate_open_endpoint_recovery_envelope_binding(
+                dynamic,
+                episode.get("current_joint_velocity_recovery"),
+                enabled=concurrent_arm_gripper_enabled,
             )
             for field in GRIPPER_RUNTIME_AGGREGATE_MAXIMA_FIELDS:
                 expected_gripper_maxima[field] = [
@@ -4300,6 +4638,33 @@ def _validate_runtime_aggregate_consistency(
                         expected_gripper_maxima[field], dynamic[field], strict=True
                     )
                 ]
+            if concurrent_arm_gripper_enabled:
+                telemetry = dynamic[OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD]
+                expected_telemetry = expected_gripper_maxima[
+                    GRIPPER_RUNTIME_CONCURRENT_AGGREGATE_FIELD
+                ]
+                for field in (
+                    "open_endpoint_samples",
+                    "nonfinite_open_endpoint_samples",
+                    "follower_threshold_crossing_samples",
+                    "coupled_impulse_failure_samples",
+                ):
+                    expected_telemetry[field] += telemetry[field]
+                for field in (
+                    "max_abs_arm_joint_velocity_rad_s",
+                    "max_abs_follower_joint_velocity_rad_s",
+                    "max_abs_follower_joint_acceleration_rad_s2",
+                ):
+                    expected_telemetry[field] = [
+                        max(previous, float(current))
+                        for previous, current in zip(
+                            expected_telemetry[field], telemetry[field], strict=True
+                        )
+                    ]
+                expected_telemetry["passed"] = (
+                    expected_telemetry["nonfinite_open_endpoint_samples"] == 0
+                    and expected_telemetry["coupled_impulse_failure_samples"] == 0
+                )
 
     counters = ik_safety.get("counters")
     if not isinstance(counters, Mapping) or dict(counters) != expected_counters:
@@ -4368,9 +4733,13 @@ def atomic_write_runtime_contract(
         raise ValueError("Runtime frame and aggregate EEF IK safety profiles disagree")
     payload = {
         "schema_version": (
-            EEF_RUNTIME_CONTRACT_VELOCITY_RECOVERY_SCHEMA_VERSION
-            if controller_spec.current_joint_velocity_recovery_enabled
-            else EEF_RUNTIME_CONTRACT_SCHEMA_VERSION
+            EEF_RUNTIME_CONTRACT_CONCURRENT_ARM_GRIPPER_SCHEMA_VERSION
+            if controller_spec.concurrent_arm_gripper_enabled
+            else (
+                EEF_RUNTIME_CONTRACT_VELOCITY_RECOVERY_SCHEMA_VERSION
+                if controller_spec.current_joint_velocity_recovery_enabled
+                else EEF_RUNTIME_CONTRACT_SCHEMA_VERSION
+            )
         ),
         "eef_controller_profile": controller_spec.profile,
         "controller_repair_candidate": validated_controller_repair,

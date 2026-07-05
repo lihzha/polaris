@@ -553,6 +553,103 @@ for failure in ("effort", "effort_readback"):
     assert terminal_snapshot["hold_effort_target_readback_nm"] is None
 
 
+disabled_staged = robust._StagedGripperCloseArmInterlockState(
+    anchor=zero,
+    max_abs_current_anchor_residual=zero,
+    max_abs_target_anchor_residual=zero,
+    max_abs_active_delta=zero,
+    max_abs_released_delta=zero,
+    anchor_valid=False,
+    anchor_capture_count=0,
+    anchor_target_apply_count=0,
+    anchor_first_exact_target_count=0,
+    anchor_slew_limit_event_count=0,
+    anchor_slew_limited_joint_count=0,
+    anchor_position_limit_event_count=0,
+    anchor_position_limited_joint_count=0,
+    anchor_completion_count=0,
+    anchor_open_cancel_count=0,
+    last_activation_apply_index=None,
+    remaining=0,
+    observed_endpoint_change_count=0,
+    endpoint_observed=False,
+    activation_count=0,
+    active_apply_count=0,
+    released_apply_count=0,
+)
+concurrent = recovery_transaction_action()
+concurrent._arm_release_ramp_enabled = False
+concurrent._concurrent_arm_gripper_enabled = True
+concurrent._reset_concurrent_arm_gripper_state()
+concurrent._validated_concurrent_gripper_endpoint_is_closed = lambda: False
+concurrent_trace = {
+    "new_joint_pos_target": safe_target,
+    "new_joint_vel_target": zero.unsqueeze(0),
+    "new_joint_effort_target": zero.unsqueeze(0),
+}
+over_velocity = torch.tensor([[11.743, 0, 0, 0, 0, 0, 0]], dtype=torch.float32)
+for apply_index, over in enumerate((True, False, False), start=1):
+    concurrent._apply_call_count = apply_index
+    transition = robust.advance_concurrent_arm_current_joint_velocity_recovery(
+        enabled=True,
+        phase_before_apply=concurrent._current_joint_velocity_recovery_phase,
+        consecutive_active_substeps_before_apply=(
+            concurrent._current_joint_velocity_recovery_consecutive_active_substeps
+        ),
+        consecutive_clean_samples_before_apply=(
+            concurrent._current_joint_velocity_recovery_consecutive_clean_samples
+        ),
+        next_release_ramp_index_before_apply=None,
+        measured_velocity_over_envelope=over,
+    )
+    concurrent._set_targets_and_commit_gripper_close_arm_interlock(
+        safe_target,
+        disabled_staged,
+        None,
+        concurrent_trace,
+        transition,
+        safe_target,
+        over_velocity if over else zero.unsqueeze(0),
+        safe_target,
+        torch.ones((1, 7), dtype=torch.float32),
+        True,
+    )
+assert concurrent._current_joint_velocity_recovery_phase == "inactive"
+assert concurrent._current_joint_velocity_recovery_recovered_events == 1
+assert concurrent._current_joint_velocity_recovery_release_ramp_target_applies == 0
+assert concurrent._current_joint_velocity_recovery_events[0]["end_reason"] == (
+    "clean2_concurrent_resume"
+)
+assert concurrent._concurrent_arm_recovery_owned_target_applies == 3
+assert concurrent._gripper_close_arm_interlock_activation_count == 0
+assert concurrent._gripper_close_arm_interlock_active_apply_count == 0
+concurrent._apply_call_count = 4
+fresh_transition = robust.advance_concurrent_arm_current_joint_velocity_recovery(
+    enabled=True,
+    phase_before_apply="inactive",
+    consecutive_active_substeps_before_apply=0,
+    consecutive_clean_samples_before_apply=0,
+    next_release_ramp_index_before_apply=None,
+    measured_velocity_over_envelope=False,
+)
+concurrent._set_targets_and_commit_gripper_close_arm_interlock(
+    safe_target,
+    disabled_staged,
+    None,
+    concurrent_trace,
+    fresh_transition,
+    safe_target,
+    zero.unsqueeze(0),
+    safe_target,
+    torch.ones((1, 7), dtype=torch.float32),
+    False,
+)
+assert concurrent._concurrent_arm_fresh_dls_target_applies == 1
+assert concurrent._concurrent_arm_normal_target_setter_applies == 1
+assert concurrent._concurrent_arm_deferred_endpoint_transition_count == 0
+assert concurrent._concurrent_arm_stored_target_replay_count == 0
+
+
 class ParentPathAsset:
     def __init__(self):
         self.calls = []

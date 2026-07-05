@@ -12,6 +12,9 @@ from polaris.eef_controller_profile import (
 )
 from polaris.eef_controller_repair import ARM_RELEASE_RAMP_SUBSTEPS
 from polaris.eef_controller_repair import advance_current_joint_velocity_recovery
+from polaris.eef_controller_repair import (
+    advance_concurrent_arm_current_joint_velocity_recovery,
+)
 from polaris.eef_controller_repair import suspend_arm_release_ramp
 from polaris.eef_controller_repair import suspend_gripper_close_arm_interlock
 from polaris.eef_ik_safety import classify_current_joint_velocity_for_recovery
@@ -36,6 +39,13 @@ from polaris.eef_ik_safety import (
 )
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_SCHEMA_VERSION
 from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_TRANSACTION_PROFILE
+from polaris.eef_ik_safety import CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_PROFILE
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_SCHEMA_VERSION,
+)
+from polaris.eef_ik_safety import (
+    CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_TRANSACTION_PROFILE,
+)
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_PHYSICS_DT_FLOAT32
 from polaris.eef_ik_safety import PANDA_PHYSX_HARD_JOINT_POS_LIMITS_FLOAT32_SHA256
@@ -162,6 +172,69 @@ def _transition(
         next_release_ramp_index_before_apply=index,
         measured_velocity_over_envelope=over,
     )
+
+
+def test_concurrent_v6_clean2_holds_then_resumes_fresh_dls_without_ramp() -> None:
+    first = advance_concurrent_arm_current_joint_velocity_recovery(
+        enabled=True,
+        phase_before_apply=CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE,
+        consecutive_active_substeps_before_apply=0,
+        consecutive_clean_samples_before_apply=0,
+        next_release_ramp_index_before_apply=None,
+        measured_velocity_over_envelope=True,
+    )
+    assert (
+        first.phase_after_successful_apply == CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_HOLD
+    )
+    assert first.skip_dls is True
+    assert first.hold_current_position is True
+    clean1 = advance_concurrent_arm_current_joint_velocity_recovery(
+        enabled=True,
+        phase_before_apply=first.phase_after_successful_apply,
+        consecutive_active_substeps_before_apply=1,
+        consecutive_clean_samples_before_apply=0,
+        next_release_ramp_index_before_apply=None,
+        measured_velocity_over_envelope=False,
+    )
+    clean2 = advance_concurrent_arm_current_joint_velocity_recovery(
+        enabled=True,
+        phase_before_apply=clean1.phase_after_successful_apply,
+        consecutive_active_substeps_before_apply=2,
+        consecutive_clean_samples_before_apply=1,
+        next_release_ramp_index_before_apply=None,
+        measured_velocity_over_envelope=False,
+    )
+    assert clean2.phase_after_successful_apply == (
+        CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_INACTIVE
+    )
+    assert clean2.skip_dls is True
+    assert clean2.hold_current_position is True
+    assert clean2.recovered_event_delta == 1
+    assert clean2.release_ramp_index_to_apply is None
+    assert clean2.next_release_ramp_index_after_successful_apply is None
+    resumed = advance_concurrent_arm_current_joint_velocity_recovery(
+        enabled=True,
+        phase_before_apply=clean2.phase_after_successful_apply,
+        consecutive_active_substeps_before_apply=0,
+        consecutive_clean_samples_before_apply=0,
+        next_release_ramp_index_before_apply=None,
+        measured_velocity_over_envelope=False,
+    )
+    assert resumed.skip_dls is False
+    assert resumed.hold_current_position is False
+    assert resumed.release_ramp_index_to_apply is None
+
+
+def test_concurrent_v6_rejects_any_legacy_release_ramp_state() -> None:
+    with pytest.raises(ValueError, match="retained release-ramp state"):
+        advance_concurrent_arm_current_joint_velocity_recovery(
+            enabled=True,
+            phase_before_apply=CURRENT_JOINT_VELOCITY_RECOVERY_PHASE_RELEASE_RAMP,
+            consecutive_active_substeps_before_apply=0,
+            consecutive_clean_samples_before_apply=0,
+            next_release_ramp_index_before_apply=1,
+            measured_velocity_over_envelope=False,
+        )
 
 
 def test_recovery_state_machine_bounds_clean2_ramp_and_reexceed_lifecycle() -> None:
@@ -727,6 +800,46 @@ def test_recovery_report_schema_and_open_event_are_closed() -> None:
         mutation(drifted)
         with pytest.raises(ValueError):
             validate_current_joint_velocity_recovery_report(drifted, apply_calls=1)
+
+
+def test_concurrent_v6_active_recovery_report_has_no_release_ramp_contract() -> None:
+    report = _active_recovery_report()
+    report["contract"].update(
+        {
+            "schema_version": CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_SCHEMA_VERSION,
+            "profile": CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_PROFILE,
+            "release_ramp_profile": None,
+            "transaction_profile": (
+                CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_TRANSACTION_PROFILE
+            ),
+        }
+    )
+    assert (
+        validate_current_joint_velocity_recovery_report(report, apply_calls=1) == report
+    )
+    report["counters"]["release_ramp_target_applies"] = 1
+    with pytest.raises(ValueError, match="counter drift"):
+        validate_current_joint_velocity_recovery_report(report, apply_calls=1)
+
+
+def test_concurrent_v6_clean_completion_closes_without_release_targets() -> None:
+    report = _clean_completed_recovery_report()
+    report["contract"].update(
+        {
+            "schema_version": CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_SCHEMA_VERSION,
+            "profile": CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_PROFILE,
+            "release_ramp_profile": None,
+            "transaction_profile": (
+                CURRENT_JOINT_VELOCITY_RECOVERY_CONCURRENT_TRANSACTION_PROFILE
+            ),
+        }
+    )
+    report["counters"]["release_ramp_target_applies"] = 0
+    report["events"][0]["end_reason"] = "clean2_concurrent_resume"
+    assert (
+        validate_current_joint_velocity_recovery_report(report, apply_calls=18)
+        == report
+    )
 
 
 def test_clean_and_sustained_terminal_reports_bind_minimum_chronology() -> None:

@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 
 from polaris import eef_gripper_runtime as runtime
+from polaris.eef_ik_safety import current_joint_velocity_recovery_envelope
+from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 
 
 def _tensor(values, *, shape, device):
@@ -194,6 +196,59 @@ def _dynamic_evidence():
         "driver_target_slew": _target_slew_dynamic(),
         "nonfinite_samples": 0,
         "dropped_diagnostics": 0,
+    }
+
+
+def _concurrent_open_endpoint_telemetry(*, coupled_failure: bool = False):
+    envelopes = [
+        current_joint_velocity_recovery_envelope(limit)
+        for limit in PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
+    ]
+    arm_velocity = [0.0] * 7
+    if coupled_failure:
+        arm_velocity[0] = envelopes[0] + 0.001
+    follower_velocity = [7.174964, 0.0, 0.0, 5.00002, 0.0]
+    diagnostic = {
+        "sample_phase": "post_policy_step",
+        "sample_index": 8,
+        "arm_joint_velocity_rad_s": arm_velocity,
+        "follower_joint_velocity_rad_s": follower_velocity,
+        "follower_joint_acceleration_rad_s2": [0.0] * 5,
+        "follower_threshold_crossed": True,
+        "arm_recovery_envelope_crossed": coupled_failure,
+        "coupled_impulse_failure": coupled_failure,
+    }
+    return {
+        "enabled": True,
+        "profile": runtime.OPEN_ENDPOINT_COUPLED_IMPULSE_PROFILE,
+        "endpoint": "open",
+        "follower_threshold_rad_s_float32": (
+            runtime.OPEN_ENDPOINT_FOLLOWER_TELEMETRY_THRESHOLD_RAD_S_FLOAT32
+        ),
+        "follower_threshold_semantics": (
+            "passive_follower_crossing_is_telemetry_only_v1"
+        ),
+        "arm_threshold_profile": (
+            "per_joint_float32_physical_limit_plus_limit_times_float32_1e_4_v1"
+        ),
+        "arm_velocity_envelopes_rad_s": envelopes,
+        "failure_predicate": (
+            "open_and_follower_gt_5p001_and_any_arm_gt_its_recovery_envelope_v1"
+        ),
+        "open_endpoint_samples": 9,
+        "nonfinite_open_endpoint_samples": 0,
+        "follower_threshold_crossing_samples": 1,
+        "coupled_impulse_failure_samples": int(coupled_failure),
+        "max_abs_arm_joint_velocity_rad_s": [abs(item) for item in arm_velocity],
+        "max_abs_follower_joint_velocity_rad_s": [
+            abs(item) for item in follower_velocity
+        ],
+        "max_abs_follower_joint_acceleration_rad_s2": [0.0] * 5,
+        "maximum_follower_diagnostic": diagnostic,
+        "first_coupled_impulse_failure_diagnostic": (
+            copy.deepcopy(diagnostic) if coupled_failure else None
+        ),
+        "passed": not coupled_failure,
     }
 
 
@@ -819,6 +874,42 @@ def test_dynamic_contract_records_but_does_not_claim_passive_velocity_is_bounded
     dynamic = runtime.validate_eef_gripper_dynamic_evidence(_dynamic_evidence())
     assert static["measured_velocity_is_hard_bounded_by_limit"] is False
     assert max(dynamic["max_abs_joint_velocity_rad_s"]) == pytest.approx(7.174964)
+
+
+def test_open_endpoint_follower_crossing_is_telemetry_only_below_arm_envelope():
+    evidence = _dynamic_evidence()
+    evidence[runtime.OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD] = (
+        _concurrent_open_endpoint_telemetry()
+    )
+    validated = runtime.validate_eef_gripper_dynamic_evidence(
+        evidence,
+        expect_open_endpoint_coupled_impulse=True,
+    )
+    telemetry = validated[runtime.OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD]
+    assert telemetry["follower_threshold_crossing_samples"] == 1
+    assert telemetry["coupled_impulse_failure_samples"] == 0
+    assert telemetry["passed"] is True
+
+
+def test_open_endpoint_coupled_failure_requires_independent_failure_diagnostic():
+    evidence = _dynamic_evidence()
+    evidence[runtime.OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD] = (
+        _concurrent_open_endpoint_telemetry(coupled_failure=True)
+    )
+    validated = runtime.validate_eef_gripper_dynamic_evidence(
+        evidence,
+        expect_open_endpoint_coupled_impulse=True,
+    )
+    assert validated[runtime.OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD]["passed"] is False
+    drifted = copy.deepcopy(evidence)
+    drifted[runtime.OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD][
+        "first_coupled_impulse_failure_diagnostic"
+    ] = None
+    with pytest.raises(ValueError, match="failure diagnostic"):
+        runtime.validate_eef_gripper_dynamic_evidence(
+            drifted,
+            expect_open_endpoint_coupled_impulse=True,
+        )
 
 
 @pytest.mark.parametrize(

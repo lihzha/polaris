@@ -14,10 +14,17 @@ import traceback
 from pathlib import Path
 
 from isaaclab.app import AppLauncher
+from polaris.config import EEF_CONTROLLER_BASELINE_PROFILE
+from polaris.config import EEF_CONTROLLER_PROFILES
 
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--environment", default="DROID-FoodBussing")
+parser.add_argument(
+    "--eef-controller-profile",
+    choices=EEF_CONTROLLER_PROFILES,
+    default=EEF_CONTROLLER_BASELINE_PROFILE,
+)
 parser.add_argument("--hold-steps", type=int, default=45)
 parser.add_argument("--position-delta", type=float, default=0.04)
 parser.add_argument("--rotation-degrees", type=float, default=15.0)
@@ -127,7 +134,7 @@ def _atomic_write_strict_json(path: Path, payload: dict[str, object]) -> None:
 def _result_payload(
     state: dict[str, object], *, finalized: bool, exit_code: int
 ) -> dict[str, object]:
-    return {
+    payload = {
         "schema_version": 2,
         "finalized": finalized,
         "environment": args_cli.environment,
@@ -160,6 +167,14 @@ def _result_payload(
         "close_failures": state["close_failures"],
         "persistence_failures": state["persistence_failures"],
     }
+    if args_cli.eef_controller_profile != EEF_CONTROLLER_BASELINE_PROFILE:
+        payload["eef_controller_profile"] = args_cli.eef_controller_profile
+        payload["schema_version"] = 3
+    if state.get("concurrent_close_result") is not None:
+        payload["concurrent_arm_gripper_discriminator"] = state[
+            "concurrent_close_result"
+        ]
+    return payload
 
 
 def _raw_is_eligible_for_close(
@@ -351,6 +366,8 @@ def main(state: dict[str, object]) -> int:
 
     import polaris.environments  # noqa: F401
     from polaris.config import LAP_EEF_FRAME
+    from polaris.config import EEF_CONTROLLER_CONCURRENT_ARM_GRIPPER_CANDIDATE_PROFILE
+    from polaris.eef_controller_profile import configure_eef_controller_profile
     from polaris.eef_runtime_contract import validate_eef_runtime_frame
     from polaris.eef_runtime_contract import validate_eef_runtime_safety
     from polaris.eef_ik_safety import validate_one_step_adversarial_report
@@ -358,14 +375,16 @@ def main(state: dict[str, object]) -> int:
     from polaris.eef_runtime_contract import begin_eef_safety_episode
     from polaris.eef_runtime_contract import eef_episode_safety_report
     from polaris.eef_gripper_runtime import install_eef_gripper_runtime
+    from polaris.eef_gripper_runtime import GRIPPER_CLOSE_TRANSITION_APPLIES
+    from polaris.eef_gripper_runtime import GRIPPER_CLOSE_TRANSITION_0P25_APPLIES
     from polaris.eef_gripper_runtime import record_eef_gripper_post_policy_step
     from polaris.eef_gripper_runtime import validate_eef_gripper_post_reset
     from polaris.environments.droid_cfg import EgoLapEefPoseActionCfg
     from polaris.environments.robot_cfg import configure_eef_pose_joint_safety
     from polaris.policy.lap_eef_pose_client import anchor_action_chunk
 
-    state["episode_safety_reporter"] = eef_episode_safety_report
     state["eef_frame"] = LAP_EEF_FRAME
+    record_concurrent_post_step = record_eef_gripper_post_policy_step
     state["stage"] = "build_environment"
     env_cfg = parse_env_cfg(
         args_cli.environment,
@@ -379,6 +398,38 @@ def main(state: dict[str, object]) -> int:
         physx_cfg=env_cfg.sim.physx,
         enable_gripper_velocity_limit=True,
     )
+    controller_spec = configure_eef_controller_profile(
+        env_cfg,
+        profile=args_cli.eef_controller_profile,
+    )
+    target_slew_profile = controller_spec.target_slew_profile
+    concurrent_v6 = (
+        controller_spec.profile
+        == EEF_CONTROLLER_CONCURRENT_ARM_GRIPPER_CANDIDATE_PROFILE
+    )
+    transition_substeps = (
+        GRIPPER_CLOSE_TRANSITION_0P25_APPLIES
+        if controller_spec.target_slew_rate_0p25_enabled
+        else GRIPPER_CLOSE_TRANSITION_APPLIES
+    )
+    transition_policy_steps = math.ceil(transition_substeps / 8)
+
+    def episode_safety_report(active_env, episode_index):
+        return eef_episode_safety_report(
+            active_env,
+            episode_index,
+            expected_gripper_target_slew_profile=target_slew_profile,
+            expected_eef_controller_profile=controller_spec.profile,
+        )
+
+    def validate_runtime_safety(active_env):
+        return validate_eef_runtime_safety(
+            active_env,
+            expected_gripper_target_slew_profile=target_slew_profile,
+            expected_eef_controller_profile=controller_spec.profile,
+        )
+
+    state["episode_safety_reporter"] = episode_safety_report
     robot_usd_path = Path(env_cfg.scene.robot.spawn.usd_path)
     env = gym.make(args_cli.environment, cfg=env_cfg)
     state["env"] = env
@@ -429,7 +480,10 @@ def main(state: dict[str, object]) -> int:
         flush=True,
     )
     state["stage"] = "validate_runtime_safety_capture"
-    validated_initial_capture = validate_eef_runtime_safety(env)
+    if controller_spec.profile == EEF_CONTROLLER_BASELINE_PROFILE:
+        validated_initial_capture = validate_eef_runtime_safety(env)
+    else:
+        validated_initial_capture = validate_runtime_safety(env)
     if validated_initial_capture != initial_capture:
         raise RuntimeError("Live EEF safety report changed during initial validation")
 
@@ -458,7 +512,7 @@ def main(state: dict[str, object]) -> int:
         state["stage"] = "execute_case"
         for _ in range(args_cli.hold_steps):
             observation, _, terminated, truncated, _ = env.step(action, expensive=False)
-            record_eef_gripper_post_policy_step(env)
+            record_concurrent_post_step(env)
             if bool(terminated[0]) or bool(truncated[0]):
                 raise RuntimeError(f"Episode ended during smoke case {label!r}")
 
@@ -493,8 +547,8 @@ def main(state: dict[str, object]) -> int:
             }
         )
         state["stage"] = "validate_case_safety"
-        validate_eef_runtime_safety(env)
-        safety_report = eef_episode_safety_report(env, case_index)
+        validate_runtime_safety(env)
+        safety_report = episode_safety_report(env, case_index)
         expected_apply_calls = args_cli.hold_steps * 8
         if safety_report["counters"]["apply_calls"] != expected_apply_calls:
             raise RuntimeError(
@@ -541,7 +595,7 @@ def main(state: dict[str, object]) -> int:
     delayed_truncated = False
     for phase, action_target, policy_steps in (
         ("open", open_target, DELAYED_CLOSE_OPEN_POLICY_STEPS),
-        ("close", close_target, DELAYED_CLOSE_CLOSE_POLICY_STEPS),
+        ("close", close_target, transition_policy_steps),
     ):
         state["stage"] = f"execute_delayed_close_{phase}"
         action = torch.as_tensor(action_target, device=env.device).reshape(1, -1)
@@ -555,14 +609,14 @@ def main(state: dict[str, object]) -> int:
                     f"Episode ended during delayed-close {phase!r} phase"
                 )
     state["stage"] = "validate_delayed_close_replay"
-    validate_eef_runtime_safety(env)
-    delayed_safety = eef_episode_safety_report(env, delayed_close_index)
+    validate_runtime_safety(env)
+    delayed_safety = episode_safety_report(env, delayed_close_index)
     delayed_counters = delayed_safety["counters"]
     delayed_target_slew = delayed_safety["gripper_runtime_dynamic"][
         "driver_target_slew"
     ]
     delayed_total_policy_steps = (
-        DELAYED_CLOSE_OPEN_POLICY_STEPS + DELAYED_CLOSE_CLOSE_POLICY_STEPS
+        DELAYED_CLOSE_OPEN_POLICY_STEPS + transition_policy_steps
     )
     delayed_apply_calls = delayed_total_policy_steps * 8
     delayed_abort_count = sum(
@@ -592,6 +646,8 @@ def main(state: dict[str, object]) -> int:
         "immediate_close_hold": immediate_close_headroom,
         "delayed_close_replay": delayed_close_headroom,
     }
+    if concurrent_v6:
+        state["close_headroom_result"]["completion_gate_applied"] = False
     delayed_passed = (
         not delayed_terminated
         and not delayed_truncated
@@ -604,13 +660,12 @@ def main(state: dict[str, object]) -> int:
         and delayed_target_slew["endpoint_change_count"] == 1
         and delayed_target_slew["repeated_endpoint_process_count"]
         == delayed_total_policy_steps - 2
-        and delayed_target_slew["slew_limited_apply_count"]
-        == DELAYED_CLOSE_LIMITED_APPLIES
+        and delayed_target_slew["slew_limited_apply_count"] == transition_substeps - 1
         and delayed_target_slew["endpoint_reached_apply_count"]
-        == delayed_apply_calls - DELAYED_CLOSE_LIMITED_APPLIES
+        == delayed_apply_calls - (transition_substeps - 1)
         and delayed_target_slew["last_requested_endpoint_rad"] == closed_target_rad
         and delayed_target_slew["last_applied_target_rad"] == closed_target_rad
-        and delayed_close_headroom["passed"]
+        and (concurrent_v6 or delayed_close_headroom["passed"])
     )
     state["delayed_close_result"] = {
         "profile": DELAYED_CLOSE_REPLAY_PROFILE,
@@ -618,15 +673,16 @@ def main(state: dict[str, object]) -> int:
         "passed": delayed_passed,
         "episode_index": delayed_close_index,
         "open_policy_steps": DELAYED_CLOSE_OPEN_POLICY_STEPS,
-        "close_policy_steps": DELAYED_CLOSE_CLOSE_POLICY_STEPS,
-        "close_transition_substeps": DELAYED_CLOSE_TRANSITION_SUBSTEPS,
+        "close_policy_steps": transition_policy_steps,
+        "close_transition_substeps": transition_substeps,
         "terminated": delayed_terminated,
         "truncated": delayed_truncated,
         "arm_abort_count": delayed_abort_count,
         "ik_safety": delayed_safety,
     }
     failures += int(not delayed_passed)
-    failures += int(not immediate_close_headroom["passed"])
+    if not concurrent_v6:
+        failures += int(not immediate_close_headroom["passed"])
     print(
         " delayed close: "
         f"{'PASS' if delayed_passed else 'FAIL'} "
@@ -639,10 +695,156 @@ def main(state: dict[str, object]) -> int:
         flush=True,
     )
 
+    # V6 must prove that gripper transitions never own the arm target.  Move
+    # through a distinct absolute EEF pose on every policy step while closing,
+    # then continue moving while reopening so the contact/mimic impulse gate
+    # observes the relevant endpoint.  Every physics apply must be accounted
+    # as a fresh ordinary DLS/slew transaction.
+    concurrent_discriminator_checks = 0
+    if concurrent_v6:
+        concurrent_index = len(test_cases) + 1
+        state["stage"] = "reset_concurrent_arm_gripper_discriminator"
+        state["case"] = "moving EEF through close and reopen transitions"
+        state["active_episode_index"] = None
+        observation, _ = env.reset(expensive=False)
+        validate_eef_gripper_post_reset(env, gripper_runtime_contract)
+        begin_eef_safety_episode(env, concurrent_index)
+        state["active_episode_index"] = concurrent_index
+        anchor_position = observation["policy"]["eef_pos"][0].detach().cpu().numpy()
+        anchor_quaternion = observation["policy"]["eef_quat"][0].detach().cpu().numpy()
+        moving_targets = []
+        transition_terminated = False
+        transition_truncated = False
+        for phase, gripper_open in (("initial_open", 1.0),):
+            target = anchor_action_chunk(
+                np.array([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, gripper_open]]),
+                anchor_position,
+                anchor_quaternion,
+            )[0]
+            moving_targets.append(target[:7].tolist())
+            state["stage"] = f"execute_concurrent_{phase}"
+            _, _, terminated, truncated, _ = env.step(
+                torch.as_tensor(target, device=env.device).reshape(1, -1),
+                expensive=False,
+            )
+            record_eef_gripper_post_policy_step(env)
+            transition_terminated = transition_terminated or bool(terminated[0])
+            transition_truncated = transition_truncated or bool(truncated[0])
+        for phase, gripper_open in (("close", 0.0), ("reopen", 1.0)):
+            for step in range(transition_policy_steps):
+                fraction = (step + 1) / transition_policy_steps
+                pose_delta = np.array(
+                    [
+                        0.02 * fraction,
+                        (0.004 * fraction if phase == "reopen" else 0.0),
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        gripper_open,
+                    ]
+                )
+                target = anchor_action_chunk(
+                    pose_delta[None, :],
+                    anchor_position,
+                    anchor_quaternion,
+                )[0]
+                moving_targets.append(target[:7].tolist())
+                state["stage"] = f"execute_concurrent_{phase}_moving"
+                _, _, terminated, truncated, _ = env.step(
+                    torch.as_tensor(target, device=env.device).reshape(1, -1),
+                    expensive=False,
+                )
+                record_concurrent_post_step(env)
+                transition_terminated = transition_terminated or bool(terminated[0])
+                transition_truncated = transition_truncated or bool(truncated[0])
+                if transition_terminated or transition_truncated:
+                    raise RuntimeError(
+                        f"Episode ended during concurrent {phase!r} discriminator"
+                    )
+        state["stage"] = "validate_concurrent_arm_gripper_discriminator"
+        validate_runtime_safety(env)
+        concurrent_safety = episode_safety_report(env, concurrent_index)
+        concurrent_report = arm_term.controller_repair_candidate_report()
+        concurrent_evidence = concurrent_report["concurrent_arm_gripper"]
+        interlock = concurrent_report["gripper_close_arm_interlock"]
+        interlock_counter_fields = (
+            "remaining_substeps",
+            "observed_endpoint_change_count",
+            "activation_count",
+            "active_apply_count",
+            "released_apply_count",
+            "anchor_capture_count",
+            "anchor_target_apply_count",
+            "anchor_first_exact_target_count",
+            "anchor_refresh_count",
+            "anchor_slew_limit_event_count",
+            "anchor_slew_limited_joint_count",
+            "anchor_position_limit_event_count",
+            "anchor_position_limited_joint_count",
+            "anchor_completion_count",
+            "anchor_open_cancel_count",
+        )
+        telemetry = concurrent_safety["gripper_runtime_dynamic"][
+            "open_endpoint_contact_mimic_impulse"
+        ]
+        concurrent_policy_steps = 1 + 2 * transition_policy_steps
+        expected_apply_calls = concurrent_policy_steps * 8
+        expected_closed_applies = transition_policy_steps * 8
+        concurrent_passed = (
+            not transition_terminated
+            and not transition_truncated
+            and concurrent_safety["counters"]["apply_calls"] == expected_apply_calls
+            and concurrent_evidence["fresh_dls_target_applies"] == expected_apply_calls
+            and concurrent_evidence["normal_target_setter_applies"]
+            == expected_apply_calls
+            and concurrent_evidence["closed_endpoint_fresh_dls_target_applies"]
+            == expected_closed_applies
+            and concurrent_evidence["closed_endpoint_distinct_desired_pose_count"]
+            >= transition_policy_steps
+            and concurrent_evidence["recovery_owned_target_applies"] == 0
+            and concurrent_evidence["deferred_endpoint_transition_count"] == 0
+            and concurrent_evidence["stored_target_replay_count"] == 0
+            and interlock["enabled"] is False
+            and interlock["configured_substeps"] == 0
+            and interlock["endpoint_observed"] is False
+            and interlock["anchor_valid"] is False
+            and all(interlock[field] == 0 for field in interlock_counter_fields)
+            and "arm_release_ramp" not in concurrent_report
+            and telemetry["open_endpoint_samples"] > 0
+            and telemetry["maximum_follower_diagnostic"] is not None
+            and telemetry["passed"] is True
+        )
+        state["concurrent_close_result"] = {
+            "profile": "moving_eef_close_reopen_fresh_dls_every_apply_v1",
+            "passed": concurrent_passed,
+            "episode_index": concurrent_index,
+            "transition_substeps": transition_substeps,
+            "transition_policy_steps": transition_policy_steps,
+            "expected_apply_calls": expected_apply_calls,
+            "expected_closed_endpoint_applies": expected_closed_applies,
+            "distinct_policy_targets": moving_targets,
+            "controller_report": concurrent_report,
+            "open_endpoint_contact_mimic_impulse": telemetry,
+            "ik_safety": concurrent_safety,
+        }
+        failures += int(not concurrent_passed)
+        concurrent_discriminator_checks = 1
+        print(
+            " concurrent close/reopen: "
+            f"{'PASS' if concurrent_passed else 'FAIL'} "
+            f"fresh_dls={concurrent_evidence['fresh_dls_target_applies']} "
+            f"closed_fresh={concurrent_evidence['closed_endpoint_fresh_dls_target_applies']} "
+            f"distinct_closed={concurrent_evidence['closed_endpoint_distinct_desired_pose_count']} "
+            f"open_samples={telemetry['open_endpoint_samples']} "
+            f"coupled_failures={telemetry['coupled_impulse_failure_samples']}",
+            flush=True,
+        )
+
     # One bounded adversarial target proves that the guard activates while
     # preserving a finite simulator state. Never hold this target beyond
     # the one policy step; reset immediately after evidence capture.
-    adversarial_index = len(test_cases) + 1
+    adversarial_index = len(test_cases) + 1 + concurrent_discriminator_checks
     state["stage"] = "reset_adversarial_case"
     state["case"] = "oversized absolute +x target for one policy step"
     state["active_episode_index"] = None
@@ -697,7 +899,7 @@ def main(state: dict[str, object]) -> int:
         "position_within_captured_soft_limits": (joint_pos_within_soft_limits),
     }
     state["stage"] = "validate_adversarial_case"
-    adversarial_safety = eef_episode_safety_report(env, adversarial_index)
+    adversarial_safety = episode_safety_report(env, adversarial_index)
     json.dumps(adversarial_safety, allow_nan=False)
     counters = adversarial_safety["counters"]
     try:
@@ -744,7 +946,7 @@ def main(state: dict[str, object]) -> int:
     validate_eef_gripper_post_reset(env, gripper_runtime_contract)
     state["active_episode_index"] = None
 
-    total_checks = len(test_cases) + 2
+    total_checks = len(test_cases) + 2 + concurrent_discriminator_checks
     print(f"EEF pose smoke: {total_checks - failures}/{total_checks} passed")
     state["stage"] = "main_complete"
     state["case"] = None
@@ -762,6 +964,7 @@ if __name__ == "__main__":
         "adversarial_result": None,
         "delayed_close_result": None,
         "close_headroom_result": None,
+        "concurrent_close_result": None,
         "terminal_failure_evidence": None,
         "active_episode_index": None,
         "episode_safety_reporter": None,
