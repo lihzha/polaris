@@ -382,3 +382,92 @@ truthful status requires a corrected camera/image-contract smoke first, and
 only a passing result from that gate may advance to the paired official and
 reasoning FoodBussing canaries. The finalizer keeps
 `camera_image_contract_validated=false` and retains its controller-only scope.
+
+## Corrected FoodBussing image-contract smoke and evidence finalizer
+
+The image-contract producer is commit
+`9d296361bb323b2e309a3b92a204c102908c61a6`, tree
+`2e868fd4a31a55c9cedfb3221e4c2bc1fbbb9310`, with exact parent
+`42e266353df71d5906e98975165f8aa021020dad`. It changes only the standalone
+smoke, its focused host test, and its owned worklog. The seven producer source
+digests are pinned by the evidence finalizer, including
+`29db9e302179bb3ca4b05c14cae92e697376bb26066e4583b752bf9f6ce8d202`
+for `scripts/smoke_splat_image_contract.py`.
+
+The first wrapper attempt, Slurm job `1098980`, is preserved as a
+non-authoritative failed evidence attempt. Its primary simulator srun completed
+`0:0` and created a valid raw/ready/28-leaf bundle, but the host wrapper
+canonicalized `/lustre/fsw` to `/lustre/fs11` while comparing the ready
+marker's intentionally literal producer path. The post-srun assertion failed,
+so allocation and batch accounting ended `FAILED 1:0`. No evidence attestation
+may accept that attempt.
+
+The corrected fresh attempt is job `1098982` (`pol_img_9d29636`) at result
+root
+`/lustre/fsw/portfolios/nvr/users/lzha/results/polaris_eval/image_contract_smoke/9d29636-20260705T061730Z`.
+Allocation, batch, extern, and main srun `.0` all completed `0:0` on one
+`pool0-00010` L40S. The allocation ran from `2026-07-04T23:19:11-07:00`
+through `23:22:02` (171 seconds), and the srun ran from `23:19:22` through
+`23:22:02` (160 seconds). Its reviewed capture identities are:
+
+- raw: 25,039 bytes, mode `0444`, SHA-256
+  `5f7f03d59728a54fd78fc10638886f9053bd3c2754c3aac80bf73960c2641a84`;
+- ready: 427 bytes, mode `0444`, SHA-256
+  `2c423b14a72fa6f7cc526928f99d62ebbb20f7c11dcaeb380d95129f96905be3`;
+- source identity: 763 bytes, mode `0444`, SHA-256
+  `0b3cec33eb34e48dd411a67ac022ff9b432677c68230018b74a49d0568be13d3`;
+- post-srun validation: 1,066 bytes, mode `0444`, SHA-256
+  `823bc029b4c3630df36a75344d835d61813276d509e9c50580931e5502ce3787`;
+- saved wrapper: 13,018 bytes, mode `0444`, SHA-256
+  `71b6dabef645c1807c4ad07fcdcbb360e7f6ae3238ce4836fdd3e96b18528934`;
+- Slurm log: 21,283 bytes, mode `0644`, SHA-256
+  `886c91b5d5385515c50228673b53c058bb9952236857fe918069cab05af06fc4`.
+
+The raw record closes all 28 array/PNG/MessagePack leaves. Their canonical
+path/size/SHA/mode/kind manifest is 9,456 bytes with SHA-256
+`d14bdb03f67b2b105d21c8544ef19c1671c1dc437b9240fc60c1e3e0798d763b`.
+The runtime remains pinned to container SHA-256 `ad566a3a...`, FoodBussing
+scene `82cd641e...`, initial conditions `40091fae...` at index zero, Hub
+revision `8c7e410...`, and both metadata digests. The live request exercised
+only `base_0_rgb` and `left_wrist_0_rgb`; no checkpoint, server, reasoning
+blank image, normalization, policy action, task metric, or success-rate
+surface was exercised.
+
+`scripts/finalize_splat_image_contract_smoke.py` is a separate stdlib-only
+evidence finalizer. It does not import the producer. It independently parses
+NPY, PNG, and restricted MessagePack bytes; recomputes the float renderer
+conversion, RGB channel-order discriminator, robot-mask compositing, removed
+resize difference, float32 half-pixel resize/pad, wrist rotation ordering,
+noncommuting odd probe, request image bytes, and every array/PNG summary. It
+uses lstat/open/fstat/read/fstat/lstat binding and rejects symlinks, hardlinks,
+mode drift, replacement races, non-strict JSON, malformed binary formats, and
+source/Git drift.
+
+The reviewed finalizer source is 81,744 bytes with pre-commit SHA-256
+`4faf9d6edbea18e2761b333b15e23bab57a6443f81cb31a111d3db91d27b1e7c`.
+
+Volatile job/result identities are explicit CLI inputs. The finalizer requires
+their expected sizes and SHA-256 values, a reviewer-supplied canonical digest
+over all 28 leaf identities, and an immutable terminal sacct snapshot. It also
+queries live sacct and requires exact equality with the allocation/batch/
+extern/srun snapshot. Both `finalize` and `verify` reconstruct the same closed
+attestation bytes; `finalize` is non-overwriting and publishes mode `0444`
+with one hard link. The attestation's authorization object keeps checkpoint,
+policy serving, task metric, benchmark, controller behavior, canary, smoke
+suite, standard suite, and promotion fields false.
+
+Host-safe pre-commit validation:
+
+```text
+focused image finalizer: 31 passed
+image producer/finalizer/client integration: 103 passed, 30 subtests passed
+Ruff lint/format: passed
+Python byte compilation: passed
+full retry raw/ready/28-leaf semantic replay: passed
+git diff --check: passed
+```
+
+This evidence-only change launches no simulator, GPU, Slurm, checkpoint, or
+evaluation job and publishes no attestation. The intended commit changes only
+this append-only worklog, the image finalizer, and its focused test, and must
+remain a direct child of producer `9d29636`.
