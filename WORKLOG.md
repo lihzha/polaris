@@ -223,3 +223,52 @@
   the full trace/metric/video transaction.
 - Implementation commit: `98111ef50d18927389a694e141151dc06b1a8403`
   (tree `05262e39bb82f7973f283372ccf120cee8d7a2dd`, parent `7d83ea21778d8a0de68ea4dd82a209f6f8d53632`).
+
+### Exact-tip smoke and checkpoint-canary result
+
+- Launch/governance tip `25563f0b99ff03191aa7cc28c6947c60b4e6cafc`
+  (tree `1d59e3ee20c56666c36872216e6ee01967148b5a`) passed independent
+  source review without changing any model-facing field relative to the failed
+  attempt's resolved contract.
+- Controller-only L40S smoke job `1099016` completed `0:0`. Its immutable
+  attestation is 11,828 bytes, mode `0444`, link count one, SHA-256
+  `5d5083863324e6b52e34c9b0d9a2825ac18d206d00da959f3bf405f9f1ccfd36`.
+  All 16 signed/gripper cases used exactly eight target applications; the
+  two-step probe proved fresh measured-state reanchoring; the one-float32-ULP
+  limit probe was rejected before the setter; env/Kit close lifecycle passed;
+  and the job-owned cache was removed.
+- Fresh same-protocol one-rollout job `1099017` completed `0:0` on one L40S
+  from a new independent 20-object, 12,429,488,598-byte checkpoint snapshot.
+  Pre/post full-MD5 attestations matched, and the scientific resolved-contract
+  SHA-256 remained `b967029e1f8b9b9abc36011266b24de59c1eeed0ad68d319a708bd7573bf568e`.
+- The repaired runtime completed exactly 57 FLOW Euler-10 queries, 450 actions,
+  450 environment executions, and 3,600 identical-per-step absolute-position
+  target applications. Every execution was nonterminated/nontruncated, each
+  target passed the exact hard/soft intersection guard, both camera counters
+  advanced by 450, and the all-13-DOF monitor reported no terminal failure.
+- The independent post-job trace audit reproduced the worker validation
+  bit-for-bit at SHA-256
+  `2dd9f579b2ff186acea0bc0133512211b70aab0a2b7a4e8f642be2fd9d2927e8`.
+  Completion SHA-256 is
+  `22ececb141a185d988f47a983f4b2a6d4fe16b403000dbeb3f8867aa7b1f2b4a`;
+  candidate SHA-256 is
+  `464cb4aa2d26ca1ac712135644b000cffb5d96291dd9f3b531cb6e2b1079ef18`.
+- Train/eval-contract recheck passed for the released pi0.5 checkpoint: exact
+  `pi05_droid` OpenPI runtime commit `bd70b8f...`, checkpoint-global DROID
+  statistics SHA-256 `403b3a22...` with any `single_arm` category substitution
+  rejected, state `7q + closed-positive gripper`, external/wrist/masked-blank
+  ordering, native `720x1280` uint8 inputs, OpenPI pad-to-`224x224`, zero wrist
+  rotation, bfloat16 model compute, JAX x64 disabled, FLOW Euler-10 seed 0,
+  response `15x8`, execute-first-eight, and official fresh-q `0.2` normalized
+  command integration.
+- Scientific result: task failure, raw rubric `0/1`, progress `0.0`, and zero
+  numerical failures. Both H.264/yuv420p videos fully decode to 450 frames,
+  30 seconds, 15 fps, at `448x224`. First/middle/last frames and a ten-frame
+  contact sheet show valid moving external/wrist imagery, but no food is placed
+  in the bowl. The model commanded the gripper open on all 450 steps (raw
+  gripper maximum `0.273997 < 0.5`), so visual adjudication agrees with the
+  rubric failure. This one-rollout canary cannot estimate success rate.
+- Local evidence mirror:
+  `/home/lzha/code/ego-lap/.codex_artifacts/pi05-position-deploy/canary-20260705T103530Z/job-1099017`;
+  video viewer:
+  `http://localhost:8765/view?path=ego-lap/.codex_artifacts/pi05-position-deploy/canary-20260705T103530Z/job-1099017/pi05_droid_position_canary.mp4`.
