@@ -471,3 +471,77 @@ This evidence-only change launches no simulator, GPU, Slurm, checkpoint, or
 evaluation job and publishes no attestation. The intended commit changes only
 this append-only worklog, the image finalizer, and its focused test, and must
 remain a direct child of producer `9d29636`.
+
+## Finalized dual-evidence checkpoint-canary promotion gate
+
+On 2026-07-05, `CODEX_AGENT_ID=polaris_v6_promotion_design` finalized the
+schema-2 promotion gate in an isolated worktree at exact image-evidence C5
+`5c9a2c50f564fb58d58777fbe34fb831ba362ec3`, tree
+`707a5d7b659e7c4dfc13d19ede9ce8a8077aeec7`, direct parent image-smoke
+producer C4 `9d296361bb323b2e309a3b92a204c102908c61a6`. The change is restricted to
+this worklog, `src/polaris/eef_concurrent_arm_gripper_v6_promotion.py`, and
+`tests/test_eef_concurrent_arm_gripper_v6_promotion.py`; it changes no
+controller, evaluator, image, policy, or serving behavior.
+
+The gate embeds and validates only the cadence-correct job-1098975 controller
+attestation (11,481 bytes, SHA-256
+`4b5f53524590711874a06fa3d2f47b1b430df7ff7b82b445d14e44db2c4e1e90`)
+and freshly binds the immutable job-1098982 image attestation at
+`/lustre/fsw/portfolios/nvr/users/lzha/results/polaris_eval/image_contract_smoke/9d29636-20260705T061730Z/smoke-1098982.image-evidence-attestation.json`
+(28,839 bytes, mode `0444`, one hard link, SHA-256
+`f85125e27c00bab0173a2f78642555bc4cdcf7d72ab5bb4cc9c2948cb84e4212`).
+The image attestation is independently parsed in its actual finalized schema:
+producer C4, reviewer C5, finalizer SHA-256
+`4faf9d6edbea18e2761b333b15e23bab57a6443f81cb31a111d3db91d27b1e7c`,
+terminal allocation/batch/extern/srun records, real FoodBussing environment,
+production renderer call path, exact RGB conversion/compositing pixels,
+resize-pad-before-wrist-rotation evidence, MessagePack image bytes, and the
+removed-resize counterfactual. Its standalone authorization fields remain all
+false; the C6 composition gate, not the evidence artifact itself, grants the
+narrow next step. Job 1098982 exercised the public `base_0_rgb`/wrist request
+only; it did not runtime-exercise the reasoning blank-image/model-key mapping,
+either checkpoint, or normalization. Those remain closed static request
+constraints whose first permitted runtime exercise is the paired canary.
+
+The complete lineage binds controller C1 `3941840`, controller evidence C2
+`be2f608`, image implementation `f1d32a3`, integration tip `42e2663`, image
+producer C4 `9d29636`, and image evidence C5 `5c9a2c5`, while preserving the
+exact v5 promotion-module bytes. The earlier controller job and promotion
+evidence are not authority; `ee6d093` remains only the historical Git parent
+of C1. Local validation also hashes all seven image-attested runtime sources,
+including the production splat renderer.
+
+The only authorized request is exactly one official-LAP3B and one
+reasoning-43075 FLOW-10 canary on `DROID-FoodBussing`, response horizon 16 and
+execution horizon 8, with native 720x1280 RGB uint8 images and model 224x224
+images. Official uses `[external,wrist]` and row-R6; reasoning uses
+`[wrist,external,blank]` and column-R6. Both bind resize/pad before the
+180-degree wrist rotation and global float32 train-matched Q99, with
+`single_arm` configured metadata and effective category null. Smoke-suite,
+standard, native joint-position, pi0.5, and any other task/checkpoint/scale
+remain explicitly unauthorized.
+
+Host validation of the finalized gate:
+
+```text
+focused schema/promotion tests: 59 passed
+promotion + image producer/finalizer/client + v5 preservation selection:
+245 passed, 1 skipped, 30 subtests passed; the 2 closed historical v5 identity
+tests fail only on `src/polaris/config.py`, as before
+broad host-safe suite (Isaac-only robust-DIK test excluded):
+1202 passed, 1 skipped, 30 subtests passed, 8 closed historical identity
+tests failed; exact C5 baseline has the same 8 node IDs plus 2 superseded old
+v6 promotion failures, so C6 introduces no new broad-suite failure
+exact content-addressed dual-attestation/source authorizer: authorized=true,
+eval_scale=canary, stage=paired_official_and_reasoning_foodbussing_canaries
+Ruff lint/format: passed
+Python byte compilation: passed
+git diff --check: passed
+final promotion-manifest SHA-256:
+5a03e09fc5dd8d3c3d196909695d58e7ae589a99d3db9fe730877481858ab301
+paired canary-request SHA-256:
+6963d2cc0f3c02ee9a4e5f2f3c3718a027bbbfe36a97e884c48e83e94122be28
+```
+
+No GPU, simulator, checkpoint server, policy, Slurm job, or evaluation was
+launched while finalizing this evidence-only authorization gate.
