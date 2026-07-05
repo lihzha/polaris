@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Finalize the exact successful concurrent-arm/gripper v6 controller smoke.
+"""Finalize the exact cadence-correct concurrent-arm/gripper v6 smoke.
 
 This evidence-only host finalizer changes no controller or simulator behavior.
-It validates the immutable job-1098922 capture, its saved launch surface, the
+It validates the immutable job-1098975 capture, its saved launch surface, the
 exact producer checkout, image, FoodBussing scene, and terminal Slurm record,
 then publishes one non-overwriting mode-0444 promotion attestation.
 """
@@ -28,11 +28,11 @@ class VerificationError(RuntimeError):
     """Raised when any immutable smoke-evidence invariant drifts."""
 
 
-JOB_ID = 1098922
-JOB_NAME = "pol_v6_ctrl_6e4b7c5"
-PRODUCER_COMMIT = "6e4b7c5be5ff6db670970774be3250c5d5ffa4d2"
-PRODUCER_TREE = "328063f148832f7050634b09b9db22bc5d1d5095"
-PRODUCER_PARENT = "b6dec3d0c053066d65f6998cf1ecc33fc6e6e9ff"
+JOB_ID = 1098975
+JOB_NAME = "pol_v6_cad_3941840"
+PRODUCER_COMMIT = "39418400493cdcf8cd8272608980a798f7929a20"
+PRODUCER_TREE = "7fc1ff24053e3aeab5ed3e06068089b5aa596bc6"
+PRODUCER_PARENT = "ee6d09351bed75e32db93ecf59c039a8e99fac9f"
 CONTROLLER_PROFILE = (
     "arm_slew_0p95_gripper_rate0p25_concurrent_arm_velocity_recovery8_"
     "clean2_mimic100_damping1p2_v6"
@@ -41,12 +41,19 @@ IK_SAFETY_PROFILE = (
     "panda_velocity_physxlimit_solveriter1_residual_recovery8_clean2_"
     "concurrent_arm_gripper_v6"
 )
-PROMOTION_PROFILE = "concurrent_arm_gripper_v6_controller_smoke_job1098922_v1"
-PROMOTION_STATUS = "validated_controller_smoke_pending_two_checkpoint_canaries"
+PROMOTION_PROFILE = "concurrent_arm_gripper_v6_cadence_smoke_job1098975_v1"
+PROMOTION_STATUS = (
+    "validated_controller_smoke_pending_corrected_camera_image_contract_smoke_"
+    "then_two_checkpoint_canaries"
+)
 PROMOTION_SCOPE = "standalone_controller_smoke_only_no_checkpoint_or_task_metric"
+NEXT_REQUIRED_GATE = (
+    "corrected_camera_image_contract_smoke_before_paired_official_and_reasoning_"
+    "foodbussing_canaries"
+)
 IMAGE_SHA256 = "ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d556b324a"
 SCENE_SHA256 = "82cd641e422935b394ce7ea7b6be55214c9952a2544000222921e544c409b489"
-SRUN_START_EPOCH_NS = 1_783_217_920_000_000_000
+SRUN_START_EPOCH_NS = 1_783_229_839_000_000_000
 IMAGE_METADATA = {
     "size_bytes": 7_183_130_624,
     "mtime_ns": 1_782_886_704_000_000_000,
@@ -64,7 +71,7 @@ L401_CANONICAL_USER_ROOT = Path(
 
 RESULT_ROOT = (
     "/lustre/fsw/portfolios/nvr/users/lzha/results/polaris_eval/"
-    "controller_concurrent_v6_smoke/6e4b7c5-20260705T021644Z"
+    "controller_concurrent_v6_cadence_smoke/3941840-20260705T053510Z"
 )
 RAW_PATH = f"{RESULT_ROOT}/smoke-{JOB_ID}.raw.json"
 READY_PATH = f"{RAW_PATH}.ready.json"
@@ -78,15 +85,15 @@ SEALED_SLURM_LOG_PATH = f"{PROVENANCE_ROOT}/slurm.out"
 SEALED_SACCT_PATH = f"{PROVENANCE_ROOT}/sacct.json"
 SAVED_JOB_SCRIPT_PATH = (
     "/lustre/fsw/portfolios/nvr/users/lzha/launchers/polaris_eval/"
-    "polaris_v6_controller_smoke_6e4b7c5_20260705T021644Z.sbatch"
+    "polaris_v6_cadence_smoke_3941840_20260705T053510Z.sbatch"
 )
 SLURM_LOG_PATH = (
     "/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris_eval/"
-    "pol_v6_ctrl_6e4b7c5-1098922.out"
+    "pol_v6_cad_3941840-1098975.out"
 )
 PRODUCER_REPO_PATH = (
     "/lustre/fsw/portfolios/nvr/users/lzha/src/"
-    "PolaRiS-concurrent-v6-6e4b7c5-20260705T021644Z"
+    "PolaRiS-concurrent-v6-cadence-3941840-20260705T053510Z"
 )
 CONTAINER_IMAGE_PATH = (
     "/lustre/fsw/portfolios/nvr/users/lzha/cache/polaris/"
@@ -99,97 +106,125 @@ SCENE_PATH = (
 ARTIFACT_SPECS = {
     "raw": {
         "size_bytes": 793098,
-        "sha256": "793f8319c9afaed1f3ec32b703b73f7b7408bd1c6df28565a9a15d09fc36ca55",
+        "sha256": "393f0a57f409beb249635214ab2d7efb66783625048ddb18a5dc57426eaef2a5",
         "mode": "0444",
     },
     "ready": {
-        "size_bytes": 372,
-        "sha256": "c00349a358380ff405bdd92cb36e91e70ada46e4bc988b5596a79ca4585063de",
+        "size_bytes": 380,
+        "sha256": "9e0a6826601a9d7019f6a4836a6524e259551bdc048b11e6184de0cf6dafc576",
         "mode": "0444",
     },
     "inline_attestation": {
-        "size_bytes": 1770,
-        "sha256": "15a6b4862ef99acc72d9b4117faac49c849b8f88b8745be05fab5c88d0307944",
+        "size_bytes": 1923,
+        "sha256": "dfb0d40593241b85ea2af261e3de70d3c4d75fc6331109f38d32c305adefee42",
         "mode": "0444",
     },
     "source_identity": {
         "size_bytes": 800,
-        "sha256": "52c9a5c00506886e68dd394950fb84e80cbd9bfb18c91290e3abd201162561ad",
+        "sha256": "d18a718f402d539d031ae699da1230144e8f9f016874530189d31916f508e2d1",
         "mode": "0644",
     },
     "saved_job_script": {
-        "size_bytes": 9548,
-        "sha256": "a74f46d5e6d1e359b8df9bc02209e1b08c10b400cfd710826c6203fdeec55669",
-        "mode": "0640",
+        "size_bytes": 10396,
+        "sha256": "2215a73434d5c0f76368238932a8a18ebfd18125afb3b447f9396b4187fa18d4",
+        "mode": "0444",
     },
     "slurm_log": {
-        "size_bytes": 44136,
-        "sha256": "64179ecdc1ae32b51fe12a88b11987df955e7053a03e2b26cfad30c08a0621f6",
+        "size_bytes": 43539,
+        "sha256": "115a7d83b887a3403138626cd85429615955ab99a050e07e9c710f093b772b56",
         "mode": "0644",
     },
 }
 
 EXPECTED_SCHEDULER_EVIDENCE = {
     "allocation": {
-        "job_id": "1098922",
-        "job_name": "pol_v6_ctrl_6e4b7c5",
+        "job_id": "1098975",
+        "job_name": "pol_v6_cad_3941840",
         "account": "nvr_lpr_rvp",
         "partition": "batch",
         "state": "COMPLETED",
         "exit_code": "0:0",
-        "elapsed_seconds": 317,
-        "start": "2026-07-04T19:18:30",
-        "end": "2026-07-04T19:23:47",
-        "node": "pool0-00016",
+        "elapsed_seconds": 310,
+        "start": "2026-07-04T22:37:09",
+        "end": "2026-07-04T22:42:19",
+        "node": "pool0-00010",
         "allocated_tres": "billing=1,cpu=16,gres/gpu=1,mem=96G,node=1",
         "requested_tres": "billing=1,cpu=16,gres/gpu=1,mem=96G,node=1",
     },
     "batch": {
-        "job_id": "1098922.batch",
+        "job_id": "1098975.batch",
         "job_name": "batch",
         "account": "nvr_lpr_rvp",
         "partition": "",
         "state": "COMPLETED",
         "exit_code": "0:0",
-        "elapsed_seconds": 317,
-        "start": "2026-07-04T19:18:30",
-        "end": "2026-07-04T19:23:47",
-        "node": "pool0-00016",
+        "elapsed_seconds": 310,
+        "start": "2026-07-04T22:37:09",
+        "end": "2026-07-04T22:42:19",
+        "node": "pool0-00010",
         "allocated_tres": "cpu=16,gres/gpu=1,mem=96G,node=1",
         "requested_tres": "",
     },
     "extern": {
-        "job_id": "1098922.extern",
+        "job_id": "1098975.extern",
         "job_name": "extern",
         "account": "nvr_lpr_rvp",
         "partition": "",
         "state": "COMPLETED",
         "exit_code": "0:0",
-        "elapsed_seconds": 317,
-        "start": "2026-07-04T19:18:30",
-        "end": "2026-07-04T19:23:47",
-        "node": "pool0-00016",
+        "elapsed_seconds": 310,
+        "start": "2026-07-04T22:37:09",
+        "end": "2026-07-04T22:42:19",
+        "node": "pool0-00010",
         "allocated_tres": "billing=1,cpu=16,gres/gpu=1,mem=96G,node=1",
         "requested_tres": "",
     },
     "srun": {
-        "job_id": "1098922.0",
+        "job_id": "1098975.0",
         "job_name": "env",
         "account": "nvr_lpr_rvp",
         "partition": "",
         "state": "COMPLETED",
         "exit_code": "0:0",
-        "elapsed_seconds": 307,
-        "start": "2026-07-04T19:18:40",
-        "end": "2026-07-04T19:23:47",
-        "node": "pool0-00016",
+        "elapsed_seconds": 300,
+        "start": "2026-07-04T22:37:19",
+        "end": "2026-07-04T22:42:19",
+        "node": "pool0-00010",
         "allocated_tres": "cpu=16,gres/gpu=1,mem=96G,node=1",
+        "requested_tres": "",
+    },
+    "monitoring_1": {
+        "job_id": "1098975.1",
+        "job_name": "nvidia-smi",
+        "account": "nvr_lpr_rvp",
+        "partition": "",
+        "state": "COMPLETED",
+        "exit_code": "0:0",
+        "elapsed_seconds": 1,
+        "start": "2026-07-04T22:38:49",
+        "end": "2026-07-04T22:38:50",
+        "node": "pool0-00010",
+        "allocated_tres": "cpu=1,gres/gpu=1,mem=96G,node=1",
+        "requested_tres": "",
+    },
+    "monitoring_2": {
+        "job_id": "1098975.2",
+        "job_name": "nvidia-smi",
+        "account": "nvr_lpr_rvp",
+        "partition": "",
+        "state": "COMPLETED",
+        "exit_code": "0:0",
+        "elapsed_seconds": 0,
+        "start": "2026-07-04T22:39:11",
+        "end": "2026-07-04T22:39:11",
+        "node": "pool0-00010",
+        "allocated_tres": "cpu=1,gres/gpu=1,mem=96G,node=1",
         "requested_tres": "",
     },
 }
 SACCT_SNAPSHOT_PAYLOAD = {
     "schema_version": 1,
-    "profile": "slurm_job_and_srun_terminal_identity_v1",
+    "profile": "slurm_job_srun_and_read_only_monitoring_terminal_identity_v1",
     "scheduler": EXPECTED_SCHEDULER_EVIDENCE,
 }
 SACCT_SNAPSHOT_BYTES = (
@@ -222,16 +257,16 @@ EVIDENCE_COMMIT_CHANGED_PATHS = {
 
 CAPTURE_SOURCE_SHA256 = {
     "scripts/smoke_eef_pose_controller.py": (
-        "30e0e29c70c470b366cbbf8afa4ac61fa2e1cd05d30f5d0cd4dc4fb2d5cbe63e"
+        "b5b1b621041b74247dbce6488483cdf7d33d6fa7c4002e821cf50ed26609f6a8"
     ),
     "src/polaris/config.py": (
         "47f1a5af67e680e7b5762848697bd4c51b3b0f31132968d3551e0b28b0c889b6"
     ),
     "src/polaris/eef_controller_profile.py": (
-        "e549608d618ad109cb35e7e30e0e5ac452091dd97fd1f6f10bc9be502c8b6608"
+        "fa55f0b1fc1bb9600c5d2d11d39bd670980791374de5a0dfba955e90929496a4"
     ),
     "src/polaris/eef_controller_repair.py": (
-        "1eb7771cc2f3f2f457949208c6cdbcbf6bc20fede431e77908012f1f69d1001a"
+        "b2a4df4cccf5c7a4efadd9f6ca990e9b9c9eca8230024787c519c94b284d0f76"
     ),
     "src/polaris/eef_gripper_runtime.py": (
         "0687434bc2c61bb09739be473d5477f7b92d7b7b846a800298a89225f5b4f220"
@@ -243,7 +278,7 @@ CAPTURE_SOURCE_SHA256 = {
         "fb7094a37a1b6c676c61cce1a371d1f146db69183d55fd46d9db84c2a8739a8b"
     ),
     "src/polaris/robust_differential_ik.py": (
-        "83b25b04a43c36d5ba5f5b7ac5ba3481b6e864ec98c4be8c3a79bedfa458d0f0"
+        "a07a62f0ef5aebfb69e214e2c2d11bac197ab1a377686a72b02024e8285b16f4"
     ),
 }
 PRODUCER_SOURCE_SHA256 = {
@@ -294,15 +329,18 @@ RECOVERY_ZERO_COUNTERS = {
     "lower_endpoint_transition_aborts",
 }
 INLINE_CHECKS = {
+    "arm_observed_endpoint_change_count": 2,
     "pose_cases_passed": 13,
     "concurrent_apply_calls": 168,
     "closed_endpoint_fresh_dls_target_applies": 80,
     "closed_endpoint_distinct_desired_pose_count": 10,
     "recovery_owned_target_applies": 0,
     "deferred_endpoint_transition_count": 0,
+    "driver_endpoint_change_count": 2,
     "stored_target_replay_count": 0,
     "open_endpoint_samples": 99,
     "follower_threshold_crossing_samples": 0,
+    "interlock_control_counters_zero": True,
     "coupled_impulse_failure_samples": 0,
 }
 RAW_FIELDS = {
@@ -2111,6 +2149,10 @@ def _semantic_summary(raw: Mapping[str, Any]) -> dict[str, Any]:
     interlock = _object(
         controller.get("gripper_close_arm_interlock"), "close interlock"
     )
+    discriminator_driver = _object(
+        discriminator["ik_safety"]["gripper_runtime_dynamic"].get("driver_target_slew"),
+        "discriminator driver target slew",
+    )
     _require(
         set(interlock) == INTERLOCK_FIELDS
         and interlock.get("enabled") is False
@@ -2134,6 +2176,7 @@ def _semantic_summary(raw: Mapping[str, Any]) -> dict[str, Any]:
             "last_activation_apply_index",
             "last_anchor_joint_pos_rad",
             "last_anchor_little_endian_float32_sha256",
+            "observed_endpoint_change_count",
         }:
             continue
         if type(value) is int:
@@ -2142,6 +2185,14 @@ def _semantic_summary(raw: Mapping[str, Any]) -> dict[str, Any]:
             _require(value == [0.0] * 7, f"close interlock {field} maxima")
         else:
             raise VerificationError(f"unexpected close interlock field: {field}")
+    _exact_int(
+        interlock.get("observed_endpoint_change_count"),
+        discriminator_driver.get("endpoint_change_count"),
+        # This is cadence evidence, not disabled interlock control state.  The
+        # corrected producer must report the exact two-transition round trip
+        # on both the arm-side cursor and the validated finger driver.
+        "close interlock/discriminator driver endpoint-change cadence",
+    )
     _require(
         discriminator.get("open_endpoint_contact_mimic_impulse")
         == discriminator_telemetry,
@@ -2483,14 +2534,16 @@ def _scheduler_evidence() -> dict[str, Any]:
         raise VerificationError(f"Slurm accounting query failed: {error}") from error
     rows = [line.split("|") for line in completed.stdout.splitlines() if line.strip()]
     _require(
-        len(rows) == 4 and all(len(row) == 12 for row in rows),
+        len(rows) == 6 and all(len(row) == 12 for row in rows),
         "unexpected Slurm accounting rows",
     )
     names = {
-        "1098922": "allocation",
-        "1098922.batch": "batch",
-        "1098922.extern": "extern",
-        "1098922.0": "srun",
+        "1098975": "allocation",
+        "1098975.batch": "batch",
+        "1098975.extern": "extern",
+        "1098975.0": "srun",
+        "1098975.1": "monitoring_1",
+        "1098975.2": "monitoring_2",
     }
     actual: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -2891,7 +2944,7 @@ def _build_expected(args: argparse.Namespace) -> dict[str, Any]:
             "scene_post_job_digest_and_pre_srun_metadata_validated": True,
             "live_recovery_event_observed": False,
             "live_follower_threshold_crossing_observed": False,
-            "next_required_gate": "paired_official_and_reasoning_foodbussing_canaries",
+            "next_required_gate": NEXT_REQUIRED_GATE,
         },
         "reviewer": {
             "evidence_repo": str(args.evidence_repo),

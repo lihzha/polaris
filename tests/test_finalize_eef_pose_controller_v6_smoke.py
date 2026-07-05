@@ -14,19 +14,40 @@ from scripts import finalize_eef_pose_controller_v6_smoke as finalizer
 
 CAPTURE_ROOT = Path(
     "/home/lzha/code/ego-lap/.codex_artifacts/"
-    "polaris-v6-controller-smoke-6e4b7c5-job1098922-success"
+    "polaris-v6-cadence-smoke-3941840-job1098975-success"
+)
+SACCT_STDOUT = (
+    "1098975|pol_v6_cad_3941840|nvr_lpr_rvp|batch|COMPLETED|0:0|310|"
+    "2026-07-04T22:37:09|2026-07-04T22:42:19|pool0-00010|"
+    "billing=1,cpu=16,gres/gpu=1,mem=96G,node=1|"
+    "billing=1,cpu=16,gres/gpu=1,mem=96G,node=1\n"
+    "1098975.batch|batch|nvr_lpr_rvp||COMPLETED|0:0|310|"
+    "2026-07-04T22:37:09|2026-07-04T22:42:19|pool0-00010|"
+    "cpu=16,gres/gpu=1,mem=96G,node=1|\n"
+    "1098975.extern|extern|nvr_lpr_rvp||COMPLETED|0:0|310|"
+    "2026-07-04T22:37:09|2026-07-04T22:42:19|pool0-00010|"
+    "billing=1,cpu=16,gres/gpu=1,mem=96G,node=1|\n"
+    "1098975.0|env|nvr_lpr_rvp||COMPLETED|0:0|300|"
+    "2026-07-04T22:37:19|2026-07-04T22:42:19|pool0-00010|"
+    "cpu=16,gres/gpu=1,mem=96G,node=1|\n"
+    "1098975.1|nvidia-smi|nvr_lpr_rvp||COMPLETED|0:0|1|"
+    "2026-07-04T22:38:49|2026-07-04T22:38:50|pool0-00010|"
+    "cpu=1,gres/gpu=1,mem=96G,node=1|\n"
+    "1098975.2|nvidia-smi|nvr_lpr_rvp||COMPLETED|0:0|0|"
+    "2026-07-04T22:39:11|2026-07-04T22:39:11|pool0-00010|"
+    "cpu=1,gres/gpu=1,mem=96G,node=1|\n"
 )
 
 
 def _capture_paths(root: Path) -> dict[str, Path]:
     result = root / "result"
     return {
-        "raw_result": result / "smoke-1098922.raw.json",
-        "ready": result / "smoke-1098922.raw.json.ready.json",
-        "inline_attestation": result / "smoke-1098922.host-attestation.json",
-        "source_identity": result / "source-identity-1098922.sha256",
+        "raw_result": result / "smoke-1098975.raw.json",
+        "ready": result / "smoke-1098975.raw.json.ready.json",
+        "inline_attestation": result / "smoke-1098975.host-attestation.json",
+        "source_identity": result / "source-identity-1098975.sha256",
         "saved_job_script": root / "remote-saved-wrapper.sbatch",
-        "slurm_log": root / "pol_v6_ctrl_6e4b7c5-1098922.out",
+        "slurm_log": root / "pol_v6_cad_3941840-1098975.out",
     }
 
 
@@ -42,7 +63,7 @@ def _validate(paths: dict[str, Path]) -> dict:
 
 def _copy_capture(tmp_path: Path) -> dict[str, Path]:
     if not CAPTURE_ROOT.is_dir():
-        pytest.skip("local immutable job-1098922 capture is unavailable")
+        pytest.skip("local immutable job-1098975 capture is unavailable")
     source = _capture_paths(CAPTURE_ROOT)
     target_root = tmp_path / "capture"
     (target_root / "result").mkdir(parents=True)
@@ -52,9 +73,14 @@ def _copy_capture(tmp_path: Path) -> dict[str, Path]:
     return target
 
 
+def _exact_raw() -> dict:
+    raw_path = _capture_paths(CAPTURE_ROOT)["raw_result"]
+    return json.loads(raw_path.read_text())
+
+
 def test_exact_capture_identity_and_semantics_are_closed() -> None:
     if not CAPTURE_ROOT.is_dir():
-        pytest.skip("local immutable job-1098922 capture is unavailable")
+        pytest.skip("local immutable job-1098975 capture is unavailable")
 
     validated = _validate(_capture_paths(CAPTURE_ROOT))
 
@@ -88,6 +114,24 @@ def test_exact_capture_identity_and_semantics_are_closed() -> None:
     assert {
         name: entry["sha256"] for name, entry in validated["identities"].items()
     } == {name: spec["sha256"] for name, spec in finalizer.ARTIFACT_SPECS.items()}
+
+
+@pytest.mark.parametrize("observed_count", [0, 1, 3, True])
+def test_finalizer_rejects_disabled_interlock_driver_cadence_mutations(
+    observed_count,
+) -> None:
+    if not CAPTURE_ROOT.is_dir():
+        pytest.skip("local immutable job-1098975 capture is unavailable")
+    raw = _exact_raw()
+    raw["concurrent_arm_gripper_discriminator"]["controller_report"][
+        "gripper_close_arm_interlock"
+    ]["observed_endpoint_change_count"] = observed_count
+
+    with pytest.raises(
+        finalizer.VerificationError,
+        match="endpoint-change cadence",
+    ):
+        finalizer._semantic_summary(raw)
 
 
 @pytest.mark.parametrize(
@@ -153,10 +197,8 @@ def test_strict_json_rejects_duplicate_and_nonfinite_values() -> None:
 )
 def test_semantic_validator_rejects_nested_evidence_drift(mutation: str) -> None:
     if not CAPTURE_ROOT.is_dir():
-        pytest.skip("local immutable job-1098922 capture is unavailable")
-    raw_path = _capture_paths(CAPTURE_ROOT)["raw_result"]
-    raw = json.loads(raw_path.read_text())
-    mutated = deepcopy(raw)
+        pytest.skip("local immutable job-1098975 capture is unavailable")
+    mutated = deepcopy(_exact_raw())
     discriminator = mutated["concurrent_arm_gripper_discriminator"]
     if mutation == "safety_schema":
         discriminator["ik_safety"].pop("decimation")
@@ -257,26 +299,19 @@ def test_scheduler_evidence_binds_exact_terminal_allocation(monkeypatch) -> None
     monkeypatch.setattr(
         finalizer.subprocess,
         "run",
-        lambda *args, **kwargs: SimpleNamespace(
-            stdout=(
-                "1098922|pol_v6_ctrl_6e4b7c5|nvr_lpr_rvp|batch|COMPLETED|0:0|317|"
-                "2026-07-04T19:18:30|2026-07-04T19:23:47|pool0-00016|"
-                "billing=1,cpu=16,gres/gpu=1,mem=96G,node=1|"
-                "billing=1,cpu=16,gres/gpu=1,mem=96G,node=1\n"
-                "1098922.batch|batch|nvr_lpr_rvp||COMPLETED|0:0|317|"
-                "2026-07-04T19:18:30|2026-07-04T19:23:47|pool0-00016|"
-                "cpu=16,gres/gpu=1,mem=96G,node=1|\n"
-                "1098922.extern|extern|nvr_lpr_rvp||COMPLETED|0:0|317|"
-                "2026-07-04T19:18:30|2026-07-04T19:23:47|pool0-00016|"
-                "billing=1,cpu=16,gres/gpu=1,mem=96G,node=1|\n"
-                "1098922.0|env|nvr_lpr_rvp||COMPLETED|0:0|307|"
-                "2026-07-04T19:18:40|2026-07-04T19:23:47|pool0-00016|"
-                "cpu=16,gres/gpu=1,mem=96G,node=1|\n"
-            )
-        ),
+        lambda *args, **kwargs: SimpleNamespace(stdout=SACCT_STDOUT),
     )
 
-    assert finalizer._scheduler_evidence() == finalizer.EXPECTED_SCHEDULER_EVIDENCE
+    evidence = finalizer._scheduler_evidence()
+    assert evidence == finalizer.EXPECTED_SCHEDULER_EVIDENCE
+    assert set(evidence) == {
+        "allocation",
+        "batch",
+        "extern",
+        "srun",
+        "monitoring_1",
+        "monitoring_2",
+    }
 
 
 def test_scheduler_evidence_rejects_lifecycle_drift(monkeypatch) -> None:
@@ -285,20 +320,9 @@ def test_scheduler_evidence_rejects_lifecycle_drift(monkeypatch) -> None:
         finalizer.subprocess,
         "run",
         lambda *args, **kwargs: SimpleNamespace(
-            stdout=(
-                "1098922|pol_v6_ctrl_6e4b7c5|nvr_lpr_rvp|batch|COMPLETED|0:0|317|"
-                "2026-07-04T19:18:30|2026-07-04T19:23:47|pool0-00016|"
-                "billing=1,cpu=16,gres/gpu=1,mem=96G,node=1|"
-                "billing=1,cpu=16,gres/gpu=1,mem=96G,node=1\n"
-                "1098922.batch|batch|nvr_lpr_rvp||COMPLETED|0:0|317|"
-                "2026-07-04T19:18:30|2026-07-04T19:23:47|pool0-00016|"
-                "cpu=16,gres/gpu=1,mem=96G,node=1|\n"
-                "1098922.extern|extern|nvr_lpr_rvp||COMPLETED|0:0|317|"
-                "2026-07-04T19:18:30|2026-07-04T19:23:47|pool0-00016|"
-                "billing=1,cpu=16,gres/gpu=1,mem=96G,node=1|\n"
-                "1098922.0|env|nvr_lpr_rvp||FAILED|1:0|307|"
-                "2026-07-04T19:18:40|2026-07-04T19:23:47|pool0-00016|"
-                "cpu=16,gres/gpu=1,mem=96G,node=1|\n"
+            stdout=SACCT_STDOUT.replace(
+                "1098975.2|nvidia-smi|nvr_lpr_rvp||COMPLETED|0:0|0|",
+                "1098975.2|nvidia-smi|nvr_lpr_rvp||FAILED|1:0|0|",
             )
         ),
     )
@@ -610,13 +634,25 @@ def test_finalizer_is_stdlib_only_and_v5_modules_are_not_modified() -> None:
 
 
 def test_capture_constants_pin_exact_job_and_authorize_no_checkpoint() -> None:
-    assert finalizer.JOB_ID == 1098922
-    assert finalizer.PRODUCER_COMMIT == ("6e4b7c5be5ff6db670970774be3250c5d5ffa4d2")
-    assert finalizer.PRODUCER_PARENT == ("b6dec3d0c053066d65f6998cf1ecc33fc6e6e9ff")
-    assert finalizer.PROMOTION_STATUS.endswith("pending_two_checkpoint_canaries")
+    assert finalizer.JOB_ID == 1098975
+    assert finalizer.PRODUCER_COMMIT == ("39418400493cdcf8cd8272608980a798f7929a20")
+    assert finalizer.PRODUCER_PARENT == ("ee6d09351bed75e32db93ecf59c039a8e99fac9f")
+    assert finalizer.PROMOTION_STATUS == (
+        "validated_controller_smoke_pending_corrected_camera_image_contract_smoke_"
+        "then_two_checkpoint_canaries"
+    )
     assert finalizer.PROMOTION_SCOPE == (
         "standalone_controller_smoke_only_no_checkpoint_or_task_metric"
     )
+    assert finalizer.NEXT_REQUIRED_GATE == (
+        "corrected_camera_image_contract_smoke_before_paired_official_and_reasoning_"
+        "foodbussing_canaries"
+    )
+    source = Path(finalizer.__file__).read_text(encoding="utf-8")
+    assert '"status": PROMOTION_STATUS' in source
+    assert '"scope": PROMOTION_SCOPE' in source
+    assert '"camera_image_contract_validated": False' in source
+    assert '"next_required_gate": NEXT_REQUIRED_GATE' in source
     assert (
         max(
             finalizer.IMAGE_METADATA["mtime_ns"],

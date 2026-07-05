@@ -256,8 +256,9 @@ error is 0.4384913281711513 degrees, and maximum follower velocity is
 0.7730712294578552 rad/s. Controller aborts, coupled-impulse failure samples,
 and recovery events are all zero.
 
-The only authorized next request is a paired canary on `DROID-FoodBussing`,
-one rollout per checkpoint (two total):
+At that review point, before the later camera/image audit documented below,
+the recorded next request was a paired canary on `DROID-FoodBussing`, one
+rollout per checkpoint (two total):
 
 - official LAP-3B at HF revision
   `601db9c1ab4bcaf6dddb160c7b2dec589a67b730`, content manifest
@@ -299,5 +300,85 @@ promotion evidence SHA-256:
 ```
 
 No GPU, simulator, Slurm, checkpoint, canary, smoke-suite, or standard job was
-launched by this evidence-only change. The paired canary is merely the next
-permitted stage and still requires a separate exact launch review.
+launched by this evidence-only change. Its then-recorded paired-canary next
+stage is superseded by the corrected camera/image-contract requirement below.
+
+## Cadence-correct controller smoke and evidence finalizer
+
+The cadence repair was committed as producer
+`39418400493cdcf8cd8272608980a798f7929a20`, tree
+`7fc1ff24053e3aeab5ed3e06068089b5aa596bc6`, with direct parent
+`ee6d09351bed75e32db93ecf59c039a8e99fac9f`. Its fresh standalone L40S
+controller smoke, Slurm job `1098975` (`pol_v6_cad_3941840`), completed
+`0:0` on `pool0-00010`: the allocation ran from
+`2026-07-04T22:37:09-07:00` through `22:42:19`, and the main srun ran for
+300 seconds from `22:37:19` through `22:42:19`.
+
+The exact remote inputs are:
+
+- producer repo:
+  `/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-concurrent-v6-cadence-3941840-20260705T053510Z`;
+- result root:
+  `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris_eval/controller_concurrent_v6_cadence_smoke/3941840-20260705T053510Z`;
+- saved wrapper:
+  `/lustre/fsw/portfolios/nvr/users/lzha/launchers/polaris_eval/polaris_v6_cadence_smoke_3941840_20260705T053510Z.sbatch`;
+- Slurm log:
+  `/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris_eval/pol_v6_cad_3941840-1098975.out`.
+
+The copied immutable capture is
+`/home/lzha/code/ego-lap/.codex_artifacts/polaris-v6-cadence-smoke-3941840-job1098975-success`.
+Its pinned leaves are:
+
+- raw: 793,098 bytes, mode `0444`,
+  `393f0a57f409beb249635214ab2d7efb66783625048ddb18a5dc57426eaef2a5`;
+- ready: 380 bytes, mode `0444`,
+  `9e0a6826601a9d7019f6a4836a6524e259551bdc048b11e6184de0cf6dafc576`;
+- inline attestation: 1,923 bytes, mode `0444`,
+  `dfb0d40593241b85ea2af261e3de70d3c4d75fc6331109f38d32c305adefee42`;
+- source identity: 800 bytes, mode `0644`,
+  `d18a718f402d539d031ae699da1230144e8f9f016874530189d31916f508e2d1`;
+- saved wrapper: 10,396 bytes, mode `0444`,
+  `2215a73434d5c0f76368238932a8a18ebfd18125afb3b447f9396b4187fa18d4`;
+- Slurm log: 43,539 bytes, mode `0644`,
+  `115a7d83b887a3403138626cd85429615955ab99a050e07e9c710f093b772b56`.
+
+The producer source set is pinned to `b5b1b621...` for the smoke,
+`47f1a5af...` for config, `fa55f0b1...` for controller profile,
+`b2a4df4c...` for controller repair, `0687434b...` for gripper runtime,
+`bc34d745...` for IK safety, `fb7094a3...` for runtime contract, and
+`a07a62f0...` for robust differential IK. The additional production sources
+remain `b5464158...` for `scripts/eval.py` and `f66af500...` for the all-six
+gripper trace.
+
+All six exact Slurm rows are terminal and pinned: allocation, batch, extern,
+main srun `.0`, and the two read-only `nvidia-smi` monitoring steps `.1` and
+`.2`. The monitoring steps completed `0:0` on the same node at
+`22:38:49..22:38:50` and `22:39:11`, respectively. The canonical sealed
+sacct payload is 2,675 bytes with SHA-256
+`05464ee37834c59e55bef41eabd489cc85fb93b545594041d9e21e3eb92dabb1`.
+
+The smoke independently passed all 16 checks. Its discriminator records 168
+fresh-DLS applies, 80 closed-endpoint fresh applies, ten distinct closed
+desired poses, and exactly two driver endpoint changes. The disabled arm-side
+cursor also records exactly two changes. Every actual close-interlock,
+anchor, hold, release, deferred, and replay counter remains zero; no recovery,
+controller abort, non-finite sample, or coupled-impulse failure occurred. The
+closed semantic summary remains 17 safety reports, 5,856 applies, 732
+post-policy samples, 6,003 open-endpoint samples, and eight adversarial slew
+events.
+
+The adapted stdlib-only finalizer is 108,170 bytes with pre-commit SHA-256
+`953eb9e43c93a4aa3525bcd3001019348d30b38c0279be6ea51cfd88cd6c6d81`.
+It retains the exact arm/finger `2 == 2` cross-binding and the zero-control-
+state gate. The intended evidence commit changes only this worklog, the
+finalizer, and its focused test, and must be a direct child of producer
+`3941840`. No promotion attestation is claimed until that evidence-only child
+is committed and the finalizer is run against its clean detached checkout.
+
+A separate camera/image audit found an extra PolaRiS down/up filtering stage.
+This controller-only smoke therefore does not validate the camera/image
+contract and cannot authorize the paired checkpoint canaries directly. Its
+truthful status requires a corrected camera/image-contract smoke first, and
+only a passing result from that gate may advance to the paired official and
+reasoning FoodBussing canaries. The finalizer keeps
+`camera_image_contract_validated=false` and retains its controller-only scope.
