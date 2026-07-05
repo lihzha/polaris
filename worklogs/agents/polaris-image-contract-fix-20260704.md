@@ -81,3 +81,16 @@ compilation and `git diff --check` also passed.  No GPU process, simulator,
 Slurm allocation, checkpoint server, or evaluation was launched.  The image
 fix still requires a fresh real-PolaRiS image-contract smoke before any
 checkpoint canary or standard evaluation is authorized.
+
+## Handoff
+
+- `CODEX_AGENT_ID`: `polaris_image_contract_fix`
+- Branch: `codex/image-contract-fix-20260704`
+- Base: `39418400493cdcf8cd8272608980a798f7929a20`
+- Final implementation commit: `1b38a20875433dde0a1a0e09fbfd607cb5240f7d`
+- Implementation tree: `1d3ef5570cdc8d1403ded8816033c7d6aa1e4458`
+
+The temporary detached baseline-comparison worktree was removed after the
+failure-set comparison.  No owned process or job remains.  The dedicated
+implementation worktree and branch are retained for orchestrator review and
+integration.
