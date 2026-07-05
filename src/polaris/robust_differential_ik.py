@@ -1641,19 +1641,31 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         """Read the bound binary endpoint and stage one interlock transition."""
 
         configured_substeps = self._gripper_close_arm_interlock_configured_substeps
-        if type(configured_substeps) is not int or configured_substeps <= 0:
+        if (
+            type(configured_substeps) is not int
+            or configured_substeps < 0
+            or (self._gripper_close_arm_interlock_enabled and configured_substeps == 0)
+        ):
             raise ValueError(
                 "PolaRiS EEF close interlock has no target-slew profile binding"
             )
+        finger_term = getattr(self, "_gripper_target_slew_term", None)
+        if finger_term is None:
+            raise ValueError(
+                "PolaRiS EEF close interlock requires the installed gripper term"
+            )
+        endpoint_change_count = getattr(
+            finger_term, "_gripper_target_slew_endpoint_change_count", None
+        )
+        if type(endpoint_change_count) is not int or endpoint_change_count < 0:
+            raise ValueError("PolaRiS EEF close-interlock endpoint state drift")
         if not self._gripper_close_arm_interlock_enabled:
             return advance_gripper_close_arm_interlock(
                 enabled=False,
                 previous_endpoint_change_count=(
                     self._gripper_close_arm_interlock_observed_endpoint_change_count
                 ),
-                current_endpoint_change_count=(
-                    self._gripper_close_arm_interlock_observed_endpoint_change_count
-                ),
+                current_endpoint_change_count=endpoint_change_count,
                 endpoint_observed_before_apply=(
                     self._gripper_close_arm_interlock_endpoint_observed
                 ),
@@ -1661,18 +1673,10 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 remaining_before_apply=self._gripper_close_arm_interlock_remaining,
                 configured_substeps=configured_substeps,
             )
-        finger_term = getattr(self, "_gripper_target_slew_term", None)
-        if finger_term is None:
-            raise ValueError(
-                "PolaRiS EEF close interlock requires the installed gripper term"
-            )
         endpoint = getattr(finger_term, "_gripper_target_slew_endpoint", None)
         endpoint_seen = getattr(finger_term, "_gripper_target_slew_endpoint_seen", None)
         close_command = getattr(finger_term, "_close_command", None)
         open_command = getattr(finger_term, "_open_command", None)
-        endpoint_change_count = getattr(
-            finger_term, "_gripper_target_slew_endpoint_change_count", None
-        )
         if (
             endpoint_seen is not True
             or not isinstance(endpoint, torch.Tensor)
@@ -1690,8 +1694,6 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             or not bool(torch.isfinite(endpoint).all().item())
             or not bool(torch.isfinite(close_command).all().item())
             or not bool(torch.isfinite(open_command).all().item())
-            or type(endpoint_change_count) is not int
-            or endpoint_change_count < 0
         ):
             raise ValueError("PolaRiS EEF close-interlock endpoint state drift")
         expected_close = torch.full_like(close_command, GRIPPER_CLOSED_TARGET_FLOAT32)
@@ -3655,7 +3657,10 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         if not self._current_joint_velocity_recovery_enabled:
             close_interlock_transition = (
                 self._next_gripper_close_arm_interlock_transition()
-                if self._gripper_close_arm_interlock_enabled
+                if (
+                    self._gripper_close_arm_interlock_enabled
+                    or concurrent_arm_gripper_enabled
+                )
                 else DISABLED_GRIPPER_CLOSE_ARM_INTERLOCK_TRANSITION
             )
         ee_pos_curr, ee_quat_curr = self._compute_frame_pose()
@@ -4087,7 +4092,7 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             and self._gripper_close_arm_interlock_remaining > 0
         )
         if self._current_joint_velocity_recovery_enabled:
-            if lower_controller_suspended:
+            if lower_controller_suspended and self._gripper_close_arm_interlock_enabled:
                 close_interlock_transition = suspend_gripper_close_arm_interlock(
                     remaining_before_apply=(
                         self._gripper_close_arm_interlock_remaining
@@ -4102,7 +4107,10 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
             else:
                 close_interlock_transition = (
                     self._next_gripper_close_arm_interlock_transition()
-                    if self._gripper_close_arm_interlock_enabled
+                    if (
+                        self._gripper_close_arm_interlock_enabled
+                        or concurrent_arm_gripper_enabled
+                    )
                     else DISABLED_GRIPPER_CLOSE_ARM_INTERLOCK_TRANSITION
                 )
         if close_interlock_transition is None:

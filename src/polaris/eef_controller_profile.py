@@ -166,6 +166,11 @@ GRIPPER_CLOSE_ARM_INTERLOCK_COUNTER_FIELDS = (
     "anchor_completion_count",
     "anchor_open_cancel_count",
 )
+GRIPPER_CLOSE_ARM_INTERLOCK_CONTROL_COUNTER_FIELDS = tuple(
+    field
+    for field in GRIPPER_CLOSE_ARM_INTERLOCK_COUNTER_FIELDS
+    if field != "observed_endpoint_change_count"
+)
 ARM_RELEASE_RAMP_REPORT_FIELDS = {
     "enabled",
     "profile",
@@ -2232,7 +2237,7 @@ def validate_eef_controller_repair_candidate_report(
         if (
             any(
                 interlock[field] != 0
-                for field in GRIPPER_CLOSE_ARM_INTERLOCK_COUNTER_FIELDS
+                for field in GRIPPER_CLOSE_ARM_INTERLOCK_CONTROL_COUNTER_FIELDS
             )
             or interlock["endpoint_observed"] is not False
             or interlock["anchor_valid"] is not False

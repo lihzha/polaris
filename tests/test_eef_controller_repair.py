@@ -403,23 +403,35 @@ def test_float32_close_simulation_binds_nextafter_corrections():
     ) == (76, 75, 41)
 
 
-def test_disabled_interlock_is_a_zero_state_identity():
+def test_disabled_interlock_tracks_endpoint_cadence_without_control_state():
     assert DISABLED_GRIPPER_CLOSE_ARM_INTERLOCK_TRANSITION.active is False
-    transition = advance_gripper_close_arm_interlock(
+    transition = _advance_gripper_close_arm_interlock(
         enabled=False,
         previous_endpoint_change_count=0,
-        current_endpoint_change_count=0,
+        current_endpoint_change_count=1,
         endpoint_observed_before_apply=False,
         endpoint_is_closed=False,
         remaining_before_apply=0,
+        configured_substeps=0,
     )
     assert transition.active is False
     assert transition.remaining_after_successful_apply == 0
-    assert transition.observed_endpoint_change_count == 0
+    assert transition.observed_endpoint_change_count == 1
     assert transition.endpoint_observed_after_successful_apply is False
     assert transition.activation_count_delta == 0
     assert transition.completion_count_delta == 0
     assert transition.open_cancel_count_delta == 0
+
+    with pytest.raises(ValueError, match="positive int when enabled"):
+        _advance_gripper_close_arm_interlock(
+            enabled=True,
+            previous_endpoint_change_count=0,
+            current_endpoint_change_count=0,
+            endpoint_observed_before_apply=False,
+            endpoint_is_closed=False,
+            remaining_before_apply=0,
+            configured_substeps=0,
+        )
 
 
 def test_initial_close_starts_bounded_countdown_without_refresh():

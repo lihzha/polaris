@@ -26,6 +26,9 @@ from polaris.eef_runtime_contract import (
     EEF_RUNTIME_CONTRACT_VELOCITY_RECOVERY_SCHEMA_VERSION,
 )
 from polaris.eef_runtime_contract import (
+    EEF_SAFETY_SIDECAR_CONCURRENT_ARM_GRIPPER_SCHEMA_VERSION,
+)
+from polaris.eef_runtime_contract import (
     EEF_SAFETY_SIDECAR_VELOCITY_RECOVERY_SCHEMA_VERSION,
 )
 from polaris.eef_runtime_contract import eef_episode_safety_report
@@ -37,9 +40,11 @@ from polaris.eef_runtime_contract import validate_eef_runtime_safety
 from polaris.eef_runtime_contract import validate_ego_lap_runtime_protocol
 from polaris import eef_runtime_contract as runtime_contract_module
 from polaris.config import EEF_CONTROLLER_BASELINE_PROFILE
+from polaris.config import EEF_CONTROLLER_CONCURRENT_ARM_GRIPPER_CANDIDATE_PROFILE
 from polaris.config import EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE
 from polaris.config import EEF_CONTROLLER_RELEASE_RAMP_CANDIDATE_PROFILE
 from polaris.config import EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+from polaris.eef_controller_profile import CONCURRENT_ARM_GRIPPER_PROFILE
 from polaris.eef_controller_profile import eef_controller_profile
 from polaris.eef_controller_repair import ARM_RELEASE_RAMP_FORMULA_PROFILE
 from polaris.eef_controller_repair import ARM_RELEASE_RAMP_FRACTION_PROFILE
@@ -55,6 +60,9 @@ from polaris.eef_gripper_runtime import (
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+from polaris.eef_ik_safety import (
+    EEF_IK_CONCURRENT_ARM_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
+)
 from polaris.eef_ik_safety import (
     EEF_IK_CURRENT_VELOCITY_RECOVERY_CANDIDATE_PROFILE,
 )
@@ -914,6 +922,7 @@ def _candidate_controller_report(
     *,
     initial: bool,
     profile: str = EEF_CONTROLLER_MIMIC_COMPLIANCE_CANDIDATE_PROFILE,
+    endpoint_changes: int = 0,
 ) -> dict:
     spec = eef_controller_profile(profile)
     physical = np.asarray(safety["max_delta_joint_pos_rad"], dtype=np.float32).tolist()
@@ -931,12 +940,14 @@ def _candidate_controller_report(
             "nominal_max_delta_joint_pos_rad": nominal,
         },
         "gripper_close_arm_interlock": {
-            "enabled": True,
+            "enabled": spec.gripper_close_arm_interlock_enabled,
             "profile": spec.close_interlock_profile,
             "configured_substeps": spec.close_interlock_substeps,
             "remaining_substeps": 0,
-            "observed_endpoint_change_count": 0,
-            "endpoint_observed": not initial,
+            "observed_endpoint_change_count": endpoint_changes,
+            "endpoint_observed": (
+                not initial and spec.gripper_close_arm_interlock_enabled
+            ),
             "activation_count": 0,
             "active_apply_count": 0,
             "anchor_valid": False,
@@ -990,6 +1001,19 @@ def _candidate_controller_report(
             "last_ramp_index": None,
             "max_abs_nominal_to_ramped_target_change_rad": [0.0] * 7,
             "gripper_target_or_state_write_count": 0,
+        }
+    if spec.concurrent_arm_gripper_enabled:
+        apply_calls = safety["counters"]["apply_calls"]
+        report["concurrent_arm_gripper"] = {
+            "enabled": True,
+            "profile": CONCURRENT_ARM_GRIPPER_PROFILE,
+            "fresh_dls_target_applies": apply_calls,
+            "normal_target_setter_applies": apply_calls,
+            "closed_endpoint_fresh_dls_target_applies": 0,
+            "closed_endpoint_distinct_desired_pose_count": 0,
+            "recovery_owned_target_applies": 0,
+            "deferred_endpoint_transition_count": 0,
+            "stored_target_replay_count": 0,
         }
     if spec.current_joint_velocity_recovery_enabled:
         report["current_joint_velocity_recovery"] = _empty_velocity_recovery_report()
@@ -2191,6 +2215,104 @@ def test_velocity_recovery_v5_sidecar_is_schema7_and_profile_bound(
                 expected_eef_controller_profile=(
                     EEF_CONTROLLER_VELOCITY_RECOVERY_CANDIDATE_PROFILE
                 ),
+                expected_gripper_target_slew_profile=(
+                    EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+                ),
+            )
+
+
+def test_concurrent_v6_sidecar_binds_disabled_interlock_to_driver_cadence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    result = _episode_result(length=450)
+    safety = _attach_candidate_stub_gripper(
+        _episode_safety(length=450),
+        length=450,
+    )
+    safety["profile"] = EEF_IK_CONCURRENT_ARM_VELOCITY_RECOVERY_CANDIDATE_PROFILE
+    safety["current_joint_velocity_abort"] = None
+    safety["current_joint_velocity_recovery"] = _empty_velocity_recovery_report()
+    dynamic = safety["gripper_runtime_dynamic"]
+    dynamic["driver_target_slew"]["endpoint_change_count"] = 2
+    dynamic["open_endpoint_contact_mimic_impulse"] = {
+        "passed": True,
+        "arm_velocity_envelopes_rad_s": safety["current_joint_velocity_recovery"][
+            "contract"
+        ]["velocity_envelopes_rad_s"],
+    }
+    report = _candidate_controller_report(
+        safety,
+        initial=False,
+        profile=EEF_CONTROLLER_CONCURRENT_ARM_GRIPPER_CANDIDATE_PROFILE,
+        endpoint_changes=2,
+    )
+    trace = _all_six_trace(episode=0, length=450, apply_calls=3600)
+    terminal = _terminal_rollout(result)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            runtime_contract_module,
+            "validate_eef_gripper_static_contract",
+            lambda value, **_kwargs: dict(value),
+        )
+        patch.setattr(
+            runtime_contract_module,
+            "validate_eef_gripper_dynamic_evidence",
+            lambda value, **_kwargs: dict(value),
+        )
+        patch.setattr(
+            runtime_contract_module,
+            "validate_eef_controller_safety_evidence",
+            lambda *_args, expected_profile, **_kwargs: eef_controller_profile(
+                expected_profile
+            ),
+        )
+        payload = atomic_write_episode_safety(
+            tmp_path / "matching" / "episode_000000.json",
+            eef_controller_profile=(
+                EEF_CONTROLLER_CONCURRENT_ARM_GRIPPER_CANDIDATE_PROFILE
+            ),
+            controller_repair_candidate=report,
+            arm_failure_substep_trace=None,
+            all_six_gripper_trace=trace,
+            episode_index=0,
+            episode_result=result,
+            safety=safety,
+            artifact_identity=_artifact_identity_for_terminal(result, terminal),
+            terminal_rollout=terminal,
+            expected_gripper_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+        )
+        assert (
+            payload["schema_version"]
+            == EEF_SAFETY_SIDECAR_CONCURRENT_ARM_GRIPPER_SCHEMA_VERSION
+            == 8
+        )
+        assert (
+            payload["controller_repair_candidate"]["gripper_close_arm_interlock"][
+                "observed_endpoint_change_count"
+            ]
+            == 2
+        )
+
+        drifted = copy.deepcopy(report)
+        drifted["gripper_close_arm_interlock"]["observed_endpoint_change_count"] = 1
+        with pytest.raises(ValueError, match="endpoint-change cadence drift"):
+            atomic_write_episode_safety(
+                tmp_path / "drifted" / "episode_000000.json",
+                eef_controller_profile=(
+                    EEF_CONTROLLER_CONCURRENT_ARM_GRIPPER_CANDIDATE_PROFILE
+                ),
+                controller_repair_candidate=drifted,
+                arm_failure_substep_trace=None,
+                all_six_gripper_trace=trace,
+                episode_index=0,
+                episode_result=result,
+                safety=safety,
+                artifact_identity=_artifact_identity_for_terminal(result, terminal),
+                terminal_rollout=terminal,
                 expected_gripper_target_slew_profile=(
                     EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
                 ),

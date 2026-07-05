@@ -809,7 +809,6 @@ def main(state: dict[str, object]) -> int:
         interlock = concurrent_report["gripper_close_arm_interlock"]
         interlock_counter_fields = (
             "remaining_substeps",
-            "observed_endpoint_change_count",
             "activation_count",
             "active_apply_count",
             "released_apply_count",
@@ -826,6 +825,9 @@ def main(state: dict[str, object]) -> int:
         )
         telemetry = concurrent_safety["gripper_runtime_dynamic"][
             "open_endpoint_contact_mimic_impulse"
+        ]
+        driver_target_slew = concurrent_safety["gripper_runtime_dynamic"][
+            "driver_target_slew"
         ]
         concurrent_policy_steps = 1 + 2 * transition_policy_steps
         expected_apply_calls = concurrent_policy_steps * 8
@@ -848,6 +850,8 @@ def main(state: dict[str, object]) -> int:
             and interlock["configured_substeps"] == 0
             and interlock["endpoint_observed"] is False
             and interlock["anchor_valid"] is False
+            and interlock["observed_endpoint_change_count"]
+            == driver_target_slew["endpoint_change_count"]
             and all(interlock[field] == 0 for field in interlock_counter_fields)
             and "arm_release_ramp" not in concurrent_report
             and telemetry["open_endpoint_samples"] > 0

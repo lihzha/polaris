@@ -570,7 +570,7 @@ def _candidate_report() -> dict:
     }
 
 
-def _concurrent_v6_report(*, apply_calls: int) -> dict:
+def _concurrent_v6_report(*, apply_calls: int, endpoint_changes: int = 0) -> dict:
     report = _candidate_report()
     interlock = report["gripper_close_arm_interlock"]
     interlock.update(
@@ -578,6 +578,7 @@ def _concurrent_v6_report(*, apply_calls: int) -> dict:
             "enabled": False,
             "profile": CONCURRENT_ARM_NO_CLOSE_INTERLOCK_PROFILE,
             "configured_substeps": 0,
+            "observed_endpoint_change_count": endpoint_changes,
         }
     )
     report["concurrent_arm_gripper"] = {
@@ -608,7 +609,7 @@ def test_concurrent_v6_report_has_explicit_disabled_interlock_and_fresh_dls_cade
             }
         },
     )
-    report = _concurrent_v6_report(apply_calls=80)
+    report = _concurrent_v6_report(apply_calls=80, endpoint_changes=15)
     validated = validate_eef_controller_repair_candidate_report(
         report,
         expected_profile=EEF_CONTROLLER_CONCURRENT_ARM_GRIPPER_CANDIDATE_PROFILE,
@@ -619,6 +620,9 @@ def test_concurrent_v6_report_has_explicit_disabled_interlock_and_fresh_dls_cade
         apply_calls=80,
     )
     assert validated["gripper_close_arm_interlock"]["configured_substeps"] == 0
+    assert (
+        validated["gripper_close_arm_interlock"]["observed_endpoint_change_count"] == 15
+    )
     assert "arm_release_ramp" not in validated
     drifted = copy.deepcopy(report)
     drifted["concurrent_arm_gripper"]["stored_target_replay_count"] = 1
@@ -691,6 +695,11 @@ def test_controller_smoke_has_v6_moving_close_reopen_target_surface_gate() -> No
     assert '"closed_endpoint_distinct_desired_pose_count"' in source
     assert '"stored_target_replay_count"' in source
     assert '"open_endpoint_contact_mimic_impulse"' in source
+    assert 'driver_target_slew = concurrent_safety["gripper_runtime_dynamic"]' in source
+    assert (
+        'interlock["observed_endpoint_change_count"]\n'
+        '            == driver_target_slew["endpoint_change_count"]' in source
+    )
     assert '"arm_release_ramp" not in concurrent_report' in source
     assert '"eef_open115_then_close5_same_arm_pose_v1"' in source
     assert '"eef_open115_then_close10_same_arm_pose_v2"' in source

@@ -216,6 +216,37 @@ for label, open_command, close_command in malformed_commands:
 finger._open_command = valid_open
 finger._close_command = valid_close
 
+# Disabled concurrent-arm mode still consumes the driver's endpoint-change
+# cadence, but it must never create hold/interlock control state.
+concurrent_finger = Finger()
+concurrent_action = bare_action()
+concurrent_action.install_gripper_runtime_contract(
+    static, finger_term=concurrent_finger
+)
+concurrent_action._gripper_close_arm_interlock_enabled = False
+concurrent_action._gripper_close_arm_interlock_configured_substeps = 0
+concurrent_action._gripper_close_arm_interlock_observed_endpoint_change_count = 0
+concurrent_action._gripper_close_arm_interlock_endpoint_observed = False
+concurrent_action._gripper_close_arm_interlock_remaining = 0
+concurrent_finger._gripper_target_slew_endpoint_change_count = 1
+disabled_transition = (
+    concurrent_action._next_gripper_close_arm_interlock_transition()
+)
+assert disabled_transition.active is False
+assert disabled_transition.remaining_after_successful_apply == 0
+assert disabled_transition.observed_endpoint_change_count == 1
+assert disabled_transition.endpoint_observed_after_successful_apply is False
+assert disabled_transition.activation_count_delta == 0
+assert disabled_transition.completion_count_delta == 0
+assert disabled_transition.open_cancel_count_delta == 0
+concurrent_action._gripper_close_arm_interlock_observed_endpoint_change_count = 1
+concurrent_finger._gripper_target_slew_endpoint_change_count = 2
+second_disabled_transition = (
+    concurrent_action._next_gripper_close_arm_interlock_transition()
+)
+assert second_disabled_transition.observed_endpoint_change_count == 2
+assert second_disabled_transition.active is False
+
 
 class SetterAsset:
     def __init__(self, failure):
@@ -571,7 +602,7 @@ disabled_staged = robust._StagedGripperCloseArmInterlockState(
     anchor_open_cancel_count=0,
     last_activation_apply_index=None,
     remaining=0,
-    observed_endpoint_change_count=0,
+    observed_endpoint_change_count=1,
     endpoint_observed=False,
     activation_count=0,
     active_apply_count=0,
@@ -621,6 +652,7 @@ assert concurrent._current_joint_velocity_recovery_events[0]["end_reason"] == (
     "clean2_concurrent_resume"
 )
 assert concurrent._concurrent_arm_recovery_owned_target_applies == 3
+assert concurrent._gripper_close_arm_interlock_observed_endpoint_change_count == 1
 assert concurrent._gripper_close_arm_interlock_activation_count == 0
 assert concurrent._gripper_close_arm_interlock_active_apply_count == 0
 concurrent._apply_call_count = 4
@@ -1266,6 +1298,11 @@ v5_next_gripper = apply_source.index(
     dls_dispatch,
 )
 assert overflow_guard < dls_dispatch < v5_next_gripper < target_setter
+assert (
+    "if lower_controller_suspended and self._gripper_close_arm_interlock_enabled:"
+    in apply_source
+)
+assert apply_source.count("or concurrent_arm_gripper_enabled") >= 2
 
 print("robust_target_slew_host_stub_ok")
 """

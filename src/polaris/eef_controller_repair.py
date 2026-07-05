@@ -681,7 +681,9 @@ def advance_gripper_close_arm_interlock(
     A newly observed close transition starts the caller's profile-bound
     substep window. A newly observed open transition cancels it. Repeated
     endpoint commands do not refresh the countdown, so a policy cannot freeze
-    the arm forever by merely holding a binary close action.
+    the arm forever by merely holding a binary close action. Disabled mode
+    advances only the endpoint-change cadence cursor and retains no control
+    state.
     """
 
     for name, value in (
@@ -691,16 +693,21 @@ def advance_gripper_close_arm_interlock(
     ):
         if type(value) is not int or value < 0:
             raise ValueError(f"PolaRiS EEF {name} must be a non-negative int")
-    if type(configured_substeps) is not int or configured_substeps <= 0:
-        raise ValueError(
-            "PolaRiS EEF configured interlock substeps must be a positive int"
-        )
     if (
         type(enabled) is not bool
         or type(endpoint_observed_before_apply) is not bool
         or type(endpoint_is_closed) is not bool
     ):
         raise ValueError("PolaRiS EEF close-interlock flags must be bool")
+    if (
+        type(configured_substeps) is not int
+        or configured_substeps < 0
+        or (enabled and configured_substeps == 0)
+    ):
+        raise ValueError(
+            "PolaRiS EEF configured interlock substeps must be a positive int "
+            "when enabled and a non-negative int when disabled"
+        )
     if current_endpoint_change_count < previous_endpoint_change_count:
         raise ValueError("PolaRiS EEF gripper endpoint-change count regressed")
     count_delta = current_endpoint_change_count - previous_endpoint_change_count
