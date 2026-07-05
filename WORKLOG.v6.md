@@ -166,3 +166,46 @@ broad host-safe: 1037 passed, 1 skipped, 8 deselected, 1 warning, 30 subtests pa
 
 Ruff lint/format, Python compilation, and `git diff --check` pass. The eight
 deselections are the same immutable-v5 source-identity gates documented above.
+
+## Reviewed post-job finalizer
+
+Job `1098922` completed `0:0` after 317 seconds on `pool0-00016`. Its exact
+raw/ready/inline-attestation/source/wrapper/log bundle was fetched and passed
+an independent strict-JSON, finite-value, source-byte, mode/hash, scheduler,
+counter, and log audit. The inline wrapper attestation is retained as an input,
+not used as the promotion attestation, because it does not bind the producer
+parent, saved wrapper and log, terminal Slurm lifecycle, or a reviewed
+finalizer identity.
+
+`scripts/finalize_eef_pose_controller_v6_smoke.py` is a new stdlib-only,
+v6-specific evidence finalizer. It changes no simulator/controller source and
+does not touch either immutable v5 promotion module. It pins all six capture
+artifacts, producer commit/tree/parent and ten source hashes, the exact image
+and FoodBussing scene, the allocation/batch/extern/srun terminal `sacct` rows,
+and the evidence-descendant commit/tree/finalizer hash. Image and scene
+size/mode/link/time metadata are pinned; both mtime and ctime predate the srun,
+recovering temporal provenance for the otherwise post-job scene digest. Input
+leaves use lstat/open/fstat/read/fstat/lstat binding and reject symlinks,
+hardlinks, mode drift, and parent replacement. The fixed l401 aliases must
+resolve to the pinned canonical user root, and both Git inputs must be clean,
+standalone, top-level detached checkouts with in-root `.git` directories.
+
+The semantic verifier independently closes every nested result/safety/
+gripper/recovery/controller schema, reconstructs the 13 target geometries and
+the 21-pose concurrent discriminator, binds per-report cadence and aggregates,
+and proves finite adversarial q/dq plus genuine bounded slew saturation. It
+publishes only one non-overwriting mode-0444 promotion attestation and labels
+its scope as a standalone controller smoke with no checkpoint or task metric.
+
+Host-safe finalizer validation before commit:
+
+```text
+focused finalizer: 47 passed
+broad host-safe: 1084 passed, 1 skipped, 8 deselected, 1 warning, 30 subtests passed
+```
+
+The eight deselections are the same immutable-v5 source-identity gates listed
+above. Ruff lint/format, Python compilation, and `git diff --check` pass. The
+separate promotion manifest and any checkpoint-canary authorization remain
+blocked until this committed finalizer is run and its immutable output is
+verified.
