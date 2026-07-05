@@ -94,8 +94,10 @@ and non-array/old-gate launcher guards.
 
 The orchestrator-owned controller smoke job `1099012` failed safely before
 target execution because the first core runtime report conflated raw PhysX hard
-limits with tolerance-adjusted guard limits. This agent did not launch, cancel,
-or mutate that job. The core agent is preparing a corrected descendant. Per
+limits with Isaac Lab's separately derived factor-1 float32 soft limits. This
+was midpoint/range rounding, not a comparison tolerance. This agent did not
+launch, cancel, or mutate that job. The core agent prepared a corrected
+descendant with a zero-inset hard/soft-intersection guard. Per
 orchestrator direction, this wrapper implementation is handed off against
 `921a3e2`; the orchestrator will cherry-pick it onto the reviewed corrected-core
 descendant and own the cluster canary. No cluster job was launched, cancelled,

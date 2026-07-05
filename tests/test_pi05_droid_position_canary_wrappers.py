@@ -397,3 +397,17 @@ def test_resolved_contract_binds_train_matched_images_stats_and_flow():
     assert contract["execution"]["arm_formula"] == (
         "q_target_t=fresh_measured_q_t+0.2*clip(command_t,-1,1)"
     )
+    limits = contract["execution"]["position_limits"]
+    assert limits["profile"] == (
+        "openpi_pi05_droid_position_limits_factor1_hard_soft_intersection_v1"
+    )
+    assert limits["hard_limits"]["little_endian_float32_sha256"] == (
+        "d7ec7ea6108d670f910c43a9fba370e5023c7a5b9aa31df06b89ffc172529e00"
+    )
+    assert limits["isaaclab_soft_limits"]["little_endian_float32_sha256"] == (
+        "fbf7535901c042fea5d901812ecd02c5fd81ade06c23c1499c32d66a859104de"
+    )
+    assert limits["target_guard"]["little_endian_float32_sha256"] == (
+        "558f0c01f992abe1e6c60559665047d115b4891d25cd627c7bd68d9e9cbcfedb"
+    )
+    assert limits["target_guard"]["guard_inset_rad"] == 0.0

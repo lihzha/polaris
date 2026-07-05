@@ -56,7 +56,10 @@ from polaris.pi05_droid_native_eval_contract import (
     publish_immutable_json,
     validate_immutable_json,
 )
-from polaris.pi05_droid_position_adapter import PI05_DROID_POSITION_ADAPTER_PROFILE
+from polaris.pi05_droid_position_adapter import (
+    PI05_DROID_POSITION_ADAPTER_PROFILE,
+    expected_position_limit_contract,
+)
 from polaris.pi05_droid_position_contract import (
     PI05_DROID_CHECKPOINT_BYTES,
     PI05_DROID_CHECKPOINT_MANIFEST_SHA256,
@@ -1137,6 +1140,7 @@ def resolved_contract() -> dict[str, Any]:
             "simulator_command": "absolute_joint_position_target",
             "same_target_apply_calls": 8,
             "gripper": "absolute_closed_positive_binarize_gt_0p5",
+            "position_limits": expected_position_limit_contract(),
         },
         "transport": {
             "host": "127.0.0.1",
