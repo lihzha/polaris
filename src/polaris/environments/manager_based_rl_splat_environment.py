@@ -1,5 +1,4 @@
 import torch
-import cv2
 from pathlib import Path
 import numpy as np
 
@@ -15,6 +14,7 @@ from polaris.environments.rubrics import Rubric
 from polaris.headless_viewport import (
     install_isaaclab_headless_viewport_camera_guard,
 )
+from polaris.splat_image_contract import splat_rgb_float_to_uint8
 
 
 class ManagerBasedRLSplatEnv(ManagerBasedRLEnv):
@@ -291,12 +291,6 @@ class ManagerBasedRLSplatEnv(ManagerBasedRLEnv):
 
         # process output
         for k, v in rgb.items():
-            rgb[k] = v.detach().cpu().numpy()
-            rgb[k] = np.clip(rgb[k], 0, 1)
-            rgb[k] = (rgb[k] * 255).astype(np.uint8)
-
-            # TODO: why is there a resize?
-            rgb[k] = cv2.resize(rgb[k], (rgb[k].shape[1] // 2, rgb[k].shape[0] // 2))
-            rgb[k] = cv2.resize(rgb[k], (rgb[k].shape[1] * 2, rgb[k].shape[0] * 2))
+            rgb[k] = splat_rgb_float_to_uint8(v)
 
         return rgb
