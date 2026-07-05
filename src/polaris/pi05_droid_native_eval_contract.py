@@ -792,7 +792,10 @@ def should_render_expensive(
 ) -> bool:
     """Keep native video cadence separate without changing other clients."""
 
-    if policy_client_name != "DroidJointVelocity":
+    if policy_client_name not in {
+        "DroidJointVelocity",
+        "DroidDeltaJointPosition",
+    }:
         return needs_next_policy_render
 
     if (

@@ -21,6 +21,7 @@ def main(eval_args: EvalArgs):
         NATIVE_GRIPPER_DRIVE_PROFILE,
     )
 
+    position_adapter = eval_args.policy.client == "DroidDeltaJointPosition"
     if (
         eval_args.policy.client == "EgoLAPEefPose"
         and eval_args.control_mode != "eef-pose"
@@ -36,6 +37,12 @@ def main(eval_args: EvalArgs):
         and eval_args.control_mode != "joint-velocity"
     ):
         raise ValueError("DroidJointVelocity requires --control-mode joint-velocity")
+    if position_adapter and eval_args.control_mode != "joint-position":
+        raise ValueError(
+            "DroidDeltaJointPosition requires --control-mode joint-position"
+        )
+    if position_adapter and eval_args.rollouts != 1:
+        raise ValueError("DroidDeltaJointPosition requires exactly one rollout")
     if (
         eval_args.control_mode == "joint-velocity"
         and eval_args.policy.client != "DroidJointVelocity"
@@ -43,21 +50,29 @@ def main(eval_args: EvalArgs):
         raise ValueError(
             "joint-velocity control mode is reserved for DroidJointVelocity"
         )
-    if eval_args.policy.client == "DroidJointVelocity" and (
+    if (eval_args.policy.client == "DroidJointVelocity" or position_adapter) and (
         not eval_args.runtime_contract_path
         or not eval_args.lifecycle_ready_path
         or not eval_args.policy.trace_path
     ):
         raise ValueError(
-            "DroidJointVelocity requires --runtime-contract-path and "
+            "Audited pi0.5-DROID clients require --runtime-contract-path and "
             "--lifecycle-ready-path and --policy.trace-path"
         )
     if eval_args.control_mode == "joint-velocity":
         if eval_args.expected_gripper_drive_profile != NATIVE_GRIPPER_DRIVE_PROFILE:
-            raise ValueError("joint-velocity expected gripper drive profile mismatch")
+            raise ValueError(
+                "joint-velocity expected gripper drive profile mismatch"
+            )
+    elif position_adapter:
+        if eval_args.expected_gripper_drive_profile != NATIVE_GRIPPER_DRIVE_PROFILE:
+            raise ValueError(
+                "DroidDeltaJointPosition expected gripper drive profile mismatch"
+            )
     elif eval_args.expected_gripper_drive_profile is not None:
         raise ValueError(
-            "expected gripper drive profile is valid only for joint-velocity control"
+            "expected gripper drive profile is valid only for joint-velocity control "
+            "or DroidDeltaJointPosition"
         )
 
     # This must be done before importing anything from IsaacLab
@@ -92,6 +107,14 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         EefPoseActionCfg,
     )
     from polaris.environments.robot_cfg import NVIDIA_DROID_JOINT_VELOCITY
+    from polaris.environments.pi05_droid_position_cfg import (
+        DroidPositionAdapterActionCfg,
+        DroidPositionAdapterEventCfg,
+        DroidPositionAdapterObservationCfg,
+    )
+    from polaris.environments.pi05_droid_position_robot_cfg import (
+        NVIDIA_DROID_POSITION_ADAPTER,
+    )
     from polaris.joint_velocity_runtime import (
         print_joint_velocity_runtime,
         validate_joint_velocity_runtime,
@@ -107,6 +130,15 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         publish_immutable_json,
         should_render_expensive,
     )
+    from polaris.pi05_droid_position_runtime import (
+        capture_position_adapter_runtime,
+        make_position_close_ready,
+        make_position_episode_sidecar,
+        make_position_failure_close_ready,
+        make_position_failure_sidecar,
+        make_position_safety_report,
+        print_position_adapter_runtime,
+    )
     from polaris.utils import load_eval_initial_conditions
     from polaris.policy import InferenceClient
     from polaris.policy.droid_jointpos_client import (
@@ -115,10 +147,13 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
     from polaris.policy.droid_jointvelocity_client import (
         JointVelocityObservationNumericalError,
     )
+    from polaris.policy.droid_delta_position_client import PositionTargetLimitError
     from polaris.robust_differential_ik import DifferentialIKNumericalError
     from polaris.native_gripper_runtime import NativeAllJointVelocityLimitError
     # from real2simeval.autoscoring import TASK_TO_SUCCESS_CHECKER
 
+    position_adapter = eval_args.policy.client == "DroidDeltaJointPosition"
+    audited_droid = eval_args.control_mode == "joint-velocity" or position_adapter
     env_cfg = parse_env_cfg(
         eval_args.environment,
         device="cuda",
@@ -135,6 +170,14 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         env_cfg.actions = DroidJointVelocityActionCfg()
         env_cfg.events = DroidJointVelocityEventCfg()
         env_cfg.observations = DroidJointVelocityObservationCfg()
+        configured_episode_length_seconds = configure_native_environment_timeout(
+            env_cfg
+        )
+    elif position_adapter:
+        env_cfg.scene.robot = NVIDIA_DROID_POSITION_ADAPTER.copy()
+        env_cfg.actions = DroidPositionAdapterActionCfg()
+        env_cfg.events = DroidPositionAdapterEventCfg()
+        env_cfg.observations = DroidPositionAdapterObservationCfg()
         configured_episode_length_seconds = configure_native_environment_timeout(
             env_cfg
         )
@@ -163,6 +206,19 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         runtime_artifact = publish_immutable_json(
             Path(eval_args.runtime_contract_path),
             make_runtime_artifact(runtime_contract, environment_runtime_contract),
+        )
+    elif position_adapter:
+        # Reset-mode events establish the all-six gripper limits before the
+        # live controller report is accepted. The rollout reset repeats them.
+        env.reset(expensive=False)
+        environment_runtime_contract = make_environment_runtime_contract(
+            configured_episode_length_seconds=configured_episode_length_seconds,
+            live_max_episode_length=env.max_episode_length,
+        )
+        runtime_contract = capture_position_adapter_runtime(env)
+        print_position_adapter_runtime(runtime_contract)
+        runtime_artifact = publish_immutable_json(
+            Path(eval_args.runtime_contract_path), runtime_contract
         )
 
     default_instruction, initial_conditions = load_eval_initial_conditions(
@@ -207,26 +263,34 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
     policy_client: InferenceClient = InferenceClient.get_client(eval_args.policy)
     if eval_args.control_mode == "joint-velocity":
         policy_client.bind_evaluation_runtime(environment_runtime_contract)
+    elif position_adapter:
+        policy_client.bind_evaluation_runtime(environment_runtime_contract)
 
     horizon = (
         PI05_DROID_NATIVE_EPISODE_STEPS
-        if eval_args.control_mode == "joint-velocity"
+        if audited_droid
         else env.max_episode_length
     )
     terminal_outcome = None
     episode_sidecar_artifact = None
+    position_safety_report = None
+    trace_artifact = None
+    metrics_artifact = None
     while episode < rollouts:
         # Index the initial condition with the episode being started. The old
         # loop reset before incrementing ``episode``, repeating condition zero.
         obs, info = env.reset(object_positions=initial_conditions[episode])
         policy_client.reset()
         native_arm_term = None
-        if eval_args.control_mode == "joint-velocity":
-            policy_client.begin_rollout(env)
+        if audited_droid:
             native_arm_term = getattr(env, "unwrapped", env).action_manager._terms[
                 "arm"
             ]
             native_arm_term.bind_native_all_joint_failure_path(incident_path)
+        if position_adapter:
+            policy_client.begin_rollout(env)
+        if eval_args.control_mode == "joint-velocity":
+            policy_client.begin_rollout(env)
         video = []
         numerical_failure_reason = ""
         incident_artifact = None
@@ -253,10 +317,28 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                 action, viz = policy_client.infer(
                     obs, language_instruction, return_viz=True
                 )
+            except PositionTargetLimitError as error:
+                if not position_adapter:
+                    raise
+                video.append(policy_client.visualize(obs))
+                dynamic_report = native_arm_term.native_all_joint_dynamic_report(
+                    include_samples=False
+                )
+                terminal_outcome = policy_client.record_target_limit_failure(
+                    error, env, dynamic_report
+                )
+                numerical_failure_reason = terminal_outcome["reason"]
+                incident_artifact = error.incident_artifact
+                bar.update(1)
+                break
             except (
                 JointPositionObservationNumericalError,
                 JointVelocityObservationNumericalError,
             ) as error:
+                if position_adapter:
+                    # State/image/schema corruption is a contract-fatal error,
+                    # not a controller numerical outcome.
+                    raise
                 if eval_args.control_mode == "joint-velocity" and isinstance(
                     error, JointVelocityObservationNumericalError
                 ):
@@ -283,6 +365,17 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                     ),
                 )
             except NativeAllJointVelocityLimitError as error:
+                if position_adapter:
+                    dynamic_report = native_arm_term.native_all_joint_dynamic_report(
+                        include_samples=False
+                    )
+                    terminal_outcome = policy_client.record_execution_failure(
+                        error, env, dynamic_report
+                    )
+                    numerical_failure_reason = terminal_outcome["reason"]
+                    incident_artifact = error.incident_artifact
+                    bar.update(1)
+                    break
                 if eval_args.control_mode != "joint-velocity":
                     raise
                 (
@@ -307,10 +400,29 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                 # attempted action, so include it in the episode length.
                 bar.update(1)
                 break
-            if eval_args.control_mode == "joint-velocity":
+            if audited_droid:
                 try:
                     native_arm_term.record_native_all_joint_post_policy_step()
                 except NativeAllJointVelocityLimitError as error:
+                    if position_adapter:
+                        policy_client.record_execution(
+                            obs,
+                            env,
+                            terminated=term,
+                            truncated=trunc,
+                        )
+                        dynamic_report = (
+                            native_arm_term.native_all_joint_dynamic_report(
+                                include_samples=False
+                            )
+                        )
+                        terminal_outcome = policy_client.record_execution_failure(
+                            error, env, dynamic_report
+                        )
+                        numerical_failure_reason = terminal_outcome["reason"]
+                        incident_artifact = error.incident_artifact
+                        bar.update(1)
+                        break
                     # env.step completed all eight physics substeps. Persist its
                     # execution record before closing the failing boundary sample.
                     policy_client.record_execution(
@@ -338,7 +450,7 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                     truncated=trunc,
                 )
             bar.update(1)
-            if eval_args.control_mode != "joint-velocity" and (term[0] or trunc[0]):
+            if not audited_droid and (term[0] or trunc[0]):
                 break
 
         episode_length = bar.n
@@ -353,12 +465,26 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                 .action_manager._terms["arm"]
                 .native_all_joint_dynamic_report(include_samples=False)
             )
+        elif (
+            position_adapter
+            and not numerical_failure_reason
+            and episode_length == PI05_DROID_NATIVE_EPISODE_STEPS
+        ):
+            terminal_outcome = policy_client.finish_rollout(env, info["rubric"])
+            dynamic_report = (
+                getattr(env, "unwrapped", env)
+                .action_manager._terms["arm"]
+                .native_all_joint_dynamic_report(include_samples=False)
+            )
+            position_safety_report = make_position_safety_report(
+                dynamic_report, outer_steps=episode_length
+            )
         bar.close()
 
         video_artifact = None
         if video:
             filename = run_folder / f"episode_{episode}.mp4"
-            if eval_args.control_mode == "joint-velocity":
+            if audited_droid:
                 temporary_video = filename.with_name(
                     f".{filename.stem}.partial-{os.getpid()}.mp4"
                 )
@@ -386,7 +512,7 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                 if numerical_failure_reason
                 else (
                     terminal_outcome["rubric"]["success"]
-                    if eval_args.control_mode == "joint-velocity"
+                    if audited_droid
                     else info["rubric"]["success"]
                 )
             ),
@@ -395,7 +521,7 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                 if numerical_failure_reason
                 else (
                     terminal_outcome["rubric"]["progress"]
-                    if eval_args.control_mode == "joint-velocity"
+                    if audited_droid
                     else info["rubric"]["progress"]
                 )
             ),
@@ -429,16 +555,64 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                 key: sidecar_artifact[key]
                 for key in ("path", "size", "sha256", "mode", "nlink")
             }
+        elif position_adapter:
+            trace_artifact = policy_client.finalized_trace_artifact
+            if trace_artifact is None or video_artifact is None:
+                raise RuntimeError(
+                    "DROID position-adapter episode transaction is incomplete"
+                )
+            if numerical_failure_reason:
+                if (
+                    incident_artifact is None
+                    or dynamic_report is None
+                    or terminal_outcome is None
+                ):
+                    raise RuntimeError(
+                        "DROID position numerical-failure evidence is incomplete"
+                    )
+                sidecar_payload = make_position_failure_sidecar(
+                    episode_result=episode_data,
+                    environment_runtime_contract=environment_runtime_contract,
+                    terminal_failure=terminal_outcome,
+                    dynamic_report=dynamic_report,
+                    trace_artifact=trace_artifact,
+                    video_artifact=video_artifact,
+                    incident_artifact=incident_artifact,
+                )
+            else:
+                if (
+                    position_safety_report is None
+                    or episode_length != PI05_DROID_NATIVE_EPISODE_STEPS
+                    or terminal_outcome is None
+                ):
+                    raise RuntimeError(
+                        "DROID position successful episode evidence is incomplete"
+                    )
+                sidecar_payload = make_position_episode_sidecar(
+                    episode_result=episode_data,
+                    environment_runtime_contract=environment_runtime_contract,
+                    terminal_rollout=terminal_outcome,
+                    safety_report=position_safety_report,
+                    trace_artifact=trace_artifact,
+                    video_artifact=video_artifact,
+                )
+            sidecar_artifact = publish_immutable_json(sidecar_path, sidecar_payload)
+            episode_sidecar_artifact = {
+                key: sidecar_artifact[key]
+                for key in ("path", "size", "sha256", "mode", "nlink")
+            }
         episode_df = pd.concat(
             [episode_df, pd.DataFrame([episode_data])], ignore_index=True
         )
-        if eval_args.control_mode == "joint-velocity":
+        if audited_droid:
             temporary_csv = csv_path.with_name(
                 f".{csv_path.name}.partial-{os.getpid()}"
             )
             try:
                 episode_df.to_csv(temporary_csv, index=False)
-                publish_immutable_file_from_temporary(temporary_csv, csv_path)
+                metrics_artifact = publish_immutable_file_from_temporary(
+                    temporary_csv, csv_path
+                )
             finally:
                 if temporary_csv.exists() and not temporary_csv.is_symlink():
                     temporary_csv.unlink()
@@ -469,6 +643,47 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                 terminal_outcome=terminal_outcome,
                 episode_sidecar=episode_sidecar_artifact,
             ),
+        )
+    elif position_adapter:
+        if (
+            runtime_artifact is None
+            or environment_runtime_contract is None
+            or terminal_outcome is None
+            or trace_artifact is None
+            or video_artifact is None
+            or metrics_artifact is None
+            or episode_sidecar_artifact is None
+            or not eval_args.policy.trace_path
+        ):
+            raise RuntimeError("DROID position-adapter close evidence is incomplete")
+        if numerical_failure_reason:
+            close_payload = make_position_failure_close_ready(
+                runtime_artifact=runtime_artifact,
+                trace_artifact=trace_artifact,
+                video_artifact=video_artifact,
+                metrics_artifact=metrics_artifact,
+                sidecar_artifact=episode_sidecar_artifact,
+                environment_runtime_contract=environment_runtime_contract,
+                terminal_failure=terminal_outcome,
+            )
+        else:
+            if position_safety_report is None:
+                raise RuntimeError("DROID position success safety report is missing")
+            close_payload = make_position_close_ready(
+                runtime_artifact=runtime_artifact,
+                trace_artifact=trace_artifact,
+                video_artifact=video_artifact,
+                metrics_artifact=metrics_artifact,
+                sidecar_artifact=episode_sidecar_artifact,
+                safety_report=position_safety_report,
+                environment_runtime_contract=environment_runtime_contract,
+                terminal_rollout=terminal_outcome,
+                outer_steps=PI05_DROID_NATIVE_EPISODE_STEPS,
+            )
+        lifecycle.prepare_close_ready(
+            publish_immutable_json,
+            Path(eval_args.lifecycle_ready_path),
+            close_payload,
         )
 
 
