@@ -478,6 +478,19 @@ def main(state: dict[str, object]) -> int:
     safety_reports = state["safety_reports"]
     state["stage"] = "capture_runtime_safety"
     arm_term = env.unwrapped.action_manager._terms["arm"]
+    finger_term = env.unwrapped.action_manager._terms["finger_joint"]
+
+    def begin_gripper_trace_policy_step(
+        *, episode_index: int, policy_step: int
+    ) -> None:
+        """Install the same trace context that production eval sets per step."""
+
+        if controller_spec.all_six_gripper_trace_enabled:
+            finger_term.begin_eef_policy_step(
+                episode_index=episode_index,
+                policy_step=policy_step,
+            )
+
     initial_capture = arm_term.safety_report()
     state["raw_capture"] = initial_capture
     print(
@@ -516,7 +529,11 @@ def main(state: dict[str, object]) -> int:
         action = torch.as_tensor(target, device=env.device).reshape(1, -1)
 
         state["stage"] = "execute_case"
-        for _ in range(args_cli.hold_steps):
+        for policy_step in range(args_cli.hold_steps):
+            begin_gripper_trace_policy_step(
+                episode_index=case_index,
+                policy_step=policy_step,
+            )
             observation, _, terminated, truncated, _ = env.step(action, expensive=False)
             record_concurrent_post_step(env)
             if bool(terminated[0]) or bool(truncated[0]):
@@ -571,9 +588,8 @@ def main(state: dict[str, object]) -> int:
 
     # Replay the official failure boundary without changing the ordinary
     # 13-case contract: hold one reset-anchored arm pose open for policy steps
-    # 0..114, then request the same arm pose with close for five policy steps.
-    # At 2.5 rad/s and 120 Hz, the exact pi/4 endpoint is reached on close
-    # substep 38, leaving two endpoint-hold substeps in the fifth policy step.
+    # 0..114, then request the same arm pose with close for the profile-selected
+    # number of policy steps (five at 0.5 rate, ten at v6's 0.25 rate).
     delayed_close_index = len(test_cases)
     state["stage"] = "reset_delayed_close_replay"
     state["case"] = "open 115 policy steps then close at the same arm pose"
@@ -599,6 +615,7 @@ def main(state: dict[str, object]) -> int:
         raise RuntimeError("Delayed-close replay changed the anchored arm target")
     delayed_terminated = False
     delayed_truncated = False
+    delayed_policy_step = 0
     for phase, action_target, policy_steps in (
         ("open", open_target, DELAYED_CLOSE_OPEN_POLICY_STEPS),
         ("close", close_target, transition_policy_steps),
@@ -606,8 +623,13 @@ def main(state: dict[str, object]) -> int:
         state["stage"] = f"execute_delayed_close_{phase}"
         action = torch.as_tensor(action_target, device=env.device).reshape(1, -1)
         for _ in range(policy_steps):
+            begin_gripper_trace_policy_step(
+                episode_index=delayed_close_index,
+                policy_step=delayed_policy_step,
+            )
             _, _, terminated, truncated, _ = env.step(action, expensive=False)
             record_eef_gripper_post_policy_step(env)
+            delayed_policy_step += 1
             delayed_terminated = delayed_terminated or bool(terminated[0])
             delayed_truncated = delayed_truncated or bool(truncated[0])
             if delayed_terminated or delayed_truncated:
@@ -721,6 +743,7 @@ def main(state: dict[str, object]) -> int:
         moving_targets = []
         transition_terminated = False
         transition_truncated = False
+        concurrent_policy_step = 0
         for phase, gripper_open in (("initial_open", 1.0),):
             target = anchor_action_chunk(
                 np.array([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, gripper_open]]),
@@ -729,11 +752,16 @@ def main(state: dict[str, object]) -> int:
             )[0]
             moving_targets.append(target[:7].tolist())
             state["stage"] = f"execute_concurrent_{phase}"
+            begin_gripper_trace_policy_step(
+                episode_index=concurrent_index,
+                policy_step=concurrent_policy_step,
+            )
             _, _, terminated, truncated, _ = env.step(
                 torch.as_tensor(target, device=env.device).reshape(1, -1),
                 expensive=False,
             )
             record_eef_gripper_post_policy_step(env)
+            concurrent_policy_step += 1
             transition_terminated = transition_terminated or bool(terminated[0])
             transition_truncated = transition_truncated or bool(truncated[0])
         for phase, gripper_open in (("close", 0.0), ("reopen", 1.0)):
@@ -757,11 +785,16 @@ def main(state: dict[str, object]) -> int:
                 )[0]
                 moving_targets.append(target[:7].tolist())
                 state["stage"] = f"execute_concurrent_{phase}_moving"
+                begin_gripper_trace_policy_step(
+                    episode_index=concurrent_index,
+                    policy_step=concurrent_policy_step,
+                )
                 _, _, terminated, truncated, _ = env.step(
                     torch.as_tensor(target, device=env.device).reshape(1, -1),
                     expensive=False,
                 )
                 record_concurrent_post_step(env)
+                concurrent_policy_step += 1
                 transition_terminated = transition_terminated or bool(terminated[0])
                 transition_truncated = transition_truncated or bool(truncated[0])
                 if transition_terminated or transition_truncated:
@@ -865,6 +898,10 @@ def main(state: dict[str, object]) -> int:
         oversized_delta, anchor_position, anchor_quaternion
     )[0]
     state["stage"] = "execute_adversarial_case"
+    begin_gripper_trace_policy_step(
+        episode_index=adversarial_index,
+        policy_step=0,
+    )
     adversarial_observation, _, terminated, truncated, _ = env.step(
         torch.as_tensor(oversized_target, device=env.device).reshape(1, -1),
         expensive=False,

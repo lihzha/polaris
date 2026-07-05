@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import copy
 import hashlib
 from pathlib import Path
@@ -694,6 +695,130 @@ def test_controller_smoke_has_v6_moving_close_reopen_target_surface_gate() -> No
     assert '"eef_open115_then_close5_same_arm_pose_v1"' in source
     assert '"eef_open115_then_close10_same_arm_pose_v2"' in source
     assert "delayed_close_replay_profile = (" in source
+    assert "finger_term.begin_eef_policy_step(" in source
+
+    tree = ast.parse(source)
+    env_steps_with_context: list[tuple[ast.stmt, ast.stmt | None, list[ast.stmt]]] = []
+
+    def visit_statement_lists(node: ast.AST) -> None:
+        for _, value in ast.iter_fields(node):
+            if isinstance(value, ast.AST):
+                visit_statement_lists(value)
+            elif isinstance(value, list):
+                if value and all(isinstance(item, ast.stmt) for item in value):
+                    for index, statement in enumerate(value):
+                        has_env_step = isinstance(statement, ast.Assign) and any(
+                            isinstance(candidate, ast.Call)
+                            and isinstance(candidate.func, ast.Attribute)
+                            and isinstance(candidate.func.value, ast.Name)
+                            and candidate.func.value.id == "env"
+                            and candidate.func.attr == "step"
+                            for candidate in ast.walk(statement)
+                        )
+                        if has_env_step:
+                            predecessor = value[index - 1] if index else None
+                            env_steps_with_context.append(
+                                (statement, predecessor, value[index + 1 : index + 3])
+                            )
+                        visit_statement_lists(statement)
+                else:
+                    for item in value:
+                        if isinstance(item, ast.AST):
+                            visit_statement_lists(item)
+
+    visit_statement_lists(tree)
+    expected_contexts = [
+        ({"episode_index": "case_index", "policy_step": "policy_step"}, None),
+        (
+            {
+                "episode_index": "delayed_close_index",
+                "policy_step": "delayed_policy_step",
+            },
+            "delayed_policy_step",
+        ),
+        (
+            {
+                "episode_index": "concurrent_index",
+                "policy_step": "concurrent_policy_step",
+            },
+            "concurrent_policy_step",
+        ),
+        (
+            {
+                "episode_index": "concurrent_index",
+                "policy_step": "concurrent_policy_step",
+            },
+            "concurrent_policy_step",
+        ),
+        ({"episode_index": "adversarial_index", "policy_step": "0"}, None),
+    ]
+    assert len(env_steps_with_context) == len(expected_contexts)
+    for (env_step, predecessor, successors), (
+        expected_context,
+        expected_counter,
+    ) in zip(env_steps_with_context, expected_contexts, strict=True):
+        assert isinstance(predecessor, ast.Expr), ast.unparse(env_step)
+        begin_call = predecessor.value
+        assert isinstance(begin_call, ast.Call), ast.unparse(env_step)
+        assert isinstance(begin_call.func, ast.Name), ast.unparse(env_step)
+        assert begin_call.func.id == "begin_gripper_trace_policy_step", ast.unparse(
+            env_step
+        )
+        assert {
+            keyword.arg: ast.unparse(keyword.value) for keyword in begin_call.keywords
+        } == expected_context
+        if expected_counter is not None:
+            assert len(successors) == 2
+            increment = successors[1]
+            assert isinstance(increment, ast.AugAssign), ast.unparse(env_step)
+            assert isinstance(increment.target, ast.Name), ast.unparse(env_step)
+            assert increment.target.id == expected_counter, ast.unparse(env_step)
+            assert isinstance(increment.op, ast.Add), ast.unparse(env_step)
+            assert isinstance(increment.value, ast.Constant), ast.unparse(env_step)
+            assert increment.value.value == 1, ast.unparse(env_step)
+
+    counter_initializers = {
+        target.id: statement.value.value
+        for statement in ast.walk(tree)
+        if isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance((target := statement.targets[0]), ast.Name)
+        and target.id in {"delayed_policy_step", "concurrent_policy_step"}
+        and isinstance(statement.value, ast.Constant)
+    }
+    assert counter_initializers == {
+        "delayed_policy_step": 0,
+        "concurrent_policy_step": 0,
+    }
+
+    helper_definitions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "begin_gripper_trace_policy_step"
+    ]
+    assert len(helper_definitions) == 1
+    helper_guards = [
+        statement
+        for statement in helper_definitions[0].body
+        if isinstance(statement, ast.If)
+    ]
+    assert len(helper_guards) == 1
+    helper_guard = helper_guards[0]
+    assert ast.unparse(helper_guard.test) == (
+        "controller_spec.all_six_gripper_trace_enabled"
+    )
+    assert len(helper_guard.body) == 1
+    helper_delegate = helper_guard.body[0]
+    assert isinstance(helper_delegate, ast.Expr)
+    assert isinstance(helper_delegate.value, ast.Call)
+    assert ast.unparse(helper_delegate.value.func) == (
+        "finger_term.begin_eef_policy_step"
+    )
+    assert {
+        keyword.arg: ast.unparse(keyword.value)
+        for keyword in helper_delegate.value.keywords
+    } == {"episode_index": "episode_index", "policy_step": "policy_step"}
 
 
 def _release_ramp_candidate_report() -> dict:

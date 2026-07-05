@@ -131,3 +131,38 @@ The same eight immutable-v5 source-identity checks remain the only deliberate
 deselections. Ruff lint/format, Python compilation, and `git diff --check`
 passed. No GPU, simulator, Slurm, checkpoint, or evaluation job was launched
 before this correction was committed.
+
+## L40S smoke attempt 1098921
+
+The first exact-commit target run (`b6dec3d`, Slurm `1098921`) reached a fully
+initialized FoodBussing environment and validated the initial v6 safety
+capture, then failed before its first physics action with
+`PolaRiS EEF gripper trace process lacks policy context`. The failure was in
+the standalone harness: v6 enables the production all-six gripper trace, while
+the smoke called `env.step` without the `begin_eef_policy_step` metadata that
+`scripts/eval.py` installs before every policy step. No controller result or
+checkpoint evidence was produced; the immutable failure raw and log are kept.
+
+The follow-up makes every one of the smoke's five `env.step` call sites install
+the exact episode/policy-step trace context when the selected profile enables
+that trace. Policy indices restart at zero after each environment reset and
+advance once per outer step, matching production evaluation cadence. Profiles
+without the trace remain unchanged. A source-level regression binds all five
+call sites to the helper before the bounded rerun.
+
+Independent read-only review verified the implementation at all five call
+sites, the episode identities `0..15`, reset behavior, and per-outer-step
+cadence. The regression parses the harness AST and now binds each `env.step` to
+its immediately preceding helper call, exact episode and policy-step
+expressions, zero initialization, exactly-one increments, and the
+profile-conditional delegate to `finger_term.begin_eef_policy_step`.
+
+Post-fix host-safe validation remains:
+
+```text
+focused: 406 passed, 1 warning
+broad host-safe: 1037 passed, 1 skipped, 8 deselected, 1 warning, 30 subtests passed
+```
+
+Ruff lint/format, Python compilation, and `git diff --check` pass. The eight
+deselections are the same immutable-v5 source-identity gates documented above.
