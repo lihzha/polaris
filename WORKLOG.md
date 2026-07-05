@@ -221,3 +221,5 @@
 - Next: commit and independently review this repair, run the fresh controller
   smoke on one L40S, then submit a fresh same-protocol model canary and inspect
   the full trace/metric/video transaction.
+- Implementation commit: `98111ef50d18927389a694e141151dc06b1a8403`
+  (tree `05262e39bb82f7973f283372ccf120cee8d7a2dd`, parent `7d83ea21778d8a0de68ea4dd82a209f6f8d53632`).
