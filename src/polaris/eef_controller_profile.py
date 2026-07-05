@@ -2411,10 +2411,19 @@ def validate_eef_controller_repair_candidate_report(
         raise ValueError("Non-v6 PolaRiS EEF controller has concurrent-arm evidence")
     recovery = report.get("current_joint_velocity_recovery")
     if spec.current_joint_velocity_recovery_enabled:
-        validate_current_joint_velocity_recovery_report(
+        validated_recovery = validate_current_joint_velocity_recovery_report(
             recovery,
             apply_calls=apply_calls,
         )
+        if spec.concurrent_arm_gripper_enabled and (
+            concurrent["recovery_owned_target_applies"]
+            != validated_recovery["counters"]["hold_target_applies"]
+            or concurrent["recovery_owned_target_applies"]
+            != validated_recovery["counters"]["recovery_active_substeps"]
+        ):
+            raise ValueError(
+                "PolaRiS EEF concurrent-arm/recovery target ownership drift"
+            )
     elif recovery is not None:
         raise ValueError("Non-v5 PolaRiS EEF controller has velocity-recovery evidence")
     if require_initial_state and (

@@ -2232,6 +2232,17 @@ def validate_eef_gripper_dynamic_evidence(
         value.get("driver_target_slew"),
         expected_profile=expected_target_slew_profile,
     )
+    for field in (
+        "apply_entry_samples",
+        "post_policy_step_samples",
+        "nonfinite_samples",
+        "dropped_diagnostics",
+    ):
+        _require(
+            type(value[field]) is int and value[field] >= 0,
+            f"gripper dynamic {field}",
+        )
+    total_samples = value["apply_entry_samples"] + value["post_policy_step_samples"]
     coupled = value.get(OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD)
     if expect_open_endpoint_coupled_impulse:
         _require(
@@ -2263,7 +2274,8 @@ def validate_eef_gripper_dynamic_evidence(
                 f"open-endpoint coupled-impulse {field}",
             )
         _require(
-            coupled["nonfinite_open_endpoint_samples"]
+            coupled["open_endpoint_samples"] <= total_samples
+            and coupled["nonfinite_open_endpoint_samples"]
             <= coupled["open_endpoint_samples"]
             and coupled["follower_threshold_crossing_samples"]
             <= coupled["open_endpoint_samples"]
@@ -2419,15 +2431,6 @@ def validate_eef_gripper_dynamic_evidence(
             )
     else:
         _require(coupled is None, "unexpected open-endpoint coupled-impulse evidence")
-    for field in (
-        "apply_entry_samples",
-        "post_policy_step_samples",
-        "nonfinite_samples",
-        "dropped_diagnostics",
-    ):
-        _require(
-            type(value[field]) is int and value[field] >= 0, f"gripper dynamic {field}"
-        )
     _require(value["dropped_diagnostics"] == 0, "incomplete gripper evidence")
     for field in ("max_abs_joint_velocity_rad_s", "max_abs_joint_acceleration_rad_s2"):
         vector = value[field]
@@ -2444,7 +2447,6 @@ def validate_eef_gripper_dynamic_evidence(
             f"gripper dynamic {field}",
         )
     diagnostic = value["max_velocity_diagnostic"]
-    total_samples = value["apply_entry_samples"] + value["post_policy_step_samples"]
     _require(
         value["nonfinite_samples"] <= total_samples,
         "gripper nonfinite sample cadence",

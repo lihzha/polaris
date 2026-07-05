@@ -101,3 +101,33 @@ weakened or rewritten in this implementation descendant:
 Those checks continue to protect the exact v5 producer bytes. A distinct v6
 implementation/evidence lineage must be added separately after live smoke
 evidence exists.
+
+## Independent review correction
+
+Independent pre-launch review found three evidence-accounting defects without
+finding a defect in the concurrent control path itself:
+
+- the delayed-close smoke label still said `close5` even though the v6 0.25-rate
+  profile executes ten close policy steps;
+- open-endpoint sample counts were not bounded by total recorded runtime
+  samples; and
+- the controller report did not cross-bind recovery-owned target applies to
+  recovery hold/active-substep counters.
+
+The follow-up revision gives v6 the distinct
+`eef_open115_then_close10_same_arm_pose_v2` identity while preserving the
+legacy `close5` identity, adds the missing runtime-sample bound, and requires
+all three recovery ownership counters to agree. New negative regressions cover
+each finding.
+
+Post-correction validation:
+
+```text
+focused: 406 passed, 1 warning
+broad host-safe: 1037 passed, 1 skipped, 8 deselected, 1 warning, 30 subtests passed
+```
+
+The same eight immutable-v5 source-identity checks remain the only deliberate
+deselections. Ruff lint/format, Python compilation, and `git diff --check`
+passed. No GPU, simulator, Slurm, checkpoint, or evaluation job was launched
+before this correction was committed.

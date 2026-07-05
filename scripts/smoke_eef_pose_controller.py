@@ -44,6 +44,7 @@ args_cli.enable_cameras = True
 args_cli.headless = True
 
 DELAYED_CLOSE_REPLAY_PROFILE = "eef_open115_then_close5_same_arm_pose_v1"
+DELAYED_CLOSE_REPLAY_CONCURRENT_V6_PROFILE = "eef_open115_then_close10_same_arm_pose_v2"
 DELAYED_CLOSE_OPEN_POLICY_STEPS = 115
 DELAYED_CLOSE_CLOSE_POLICY_STEPS = 5
 DELAYED_CLOSE_TRANSITION_SUBSTEPS = 38
@@ -407,6 +408,11 @@ def main(state: dict[str, object]) -> int:
         controller_spec.profile
         == EEF_CONTROLLER_CONCURRENT_ARM_GRIPPER_CANDIDATE_PROFILE
     )
+    delayed_close_replay_profile = (
+        DELAYED_CLOSE_REPLAY_CONCURRENT_V6_PROFILE
+        if concurrent_v6
+        else DELAYED_CLOSE_REPLAY_PROFILE
+    )
     transition_substeps = (
         GRIPPER_CLOSE_TRANSITION_0P25_APPLIES
         if controller_spec.target_slew_rate_0p25_enabled
@@ -668,7 +674,7 @@ def main(state: dict[str, object]) -> int:
         and (concurrent_v6 or delayed_close_headroom["passed"])
     )
     state["delayed_close_result"] = {
-        "profile": DELAYED_CLOSE_REPLAY_PROFILE,
+        "profile": delayed_close_replay_profile,
         "case": "open 115 policy steps then close at the same arm pose",
         "passed": delayed_passed,
         "episode_index": delayed_close_index,

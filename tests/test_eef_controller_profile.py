@@ -600,7 +600,12 @@ def test_concurrent_v6_report_has_explicit_disabled_interlock_and_fresh_dls_cade
     monkeypatch.setattr(
         controller_profile_module,
         "validate_current_joint_velocity_recovery_report",
-        lambda value, *, apply_calls: value,
+        lambda value, *, apply_calls: {
+            "counters": {
+                "hold_target_applies": 0,
+                "recovery_active_substeps": 0,
+            }
+        },
     )
     report = _concurrent_v6_report(apply_calls=80)
     validated = validate_eef_controller_repair_candidate_report(
@@ -628,6 +633,50 @@ def test_concurrent_v6_report_has_explicit_disabled_interlock_and_fresh_dls_cade
         )
 
 
+def test_concurrent_v6_report_binds_recovery_owned_targets_to_recovery_counters(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        controller_profile_module,
+        "validate_current_joint_velocity_recovery_report",
+        lambda value, *, apply_calls: {
+            "counters": {
+                "hold_target_applies": 3,
+                "recovery_active_substeps": 3,
+            }
+        },
+    )
+    report = _concurrent_v6_report(apply_calls=80)
+    concurrent = report["concurrent_arm_gripper"]
+    concurrent["fresh_dls_target_applies"] = 77
+    concurrent["normal_target_setter_applies"] = 77
+    concurrent["closed_endpoint_fresh_dls_target_applies"] = 77
+    concurrent["recovery_owned_target_applies"] = 3
+    validate_eef_controller_repair_candidate_report(
+        report,
+        expected_profile=EEF_CONTROLLER_CONCURRENT_ARM_GRIPPER_CANDIDATE_PROFILE,
+        expected_target_slew_profile=(
+            EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+        ),
+        expected_physical_max_delta_joint_pos_rad=[0.01] * 7,
+        apply_calls=80,
+    )
+
+    concurrent["recovery_owned_target_applies"] = 2
+    concurrent["fresh_dls_target_applies"] = 78
+    concurrent["normal_target_setter_applies"] = 78
+    with pytest.raises(ValueError, match="target ownership drift"):
+        validate_eef_controller_repair_candidate_report(
+            report,
+            expected_profile=(EEF_CONTROLLER_CONCURRENT_ARM_GRIPPER_CANDIDATE_PROFILE),
+            expected_target_slew_profile=(
+                EEF_GRIPPER_TARGET_SLEW_RATE_0P25_CANDIDATE_PROFILE
+            ),
+            expected_physical_max_delta_joint_pos_rad=[0.01] * 7,
+            apply_calls=80,
+        )
+
+
 def test_controller_smoke_has_v6_moving_close_reopen_target_surface_gate() -> None:
     source = (
         Path(__file__).parents[1] / "scripts" / "smoke_eef_pose_controller.py"
@@ -642,6 +691,9 @@ def test_controller_smoke_has_v6_moving_close_reopen_target_surface_gate() -> No
     assert '"stored_target_replay_count"' in source
     assert '"open_endpoint_contact_mimic_impulse"' in source
     assert '"arm_release_ramp" not in concurrent_report' in source
+    assert '"eef_open115_then_close5_same_arm_pose_v1"' in source
+    assert '"eef_open115_then_close10_same_arm_pose_v2"' in source
+    assert "delayed_close_replay_profile = (" in source
 
 
 def _release_ramp_candidate_report() -> dict:

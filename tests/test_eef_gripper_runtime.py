@@ -912,6 +912,20 @@ def test_open_endpoint_coupled_failure_requires_independent_failure_diagnostic()
         )
 
 
+def test_open_endpoint_samples_cannot_exceed_total_runtime_samples():
+    evidence = _dynamic_evidence()
+    evidence[runtime.OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD] = (
+        _concurrent_open_endpoint_telemetry()
+    )
+    evidence[runtime.OPEN_ENDPOINT_COUPLED_IMPULSE_FIELD]["open_endpoint_samples"] = 10
+
+    with pytest.raises(ValueError, match="coupled-impulse gate"):
+        runtime.validate_eef_gripper_dynamic_evidence(
+            evidence,
+            expect_open_endpoint_coupled_impulse=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
