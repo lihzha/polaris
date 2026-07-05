@@ -153,6 +153,7 @@ CONTROLLER_GOVERNED_PATHS = (
     "src/polaris/environments/pi05_droid_position_robot_cfg.py",
     "src/polaris/native_gripper_runtime.py",
     "src/polaris/pi05_droid_native_eval_contract.py",
+    "src/polaris/pi05_droid_native_lifecycle.py",
     "src/polaris/pi05_droid_position_adapter.py",
     "src/polaris/pi05_droid_position_contract.py",
     "src/polaris/pi05_droid_position_runtime.py",

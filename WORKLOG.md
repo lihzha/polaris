@@ -184,3 +184,40 @@
   off queue and their isolated runtime caches were removed after checksum-copy
   and audit. Full records live under
   `/home/lzha/code/shared_artifacts/polaris-eef-eval-20260630`.
+
+## 2026-07-05 — Official pi0.5-DROID position canary runtime repair
+
+- Owner: `pi05_position_eval_orchestrator`; branch
+  `codex/pi05-position-runtime-fix-20260705`; base PolaRiS commit
+  `7d83ea21778d8a0de68ea4dd82a209f6f8d53632`.
+- Job `1099014` failed non-scientifically after one model query and one guarded
+  action but before a durable execution record. The trace remained mode `0644`
+  with only rollout-start/query/action records; no metric, video, sidecar,
+  close-ready marker, completion, or eval-success artifact exists.
+- The first request and action matched the intended train/eval contract:
+  checkpoint-global DROID normalization, external/wrist/blank ordering,
+  OpenPI pad-to-224, zero wrist rotation, FLOW Euler-10 seed 0, and
+  `q_target=fresh_q+0.2*clip(command)` within the exact hard/soft intersection.
+- Root cause: the new position client passed Isaac Lab CUDA termination tensors
+  through `numpy.asarray`; the duplicated boolean helper cannot convert CUDA
+  tensors. The resulting post-step exception was then masked because the outer
+  `finally` invoked pinned Kit teardown, which can hard-exit the child with
+  status zero.
+- Repair: reuse the promoted tensor-safe outer-step flag validator; print and
+  convert any evaluator-body failure to exit 1 before entering Kit cleanup;
+  forbid Kit close after an env-close or close-ready publication error; and
+  make the shell reject a zero evaluator return without an immutable mode-0444
+  close-ready marker.
+- Governance: added the shared native lifecycle module to the position
+  controller-smoke source set and canary controller-governed set. The old job
+  `1099013` attestation cannot authorize the repaired canary; a fresh exact-tip
+  L40S controller smoke is mandatory.
+- Local validation: 25 focused tests passed. The broader non-Isaac suite passed
+  334 tests plus 5 subtests; the single omitted test imports Isaac Lab and is
+  covered by the target-runtime controller smoke. Ruff lint/format, ShellCheck,
+  `bash -n`, Python bytecode compilation, and `git diff --check` passed.
+- Shared Ego-LAP external-checkpoint registry revision 18 records job `1099014`
+  as failed/non-scientific with zero completed episodes and no video.
+- Next: commit and independently review this repair, run the fresh controller
+  smoke on one L40S, then submit a fresh same-protocol model canary and inspect
+  the full trace/metric/video transaction.

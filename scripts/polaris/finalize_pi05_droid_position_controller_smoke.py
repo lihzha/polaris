@@ -47,6 +47,7 @@ SOURCE_PATHS = (
     "src/polaris/environments/pi05_droid_position_robot_cfg.py",
     "src/polaris/native_gripper_runtime.py",
     "src/polaris/pi05_droid_native_eval_contract.py",
+    "src/polaris/pi05_droid_native_lifecycle.py",
     "src/polaris/pi05_droid_position_adapter.py",
     "src/polaris/pi05_droid_position_contract.py",
     "src/polaris/pi05_droid_position_runtime.py",
@@ -119,7 +120,9 @@ def _regular_identity(
     )
 
 
-def _canonical_json_artifact(path: Path, field: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def _canonical_json_artifact(
+    path: Path, field: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
     identity, payload = _regular_identity(path, field, mode=0o444, one_link=True)
     try:
         value = json.loads(payload)
@@ -146,7 +149,9 @@ def _source_provenance(repo_argument: Path, expected_commit: str) -> dict[str, A
         != repo / ".git"
         or _git(repo, "rev-parse", "--abbrev-ref", "HEAD") != "HEAD"
     ):
-        raise ValueError("position smoke source is not one detached standalone checkout")
+        raise ValueError(
+            "position smoke source is not one detached standalone checkout"
+        )
     head = _git(repo, "rev-parse", "HEAD")
     if (
         head != expected_commit
@@ -180,7 +185,9 @@ def _asset_provenance(data_dir: Path) -> dict[str, Any]:
         identity, _ = _regular_identity(data_dir / relative, f"asset {relative}")
         if identity["sha256"] != expected_sha:
             raise ValueError(f"asset SHA-256 mismatch: {relative}")
-        metadata_path = data_dir / ".cache/huggingface/download" / f"{relative}.metadata"
+        metadata_path = (
+            data_dir / ".cache/huggingface/download" / f"{relative}.metadata"
+        )
         metadata_identity, metadata = _regular_identity(
             metadata_path, f"asset metadata {relative}"
         )
@@ -220,7 +227,9 @@ def main() -> None:
 
     raw_path = args.smoke.with_name(args.smoke.name + ".child-close.json")
     ready_path = raw_path.with_name(raw_path.name + ".ready.json")
-    raw, raw_identity = _canonical_json_artifact(raw_path, "position smoke child capture")
+    raw, raw_identity = _canonical_json_artifact(
+        raw_path, "position smoke child capture"
+    )
     validate_position_smoke(raw, require_parent_completion=False)
     ready, ready_identity = _canonical_json_artifact(ready_path, "position smoke ready")
     expected_ready = {
@@ -293,9 +302,7 @@ def main() -> None:
             "container_pinned_by_sha256": True,
             "isaaclab_version": runtime["isaaclab_version"],
             "isaaclab_source_sha256": runtime["isaaclab_source_sha256"],
-            "polaris_runtime_source_sha256": runtime[
-                "polaris_runtime_source_sha256"
-            ],
+            "polaris_runtime_source_sha256": runtime["polaris_runtime_source_sha256"],
             "action_term_class": runtime["action_term_class"],
             "action_cfg_class": runtime["action_cfg_class"],
             "host_finalizer_python": {

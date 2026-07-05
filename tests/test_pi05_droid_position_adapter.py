@@ -188,7 +188,10 @@ def _reference_position_runtime_report():
             "forearm_joint_names_expr": ["panda_joint[5-7]"],
             "position_stiffness": [400.0, 400.0],
             "velocity_damping": [80.0, 80.0],
-            "effort_limit_sim": [PANDA_ARM_EFFORT_LIMITS[0], PANDA_ARM_EFFORT_LIMITS[4]],
+            "effort_limit_sim": [
+                PANDA_ARM_EFFORT_LIMITS[0],
+                PANDA_ARM_EFFORT_LIMITS[4],
+            ],
             "velocity_limit_sim": [
                 PANDA_ARM_VELOCITY_LIMITS[0],
                 PANDA_ARM_VELOCITY_LIMITS[4],
@@ -239,8 +242,7 @@ def test_official_droid_math_clips_binarizes_and_anchors_fresh_each_step():
     )
     np.testing.assert_allclose(
         first["absolute_joint_position_target_rad"],
-        first_q.astype(np.float64)
-        + 0.2 * np.asarray([-1, -1, -0.5, 0, 0.5, 1, 1]),
+        first_q.astype(np.float64) + 0.2 * np.asarray([-1, -1, -0.5, 0, 0.5, 1, 1]),
         rtol=0,
         atol=0,
     )
@@ -255,9 +257,10 @@ def test_official_droid_math_clips_binarizes_and_anchors_fresh_each_step():
         rtol=0,
         atol=0,
     )
-    assert second["absolute_joint_position_target_rad"] != first[
-        "absolute_joint_position_target_rad"
-    ]
+    assert (
+        second["absolute_joint_position_target_rad"]
+        != first["absolute_joint_position_target_rad"]
+    )
 
 
 def test_adapter_evidence_and_eight_substep_hold_fail_closed():
@@ -285,9 +288,7 @@ def test_adapter_evidence_and_eight_substep_hold_fail_closed():
 
 def test_position_limits_separate_raw_factor1_rounding_and_intersection_guard():
     hard = np.asarray([PI05_DROID_PHYSX_HARD_LIMITS_RAD], dtype=np.float32)
-    expected_soft = np.asarray(
-        [PI05_DROID_ISAACLAB_SOFT_LIMITS_RAD], dtype=np.float32
-    )
+    expected_soft = np.asarray([PI05_DROID_ISAACLAB_SOFT_LIMITS_RAD], dtype=np.float32)
     derived_soft = derive_isaaclab_factor1_soft_limits(hard)
     np.testing.assert_array_equal(derived_soft, expected_soft)
     assert derived_soft[0, 3, 1] > hard[0, 3, 1]
@@ -331,9 +332,7 @@ def test_position_limits_separate_raw_factor1_rounding_and_intersection_guard():
     target[0, 5] = guard[0, 5, 0]
     _, _, violation = evaluate_position_target_guard(target, hard, derived_soft)
     assert not violation.any()
-    target[0, 5] = np.nextafter(
-        guard[0, 5, 0], np.float32(-np.inf), dtype=np.float32
-    )
+    target[0, 5] = np.nextafter(guard[0, 5, 0], np.float32(-np.inf), dtype=np.float32)
     _, _, violation = evaluate_position_target_guard(target, hard, derived_soft)
     assert np.flatnonzero(violation[0]).tolist() == [5]
 
@@ -341,9 +340,7 @@ def test_position_limits_separate_raw_factor1_rounding_and_intersection_guard():
 def test_position_smoke_guard_probe_is_one_ulp_outside_hard_but_inside_soft():
     contract = expected_position_limit_contract()
     hard = np.asarray(contract["hard_limits"]["values_rad"], dtype=np.float32)
-    soft = np.asarray(
-        contract["isaaclab_soft_limits"]["values_rad"], dtype=np.float32
-    )
+    soft = np.asarray(contract["isaaclab_soft_limits"]["values_rad"], dtype=np.float32)
     guard = np.asarray(contract["target_guard"]["values_rad"], dtype=np.float32)
     joint_index = 3
     adversarial = np.nextafter(
@@ -393,7 +390,10 @@ def test_position_contract_preserves_model_inputs_but_removes_velocity_actuation
     assert new["policy_output"]["execute_first"] == 8
     assert new["control"]["target_mode"] == "absolute_joint_position"
     assert new["control"]["command_anchor"].startswith("fresh_measured")
-    assert new["control"]["position_drive"]["claims_exact_hardware_controller_gains"] is False
+    assert (
+        new["control"]["position_drive"]["claims_exact_hardware_controller_gains"]
+        is False
+    )
     assert new["control"]["position_limits"] == expected_position_limit_contract()
     assert new["official_droid"]["revision"] == OFFICIAL_DROID_COMMIT
     assert new["official_droid"]["control_sources"] == OFFICIAL_DROID_CONTROL_SOURCES
@@ -578,6 +578,25 @@ def _observation(q):
     }
 
 
+class _CudaLikeExactBool:
+    """Exercise the CUDA tensor path without requiring CUDA in unit tests."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __array__(self, *_args, **_kwargs):
+        raise TypeError("cannot convert a CUDA tensor directly to NumPy")
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def tolist(self):
+        return [self.value]
+
+
 def _args(tmp_path):
     path = tmp_path / PI05_DROID_CONTRACT_FILENAME
     publish_immutable_position_serving_contract(
@@ -627,17 +646,24 @@ def test_client_reanchors_second_open_loop_action_to_fresh_live_q(tmp_path):
     actual_after[0] = np.float32(0.04)
     env.apply(first, actual_after)
     client.record_execution(
-        _observation(actual_after), env, terminated=[False], truncated=[False]
+        _observation(actual_after),
+        env,
+        terminated=_CudaLikeExactBool(False),
+        truncated=_CudaLikeExactBool(False),
     )
 
     second, _ = client.infer(_observation(actual_after), "move")
     assert second[0] == pytest.approx(0.24)
     assert second[0] != pytest.approx(0.4)
-    records = [json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()]
+    records = [
+        json.loads(line) for line in (tmp_path / "trace.jsonl").read_text().splitlines()
+    ]
     for record in records:
         validate_position_trace_record(record)
     actions_in_trace = [
-        record for record in records if record["record_type"] == "openpi_droid_position_action"
+        record
+        for record in records
+        if record["record_type"] == "openpi_droid_position_action"
     ]
     query = next(
         record
@@ -650,7 +676,9 @@ def test_client_reanchors_second_open_loop_action_to_fresh_live_q(tmp_path):
     assert query["images"]["wrist"]["shape"] == [224, 224, 3]
     assert len(query["images"]["native_external"]["sha256"]) == 64
     assert actions_in_trace[1]["live_pre_step_joint_position"][0] == pytest.approx(0.04)
-    assert actions_in_trace[1]["adapter"]["absolute_joint_position_target_rad"][0] == pytest.approx(0.24)
+    assert actions_in_trace[1]["adapter"]["absolute_joint_position_target_rad"][
+        0
+    ] == pytest.approx(0.24)
     tampered_action = copy.deepcopy(actions_in_trace[0])
     tampered_action["guarded_float32_joint_position_target"][0] += 1e-12
     with pytest.raises(ValueError, match="exact serialized float32"):
@@ -659,16 +687,14 @@ def test_client_reanchors_second_open_loop_action_to_fresh_live_q(tmp_path):
 
 def test_client_rejects_camera_resolution_dtype_and_state_dtype_drift():
     wrong_shape = _observation(np.zeros(7, dtype=np.float32))
-    wrong_shape["splat"]["external_cam"] = np.zeros(
-        (719, 1280, 3), dtype=np.uint8
-    )
+    wrong_shape["splat"]["external_cam"] = np.zeros((719, 1280, 3), dtype=np.uint8)
     with pytest.raises(ValueError, match=r"shape \[720,1280,3\]"):
         DroidDeltaJointPositionClient._extract_observation(wrong_shape)
 
     wrong_dtype = _observation(np.zeros(7, dtype=np.float32))
-    wrong_dtype["splat"]["wrist_cam"] = wrong_dtype["splat"][
-        "wrist_cam"
-    ].astype(np.float32)
+    wrong_dtype["splat"]["wrist_cam"] = wrong_dtype["splat"]["wrist_cam"].astype(
+        np.float32
+    )
     with pytest.raises(ValueError, match="native uint8 RGB"):
         DroidDeltaJointPositionClient._extract_observation(wrong_dtype)
 
@@ -714,7 +740,13 @@ def test_client_rejects_target_beyond_live_limit_before_setter(tmp_path):
     trace = client.finalized_trace_artifact
     assert trace["summary"]["status"] == "numerical_failure"
     assert terminal["incident"]["setter_calls_for_rejected_target"] == 0
-    identity = {"path": "/tmp/fake.mp4", "size": 1, "sha256": "0" * 64, "mode": "0444", "nlink": 1}
+    identity = {
+        "path": "/tmp/fake.mp4",
+        "size": 1,
+        "sha256": "0" * 64,
+        "mode": "0444",
+        "nlink": 1,
+    }
     sidecar = make_position_failure_sidecar(
         episode_result={
             "episode": 0,

@@ -37,8 +37,9 @@ from polaris.pi05_droid_native_eval_contract import (
     PI05_DROID_NATIVE_DECIMATION,
     PI05_DROID_NATIVE_EPISODE_STEPS,
     PI05_DROID_NATIVE_SENSOR_NAMES,
-    validate_environment_runtime_contract,
     publish_immutable_json,
+    validate_environment_runtime_contract,
+    validate_outer_step_flags,
 )
 from polaris.native_gripper_runtime import (
     NativeAllJointVelocityLimitError,
@@ -72,7 +73,9 @@ class PositionTargetLimitError(RuntimeError):
         self.incident_artifact = copy.deepcopy(incident_artifact)
 
 
-def _serialized_float32(value: Any, *, shape: tuple[int, ...], field: str) -> np.ndarray:
+def _serialized_float32(
+    value: Any, *, shape: tuple[int, ...], field: str
+) -> np.ndarray:
     serialized = np.asarray(value)
     if (
         serialized.shape != shape
@@ -138,8 +141,7 @@ def validate_position_target_limit_incident(value: Any) -> dict[str, Any]:
     if (
         value["schema_version"] != 1
         or value["profile"] != "openpi_pi05_droid_position_target_limit_failure_v1"
-        or value["reason"]
-        != "absolute_target_outside_zero_inset_live_hard_soft_guard"
+        or value["reason"] != "absolute_target_outside_zero_inset_live_hard_soft_guard"
         or reference_target.shape != (7,)
         or reference_target.dtype != np.float64
         or not np.array_equal(guarded_target, recomputed_target[0])
@@ -182,9 +184,7 @@ def _image_contract(image: Any) -> dict[str, Any]:
 def _native_image_contract(image: Any, *, field: str) -> dict[str, Any]:
     image = np.ascontiguousarray(np.asarray(image))
     if image.shape != (720, 1280, 3) or image.dtype != np.uint8:
-        raise ValueError(
-            f"{field} must be native uint8 RGB with shape [720,1280,3]"
-        )
+        raise ValueError(f"{field} must be native uint8 RGB with shape [720,1280,3]")
     return {
         "shape": [720, 1280, 3],
         "dtype": "uint8",
@@ -206,15 +206,6 @@ def _validate_image_identity(
         or any(character not in "0123456789abcdef" for character in digest)
     ):
         raise ValueError(f"{field} identity mismatch")
-
-
-def _exact_bool(value: Any, *, field: str) -> bool:
-    array = np.asarray(value)
-    if array.shape == (1,) and array.dtype == np.bool_:
-        return bool(array[0])
-    if type(value) is bool:
-        return value
-    raise ValueError(f"{field} must be one exact boolean")
 
 
 def _single_nonnegative_integer(value: Any, *, field: str) -> int:
@@ -427,18 +418,22 @@ def validate_position_trace_record(value: Any) -> dict[str, Any]:
         if actions.shape != (15, 8) or not np.isfinite(actions).all():
             raise ValueError("position query response chunk mismatch")
     elif record_type == "openpi_droid_position_action":
-        if type(value["query_index"]) is not int or type(
-            value["chunk_action_index"]
-        ) is not int:
+        if (
+            type(value["query_index"]) is not int
+            or type(value["chunk_action_index"]) is not int
+        ):
             raise ValueError("position action indices must be exact integers")
         validate_position_adapter_evidence(value["adapter"])
         live_pre = np.asarray(value["live_pre_step_joint_position"])
         policy_q = np.asarray(value["policy_observation_joint_position"])
-        if live_pre.shape != (7,) or policy_q.shape != (7,) or not np.array_equal(
-            live_pre, policy_q
-        ) or not np.array_equal(
-            live_pre,
-            np.asarray(value["adapter"]["measured_joint_position"]),
+        if (
+            live_pre.shape != (7,)
+            or policy_q.shape != (7,)
+            or not np.array_equal(live_pre, policy_q)
+            or not np.array_equal(
+                live_pre,
+                np.asarray(value["adapter"]["measured_joint_position"]),
+            )
         ):
             raise ValueError("position action fresh live anchor mismatch")
         limit_contract = expected_position_limit_contract()
@@ -488,7 +483,10 @@ def validate_position_trace_record(value: Any) -> dict[str, Any]:
         for field in ("query_index", "chunk_action_index", "outer_step_index"):
             if type(value[field]) is not int or value[field] < 0:
                 raise ValueError(f"position execution {field} is invalid")
-        if type(value["terminated"]) is not bool or type(value["truncated"]) is not bool:
+        if (
+            type(value["terminated"]) is not bool
+            or type(value["truncated"]) is not bool
+        ):
             raise ValueError("position execution flags must be booleans")
         for field, width in (
             ("processed_joint_position_target", 7),
@@ -561,8 +559,7 @@ def validate_position_trace_record(value: Any) -> dict[str, Any]:
             raise ValueError("position terminal failure schema mismatch")
         if (
             failure["schema_version"] != 1
-            or failure["profile"]
-            != "openpi_pi05_droid_position_numerical_failure_v1"
+            or failure["profile"] != "openpi_pi05_droid_position_numerical_failure_v1"
             or failure["failure_type"]
             not in {"NativeAllJointVelocityLimitError", "PositionTargetLimitError"}
             or failure["sample_kind"]
@@ -648,8 +645,7 @@ def validate_position_trace(
                 raise ValueError("position execution has no action")
             if (
                 record["query_index"] != pending_action["query_index"]
-                or record["chunk_action_index"]
-                != pending_action["chunk_action_index"]
+                or record["chunk_action_index"] != pending_action["chunk_action_index"]
                 or record["outer_step_index"] != executions
             ):
                 raise ValueError("position execution/action identity mismatch")
@@ -729,7 +725,10 @@ class DroidDeltaJointPositionClient(InferenceClient):
         self.position_limit_contract = validate_position_limit_contract(
             self.serving_contract["control"]["position_limits"]
         )
-        if not isinstance(args.serving_contract_path, str) or not args.serving_contract_path:
+        if (
+            not isinstance(args.serving_contract_path, str)
+            or not args.serving_contract_path
+        ):
             raise ValueError("DroidDeltaJointPosition requires serving_contract_path")
         self.serving_contract_artifact = validate_persisted_position_serving_contract(
             Path(args.serving_contract_path), server_metadata
@@ -833,7 +832,11 @@ class DroidDeltaJointPositionClient(InferenceClient):
             if digest != expected_sha256:
                 raise ValueError(f"imported {module_name} source digest mismatch")
             records.append(
-                {"module": module_name, "relative_path": relative_path, "sha256": digest}
+                {
+                    "module": module_name,
+                    "relative_path": relative_path,
+                    "sha256": digest,
+                }
             )
         records.sort(key=lambda item: item["module"])
         identity = {
@@ -872,7 +875,9 @@ class DroidDeltaJointPositionClient(InferenceClient):
     def bind_evaluation_runtime(self, value: dict[str, Any]) -> None:
         if self._environment_runtime_contract is not None:
             raise RuntimeError("position evaluation runtime is already bound")
-        self._environment_runtime_contract = validate_environment_runtime_contract(value)
+        self._environment_runtime_contract = validate_environment_runtime_contract(
+            value
+        )
 
     def begin_rollout(self, env: Any) -> dict[str, Any]:
         if self._environment_runtime_contract is None or self.reset_index != 0:
@@ -976,18 +981,14 @@ class DroidDeltaJointPositionClient(InferenceClient):
         reference_target = np.asarray(
             adapter["absolute_joint_position_target_rad"], dtype=np.float64
         )
-        guarded_target, target_guard_limits, violation = (
-            evaluate_position_target_guard(
-                reference_target, live_hard_limits, live_soft_limits
-            )
+        guarded_target, target_guard_limits, violation = evaluate_position_target_guard(
+            reference_target, live_hard_limits, live_soft_limits
         )
         if bool(violation.any()):
             incident = validate_position_target_limit_incident(
                 {
                     "schema_version": 1,
-                    "profile": (
-                        "openpi_pi05_droid_position_target_limit_failure_v1"
-                    ),
+                    "profile": ("openpi_pi05_droid_position_target_limit_failure_v1"),
                     "reason": (
                         "absolute_target_outside_zero_inset_live_hard_soft_guard"
                     ),
@@ -1015,8 +1016,7 @@ class DroidDeltaJointPositionClient(InferenceClient):
                         target_guard_limits[0].tolist()
                     ),
                     "guard_source": (
-                        "intersection(live_joint_pos_limits,"
-                        "live_soft_joint_pos_limits)"
+                        "intersection(live_joint_pos_limits,live_soft_joint_pos_limits)"
                     ),
                     "guard_inset_rad": 0.0,
                     "violating_joint_indices": np.flatnonzero(violation[0]).tolist(),
@@ -1056,9 +1056,7 @@ class DroidDeltaJointPositionClient(InferenceClient):
                 "query_index": self.active_query_index,
                 "chunk_action_index": action_index,
                 "live_pre_step_joint_position": live_q[0].tolist(),
-                "policy_observation_joint_position": current[
-                    "joint_position"
-                ].tolist(),
+                "policy_observation_joint_position": current["joint_position"].tolist(),
                 "guarded_float32_joint_position_target": guarded_target[0].tolist(),
                 "position_limit_contract_sha256": self.position_limit_contract[
                     "contract_sha256"
@@ -1096,10 +1094,13 @@ class DroidDeltaJointPositionClient(InferenceClient):
             or self._rollout_environment_before is None
         ):
             raise RuntimeError("position environment cadence was not bound")
-        terminated_bool = _exact_bool(terminated, field="terminated")
-        truncated_bool = _exact_bool(truncated, field="truncated")
-        if terminated_bool or truncated_bool:
-            raise ValueError("position canary terminated before the 450-step boundary")
+        flags = validate_outer_step_flags(
+            terminated,
+            truncated,
+            outer_step_index=self.outer_step_index,
+        )
+        terminated_bool = flags["terminated"]
+        truncated_bool = flags["truncated"]
         environment_after = _capture_environment_state(
             env, self._environment_runtime_contract
         )
@@ -1226,7 +1227,9 @@ class DroidDeltaJointPositionClient(InferenceClient):
             actions_attempted = self.outer_step_index + 1
         else:
             if self._pending_execution is not None:
-                raise RuntimeError("position post-policy failure retained pending action")
+                raise RuntimeError(
+                    "position post-policy failure retained pending action"
+                )
             actions_attempted = self.outer_step_index
         if self._environment_runtime_contract is None:
             raise RuntimeError("position failure has no environment runtime")
@@ -1471,9 +1474,7 @@ class DroidDeltaJointPositionClient(InferenceClient):
         external_identity = _native_image_contract(
             external, field="external camera observation"
         )
-        wrist_identity = _native_image_contract(
-            wrist, field="wrist camera observation"
-        )
+        wrist_identity = _native_image_contract(wrist, field="wrist camera observation")
         state = obs["policy"]
         joint_position = _tensor_numpy(
             state["arm_joint_pos"], field="joint-position observation"
@@ -1481,9 +1482,7 @@ class DroidDeltaJointPositionClient(InferenceClient):
         joint_velocity = _tensor_numpy(
             state["arm_joint_vel"], field="joint-velocity observation"
         )[0]
-        gripper = _tensor_numpy(
-            state["gripper_pos"], field="gripper observation"
-        )[0]
+        gripper = _tensor_numpy(state["gripper_pos"], field="gripper observation")[0]
         if (
             joint_position.shape != (7,)
             or joint_velocity.shape != (7,)

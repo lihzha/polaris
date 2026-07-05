@@ -44,24 +44,15 @@ class NativeEvaluatorLifecycle:
         if self._closed:
             raise RuntimeError("Native evaluator lifecycle closed more than once")
         self._closed = True
-        primary_error: BaseException | None = None
         try:
             if self._env is not None:
                 self._env.close()
             if self._close_ready is not None:
                 publisher, path, payload = self._close_ready
                 publisher(path, payload)
-        except BaseException as error:  # preserve cleanup evidence before Kit teardown
-            primary_error = error
-        finally:
-            try:
-                self._simulation_app.close()
-            except BaseException as simulation_error:
-                if primary_error is not None:
-                    raise BaseExceptionGroup(
-                        "Native evaluator cleanup failed",
-                        [primary_error, simulation_error],
-                    )
-                raise
-        if primary_error is not None:
-            raise primary_error
+        except BaseException as error:
+            # SimulationApp.close() may terminate the process with status zero.
+            # Do not let it mask an env-close or immutable-ready publication
+            # failure.  Only a fully prepared success reaches Kit teardown.
+            raise RuntimeError("Native evaluator pre-Kit cleanup failed") from error
+        self._simulation_app.close()

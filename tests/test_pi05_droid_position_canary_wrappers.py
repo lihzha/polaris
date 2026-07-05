@@ -364,6 +364,26 @@ def test_launchers_are_non_array_and_fail_closed_on_old_gates():
         assert "ALL_SIX_CONTROLLER_COMPLETION" in text
         assert "Old direct-rad/s controller gate is forbidden" in text
 
+    evaluator = (root / "scripts/eval.py").read_text(encoding="utf-8")
+    wrapper = (root / "scripts/polaris/eval_pi05_droid_position.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "except BaseException as error:" in evaluator
+    assert "traceback.print_exception(error, file=sys.stderr)" in evaluator
+    assert "raise SystemExit(1) from error" in evaluator
+    assert "Evaluator returned zero without immutable close-ready evidence" in wrapper
+
+
+def test_position_smoke_and_canary_govern_the_shared_native_lifecycle():
+    from scripts.polaris import (
+        finalize_pi05_droid_position_controller_smoke as smoke_finalizer,
+    )
+
+    lifecycle = "src/polaris/pi05_droid_native_lifecycle.py"
+    assert lifecycle in smoke_finalizer.SOURCE_PATHS
+    assert lifecycle in finalizer.SOURCE_PATHS
+    assert lifecycle in finalizer.CONTROLLER_GOVERNED_PATHS
+
 
 def test_resolved_contract_binds_train_matched_images_stats_and_flow():
     contract = finalizer.resolved_contract()

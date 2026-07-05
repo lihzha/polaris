@@ -437,8 +437,12 @@ PY
 (( bound_after_code == 0 )) || die "Bound-port validation failed after evaluator"
 [[ "${BOUND_PORT_AFTER}" == "${BOUND_PORT_VALIDATION}" ]] || die "Bound-port artifact changed during evaluator"
 (( post_code == 0 )) || exit "${post_code}"
+FAILURE_STAGE=evaluator_execution
 (( eval_code == 0 )) || exit "${eval_code}"
 (( tee_code == 0 )) || exit "${tee_code}"
+[[ -f "${LIFECYCLE_PATH}" && ! -L "${LIFECYCLE_PATH}" \
+  && "$(stat -c '%a' -- "${LIFECYCLE_PATH}")" == 444 ]] \
+  || die "Evaluator returned zero without immutable close-ready evidence"
 
 FAILURE_STAGE=host_finalization
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${HOST_PYTHONPATH}" "${finalizer_command[@]}"

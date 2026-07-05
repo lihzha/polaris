@@ -8,6 +8,8 @@ import torch
 import argparse
 import os
 import pandas as pd
+import sys
+import traceback
 
 
 from pathlib import Path
@@ -61,9 +63,7 @@ def main(eval_args: EvalArgs):
         )
     if eval_args.control_mode == "joint-velocity":
         if eval_args.expected_gripper_drive_profile != NATIVE_GRIPPER_DRIVE_PROFILE:
-            raise ValueError(
-                "joint-velocity expected gripper drive profile mismatch"
-            )
+            raise ValueError("joint-velocity expected gripper drive profile mismatch")
     elif position_adapter:
         if eval_args.expected_gripper_drive_profile != NATIVE_GRIPPER_DRIVE_PROFILE:
             raise ValueError(
@@ -90,9 +90,18 @@ def main(eval_args: EvalArgs):
 
     lifecycle = NativeEvaluatorLifecycle(simulation_app)
     try:
-        return _run_evaluation(eval_args, lifecycle)
-    finally:
-        lifecycle.close()
+        result = _run_evaluation(eval_args, lifecycle)
+    except BaseException as error:
+        # Pinned Kit teardown may hard-exit zero.  Never enter it with an active
+        # evaluator failure, because that would erase the original traceback
+        # and make the srun look successful.  Process exit releases the failed
+        # simulator; only a complete transaction is allowed through close().
+        traceback.print_exception(error, file=sys.stderr)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        raise SystemExit(1) from error
+    lifecycle.close()
+    return result
 
 
 def _run_evaluation(eval_args: EvalArgs, lifecycle):
@@ -267,9 +276,7 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         policy_client.bind_evaluation_runtime(environment_runtime_contract)
 
     horizon = (
-        PI05_DROID_NATIVE_EPISODE_STEPS
-        if audited_droid
-        else env.max_episode_length
+        PI05_DROID_NATIVE_EPISODE_STEPS if audited_droid else env.max_episode_length
     )
     terminal_outcome = None
     episode_sidecar_artifact = None

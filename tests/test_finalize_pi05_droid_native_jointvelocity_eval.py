@@ -1734,12 +1734,18 @@ def test_launchers_block_before_download_or_sbatch_and_forbid_resume():
     assert evaluator_source.index("finish_rollout") < evaluator_source.index(
         "lifecycle.prepare_close_ready"
     )
-    assert "finally:\n        lifecycle.close()" in evaluator_source
+    assert "except BaseException as error:" in evaluator_source
+    assert "traceback.print_exception(error, file=sys.stderr)" in evaluator_source
+    assert "raise SystemExit(1) from error" in evaluator_source
+    assert evaluator_source.index("raise SystemExit(1) from error") < (
+        evaluator_source.index("lifecycle.close()")
+    )
     assert (
         lifecycle_source.index("self._env.close()")
         < lifecycle_source.index("publisher(path, payload)")
         < lifecycle_source.index("self._simulation_app.close()")
     )
+    assert "Native evaluator pre-Kit cleanup failed" in lifecycle_source
     assert "official_model_eval_contract" in finalizer.finalize.__code__.co_consts
 
 
