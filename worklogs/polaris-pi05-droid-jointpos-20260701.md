@@ -276,3 +276,6 @@ validator status `pass`.
   `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris-pi05/pi05-jointpos-latest-4b137a6-20260706T200023Z/pi05-jointpos-latest-4b137a6-20260706T200023Z_official-pi05-polaris_DROID-FoodBussing_1100641`.
   Mirrored local inspection root:
   `/home/lzha/code/cluster_results/l401/polaris_pi05_jointpos_latest_4b137a6_1100641`.
+- Final cleanup verified jobs `1100640` and `1100641` terminal at
+  `COMPLETED 0:0`, no surviving policy server or `RUNNING` marker, and removed
+  only the 30 MiB job-scoped Isaac cache for `1100641`.
