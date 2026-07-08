@@ -50,14 +50,15 @@ from polaris.native_gripper_runtime import (
 def test_render_every_step_is_independent_of_policy_query_cadence(
     render_every_step, needs_next_policy_render, expected
 ):
-    assert (
-        should_render_expensive(
-            policy_client_name="DroidJointVelocity",
-            render_every_step=render_every_step,
-            needs_next_policy_render=needs_next_policy_render,
+    for policy_client_name in ("DroidJointPos", "DroidJointVelocity"):
+        assert (
+            should_render_expensive(
+                policy_client_name=policy_client_name,
+                render_every_step=render_every_step,
+                needs_next_policy_render=needs_next_policy_render,
+            )
+            is expected
         )
-        is expected
-    )
 
 
 @pytest.mark.parametrize("invalid", [0, 1, None, "true"])
@@ -70,7 +71,7 @@ def test_render_decision_requires_exact_booleans(invalid):
         )
 
 
-@pytest.mark.parametrize("policy_client_name", ["DroidJointPos", "EgoLAPEefPose"])
+@pytest.mark.parametrize("policy_client_name", ["EgoLAPEefPose"])
 def test_non_native_render_decision_preserves_policy_rerender_exactly(
     policy_client_name,
 ):

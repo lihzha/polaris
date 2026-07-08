@@ -16,7 +16,10 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 from polaris.config import EvalArgs
-from polaris.evaluation_seed import episode_environment_seed
+from polaris.evaluation_seed import (
+    episode_environment_seed,
+    validate_episode_seed_range,
+)
 
 
 def main(eval_args: EvalArgs):
@@ -28,7 +31,12 @@ def main(eval_args: EvalArgs):
     if eval_args.policy.client == "DroidJointPos":
         if eval_args.environment_seed is None:
             raise ValueError("DroidJointPos requires --environment-seed")
-        episode_environment_seed(eval_args.environment_seed, 0)
+        if eval_args.rollouts is not None:
+            validate_episode_seed_range(eval_args.environment_seed, eval_args.rollouts)
+        if not eval_args.runtime_contract_path or not eval_args.policy.trace_path:
+            raise ValueError(
+                "DroidJointPos requires --runtime-contract-path and --policy.trace-path"
+            )
     elif eval_args.environment_seed is not None:
         episode_environment_seed(eval_args.environment_seed, 0)
     if (
@@ -122,6 +130,10 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         DroidJointVelocityObservationCfg,
         EefPoseActionCfg,
     )
+    from polaris.environments.pi05_droid_jointpos_cfg import (
+        DroidJointPositionActionCfg,
+        DroidJointPositionObservationCfg,
+    )
     from polaris.environments.robot_cfg import NVIDIA_DROID_JOINT_VELOCITY
     from polaris.environments.pi05_droid_position_cfg import (
         DroidPositionAdapterActionCfg,
@@ -140,6 +152,14 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         episode_environment_seed,
         format_environment_seed_contract,
         make_live_environment_seed_contract,
+        validate_episode_seed_range,
+    )
+    from polaris.pi05_droid_jointpos_runtime import (
+        PI05_DROID_JOINTPOS_OUTER_STEPS,
+        capture_jointpos_runtime,
+        configure_jointpos_timeout,
+        format_jointpos_runtime,
+        publish_jointpos_runtime,
     )
     from polaris.pi05_droid_native_eval_contract import (
         PI05_DROID_NATIVE_EPISODE_STEPS,
@@ -175,6 +195,7 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
     # from real2simeval.autoscoring import TASK_TO_SUCCESS_CHECKER
 
     position_adapter = eval_args.policy.client == "DroidDeltaJointPosition"
+    audited_jointpos = eval_args.policy.client == "DroidJointPos"
     audited_droid = eval_args.control_mode == "joint-velocity" or position_adapter
     env_cfg = parse_env_cfg(
         eval_args.environment,
@@ -205,6 +226,10 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         configured_episode_length_seconds = configure_native_environment_timeout(
             env_cfg
         )
+    elif audited_jointpos:
+        env_cfg.actions = DroidJointPositionActionCfg()
+        env_cfg.observations = DroidJointPositionObservationCfg()
+        configured_episode_length_seconds = configure_jointpos_timeout(env_cfg)
     elif eval_args.control_mode != "joint-position":
         raise ValueError(f"Unsupported control mode: {eval_args.control_mode}")
     env: ManagerBasedRLSplatEnv = gym.make(  # type: ignore[assignment]
@@ -265,6 +290,8 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         else default_instruction
     )
     rollouts = len(initial_conditions)
+    if audited_jointpos:
+        validate_episode_seed_range(eval_args.environment_seed, rollouts)
     # Resume CSV logging
     run_folder = Path(eval_args.run_folder)
     run_folder.mkdir(parents=True, exist_ok=True)
@@ -304,8 +331,15 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         policy_client.bind_evaluation_runtime(environment_runtime_contract)
 
     horizon = (
-        PI05_DROID_NATIVE_EPISODE_STEPS if audited_droid else env.max_episode_length
+        PI05_DROID_NATIVE_EPISODE_STEPS
+        if audited_droid
+        else (
+            PI05_DROID_JOINTPOS_OUTER_STEPS
+            if audited_jointpos
+            else env.max_episode_length
+        )
     )
+    jointpos_runtime_sha256 = None
     terminal_outcome = None
     episode_sidecar_artifact = None
     position_safety_report = None
@@ -316,18 +350,29 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         # loop reset before incrementing ``episode``, repeating condition zero.
         episode_seed = None
         if eval_args.environment_seed is not None:
-            episode_seed = episode_environment_seed(
-                eval_args.environment_seed, episode
-            )
+            episode_seed = episode_environment_seed(eval_args.environment_seed, episode)
         obs, info = env.reset(
             seed=episode_seed,
             object_positions=initial_conditions[episode],
         )
-        if eval_args.policy.client == "DroidJointPos":
+        if audited_jointpos:
+            live_jointpos_runtime = capture_jointpos_runtime(env, obs)
+            if jointpos_runtime_sha256 is None:
+                print(format_jointpos_runtime(live_jointpos_runtime), flush=True)
+                runtime_artifact = publish_jointpos_runtime(
+                    Path(eval_args.runtime_contract_path), live_jointpos_runtime
+                )
+                jointpos_runtime_sha256 = live_jointpos_runtime["runtime_sha256"]
+            elif live_jointpos_runtime["runtime_sha256"] != jointpos_runtime_sha256:
+                raise ValueError(
+                    "live joint-position runtime drifted across episode reset"
+                )
+            policy_client.bind_jointpos_runtime(live_jointpos_runtime)
             policy_client.reset(
                 episode_index=episode,
                 episode_seed=episode_seed,
             )
+            policy_client.begin_rollout(env)
         else:
             policy_client.reset()
         native_arm_term = None
@@ -449,6 +494,18 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                 # attempted action, so include it in the episode length.
                 bar.update(1)
                 break
+            if audited_jointpos:
+                policy_client.record_execution(
+                    obs,
+                    env,
+                    terminated=term,
+                    truncated=trunc,
+                    terminal_rubric=(
+                        info["rubric"]
+                        if bar.n + 1 == PI05_DROID_JOINTPOS_OUTER_STEPS
+                        else None
+                    ),
+                )
             if audited_droid:
                 try:
                     native_arm_term.record_native_all_joint_post_policy_step()
@@ -499,10 +556,48 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                     truncated=trunc,
                 )
             bar.update(1)
-            if not audited_droid and (term[0] or trunc[0]):
+            if not audited_droid and not audited_jointpos and (term[0] or trunc[0]):
                 break
 
         episode_length = bar.n
+        if audited_jointpos and episode_length != PI05_DROID_JOINTPOS_OUTER_STEPS:
+            raise RuntimeError(
+                "DroidJointPos did not complete the explicit 450-step horizon"
+            )
+        if audited_jointpos:
+            from PIL import Image
+
+            terminal_visualization = policy_client.final_terminal_visualization()
+            terminal_path = run_folder / f"episode_{episode}_terminal.png"
+            terminal_temporary = terminal_path.with_name(
+                f".{terminal_path.stem}.partial-{os.getpid()}.png"
+            )
+            if (
+                terminal_path.exists()
+                or terminal_path.is_symlink()
+                or terminal_temporary.exists()
+                or terminal_temporary.is_symlink()
+            ):
+                raise RuntimeError(
+                    "DroidJointPos terminal visualization already exists"
+                )
+            try:
+                with terminal_temporary.open("xb") as terminal_file:
+                    Image.fromarray(terminal_visualization).save(
+                        terminal_file, format="PNG"
+                    )
+                    terminal_file.flush()
+                    os.fsync(terminal_file.fileno())
+                os.link(terminal_temporary, terminal_path, follow_symlinks=False)
+                terminal_temporary.unlink()
+                directory = os.open(run_folder, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            finally:
+                if terminal_temporary.exists() and not terminal_temporary.is_symlink():
+                    terminal_temporary.unlink()
         if (
             eval_args.control_mode == "joint-velocity"
             and not numerical_failure_reason
