@@ -763,3 +763,46 @@
   `4357677926fbe337d006e93b5f564e2aae389aa74eeb11927fd5458eee72b506`.
   These jobs perform package/checkpoint setup only and contribute zero rollout
   episodes. GPU canaries remain gated on both setup records completing.
+
+## 2026-07-08 — v11 canary fail-closed and mapped-runtime v2 repair
+
+- Fresh current setup `1101831` completed `0:0` after `00:10:27`. It verified
+  all 242 installed distributions and 240 RECORD inventories, the sealed
+  705-byte numpydantic stub at mode `0444`/link-count 1, full MD5 for all 27
+  checkpoint objects (12,434,530,837 bytes), tokenizer, checkpoint-global
+  DROID normalization, official config, and a clean source tree. Its sealed
+  and final package canonical SHA-256 is
+  `989bc5a3ad4b7c3d5bebeb81b47cec51170a7b9e8f50827d72672ce934bedd62`.
+- Public canary `1101835` then proved that exact package digest before OpenPI
+  import and after policy/tokenizer construction. It sealed the live official
+  serving and model-runtime contracts, restored the checkpoint, and started
+  the pinned simulator. Before any policy request or controller action, the
+  simulator correctly failed closed because the live process mapped one
+  NVIDIA library omitted by the earlier startup-only probe:
+  `/usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.580.105.08`.
+  Thus this attempt has zero episodes, traces, videos, or metric observations.
+  Isaac cleanup remained active for more than seven minutes after the captured
+  traceback, so job `1101835` was explicitly canceled at
+  `2026-07-08T22:50:07+00:00` after preserving all diagnostics.
+- The mapped object was independently read from the allocated L40S node:
+  39,422,584 bytes, SHA-256
+  `1ed129c4f703547fe5f8961dada7d53cb2981404fabdbfa9b9b3e3d83a04f6ac`,
+  GNU build ID `6257a5b3887eab41edd54343ea3623c373ab8e8e`. The paired
+  historical canary independently reproduced the same sole-extra-library
+  failure, establishing that this is a lifecycle-completeness bug in evidence,
+  not a model or branch regression.
+- Repair commit `6445392` advances the exact mapped-graphics profile to
+  `l401_pyxis_nvidia_580_105_08_mapped_graphics_v2`, includes the PTX JIT
+  object in the sorted closed set of 15 libraries, and pins the recomputed
+  stable digest
+  `f3ee6c8027f0cfea3c0f4875c2d3c0aba4c8cf41f8bde040a0bf236b81133a84`.
+  Missing, extra, reordered, replaced, symlinked, deleted, or hash/build-ID
+  drift remains fail-closed. Policy, normalization, image, state, action,
+  sampler, controller, scoring, and episode semantics are unchanged.
+- Validation after the repair: the complete host-safe suite passed 487 tests
+  plus eight subtests; 89 focused runtime/evidence/serving tests passed; Ruff,
+  formatting, compilation, and whitespace checks passed. An independent
+  official-OpenPI audit additionally passed 107 focused tests and found no
+  actionable checkpoint, normalization, image, state/action/gripper, horizon,
+  FLOW/RNG, cadence, or evidence mismatch. A fresh frozen setup and paired
+  one-rollout canary remain required before FoodBussing50 launch.
