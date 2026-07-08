@@ -239,3 +239,36 @@
   `cd0ae19f2ea2cbdd0b8371796acad34c6d1b36d38c26aca68e8715b663c2f9f5`.
   Historical host-safe regression is 176 passed with all eight subtests
   passed; Ruff, Bash syntax, compilation, and whitespace checks pass.
+
+## 2026-07-08 — final setup completion and paired canary launch
+
+- Historical setup job `1101828` completed `0:0` in 8:14 on
+  `cpu-large-0002`. It revalidated 242 installed distributions, all 240
+  noneditable RECORD inventories, the 27-object/12,434,530,837-byte checkpoint
+  with full MD5, tokenizer, global DROID normalization SHA-256
+  `57ce9956f9e07d65f8a8205aabec72d436a2c8927f53edb40c7a77b14a5a90c7`,
+  and `pi05_droid_jointpos_polaris`. Its package-environment canonical
+  SHA-256 is
+  `2acc79a45c9cdd7ef2242f95fbcbbac9ca60fd7f82723492bc1ff01de0db4a1c`;
+  the JSON, setup manifest, and terminal log SHA-256 values are respectively
+  `7ed2524d452991afedfc3e57ce1a4c3c1e4c62867c6759c5b4f4241d4ffbd4ef`,
+  `aa21cdd7d30d8daf13e78b990f7576f78d7d292823c863499ac354bb5c9407ec`,
+  and `d9db8511449ff7f7cf9b3bf6e48ad13fa6a84dc602ec54f589c81bf841fc32f3`.
+  Current setup `1101827` independently completed `0:0` in 6:15 with the same
+  scientific gates.
+- A byte-level parity audit found the same 242 distributions and required
+  versions in both environments. Of 72 differing RECORD paths, 65 console
+  scripts differed only by their exact virtual-environment prefix, four
+  editable OpenPI/OpenPI-client files differed only by their expected frozen
+  checkout paths, and three locally compiled `evdev` objects differed only in
+  debug sections and GNU build IDs. Their executable and data sections are
+  identical, and neither evaluated OpenPI nor PolaRiS source imports `evdev`.
+  This closes the clean-environment parity gate without changing the policy.
+- Public-submitter full-horizon seed-0 historical canary `1101830` launched
+  from the exact clean frozen historical checkout on one L40S under namespace
+  `pi05-confidence-historical-canary-v10-20260708T213230Z`. Current canary
+  `1101829` runs on a separate L40S. Both request one rollout and use the same
+  official checkpoint, global DROID normalization, three image-slot contract,
+  720x1280 client images with server-side 224x224 resize, 15x8 absolute
+  joint-position output, eight-action execution horizon, and seed 0. They are
+  runtime-validation canaries, not final scientific results.
