@@ -560,9 +560,8 @@
   `4dd166d8ced559272603aae9f9b53394c2258833cb6bbb78f624dec5a0ef2bd6`.
   Shared registry revision 17 records the v8 cancellations, both runtime probes,
   and running v9 setup without changing evaluation counts or results.
-  Both were intentionally canceled after 3:46 when the independent runtime
-  review required a stronger completion-gated GPU/Vulkan attestation. Their
-  pre-attestation source commits cannot be used for the final evaluation.
+  Their pre-attestation source commits cannot be used for the final evaluation;
+  as recorded above, the process that canceled them remains unidentified.
 
 ## 2026-07-08 — completion-gated model/simulator GPU and Vulkan identity
 
