@@ -648,3 +648,19 @@
   and is covered by the live L40S canary. Runtime/evidence focused tests pass
   50/50. Ruff format/lint, Python compilation, Bash syntax, and whitespace
   checks pass.
+
+## 2026-07-08 — final mapped-runtime setup launch
+
+- Independently reviewed source/test commit `1684777659062d305e27dba9a536678811f4fe60`
+  is launched through documentation tip `96baee6e42b9bf649337fb08b219f96c79de003e`
+  (tree `1abedf9a07a885d3a3a09d5454bfc6104f6c8365`) from the clean frozen
+  checkout
+  `/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-pi05-confidence-current-96baee6-20260708T213230Z`.
+- Fresh CPU setup job `1101827` is running under namespace
+  `pi05-confidence-final-v10-20260708T213230Z` with immutable submission and
+  ownership records. Historical job `1101828` runs in parallel from its exact
+  paired commit. Both jobs prepared all 242 locked packages; neither is a GPU
+  evaluation and neither has produced a rollout result.
+- Shared registry revision 20 records both running jobs, the final commits and
+  trees, runtime schema 3/evidence profile v5, and mapped-graphics digest
+  `cd0ae19f2ea2cbdd0b8371796acad34c6d1b36d38c26aca68e8715b663c2f9f5`.
