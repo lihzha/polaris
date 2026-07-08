@@ -143,3 +143,69 @@
   adversarial review found no blocking issue. The eval/test blobs are again
   byte-identical to the current arm; the historical evaluator lifecycle remains
   the only intended execution difference.
+
+## 2026-07-08 — final paired clean setup retry
+
+- Historical v6 setup job `1101813` was canceled at 14:00:20 PDT after 14:10,
+  before setup completion, because its source was superseded by the reviewed
+  driver/ICD runtime pin. It consumed no GPU and produced no policy rollout.
+- Independent L40S runtime probe `1101818` then completed successfully on
+  `pool0-00016`: the exact upgraded ICD was mounted into the pinned image and
+  `SimulationApp` started and closed cleanly. Its 44,079-byte log has SHA-256
+  `82bedb51d14d8b6c268438d4e5c5e601397759ca0d461b36603cac45c0330c7f`.
+- Setup jobs `1101819` and `1101820` failed closed in 3 and 2 seconds because
+  the orchestrator pre-created the supposedly fresh `SETUP_RECORD_DIR` paths.
+  The setup script rejected them before package work, simulator use, or GPU
+  rollout; this submission-only error is retained in the attempt history.
+- The corrected untouched-path pair is current job `1101822` and historical
+  job `1101823` under namespace
+  `pi05-confidence-final-v8-20260708T210352Z`. Historical uses exact commit
+  `68899317fa8dfe8c86abe47a59e2f75e37abfd6a`, tree
+  `c6abf07fb21d111d1fc26ab332caf09ca9afa1ff`, and OpenPI
+  `bd70b8f4011e85b3f3b0f039f12113f78718e7bf`; current uses commit
+  `1dcdde6fe702a3966110abb77e6022a79de53871`, tree
+  `9ed22d52879e162b0c0ef20a1b5f534115d17cd5`. The immutable submission
+  manifest SHA-256 is
+  `4f0d56d0670f56fa0b27f75bcdee36dd42ba1fde62681f5cdd795bb69bca535e`.
+
+## 2026-07-08 — v8 external cancellation
+
+- Current setup `1101822` and historical setup `1101823` were canceled
+  simultaneously by user UID `158351` after 3:46. The orchestrator and both
+  assigned agents deny any cancellation or other mutating cluster command, and
+  no matching Codex tool call was found at the exact timestamp. Historical had
+  prepared 242 packages but had not installed or attested them. Its setup-record
+  directory is empty, it used no GPU, and it produced no rollout. Historical
+  log SHA-256 is
+  `e8496038f3c53ef4a0d7df8bf347a2e0fb77b4a2dc80152ce93b3f5b4d538e2e`
+  (5,498 bytes); current log SHA-256 is
+  `7a581e5bd9bbaeb4c463d35c1b6e9c7e43b126c4dbd9ff6074b49189927b85df`
+  (12,280 bytes).
+- The paired setup is now serialized to isolate cancellation ownership:
+  current-only `1101824` is running first under
+  `pi05-confidence-final-v9-20260708T211229Z` with an explicit immutable owner
+  record and Slurm `do-not-cancel` comment. Historical clean setup will launch
+  only after current setup attests successfully. Registry revision 17 preserves
+  all failed/canceled history and leaves scientific result counts unchanged.
+
+## 2026-07-08 — mapped-runtime closure port and final setup gate
+
+- Current-only setup `1101824` completed `0:0` and revalidated the complete
+  242-package OpenPI environment, official checkpoint, tokenizer, global DROID
+  normalization, and config. It is setup-only and superseded for evaluation
+  because its source commit predates mapped-library attestation; it produced no
+  rollout.
+- L40S closure probe `1101825` completed `0:0` and sealed all 778 mapped ELF
+  objects. The canonical 375,900-byte report has SHA-256
+  `9c870463dfad67b23526a64ab044e7203a60a7730d3aaa25ffbc6369aa058207`.
+  The final runtime contract pins the image-bundled Vulkan loader and all 13
+  injected NVIDIA driver objects by path, size, SHA-256, and GNU build ID,
+  checks live map device/inode identity, and runs the simulator under an
+  explicit `env -i` baseline with loader/layer/preload overrides forbidden.
+- Commit `2d0597f` ports the reviewed closure to the historical arm. All seven
+  evaluator/runtime/evidence/test blobs are byte-identical to current commit
+  `1684777`; the historical evaluator lifecycle remains the only intended
+  execution difference. The stable graphics-runtime digest is
+  `cd0ae19f2ea2cbdd0b8371796acad34c6d1b36d38c26aca68e8715b663c2f9f5`.
+  Historical host-safe regression is 176 passed with all eight subtests
+  passed; Ruff, Bash syntax, compilation, and whitespace checks pass.
