@@ -330,3 +330,63 @@
   `4357677926fbe337d006e93b5f564e2aae389aa74eeb11927fd5458eee72b506`.
   These jobs perform package/checkpoint setup only and contribute zero rollout
   episodes. GPU canaries remain gated on both setup records completing.
+
+## 2026-07-08 — v11 setup completion and pre-rollout graphics rejection
+
+- Historical setup `1101832` completed `0:0` in 13:07 and current setup
+  `1101831` completed `0:0` in 10:27. Both verified 242 distributions, all
+  240 noneditable RECORD inventories, the 27-object/12,434,530,837-byte
+  checkpoint with full MD5, tokenizer, global DROID normalization, and the
+  official `pi05_droid_jointpos_polaris` config. Their final package canonical
+  SHA-256 values are respectively
+  `560f9a7f1650a4c4cc0a02b8ceb24e86c0b1b4693709ae274276f6930f22224c`
+  and
+  `989bc5a3ad4b7c3d5bebeb81b47cec51170a7b9e8f50827d72672ce934bedd62`;
+  each sealed report is byte-identical to its final report.
+- Paired one-rollout canaries `1101836` (historical) and `1101835` (current)
+  passed package, checkpoint, tokenizer, model-runtime v3, serving, GPU,
+  driver, and Vulkan gates, then failed closed after DROID environment reset
+  but before the first policy request. The old exact mapped-library table was
+  missing only
+  `/usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.580.105.08`.
+  Both jobs were subsequently canceled by another UID-158351 process while
+  Isaac teardown was pending. Each remains a non-authoritative zero-episode
+  infrastructure failure: no runtime JSON, policy trace, CSV, RNG proof,
+  video, terminal PNG, evidence-v6 manifest, or success marker exists.
+- The historical failure log is 19,737 bytes with SHA-256
+  `e2a9dcd9759235c5022f1d1378cb804ce625d613bc73460bf6888dad952c6fb4`.
+  The current arm independently produced the same exception; its 19,601-byte
+  log has SHA-256
+  `78bca931f646403f3613e893216908f9f826a43b24978dd431c46c2b90dc8d19`.
+  External cancellation bypassed normal marker finalization, so stale
+  `RUNNING` files are explicitly invalid and do not denote active or
+  successful evaluation.
+
+## 2026-07-08 — lazy PTX runtime closure and fresh v12 setup launch
+
+- The source probe for the prior 14-library table constructed only a bare
+  `SimulationApp`. A real DROID reset performs Warp/CUDA PTX work and lazily
+  maps the driver-matched PTX JIT compiler. Live process maps and the mounted
+  file bind that fifteenth object to 39,422,584 bytes, SHA-256
+  `1ed129c4f703547fe5f8961dada7d53cb2981404fabdbfa9b9b3e3d83a04f6ac`,
+  and GNU build ID `6257a5b3887eab41edd54343ea3623c373ab8e8e`.
+- Historical fix commit `449ab6465450a871221803d529f3febb92e5d62b` retains
+  exact-set rejection, adds only that pinned identity, advances the graphics
+  profile to `l401_pyxis_nvidia_580_105_08_mapped_graphics_v2`, and binds
+  canonical digest
+  `f3ee6c8027f0cfea3c0f4875c2d3c0aba4c8cf41f8bde040a0bf236b81133a84`.
+  Historical and current runtime/test blobs are byte-identical at
+  `41e679ae754fa2037190ec9613a95c386aca5baf` and
+  `c65935ff5da3623bda75236a733e250589ef61e9`. Host validation remains 183
+  passed plus eight subtests for historical and 487 plus eight for current;
+  the focused runtime/evidence/serving set passes 89/89 on each arm.
+- Shared registry revision 30 records both v11 failures and the v12 prelaunch
+  contract. Fresh checkout
+  `/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-pi05-confidence-historical-449ab64-20260708T225010Z`
+  is clean at tree `e25b051d18268081c91a61b11bd2519c7fd6e2bc`; the paired
+  current checkout is clean at commit
+  `61cfddc5773e35ee355eccfdf76cdc3f9aebf1f1`. CPU-only setup jobs
+  `1101842` and `1101841` were submitted under
+  `pi05-confidence-final-v12-20260708T225010Z` using immutable script SHA-256
+  `a31ebd3c0ffc687bcbe51fcc0d5e77d4aca2cdf4259dd826f8454de83dd0cd9b`.
+  No v12 GPU evaluation is launched until both setup records pass.
