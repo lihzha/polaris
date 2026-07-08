@@ -30,3 +30,18 @@
   job has yet been launched from this final control candidate.
 - Branch-local integration commit:
   `94c48f525a53a67fb8c03841682b9e9bf16db3a2`.
+
+## 2026-07-08 — shared schema-4 physical audit
+
+- CPU setup job `1101795` was intentionally canceled before evaluation after
+  the final prelaunch review found that the current tree's optional physical
+  analyzer had not yet learned the schema-4 execution records. No L40S job was
+  launched from that attempt.
+- This historical control now carries the same byte-identical schema-4
+  joint-bound analyzer, aggregate summarizer, and tests as the current arm.
+  The analyzer requires one execution record per emitted action and audits
+  every measured post-action state, including action 450; legacy query-only
+  traces are retained only with an explicit lower-bound label. These files do
+  not participate in rollout execution, so the intended historical evaluator
+  lifecycle remains unchanged while paired raw and state-valid results use the
+  same committed analysis implementation.
