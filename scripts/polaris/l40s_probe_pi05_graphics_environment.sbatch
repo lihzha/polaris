@@ -59,7 +59,7 @@ driver_version="$(xargs <<<"${driver_version}")"
 } >"${RUN_DIR}/run_record.env"
 chmod 0444 "${RUN_DIR}/run_record.env"
 
-mounts="${POLARIS_DIR}:${POLARIS_DIR}:ro,${RUN_DIR}:${RUN_DIR}:rw,${POLARIS_VULKAN_ICD_PATH}:/etc/vulkan/icd.d/nvidia_icd.json:ro"
+mounts="/dev/shm:/dev/shm,${POLARIS_DIR}:${POLARIS_DIR}:ro,${RUN_DIR}:${RUN_DIR}:rw,${POLARIS_VULKAN_ICD_PATH}:/etc/vulkan/icd.d/nvidia_icd.json:ro"
 srun --ntasks=1 --cpus-per-task="${SLURM_CPUS_PER_TASK}" \
   --container-image="${POLARIS_PYXIS_IMAGE}" \
   --container-mounts="${mounts}" \
