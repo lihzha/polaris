@@ -80,10 +80,40 @@ def _file_identity(path: Path) -> dict[str, Any]:
     }
 
 
+def _proc_initial_environment() -> dict[str, str]:
+    payload = Path("/proc/self/environ").read_bytes()
+    if payload and not payload.endswith(b"\0"):
+        raise ValueError("/proc/self/environ is truncated")
+    result = {}
+    for raw in payload.rstrip(b"\0").split(b"\0") if payload else ():
+        name, value = raw.split(b"=", 1)
+        decoded_name = name.decode("utf-8", errors="strict")
+        if decoded_name in result:
+            raise ValueError("/proc/self/environ has duplicate keys")
+        result[decoded_name] = value.decode("utf-8", errors="strict")
+    return dict(sorted(result.items()))
+
+
+def _mapped_identity(path: Path) -> dict[str, Any]:
+    identities = set()
+    for line in Path("/proc/self/maps").read_text(encoding="utf-8").splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) != 6 or fields[5] != str(path):
+            continue
+        identities.add((fields[3].lower(), int(fields[4], 10)))
+    if len(identities) != 1:
+        raise ValueError(f"Expected one mapped identity for {path}")
+    device, inode = next(iter(identities))
+    return {"device": device, "inode": inode}
+
+
 def _opencv_identity() -> dict[str, Any]:
     import cv2
 
     package_dir = Path(cv2.__file__).resolve().parent
+    native = cv2._native
+    version = cv2.version
+    higher_priority_config = package_dir / "config-3.11.py"
     selected = []
     for relative in (
         "__init__.py",
@@ -101,17 +131,42 @@ def _opencv_identity() -> dict[str, Any]:
     for distribution in importlib.metadata.distributions():
         name = distribution.metadata.get("Name", "")
         if "opencv" in name.lower():
-            distributions.append(
-                {"name": name, "version": distribution.version}
-            )
+            distributions.append({"name": name, "version": distribution.version})
     return {
         "module_file": str(Path(cv2.__file__).resolve()),
+        "module_spec_origin": str(Path(cv2.__spec__.origin).resolve()),
+        "native_module_file": str(Path(native.__file__).resolve()),
+        "native_module_spec_origin": str(Path(native.__spec__.origin).resolve()),
+        "native_module_maps_identity": _mapped_identity(
+            Path(native.__file__).resolve()
+        ),
+        "load_config_module_file": str(
+            Path(sys.modules["cv2.load_config_py3"].__file__).resolve()
+        ),
+        "version_module_file": str(Path(version.__file__).resolve()),
         "version": cv2.__version__,
+        "package_version": version.opencv_version,
+        "ci_build": version.ci_build,
+        "headless": version.headless,
+        "contrib": version.contrib,
+        "rolling": version.rolling,
+        "python_executable": str(Path(sys.executable).resolve()),
+        "python_executable_lexical": str(Path(sys.executable).absolute()),
+        "python_implementation": sys.implementation.name,
+        "python_cache_tag": sys.implementation.cache_tag,
+        "python_major": sys.version_info.major,
+        "python_minor": sys.version_info.minor,
+        "higher_priority_config_path": str(higher_priority_config),
+        "higher_priority_config_exists": higher_priority_config.exists(),
+        "selected_config_path": str(package_dir / "config-3.py"),
         "build_information_sha256": hashlib.sha256(
             cv2.getBuildInformation().encode("utf-8")
         ).hexdigest(),
         "distributions": sorted(distributions, key=lambda item: item["name"]),
         "selected_files": selected,
+        "loaded_cv2_modules": sorted(
+            name for name in sys.modules if name.startswith("cv2")
+        ),
     }
 
 
@@ -154,8 +209,7 @@ def _loader_search_safety() -> dict[str, Any]:
 
 def _publish(path: Path, value: dict[str, Any]) -> None:
     payload = (
-        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        + "\n"
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
     ).encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(
@@ -189,6 +243,7 @@ def main() -> None:
         "profile": "pi05_eval_import_order_graphics_environment_probe_v1",
         "python": sys.version,
         "stages": {"process_start": _environment()},
+        "proc_initial_environment": _proc_initial_environment(),
     }
 
     # Match the global import order of scripts/eval.py before AppLauncher.
@@ -218,6 +273,9 @@ def main() -> None:
     report["runtime_module"] = _file_identity(Path(runtime.__file__).resolve())
     report["opencv"] = _opencv_identity()
     report["loader_search_safety"] = _loader_search_safety()
+    report["proc_initial_environment_unchanged"] = (
+        report["proc_initial_environment"] == _proc_initial_environment()
+    )
     report["sha256"] = hashlib.sha256(
         json.dumps(report, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
