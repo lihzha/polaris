@@ -42,14 +42,23 @@ _ENVIRONMENT_NAMES = (
     "VK_LOADER_LAYERS_DISABLE",
     "VK_LOADER_LAYERS_ALLOW",
     "VULKAN_HEADERS_INSTALL_DIR",
+    "QT_QPA_PLATFORM_PLUGIN_PATH",
+    "QT_QPA_FONTDIR",
     "__GLX_VENDOR_LIBRARY_NAME",
     "__EGL_VENDOR_LIBRARY_FILENAMES",
     "LIBGL_DRIVERS_PATH",
 )
 
 
-def _environment() -> dict[str, str | None]:
-    return {name: os.environ.get(name) for name in _ENVIRONMENT_NAMES}
+def _environment() -> dict[str, Any]:
+    # The job launches through /usr/bin/env -i with an explicit non-secret
+    # allowlist, so recording the complete in-process environment is safe and
+    # prevents a diagnostic blind spot from another previously unknown import
+    # mutation.  The selected view keeps loader-sensitive values easy to audit.
+    return {
+        "selected": {name: os.environ.get(name) for name in _ENVIRONMENT_NAMES},
+        "full": dict(sorted(os.environ.items())),
+    }
 
 
 def _sha256(path: Path) -> str:
@@ -82,6 +91,7 @@ def _opencv_identity() -> dict[str, Any]:
         "config-3.py",
         "load_config_py2.py",
         "load_config_py3.py",
+        "version.py",
         "cv2.abi3.so",
     ):
         candidate = package_dir / relative
