@@ -44,7 +44,7 @@ PI05_DROID_JOINTPOS_SENSOR_NAMES = ("external_cam", "wrist_cam")
 PI05_DROID_JOINTPOS_NATIVE_IMAGE_SHAPE = (720, 1280, 3)
 PI05_DROID_JOINTPOS_BOUNDARY_PROFILE = "outer450_internal451_no_autoreset"
 PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE = (
-    "l401_pyxis_nvidia_580_105_08_mapped_graphics_v1"
+    "l401_pyxis_nvidia_580_105_08_mapped_graphics_v2"
 )
 PI05_DROID_JOINTPOS_GRAPHICS_PROC_MAPS_PATH = "/proc/self/maps"
 PI05_DROID_JOINTPOS_GRAPHICS_EXPECTED_LD_LIBRARY_PATH: str | None = None
@@ -152,6 +152,12 @@ PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES: tuple[
         "670be7d086f6c76c668ea3cc46ba4ab43de6b3b7",
     ),
     (
+        "/usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.580.105.08",
+        39_422_584,
+        "1ed129c4f703547fe5f8961dada7d53cb2981404fabdbfa9b9b3e3d83a04f6ac",
+        "6257a5b3887eab41edd54343ea3623c373ab8e8e",
+    ),
+    (
         "/usr/lib/x86_64-linux-gnu/libnvidia-rtcore.so.580.105.08",
         105_513_888,
         "ddd5c845a5e02542004137f49ba65f17be0968e44f921c6181e4639a962f42d2",
@@ -171,7 +177,7 @@ PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES: tuple[
     ),
 )
 PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_SHA256 = (
-    "cd0ae19f2ea2cbdd0b8371796acad34c6d1b36d38c26aca68e8715b663c2f9f5"
+    "f3ee6c8027f0cfea3c0f4875c2d3c0aba4c8cf41f8bde040a0bf236b81133a84"
 )
 
 _ACTION_TERM_CLASS = (
