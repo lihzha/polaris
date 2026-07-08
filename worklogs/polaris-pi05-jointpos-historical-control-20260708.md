@@ -201,6 +201,23 @@
 - A fresh historical setup and live full-horizon canary are mandatory. No result
   from the earlier source revisions will be reused as final evidence.
 
+## 2026-07-08 — final mapped-runtime setup launch
+
+- Independently reviewed source/test commit `2d0597f99cb2e50fe0f05c7c0e6fb17abbdf1650`
+  is launched through documentation tip `bcc2df988ee0cfaca388bf5eaa157d834cafdab3`
+  (tree `1ec2d26c5a1f64132e48e0f4ae26eea977bfcc57`) from the clean frozen
+  checkout
+  `/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-pi05-confidence-historical-bcc2df9-20260708T213230Z`.
+- Fresh CPU setup job `1101828` is running under namespace
+  `pi05-confidence-final-v10-20260708T213230Z` with immutable submission and
+  ownership records. Current job `1101827` runs in parallel from its exact
+  paired commit. Both jobs prepared all 242 locked packages; neither is a GPU
+  evaluation and neither has produced a rollout result.
+- Shared registry revision 20 records both running jobs and the exact
+  mapped-runtime contract. The source/test runtime blobs remain byte-identical
+  to current; the historical evaluator lifecycle is still the only intended
+  paired factor.
+
 ## 2026-07-08 — mapped-runtime closure port and final setup gate
 
 - Current-only setup `1101824` completed `0:0` and revalidated the complete
