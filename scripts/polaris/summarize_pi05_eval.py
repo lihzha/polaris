@@ -20,10 +20,7 @@ TASK_ORDER = (
 
 def _distribution(values: list[float | int]) -> dict[str, int]:
     counts = Counter(values)
-    return {
-        f"{value:.12g}": counts[value]
-        for value in sorted(counts, key=float)
-    }
+    return {f"{value:.12g}": counts[value] for value in sorted(counts, key=float)}
 
 
 def summarize(root: Path) -> dict:
@@ -41,9 +38,7 @@ def summarize(root: Path) -> dict:
                 raise ValueError(
                     f"Non-contiguous metrics for {task_name} at {expected_episode}"
                 )
-        trace_summary = json.loads(
-            (task_dir / "policy_trace_summary.json").read_text()
-        )
+        trace_summary = json.loads((task_dir / "policy_trace_summary.json").read_text())
         joint_audit = json.loads((task_dir / "joint_bound_audit.json").read_text())
         successes = [
             index for index, row in enumerate(rows) if row["success"] == "True"
@@ -70,19 +65,19 @@ def summarize(root: Path) -> dict:
                 "trace_status": trace_summary["status"],
                 "trace_reset_count": trace_summary["reset_count"],
                 "trace_query_records": trace_summary["query_records"],
-                "trace_emitted_action_records": trace_summary[
-                    "emitted_action_records"
-                ],
+                "trace_emitted_action_records": trace_summary["emitted_action_records"],
                 "trace_sha256": trace_summary["trace_sha256"],
+                "state_audit_is_lower_bound": joint_audit.get(
+                    "state_audit_is_lower_bound", True
+                ),
+                "state_observation_coverage": joint_audit.get(
+                    "state_observation_coverage", "policy_queries_only"
+                ),
                 "state_oob_episode_count_lower_bound": joint_audit[
                     "state_oob_episode_count"
                 ],
-                "state_oob_episodes_lower_bound": joint_audit[
-                    "state_oob_episodes"
-                ],
-                "state_oob_success_episodes": joint_audit[
-                    "state_oob_success_episodes"
-                ],
+                "state_oob_episodes_lower_bound": joint_audit["state_oob_episodes"],
+                "state_oob_success_episodes": joint_audit["state_oob_success_episodes"],
                 "state_valid_success_count_counting_invalid_as_failures": joint_audit[
                     "state_valid_success_count_counting_invalid_as_failures"
                 ],
@@ -95,17 +90,18 @@ def summarize(root: Path) -> dict:
     episode_count = sum(task["episodes"] for task in tasks)
     official_successes = sum(task["success_count"] for task in tasks)
     state_valid_successes = sum(
-        task["state_valid_success_count_counting_invalid_as_failures"]
-        for task in tasks
+        task["state_valid_success_count_counting_invalid_as_failures"] for task in tasks
     )
-    state_oob_count = sum(
-        task["state_oob_episode_count_lower_bound"] for task in tasks
-    )
+    state_oob_count = sum(task["state_oob_episode_count_lower_bound"] for task in tasks)
     numerical_failure_count = sum(
         task["recorded_numerical_failure_count"] for task in tasks
     )
-    weighted_progress = sum(
-        task["mean_progress"] * task["episodes"] for task in tasks
+    weighted_progress = sum(task["mean_progress"] * task["episodes"] for task in tasks)
+    state_audit_is_lower_bound = any(
+        task["state_audit_is_lower_bound"] for task in tasks
+    )
+    state_observation_coverage = sorted(
+        {task["state_observation_coverage"] for task in tasks}
     )
     return {
         "schema_version": 1,
@@ -115,6 +111,8 @@ def summarize(root: Path) -> dict:
         "official_success_rate": official_successes / episode_count,
         "official_mean_progress": weighted_progress / episode_count,
         "recorded_numerical_failure_count": numerical_failure_count,
+        "state_audit_is_lower_bound": state_audit_is_lower_bound,
+        "state_observation_coverage": state_observation_coverage,
         "state_oob_episode_count_lower_bound": state_oob_count,
         "state_oob_but_not_recorded_numerical_count_lower_bound": (
             state_oob_count - numerical_failure_count
@@ -128,9 +126,14 @@ def summarize(root: Path) -> dict:
         ),
         "tasks": tasks,
         "physical_audit_note": (
-            "State-OOB counts are lower bounds because state is sampled at policy "
-            "queries every eight actions. Target-only excursions are reported but do "
-            "not reduce the state-valid success numerator."
+            "At least one task only has policy-query state samples, so aggregate "
+            "State-OOB counts remain lower bounds. Target-only excursions are reported "
+            "but do not reduce the state-valid success numerator."
+            if state_audit_is_lower_bound
+            else "Schema-4 execution records cover the initial state and every "
+            "post-action state, so State-OOB counts are exact over recorded rollout "
+            "states. Target-only excursions are reported but do not reduce the "
+            "state-valid success numerator."
         ),
     }
 
@@ -143,6 +146,8 @@ def _write_tsv(path: Path, summary: dict) -> None:
         "success_rate",
         "mean_progress",
         "recorded_numerical_failure_count",
+        "state_audit_is_lower_bound",
+        "state_observation_coverage",
         "state_oob_episode_count_lower_bound",
         "state_valid_success_count_counting_invalid_as_failures",
         "trace_sha256",

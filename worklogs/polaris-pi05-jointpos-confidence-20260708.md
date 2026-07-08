@@ -321,3 +321,26 @@
   integration `2e2bdfa15c74d6901a66f986d0a13dc6b2ef23ca`. The historical control will
   consume the portable commit and a separately reviewed hand-port of its
   intentionally older evaluator lifecycle.
+
+## 2026-07-08 — schema-4 physical-audit gate
+
+- The first clean setup attempts, current job `1101794` and historical job
+  `1101795`, were intentionally canceled before any GPU launch. A final
+  prelaunch check found that the separate state/joint-bound analysis script
+  still accepted only legacy query/action trace records and rejected the new
+  schema-4 per-action execution records. Rollout, rubric scoring, trace
+  validation, and immutable evidence were unaffected, but publishing a
+  state-valid success rate from that analyzer would not have been possible.
+- `audit_pi05_joint_bounds.py` now fail-closes on one-to-one action/execution
+  identity, requires execution indices `0..episode_length-1`, and audits the
+  measured post-action state at every step in addition to the initial query
+  state. Schema-4 state-OOB counts are therefore exact over all recorded
+  rollout states, including the returned post-action-450 state. Legacy traces
+  remain supported and are explicitly labeled as policy-query-only lower
+  bounds. Target-only excursions remain separate from measured-state
+  excursions.
+- New tests prove that a transient between-query state violation is detected,
+  a success with such a violation is excluded from the state-valid numerator,
+  mismatched action/execution targets are rejected, and legacy traces retain
+  their lower-bound label. The analyzer also reproduced the existing
+  query-only result on the retained two-episode canary trace.
