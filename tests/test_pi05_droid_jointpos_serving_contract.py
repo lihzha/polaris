@@ -123,37 +123,69 @@ def _checkpoint_report(tmp_path):
 
 
 def _host_runtime(tmp_path):
-    distributions = [
-        {"name": name, "version": version}
-        for name, version in sorted(
-            contract.PI05_DROID_JOINTPOS_REQUIRED_PACKAGE_VERSIONS.items()
-        )
-    ]
-    record_verified = [
+    versions = dict(contract.PI05_DROID_JOINTPOS_REQUIRED_PACKAGE_VERSIONS)
+    versions.update(
         {
-            "name": name,
-            "version": contract.PI05_DROID_JOINTPOS_REQUIRED_PACKAGE_VERSIONS[name],
-            "file_count": 2,
-            "hashed_file_count": 1,
-            "record": {
-                "path": str(
-                    (tmp_path / f"site-packages/{name}.dist-info/RECORD").resolve()
-                ),
-                "size": 1,
-                "sha256": f"{index + 1:064x}",
-            },
-            "verified_files_sha256": f"{index + 11:064x}",
+            name: version
+            for name, version, _url, _digest, _size in (
+                contract.PI05_DROID_JOINTPOS_PINNED_WHEEL_ARTIFACTS
+            )
         }
-        for index, name in enumerate(
-            name
-            for name in sorted(contract.PI05_DROID_JOINTPOS_REQUIRED_PACKAGE_VERSIONS)
-            if name not in contract.PI05_DROID_JOINTPOS_RECORD_VERIFICATION_EXEMPTIONS
-        )
+    )
+    distributions = [
+        {"name": name, "version": version} for name, version in sorted(versions.items())
     ]
+    record_verified = []
+    for index, name in enumerate(
+        name
+        for name in sorted(versions)
+        if name not in contract.PI05_DROID_JOINTPOS_RECORD_VERIFICATION_EXEMPTIONS
+    ):
+        hex_count = sum(
+            1
+            for entry_name, entry_version, _path, _size, _digest in (
+                contract.PI05_DROID_JOINTPOS_PINNED_HEX_RECORD_ENTRIES
+            )
+            if entry_name == name and entry_version == versions[name]
+        )
+        overlap_resolutions = [
+            contract._expected_record_overlap_resolution(profile)
+            for profile in contract.PI05_DROID_JOINTPOS_PINNED_RECORD_OVERLAP_RESOLUTIONS
+            if profile[0] == name and profile[1] == versions[name]
+        ]
+        overlap_resolutions.sort(key=lambda item: item["path"])
+        overlap_count = len(overlap_resolutions)
+        hashed_file_count = max(1, hex_count + overlap_count + 1)
+        record_verified.append(
+            {
+                "name": name,
+                "version": versions[name],
+                "file_count": hashed_file_count + 1,
+                "hashed_file_count": hashed_file_count,
+                "record_validation_counts": {
+                    contract.PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES[0]: (
+                        hashed_file_count - hex_count - overlap_count
+                    ),
+                    contract.PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES[1]: hex_count,
+                    contract.PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES[
+                        2
+                    ]: overlap_count,
+                },
+                "record_overlap_resolutions": overlap_resolutions,
+                "record": {
+                    "path": str(
+                        (tmp_path / f"site-packages/{name}.dist-info/RECORD").resolve()
+                    ),
+                    "size": 1,
+                    "sha256": f"{index + 1:064x}",
+                },
+                "verified_files_sha256": f"{index + 11:064x}",
+            }
+        )
     record_exemptions = [
         {
             "name": name,
-            "version": contract.PI05_DROID_JOINTPOS_REQUIRED_PACKAGE_VERSIONS[name],
+            "version": versions[name],
             "reason": "source_attested_editable_openpi_checkout",
         }
         for name in contract.PI05_DROID_JOINTPOS_RECORD_VERIFICATION_EXEMPTIONS
@@ -193,7 +225,8 @@ def _host_runtime(tmp_path):
                 contract.PI05_DROID_JOINTPOS_REQUIRED_PACKAGE_VERSIONS
             ),
             "all_installed_versions_allowed_by_uv_lock": True,
-            "all_noneditable_record_hashes_verified": True,
+            "all_noneditable_files_bound_to_locked_records_or_pinned_overlap": True,
+            "pinned_wheel_artifacts": contract._expected_pinned_wheel_artifacts(),
             "record_verified_distributions": record_verified,
             "record_verification_exemptions": record_exemptions,
             "installed_distributions": distributions,
@@ -745,7 +778,10 @@ def test_host_runtime_seals_lockfiles_packages_python_and_jax(tmp_path):
         ),
         lambda value: value["packages"]["required_versions"].update({"jax": "0.5.4"}),
         lambda value: value["packages"].update(
-            {"all_noneditable_record_hashes_verified": False}
+            {"all_noneditable_files_bound_to_locked_records_or_pinned_overlap": False}
+        ),
+        lambda value: value["packages"]["pinned_wheel_artifacts"][0].update(
+            {"sha256": "0" * 64}
         ),
         lambda value: value["jax"].update({"default_backend": "cpu"}),
         lambda value: value["process_environment"]["required"].update(
@@ -757,6 +793,15 @@ def test_host_runtime_seals_lockfiles_packages_python_and_jax(tmp_path):
         mutate(tampered)
         with pytest.raises(ValueError):
             contract.validate_openpi_host_runtime(tampered)
+    tampered = copy.deepcopy(runtime)
+    headless = next(
+        item
+        for item in tampered["packages"]["record_verified_distributions"]
+        if item["name"] == "opencv-python-headless"
+    )
+    headless["record_overlap_resolutions"][0]["active_record"]["size"] += 1
+    with pytest.raises(ValueError, match="RECORD validation inventory mismatch"):
+        contract.validate_openpi_host_runtime(tampered)
 
 
 def test_server_loads_before_publication_and_uses_unwrapped_official_websocket():
@@ -899,6 +944,235 @@ def test_setup_rebuilds_without_cache_and_cpu_verifies_packages_and_tokenizer():
     assert str(contract.PI05_DROID_JOINTPOS_TOKENIZER_SIZE) in source
     assert contract.PI05_DROID_JOINTPOS_TOKENIZER_MD5_BASE64 in source
     assert contract.PI05_DROID_JOINTPOS_TOKENIZER_SHA256 in source
+
+
+def test_record_hash_classifier_accepts_only_pinned_augmax_hex_entries():
+    name, version, relative_path, size, digest_hex = (
+        contract.PI05_DROID_JOINTPOS_PINNED_HEX_RECORD_ENTRIES[0]
+    )
+    digest = bytes.fromhex(digest_hex)
+    assert (
+        contract._classify_distribution_record_hash(
+            distribution_name=name,
+            distribution_version=version,
+            relative_path=relative_path,
+            expected_size=size,
+            expected_hash=digest_hex,
+            actual_size=size,
+            digest=digest,
+        )
+        == contract.PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES[1]
+    )
+    base64_digest = contract.base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+    assert (
+        contract._classify_distribution_record_hash(
+            distribution_name="ordinary-wheel",
+            distribution_version="1.0",
+            relative_path="ordinary.py",
+            expected_size=size,
+            expected_hash=base64_digest,
+            actual_size=size,
+            digest=digest,
+        )
+        == contract.PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES[0]
+    )
+    with pytest.raises(ValueError, match="RECORD mismatch"):
+        contract._classify_distribution_record_hash(
+            distribution_name="ordinary-wheel",
+            distribution_version="1.0",
+            relative_path="ordinary.py",
+            expected_size=size,
+            expected_hash=digest_hex,
+            actual_size=size,
+            digest=digest,
+        )
+
+
+def test_record_hash_classifier_rejects_augmax_path_version_and_digest_drift():
+    name, version, relative_path, size, digest_hex = (
+        contract.PI05_DROID_JOINTPOS_PINNED_HEX_RECORD_ENTRIES[0]
+    )
+    digest = bytes.fromhex(digest_hex)
+    cases = (
+        (name, "0.4.2", relative_path, size, digest_hex, size, digest),
+        (name, version, f"{relative_path}.changed", size, digest_hex, size, digest),
+        (name, version, relative_path, size + 1, digest_hex, size, digest),
+        (name, version, relative_path, size, "0" * 64, size, digest),
+        (name, version, relative_path, size, digest_hex, size, bytes.fromhex("1" * 64)),
+    )
+    for (
+        case_name,
+        case_version,
+        case_path,
+        expected_size,
+        expected_hash,
+        actual_size,
+        case_digest,
+    ) in cases:
+        with pytest.raises(ValueError, match="RECORD mismatch"):
+            contract._classify_distribution_record_hash(
+                distribution_name=case_name,
+                distribution_version=case_version,
+                relative_path=case_path,
+                expected_size=expected_size,
+                expected_hash=expected_hash,
+                actual_size=actual_size,
+                digest=case_digest,
+            )
+
+
+def test_pinned_augmax_hex_record_manifest_is_exact_and_complete():
+    entries = contract.PI05_DROID_JOINTPOS_PINNED_HEX_RECORD_ENTRIES
+    assert len(entries) == 11
+    assert len(set(entries)) == len(entries)
+    assert {(name, version) for name, version, _path, _size, _digest in entries} == {
+        ("augmax", "0.4.1")
+    }
+    assert {path for _name, _version, path, _size, _digest in entries} == {
+        "augmax-0.4.1.dist-info/METADATA",
+        "augmax-0.4.1.dist-info/WHEEL",
+        "augmax/__init__.py",
+        "augmax/base.py",
+        "augmax/colorspace.py",
+        "augmax/functional/__init__.py",
+        "augmax/functional/colorspace.py",
+        "augmax/geometric.py",
+        "augmax/imagelevel.py",
+        "augmax/optimized.py",
+        "augmax/utils.py",
+    }
+    assert all(
+        size >= 0 and len(digest) == 64
+        for _name, _version, _path, size, digest in entries
+    )
+
+
+def test_pinned_opencv_overlap_requires_exact_active_record(monkeypatch, tmp_path):
+    profile = contract.PI05_DROID_JOINTPOS_PINNED_RECORD_OVERLAP_RESOLUTIONS[0]
+    (
+        losing_name,
+        losing_version,
+        relative_path,
+        losing_size,
+        losing_hash,
+        active_name,
+        active_version,
+        active_size,
+        active_hash,
+    ) = profile
+    active_file = tmp_path / "cv2.abi3.so"
+    active_file.write_bytes(b"active OpenCV file identity is supplied by caller")
+
+    class FakePackagePath:
+        size = active_size
+        hash = SimpleNamespace(mode="sha256", value=active_hash)
+
+        def __str__(self):
+            return relative_path
+
+    class FakeDistribution:
+        metadata = {"Name": active_name}
+        version = active_version
+        files = [FakePackagePath()]
+
+        @staticmethod
+        def locate_file(_package_path):
+            return active_file
+
+    monkeypatch.setattr(
+        contract.importlib_metadata,
+        "distribution",
+        lambda name: FakeDistribution() if name == active_name else None,
+    )
+    digest = contract.base64.urlsafe_b64decode(active_hash + "=")
+    resolution = contract._verify_pinned_record_overlap(
+        distribution_name=losing_name,
+        distribution_version=losing_version,
+        relative_path=relative_path,
+        expected_size=losing_size,
+        expected_hash=losing_hash,
+        raw_path=active_file,
+        actual_size=active_size,
+        digest=digest,
+    )
+    assert resolution == contract._expected_record_overlap_resolution(profile)
+    assert resolution["active_record"]["distribution"] == "opencv-python"
+
+    assert (
+        contract._verify_pinned_record_overlap(
+            distribution_name=losing_name,
+            distribution_version=losing_version,
+            relative_path=f"{relative_path}.changed",
+            expected_size=losing_size,
+            expected_hash=losing_hash,
+            raw_path=active_file,
+            actual_size=active_size,
+            digest=digest,
+        )
+        is None
+    )
+    FakeDistribution.version = "4.11.0.87"
+    with pytest.raises(ValueError, match="active distribution mismatch"):
+        contract._verify_pinned_record_overlap(
+            distribution_name=losing_name,
+            distribution_version=losing_version,
+            relative_path=relative_path,
+            expected_size=losing_size,
+            expected_hash=losing_hash,
+            raw_path=active_file,
+            actual_size=active_size,
+            digest=digest,
+        )
+
+
+def test_pinned_wheel_artifacts_match_attested_openpi_lock():
+    lock = contract.tomllib.loads(
+        (ROOT / "third_party/openpi/uv.lock").read_text(encoding="utf-8")
+    )
+    assert contract._verify_pinned_wheel_artifacts(lock) == (
+        contract._expected_pinned_wheel_artifacts()
+    )
+    assert {
+        (artifact["name"], artifact["version"], artifact["sha256"], artifact["size"])
+        for artifact in contract._expected_pinned_wheel_artifacts()
+    } == {
+        (
+            "augmax",
+            "0.4.1",
+            "60f9711a4ffc08f27d1ff0783f7c51c01e6f78e20d4581d075ebf2d904ab2d14",
+            17_299,
+        ),
+        (
+            "opencv-python",
+            "4.11.0.86",
+            "6b02611523803495003bd87362db3e1d2a0454a6a63025dc6658a9830570aa0d",
+            62_986_597,
+        ),
+        (
+            "opencv-python-headless",
+            "4.11.0.86",
+            "0e0a27c19dd1f40ddff94976cfe43066fbbe9dfbb2ec1907d66c19caef42a57b",
+            49_969_856,
+        ),
+    }
+
+
+def test_every_pinned_wheel_distribution_is_required_at_setup():
+    artifacts = contract._expected_pinned_wheel_artifacts()
+    installed = {artifact["name"]: artifact["version"] for artifact in artifacts}
+    assert (
+        contract._require_pinned_wheel_distributions_installed(installed, artifacts)
+        is None
+    )
+    for artifact in artifacts:
+        missing = dict(installed)
+        del missing[artifact["name"]]
+        with pytest.raises(ValueError, match="missing or version-drifted"):
+            contract._require_pinned_wheel_distributions_installed(missing, artifacts)
+        drifted = dict(installed)
+        drifted[artifact["name"]] = "0.0.0"
+        with pytest.raises(ValueError, match="missing or version-drifted"):
+            contract._require_pinned_wheel_distributions_installed(drifted, artifacts)
 
 
 def test_checkpoint_constants_match_public_manifest_and_norm_identity():

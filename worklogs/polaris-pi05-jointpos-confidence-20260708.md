@@ -396,3 +396,65 @@
   checkout root, preserving downstream model-runtime lexical binding.
   Dedicated helper and end-to-end model-runtime alias/adversarial tests pass;
   full current host regression is 429 passed and one unrelated test skipped.
+
+## 2026-07-08 — pinned-wheel RECORD encoding failure
+
+- Replacement setup job `1101808`, from immutable PolaRiS commit
+  `8edce3ed6b0672b387898f09c5b950a5821cfbf3` and OpenPI commit
+  `bd70b8f4011e85b3f3b0f039f12113f78718e7bf`, rebuilt and installed all 242
+  locked packages. It then failed closed in the package-integrity gate before
+  tokenizer/checkpoint validation or any GPU evaluation. The exact exception
+  was `Installed distribution RECORD mismatch: augmax
+  augmax-0.4.1.dist-info/METADATA`.
+- The terminal Slurm state is `FAILED` with exit `2:0`, from
+  `2026-07-08T20:05:45Z` through `2026-07-08T20:09:03Z`. The log is
+  `/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris-pi05/pi05-confidence-final-v4-20260708T200401Z/setup-current-1101808.out`,
+  12,764 bytes, SHA-256
+  `0d21c4b08187c9e0c60148c3ec412411ae16c65d0600d27d98925eb1af545f37`.
+  Its setup-record directory is empty, so no incomplete setup artifact can be
+  mistaken for a validated environment.
+- Historical setup `1101809` was canceled after the current failure identified
+  the shared gate. It had prepared 242 packages but had not independently
+  reached the RECORD verifier. No rollout job launched from either setup, and
+  the namespace has no remaining Slurm job or login-host process.
+- Initial forensic comparison shows this is not an installed-byte mutation:
+  the exact wheel pinned by `uv.lock` has SHA-256
+  `60f9711a4ffc08f27d1ff0783f7c51c01e6f78e20d4581d075ebf2d904ab2d14`
+  and itself stores lowercase hexadecimal SHA-256 values in its RECORD, while
+  the wheel specification requires URL-safe base64. The bytes and hexadecimal
+  digests agree. The verifier currently interprets every value as base64 and
+  therefore rejects the malformed but content-matching upstream RECORD. A
+  correction must stay fail-closed by pinning the exact nonstandard entries;
+  a package-wide exemption is not acceptable.
+- The complete clean-environment census covered 242 distributions and 45,714
+  noneditable hashed files. Exactly 11 nonstandard hashes exist, all in the
+  locked Augmax wheel and all matching their path, size, and SHA-256. It also
+  exposed three genuine last-writer-wins collisions: co-installed
+  `opencv-python-headless==4.11.0.86` and `opencv-python==4.11.0.86` claim
+  different bytes for `cv2/cv2.abi3.so`, `cv2/typing/__init__.py`, and
+  `cv2/version.py`; the live files exactly match the locked non-headless wheel.
+  No other encoding, size, or content discrepancy exists.
+- The verifier now binds the exact Linux x86_64 Augmax and both OpenCV wheel
+  URLs, sizes, and lock SHA-256 values. It accepts hexadecimal RECORD values
+  only for the exact 11 Augmax `(name, version, path, size, digest)` tuples and
+  requires the complete tuple set. The three OpenCV conflicts are explicit
+  loser-to-active-winner resolutions: each requires the exact losing RECORD
+  claim, exact live winner digest/size, the exact active distribution/version/
+  RECORD claim, and `samefile()` identity. Extra, missing, reversed, or changed
+  overlaps fail. Every direct RECORD entry also requires both its SHA-256 and
+  recorded size.
+- The package report now states the honest invariant that every noneditable
+  file is bound either to its locked RECORD or to the pinned co-install winner,
+  and seals per-mode counts plus the complete three-resolution list. The setup
+  verifier additionally requires all three pinned wheel distributions to be
+  installed at the exact version; an independent review found and closed the
+  initial fail-open case where deleting a pinned distribution's metadata could
+  otherwise skip its completeness check.
+- Focused contract regression after closure: 24 tests passed. The complete
+  current host-safe suite before the final completeness test was added passed
+  434 tests with one unrelated skip; Ruff format/lint, Python compilation, and
+  whitespace checks pass. Direct execution against an existing 242-package
+  OpenPI environment validates all 13 hashed Augmax entries and the exact three
+  OpenCV overlap resolutions; that older environment separately fails closed
+  on an unrelated stale `numpydantic` file, as expected rather than being
+  silently accepted.
