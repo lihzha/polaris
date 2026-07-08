@@ -45,3 +45,13 @@
   not participate in rollout execution, so the intended historical evaluator
   lifecycle remains unchanged while paired raw and state-valid results use the
   same committed analysis implementation.
+
+- The subsequent adversarial closure is also copied byte-identically from the
+  reviewed current arm: homogeneous schema and complete query/action/execution
+  ordering, query/post-action state continuity, canonical Panda limits and
+  `1e-3` rad tolerance, trace/CSV SHA-256 binding, sealed-evidence metrics
+  identity, and fail-closed aggregation of success, numerical, state, and
+  target episode sets. It rejects execution deletion, schema downgrade,
+  reordered pairs, missing queries, swapped steps, stale metrics, noncanonical
+  tolerance, and impossible state-valid counts. These additions remain
+  analysis/evidence-only and do not change the historical rollout lifecycle.

@@ -8,6 +8,7 @@ lower bound.  The output says explicitly which coverage was available.
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 from collections import defaultdict
@@ -23,6 +24,7 @@ PANDA_JOINT_LIMITS = (
     (-0.0175, 3.7525),
     (-2.8973, 2.8973),
 )
+PANDA_BOUND_TOLERANCE_RADIANS = 1e-3
 
 
 def _violating_joints(values: list[float], tolerance: float) -> list[int]:
@@ -50,17 +52,40 @@ def _load_metrics(metrics_csv: Path) -> list[dict]:
     return rows
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as input_file:
+        for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def audit_joint_bounds(
     trace_path: Path,
     metrics_csv: Path,
-    tolerance: float = 1e-3,
+    tolerance: float = PANDA_BOUND_TOLERANCE_RADIANS,
 ) -> dict:
+    if (
+        not isinstance(tolerance, int | float)
+        or isinstance(tolerance, bool)
+        or not math.isfinite(tolerance)
+        or tolerance != PANDA_BOUND_TOLERANCE_RADIANS
+    ):
+        raise ValueError(
+            "Standard Panda state-valid audit requires tolerance exactly 0.001 rad"
+        )
     metrics = _load_metrics(metrics_csv)
     query_states = {}
+    query_response_rows = {}
     execution_states = {}
+    execution_steps = {}
     response_rows_by_episode = defaultdict(list)
     action_rows = {}
     execution_rows = {}
+    trace_schema_versions = set()
+    pending_execution = None
+    next_query_index = defaultdict(int)
+    next_outer_step = defaultdict(int)
 
     with trace_path.open(encoding="utf-8") as trace_file:
         for line_number, line in enumerate(trace_file, start=1):
@@ -72,6 +97,10 @@ def audit_joint_bounds(
                 raise ValueError(
                     f"Invalid JSON at line {line_number}: {error}"
                 ) from error
+            schema_version = record.get("schema_version")
+            if type(schema_version) is not int:
+                raise ValueError(f"Invalid trace schema at line {line_number}")
+            trace_schema_versions.add(schema_version)
             reset_index = record.get("reset_index")
             query_index = record.get("query_index")
             if type(reset_index) is not int or type(query_index) is not int:
@@ -79,15 +108,39 @@ def audit_joint_bounds(
             query_key = (reset_index, query_index)
             record_type = record.get("record_type")
             if record_type == "openpi_joint_position_query":
+                if schema_version == 4 and pending_execution is not None:
+                    raise ValueError(
+                        f"Query interrupts an unexecuted action at line {line_number}"
+                    )
                 if query_key in query_states:
                     raise ValueError(f"Duplicate query record at line {line_number}")
+                if query_index != next_query_index[reset_index]:
+                    raise ValueError(
+                        f"Query index is not contiguous at line {line_number}"
+                    )
+                if (
+                    schema_version == 4
+                    and next_outer_step[reset_index] != query_index * 8
+                ):
+                    raise ValueError(
+                        f"Query appears before its action boundary at line {line_number}"
+                    )
                 state = [float(value) for value in record["state"]["joint_position"]]
                 _violating_joints(state, tolerance)
                 query_states[query_key] = state
-                for action in record["response_action_chunk"]:
-                    response_rows_by_episode[reset_index].append(
-                        [float(value) for value in action[:7]]
+                response_rows = [
+                    [float(value) for value in action[:7]]
+                    for action in record["response_action_chunk"]
+                ]
+                if len(response_rows) != 15:
+                    raise ValueError(
+                        f"Query response must contain 15 actions at line {line_number}"
                     )
+                for action in response_rows:
+                    _violating_joints(action, tolerance)
+                    response_rows_by_episode[reset_index].append(action)
+                query_response_rows[query_key] = response_rows
+                next_query_index[reset_index] += 1
                 continue
 
             if record_type not in {
@@ -102,10 +155,24 @@ def audit_joint_bounds(
             action = [float(value) for value in record["emitted_action"][:7]]
             _violating_joints(action, tolerance)
             if record_type == "openpi_joint_position_action":
+                if schema_version == 4 and pending_execution is not None:
+                    raise ValueError(
+                        f"Action precedes prior execution at line {line_number}"
+                    )
                 if action_key in action_rows:
                     raise ValueError(f"Duplicate action record at line {line_number}")
+                if query_key not in query_states:
+                    raise ValueError(
+                        f"Action has no preceding query at line {line_number}"
+                    )
                 action_rows[action_key] = action
+                if schema_version == 4:
+                    pending_execution = action_key
             else:
+                if schema_version == 4 and pending_execution != action_key:
+                    raise ValueError(
+                        f"Execution does not follow its action at line {line_number}"
+                    )
                 if action_key in execution_rows:
                     raise ValueError(
                         f"Duplicate action-execution record at line {line_number}"
@@ -115,6 +182,13 @@ def audit_joint_bounds(
                     raise ValueError(
                         f"Invalid execution step identity at line {line_number}"
                     )
+                if (
+                    schema_version == 4
+                    and outer_step_index != next_outer_step[reset_index]
+                ):
+                    raise ValueError(
+                        f"Execution step is not contiguous at line {line_number}"
+                    )
                 execution_key = (reset_index, outer_step_index)
                 if execution_key in execution_states:
                     raise ValueError(f"Duplicate execution state at line {line_number}")
@@ -123,12 +197,28 @@ def audit_joint_bounds(
                 ]
                 _violating_joints(state, tolerance)
                 execution_rows[action_key] = action
+                execution_steps[action_key] = outer_step_index
                 execution_states[execution_key] = {
                     "state": state,
                     "action_key": action_key,
                     "query_index": query_index,
                     "chunk_action_index": chunk_action_index,
                 }
+                if schema_version == 4:
+                    pending_execution = None
+                    next_outer_step[reset_index] += 1
+
+    if len(trace_schema_versions) != 1:
+        raise ValueError("Trace must use one homogeneous schema version")
+    trace_schema_version = next(iter(trace_schema_versions))
+    if trace_schema_version not in {1, 2, 3, 4}:
+        raise ValueError(f"Unsupported trace schema version: {trace_schema_version}")
+    if trace_schema_version == 4 and not execution_rows:
+        raise ValueError("Schema-4 trace requires per-action execution records")
+    if trace_schema_version == 4 and pending_execution is not None:
+        raise ValueError("Schema-4 trace ends with an unexecuted action")
+    if trace_schema_version != 4 and execution_rows:
+        raise ValueError("Execution records require trace schema version 4")
 
     expected_episodes = set(range(len(metrics)))
     actual_query_episodes = {reset_index for reset_index, _ in query_states}
@@ -137,7 +227,38 @@ def audit_joint_bounds(
     ):
         raise ValueError("Trace query episodes do not match metrics episodes")
 
-    if execution_rows:
+    expected_action_keys = set()
+    for episode, row in enumerate(metrics):
+        episode_length = int(float(row["episode_length"]))
+        if episode_length <= 0:
+            raise ValueError(f"Episode {episode} has a nonpositive length")
+        expected_query_count = math.ceil(episode_length / 8)
+        actual_query_indices = sorted(
+            query_index
+            for reset_index, query_index in query_states
+            if reset_index == episode
+        )
+        if actual_query_indices != list(range(expected_query_count)):
+            raise ValueError(
+                f"Episode {episode} query indices do not match its action count"
+            )
+        for outer_step_index in range(episode_length):
+            expected_action_keys.add(
+                (episode, outer_step_index // 8, outer_step_index % 8)
+            )
+
+    if set(action_rows) != expected_action_keys:
+        raise ValueError("Action records do not exactly match metrics/query episodes")
+    for action_key, action in action_rows.items():
+        query_key = action_key[:2]
+        if query_key not in query_response_rows:
+            raise ValueError(f"Action {action_key} has no query record")
+        if action != query_response_rows[query_key][action_key[2]]:
+            raise ValueError(
+                f"Emitted joint target differs from query response at {action_key}"
+            )
+
+    if trace_schema_version == 4:
         if set(action_rows) != set(execution_rows):
             raise ValueError(
                 "Schema-4 action and execution records do not have identical keys"
@@ -152,15 +273,21 @@ def audit_joint_bounds(
             raise ValueError(
                 "Schema-4 execution episodes do not match metrics episodes"
             )
-        for episode, row in enumerate(metrics):
-            episode_length = int(float(row["episode_length"]))
-            actual_steps = sorted(
-                step for reset_index, step in execution_states if reset_index == episode
-            )
-            if actual_steps != list(range(episode_length)):
+        for action_key in sorted(action_rows):
+            expected_outer_step = action_key[1] * 8 + action_key[2]
+            if execution_steps[action_key] != expected_outer_step:
                 raise ValueError(
-                    f"Episode {episode} execution steps are not exactly "
-                    f"0..{episode_length - 1}"
+                    f"Execution step does not match query/chunk order at {action_key}"
+                )
+        for (episode, query_index), state in query_states.items():
+            if query_index == 0:
+                continue
+            prior_outer_step = query_index * 8 - 1
+            prior_state = execution_states[(episode, prior_outer_step)]["state"]
+            if state != prior_state:
+                raise ValueError(
+                    f"Query {(episode, query_index)} state differs from its "
+                    "preceding post-action state"
                 )
         emitted_rows = execution_rows
         state_observation_coverage = "initial_query_plus_post_action_every_step"
@@ -276,7 +403,11 @@ def audit_joint_bounds(
                 not _violating_joints(action, tolerance) for action in preceding
             )
         detail["max_abs_recorded_state"] = episode_max_state_abs[episode]
-        detail["max_abs_query_state"] = episode_max_state_abs[episode]
+        detail["max_abs_query_state"] = max(
+            max(abs(value) for value in state)
+            for (reset_index, _), state in query_states.items()
+            if reset_index == episode
+        )
         detail["max_abs_executed_target"] = episode_max_executed_target_abs[episode]
         if episode < len(metrics):
             row = metrics[episode]
@@ -296,9 +427,12 @@ def audit_joint_bounds(
     state_invalid_successes = success_episodes & state_oob
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "trace_path": str(trace_path.resolve()),
         "metrics_csv": str(metrics_csv.resolve()),
+        "trace_sha256": _sha256_file(trace_path),
+        "metrics_sha256": _sha256_file(metrics_csv),
+        "trace_schema_version": trace_schema_version,
         "tolerance_radians": tolerance,
         "panda_joint_limits_radians": [list(bounds) for bounds in PANDA_JOINT_LIMITS],
         "episode_count": len(metrics),
@@ -307,6 +441,8 @@ def audit_joint_bounds(
         "recorded_numerical_failure_episodes": sorted(numerical_failure_episodes),
         "state_observation_coverage": state_observation_coverage,
         "state_audit_is_lower_bound": state_audit_is_lower_bound,
+        "query_record_count": len(query_states),
+        "action_record_count": len(action_rows),
         "execution_record_count": len(execution_rows),
         "state_oob_episodes": sorted(state_oob),
         "state_oob_episode_count": len(state_oob),

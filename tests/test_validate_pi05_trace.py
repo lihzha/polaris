@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import json
 import tempfile
 import unittest
@@ -291,6 +292,9 @@ class TraceAuditTest(unittest.TestCase):
                 "episode,episode_length,success,progress,numerical_failure,"
                 "numerical_failure_reason\n0,450,True,0.5,False,\n"
             )
+            expected_metrics_sha256 = hashlib.sha256(
+                metrics_path.read_bytes()
+            ).hexdigest()
             with mock.patch(
                 "polaris.pi05_droid_jointpos_runtime."
                 "validate_jointpos_runtime_artifact",
@@ -305,6 +309,7 @@ class TraceAuditTest(unittest.TestCase):
                 )
 
         self.assertEqual(summary["environment_base_seed"], 7)
+        self.assertEqual(summary["metrics_sha256"], expected_metrics_sha256)
         self.assertEqual(
             summary["environment_seed_scheme"], "base_plus_episode_index_v1"
         )

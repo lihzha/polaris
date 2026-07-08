@@ -218,6 +218,7 @@ def _validate_trace_summary(
     summary_path: Path,
     *,
     trace_identity: dict[str, Any],
+    metrics_identity: dict[str, Any],
     expected_rollouts: int,
     independently_audited: dict[str, Any],
 ) -> dict[str, Any]:
@@ -228,6 +229,10 @@ def _validate_trace_summary(
     _require(
         summary.get("trace_sha256") == trace_identity["sha256"],
         "trace summary does not bind the sealed trace",
+    )
+    _require(
+        summary.get("metrics_sha256") == metrics_identity["sha256"],
+        "trace summary does not bind the sealed metrics CSV",
     )
     _require(
         summary.get("reset_count") == expected_rollouts,
@@ -415,6 +420,7 @@ def _validate_closed_contracts(
     video_identities: list[dict[str, Any]],
     terminal_image_identities: list[dict[str, Any]],
     trace_identity: dict[str, Any],
+    metrics_identity: dict[str, Any],
     environment: str,
     expected_environment_seed: int,
     expected_rollouts: int,
@@ -441,6 +447,7 @@ def _validate_closed_contracts(
     summary = _validate_trace_summary(
         paths["trace_summary"],
         trace_identity=trace_identity,
+        metrics_identity=metrics_identity,
         expected_rollouts=expected_rollouts,
         independently_audited=independently_audited,
     )
@@ -591,6 +598,7 @@ def validate_evidence_manifest(
         video_identities=videos,
         terminal_image_identities=terminal_images,
         trace_identity=artifacts["policy_trace"],
+        metrics_identity=artifacts["metrics_csv"],
         environment=environment,
         expected_environment_seed=expected_environment_seed,
         expected_rollouts=expected_rollouts,
@@ -659,6 +667,7 @@ def finalize_evidence(
         video_identities=videos,
         terminal_image_identities=terminal_images,
         trace_identity=artifacts["policy_trace"],
+        metrics_identity=artifacts["metrics_csv"],
         environment=environment,
         expected_environment_seed=expected_environment_seed,
         expected_rollouts=expected_rollouts,
