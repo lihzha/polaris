@@ -664,3 +664,37 @@
 - Shared registry revision 20 records both running jobs, the final commits and
   trees, runtime schema 3/evidence profile v5, and mapped-graphics digest
   `cd0ae19f2ea2cbdd0b8371796acad34c6d1b36d38c26aca68e8715b663c2f9f5`.
+
+## 2026-07-08 — final setup completion and paired canary launch
+
+- Current setup job `1101827` completed `0:0` in 6:15 on `cpu-large-0001`.
+  It revalidated 242 installed distributions, all 240 noneditable RECORD
+  inventories, the 27-object/12,434,530,837-byte checkpoint with full MD5,
+  tokenizer, global DROID normalization SHA-256
+  `57ce9956f9e07d65f8a8205aabec72d436a2c8927f53edb40c7a77b14a5a90c7`,
+  and `pi05_droid_jointpos_polaris`. Its package-environment canonical
+  SHA-256 is
+  `642839d4cb7e14e8c4dde6a1452900c088a958b52d2b00a96e8f88d1be3536a6`;
+  the JSON, setup manifest, and terminal log SHA-256 values are respectively
+  `d44cc03774fca7f18cdf151fb595d7c90251cf9663b784b04af45ef47e693f7b`,
+  `eb1f7173685afa764b7e463ee5cecefa5b259f0fc78f0b9907ad8ff010fb84ad`,
+  and `9b8f83c9bb2ad8949867f18f78d2d2d71dd3b4414c57ebeee770ba68536c44f3`.
+  Historical setup `1101828` independently completed `0:0` in 8:14 with the
+  same scientific gates and package canonical SHA-256
+  `2acc79a45c9cdd7ef2242f95fbcbbac9ca60fd7f82723492bc1ff01de0db4a1c`.
+- A byte-level parity audit found the same 242 distributions and required
+  versions in both environments. Of 72 differing RECORD paths, 65 console
+  scripts differed only by their exact virtual-environment prefix, four
+  editable OpenPI/OpenPI-client files differed only by their expected frozen
+  checkout paths, and three locally compiled `evdev` objects differed only in
+  debug sections and GNU build IDs. Their executable and data sections are
+  identical, and neither evaluated OpenPI nor PolaRiS source imports `evdev`.
+  This closes the clean-environment parity gate without changing the policy.
+- Public-submitter full-horizon seed-0 canary `1101829` launched from the
+  exact clean frozen current checkout on one L40S under namespace
+  `pi05-confidence-current-canary-v10-20260708T213230Z`. The paired historical
+  canary is job `1101830` on a separate L40S. Both request one rollout and use
+  the same official checkpoint, global DROID normalization, three image-slot
+  contract, 720x1280 client images with server-side 224x224 resize, 15x8
+  absolute joint-position output, eight-action execution horizon, and seed 0.
+  They are runtime-validation canaries, not final scientific results.
