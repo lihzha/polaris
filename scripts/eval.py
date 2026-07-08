@@ -13,16 +13,16 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 from polaris.config import EvalArgs
-from polaris.evaluation_seed import make_environment_seed_contract
+from polaris.evaluation_seed import episode_environment_seed
 
 
 def main(eval_args: EvalArgs):
     if eval_args.policy.client == "DroidJointPos":
         if eval_args.environment_seed is None:
             raise ValueError("DroidJointPos requires --environment-seed")
-        make_environment_seed_contract(eval_args.environment_seed)
+        episode_environment_seed(eval_args.environment_seed, 0)
     elif eval_args.environment_seed is not None:
-        make_environment_seed_contract(eval_args.environment_seed)
+        episode_environment_seed(eval_args.environment_seed, 0)
     if (
         eval_args.policy.client == "EgoLAPEefPose"
         and eval_args.control_mode != "eef-pose"
@@ -53,6 +53,7 @@ def main(eval_args: EvalArgs):
     from polaris.evaluation_seed import (
         bind_environment_seed,
         format_environment_seed_contract,
+        make_live_environment_seed_contract,
     )
     from polaris.utils import load_eval_initial_conditions
     from polaris.policy import InferenceClient
@@ -69,13 +70,7 @@ def main(eval_args: EvalArgs):
         use_fabric=True,
     )
     if eval_args.environment_seed is not None:
-        environment_seed_contract = bind_environment_seed(
-            env_cfg, eval_args.environment_seed
-        )
-        print(
-            format_environment_seed_contract(environment_seed_contract),
-            flush=True,
-        )
+        bind_environment_seed(env_cfg, eval_args.environment_seed)
     if eval_args.control_mode == "eef-pose":
         # Action managers are constructed by gym.make, so select the controller
         # on the config before creating the environment.
@@ -85,6 +80,15 @@ def main(eval_args: EvalArgs):
     env: ManagerBasedRLSplatEnv = gym.make(  # type: ignore[assignment]
         eval_args.environment, cfg=env_cfg
     )
+    environment_seed_contract = None
+    if eval_args.environment_seed is not None:
+        environment_seed_contract = make_live_environment_seed_contract(
+            env, eval_args.environment_seed
+        )
+        print(
+            format_environment_seed_contract(environment_seed_contract),
+            flush=True,
+        )
 
     default_instruction, initial_conditions = load_eval_initial_conditions(
         usd=env.usd_file,
@@ -126,13 +130,31 @@ def main(eval_args: EvalArgs):
         return
 
     policy_client: InferenceClient = InferenceClient.get_client(eval_args.policy)
+    if eval_args.policy.client == "DroidJointPos":
+        if environment_seed_contract is None:
+            raise RuntimeError("DroidJointPos environment seed contract is missing")
+        policy_client.bind_environment_seed_contract(environment_seed_contract)
 
     horizon = env.max_episode_length
     while episode < rollouts:
         # Index the initial condition with the episode being started. The old
         # loop reset before incrementing ``episode``, repeating condition zero.
-        obs, info = env.reset(object_positions=initial_conditions[episode])
-        policy_client.reset()
+        episode_seed = None
+        if eval_args.environment_seed is not None:
+            episode_seed = episode_environment_seed(
+                eval_args.environment_seed, episode
+            )
+        obs, info = env.reset(
+            seed=episode_seed,
+            object_positions=initial_conditions[episode],
+        )
+        if eval_args.policy.client == "DroidJointPos":
+            policy_client.reset(
+                episode_index=episode,
+                episode_seed=episode_seed,
+            )
+        else:
+            policy_client.reset()
         video = []
         numerical_failure_reason = ""
         bar = tqdm.tqdm(total=horizon)

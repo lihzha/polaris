@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from polaris.config import PolicyArgs
+from polaris.evaluation_seed import make_live_environment_seed_contract
 from polaris.policy.droid_jointpos_client import (
     DroidJointPosClient,
     JointPositionObservationNumericalError,
@@ -27,6 +28,34 @@ class _FakePolicyServer:
     def infer(self, request):
         self.requests.append(request)
         return {"actions": self.actions}
+
+
+def _live_seed_contract(seed=0):
+    live_env = type(
+        "LiveEnv",
+        (),
+        {
+            "cfg": type(
+                "Cfg",
+                (),
+                {
+                    "seed": seed,
+                    "sim": type(
+                        "Sim",
+                        (),
+                        {
+                            "physx": type(
+                                "Physx",
+                                (),
+                                {"enable_enhanced_determinism": False},
+                            )()
+                        },
+                    )(),
+                },
+            )()
+        },
+    )()
+    return make_live_environment_seed_contract(live_env, seed)
 
 
 class JointActionValidationTest(unittest.TestCase):
@@ -149,7 +178,8 @@ class DroidJointPosClientContractTest(unittest.TestCase):
                 mock.patch("builtins.print") as print_mock,
             ):
                 client = DroidJointPosClient(args)
-                client.reset()
+                client.bind_environment_seed_contract(_live_seed_contract())
+                client.reset(episode_index=0, episode_seed=0)
                 returned = [
                     client.infer(
                         observation, "put all foods in the bowl", return_viz=True
@@ -180,6 +210,14 @@ class DroidJointPosClientContractTest(unittest.TestCase):
 
         self.assertEqual(len(records), 9)
         trace = records[0]
+        self.assertEqual(trace["schema_version"], 2)
+        self.assertEqual(trace["environment_rng"]["base_seed"], 0)
+        self.assertEqual(trace["environment_rng"]["episode_index"], 0)
+        self.assertEqual(trace["environment_rng"]["episode_seed"], 0)
+        self.assertEqual(
+            trace["environment_rng"]["determinism_claim"],
+            "rng_bound_not_bitwise",
+        )
         self.assertEqual(trace["response_action_shape"], [15, 8])
         self.assertEqual(trace["execution_horizon"], 8)
         self.assertEqual(len(trace["planned_action_chunk"]), 8)
@@ -200,6 +238,22 @@ class DroidJointPosClientContractTest(unittest.TestCase):
             np.testing.assert_array_equal(
                 action_record["emitted_action"], returned[action_index][0]
             )
+
+    def test_environment_seed_binding_and_episode_reset_fail_closed(self):
+        args = PolicyArgs(client="DroidJointPos", open_loop_horizon=8)
+        with mock.patch(
+            "polaris.policy.droid_jointpos_client.websocket_client_policy.WebsocketClientPolicy",
+            return_value=_FakePolicyServer(np.zeros((15, 8))),
+        ):
+            client = DroidJointPosClient(args)
+
+        contract = _live_seed_contract(5)
+        client.bind_environment_seed_contract(contract)
+        with self.assertRaisesRegex(ValueError, "Episode seed"):
+            client.reset(episode_index=0, episode_seed=6)
+        client.reset(episode_index=0, episode_seed=5)
+        with self.assertRaisesRegex(RuntimeError, "more than once"):
+            client.bind_environment_seed_contract(contract)
 
 
 if __name__ == "__main__":

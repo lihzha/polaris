@@ -36,6 +36,9 @@ PORT="${PORT:-$((20000 + ${SLURM_JOB_ID:-1} % 20000))}"
 SERVER_START_TIMEOUT_SECS="${SERVER_START_TIMEOUT_SECS:-2400}"
 DRY_RUN="${DRY_RUN:-0}"
 RESUME_FROM_TASK_DIR="${RESUME_FROM_TASK_DIR:-}"
+ENVIRONMENT_SEED_SCHEME=base_plus_episode_index_v1
+ENVIRONMENT_DETERMINISM_CLAIM=rng_bound_not_bitwise
+POLARIS_DATA_REVISION=8c7e4103e266ef83d8b1ad2e9a63116edd5f155b
 
 die() {
   echo "ERROR: $*" >&2
@@ -50,6 +53,8 @@ die() {
   || die "ENVIRONMENT_SEED must be a non-negative integer"
 (( ENVIRONMENT_SEED <= 4294967295 )) \
   || die "ENVIRONMENT_SEED must be at most 4294967295"
+[[ -z "${RESUME_FROM_TASK_DIR}" ]] \
+  || die "Seed-bound native evaluation forbids resume until policy RNG restoration is supported"
 if [[ ! "${PORT}" =~ ^[1-9][0-9]*$ ]] || (( PORT > 65535 )); then
   die "Invalid PORT=${PORT}"
 fi
@@ -67,26 +72,55 @@ fi
 case "${POLARIS_ENVIRONMENT}" in
   DROID-BlockStackKitchen)
     EXPECTED_PROMPT='Place and stack the blocks on top of the green tray'
+    ASSET_SUBDIR=block_stack_kitchen
+    EXPECTED_INITIAL_CONDITIONS_SHA256=eebd5052254c1d56681592129960412d1c4c9efbc33555213c330213025f63e7
+    EXPECTED_SCENE_SHA256=eb13abf802c16a8bff9b05151ffd0ffc26feb8fac8c76aa7a57b5d9468be3363
     ;;
   DROID-FoodBussing)
     EXPECTED_PROMPT='Put all the foods in the bowl'
+    ASSET_SUBDIR=food_bussing
+    EXPECTED_INITIAL_CONDITIONS_SHA256=40091faee14f692350220871d30705294f21f17ae3d2974cd3c09a34d560f5de
+    EXPECTED_SCENE_SHA256=82cd641e422935b394ce7ea7b6be55214c9952a2544000222921e544c409b489
     ;;
   DROID-PanClean)
     EXPECTED_PROMPT='Use the yellow sponge to scrub the blue handle frying pan'
+    ASSET_SUBDIR=pan_clean
+    EXPECTED_INITIAL_CONDITIONS_SHA256=a47debf4fdd0f3562a331380a125640b12fc0f5786aff849e71388f07756b8c8
+    EXPECTED_SCENE_SHA256=c10140794bc3a46fa2a713f4560cf9651c163c9337697c9aafbdccc26762856e
     ;;
   DROID-MoveLatteCup)
     EXPECTED_PROMPT='put the latte art cup on top of the cutting board'
+    ASSET_SUBDIR=move_latte_cup
+    EXPECTED_INITIAL_CONDITIONS_SHA256=44d73616b396abfc1ca03e37cd4de26e2f02845967a0c89bbd9a4c3a1e800421
+    EXPECTED_SCENE_SHA256=cec74210b92155782ad0e2a911c3227c8bc251c986ba15a56be4f4e5f382529b
     ;;
   DROID-OrganizeTools)
     EXPECTED_PROMPT='put the scissor into the large container'
+    ASSET_SUBDIR=organize_tools
+    EXPECTED_INITIAL_CONDITIONS_SHA256=2f2dba117c834b0137bed5a07fee3c421a49dbdb0f5b36697f080c6693b6bf54
+    EXPECTED_SCENE_SHA256=41ab252b02766aa6bd3b763d3feeaa9f5749b6984cf0f4a9f3c32d6c5db96c81
     ;;
   DROID-TapeIntoContainer)
     EXPECTED_PROMPT='put the tape into the container'
+    ASSET_SUBDIR=tape_into_container
+    EXPECTED_INITIAL_CONDITIONS_SHA256=0e8ea9329812709f194324dd19b7e64cbdbd0905aa31d2ed5f6bdc9a32a5bfec
+    EXPECTED_SCENE_SHA256=18f86c02ab6dec5ea31a67706458b9fccd80be2dcb8e0035858e2ab69f4cfad7
     ;;
   *)
     die "Unsupported PolaRiS task: ${POLARIS_ENVIRONMENT}"
     ;;
 esac
+
+initial_conditions_path="${POLARIS_DATA_DIR}/${ASSET_SUBDIR}/initial_conditions.json"
+scene_path="${POLARIS_DATA_DIR}/${ASSET_SUBDIR}/scene.usda"
+[[ -f "${initial_conditions_path}" ]] || die "Missing initial conditions: ${initial_conditions_path}"
+[[ -f "${scene_path}" ]] || die "Missing scene: ${scene_path}"
+actual_initial_conditions_sha256="$(sha256sum "${initial_conditions_path}" | awk '{print $1}')"
+actual_scene_sha256="$(sha256sum "${scene_path}" | awk '{print $1}')"
+[[ "${actual_initial_conditions_sha256}" == "${EXPECTED_INITIAL_CONDITIONS_SHA256}" ]] \
+  || die "Initial-conditions SHA-256 mismatch: ${actual_initial_conditions_sha256}"
+[[ "${actual_scene_sha256}" == "${EXPECTED_SCENE_SHA256}" ]] \
+  || die "Scene SHA-256 mismatch: ${actual_scene_sha256}"
 
 POLARIS_COMMIT="$(git -C "${POLARIS_DIR}" rev-parse HEAD)"
 OPENPI_COMMIT="$(git -C "${OPENPI_DIR}" rev-parse HEAD)"
@@ -115,6 +149,7 @@ if [[ -n "${RESUME_FROM_TASK_DIR}" ]]; then
   python3 "${SCRIPT_DIR}/validate_pi05_trace.py" \
     "${TRACE_PATH}" --metrics-csv "${TASK_DIR}/eval_results.csv" \
     --expected-prompt "${EXPECTED_PROMPT}" \
+    --expected-environment-seed "${ENVIRONMENT_SEED}" \
     --output "${RUN_DIR}/resume_trace_summary.json"
 else
   [[ ! -e "${TASK_DIR}/eval_results.csv" && ! -e "${TRACE_PATH}" ]] \
@@ -199,7 +234,13 @@ PYXIS_IMAGE_SHA256="$(sha256sum "${POLARIS_PYXIS_IMAGE}" | awk '{print $1}')"
   printf 'RESUME_FROM_TASK_DIR=%q\n' "${RESUME_FROM_TASK_DIR}"
   printf 'ROLLOUTS=%q\n' "${ROLLOUTS}"
   printf 'ENVIRONMENT_SEED=%q\n' "${ENVIRONMENT_SEED}"
-  printf 'ENVIRONMENT_SEED_PROFILE=isaaclab_env_cfg_seed_v1\n'
+  printf 'ENVIRONMENT_SEED_PROFILE=isaaclab_env_seed_base_plus_episode_v1\n'
+  printf 'ENVIRONMENT_SEED_SCHEME=%q\n' "${ENVIRONMENT_SEED_SCHEME}"
+  printf 'ENVIRONMENT_DETERMINISM_CLAIM=%q\n' "${ENVIRONMENT_DETERMINISM_CLAIM}"
+  printf 'PHYSX_ENHANCED_DETERMINISM=false\n'
+  printf 'POLARIS_DATA_REVISION=%q\n' "${POLARIS_DATA_REVISION}"
+  printf 'INITIAL_CONDITIONS_SHA256=%q\n' "${actual_initial_conditions_sha256}"
+  printf 'SCENE_SHA256=%q\n' "${actual_scene_sha256}"
   printf 'CONTROL_MODE=joint-position\n'
   printf 'STATE_CONTRACT=7_joint_radians_plus_closed_positive_gripper\n'
   printf 'ACTION_CONTRACT=15x8_absolute_joint_targets_plus_closed_positive_gripper\n'
@@ -324,8 +365,32 @@ tee_code="${pipeline_codes[1]}"
 
 grep -Fq 'POLARIS_PI05_DROID_CONTRACT=' "${EVAL_LOG}" \
   || die "Missing pi0.5 client contract marker"
-grep -Fq 'POLARIS_ENVIRONMENT_SEED_CONTRACT={"binding":"env_cfg.seed_before_gym_make","profile":"isaaclab_env_cfg_seed_v1","schema_version":1,"seed":'"${ENVIRONMENT_SEED}"'}' "${EVAL_LOG}" \
-  || die "Missing exact environment-seed contract marker"
+python3 - "${EVAL_LOG}" "${ENVIRONMENT_SEED}" <<'PY'
+import json
+import sys
+
+marker = "POLARIS_PI05_DROID_ENVIRONMENT_CONTRACT="
+lines = [line for line in open(sys.argv[1], encoding="utf-8") if marker in line]
+if len(lines) != 1:
+    raise SystemExit(f"expected one environment contract marker, found {len(lines)}")
+payload = json.loads(lines[0].split(marker, 1)[1])
+expected = {
+    "schema_version": 1,
+    "profile": "isaaclab_env_seed_base_plus_episode_v1",
+    "base_seed": int(sys.argv[2]),
+    "scheme": "base_plus_episode_index_v1",
+    "live_cfg_seed": int(sys.argv[2]),
+    "physx_enhanced_determinism": False,
+    "determinism_claim": "rng_bound_not_bitwise",
+    "binding": "env_cfg_seed_before_gym_make_and_reset_seed_per_episode",
+}
+if payload != expected:
+    raise SystemExit(f"environment contract mismatch: {payload!r}")
+PY
+! grep -Fq 'Seed not set for the environment' "${EVAL_LOG}" \
+  || die "Isaac Lab reported an unset environment seed"
+grep -Eq "Environment seed[[:space:]]*:[[:space:]]*${ENVIRONMENT_SEED}([[:space:]]|$)" "${EVAL_LOG}" \
+  || die "Isaac Lab did not report the expected live environment seed"
 grep -Fq '"expected_action_horizon": 15' "${EVAL_LOG}" \
   || die "Client did not enforce a 15-step response"
 grep -Fq '"expected_action_dim": 8' "${EVAL_LOG}" \
@@ -337,6 +402,7 @@ csv_path="${TASK_DIR}/eval_results.csv"
 [[ -s "${csv_path}" ]] || die "Missing eval metrics: ${csv_path}"
 python3 "${POLARIS_DIR}/scripts/polaris/validate_pi05_trace.py" \
   "${TRACE_PATH}" --metrics-csv "${csv_path}" --expected-prompt "${EXPECTED_PROMPT}" \
+  --expected-environment-seed "${ENVIRONMENT_SEED}" \
   --output "${TRACE_SUMMARY}"
 csv_rows="$(awk 'NR > 1 && NF {count += 1} END {print count + 0}' "${csv_path}")"
 (( csv_rows == ROLLOUTS )) || die "Expected ${ROLLOUTS} CSV rows, got ${csv_rows}"
