@@ -44,6 +44,7 @@ ENVIRONMENT_DETERMINISM_CLAIM=rng_bound_not_bitwise
 POLARIS_DATA_REVISION=8c7e4103e266ef83d8b1ad2e9a63116edd5f155b
 EXPECTED_ROBOT_ASSET_SHA256=d8379925b103963dbf3e7c85bcc4ae101b81b7c1d7dabe7d2e964f41d069ec44
 EXPECTED_ROBOT_METADATA_SHA256=208e0f85fc16fa32ffeca972aea0fd1b33b0c6c2a582e89ff3877823291a7754
+NUMPYDANTIC_STUB_WARNING_FILTER='ignore:ndarray.pyi stub file could not be generated:ImportWarning:numpydantic.meta'
 
 die() {
   echo "ERROR: $*" >&2
@@ -70,6 +71,25 @@ capture_gpu_runtime() {
     || die "NVIDIA driver version mismatch: ${actual_nvidia_driver_version}"
   [[ "${NVIDIA_VISIBLE_DEVICES:-}" == "${actual_gpu_uuid}" ]] \
     || die "NVIDIA_VISIBLE_DEVICES does not identify the allocated GPU"
+}
+
+capture_package_environment_sha256() {
+  env \
+    PYTHONWARNINGS="${NUMPYDANTIC_STUB_WARNING_FILTER}" \
+    PYTHONPATH="${POLARIS_DIR}/src" \
+    "${OPENPI_DIR}/.venv/bin/python" - "${OPENPI_DIR}" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+from polaris.pi05_droid_jointpos_serving_contract import (
+    canonical_json_bytes,
+    verify_openpi_package_environment,
+)
+
+report = verify_openpi_package_environment(Path(sys.argv[1]))
+print(hashlib.sha256(canonical_json_bytes(report)).hexdigest())
+PY
 }
 
 [[ -n "${SLURM_JOB_ID:-}" || "${DRY_RUN}" == 1 ]] \
@@ -449,6 +469,10 @@ trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+preflight_package_environment_sha256="$(capture_package_environment_sha256)" \
+  || die "Preflight OpenPI package/seal attestation failed"
+[[ "${preflight_package_environment_sha256}" =~ ^[0-9a-f]{64}$ ]] \
+  || die "Preflight OpenPI package/seal attestation returned an invalid digest"
 OPENPI_PYTHONPATH="${OPENPI_DIR}/src:${OPENPI_DIR}/packages/openpi-client/src"
 checkpoint_path="$(
   OPENPI_DATA_HOME="${OPENPI_DATA_HOME}" PYTHONPATH="${OPENPI_PYTHONPATH}" \
@@ -495,6 +519,9 @@ PYXIS_IMAGE_SHA256="$(sha256sum "${POLARIS_PYXIS_IMAGE}" | awk '{print $1}')"
   printf 'NVIDIA_GPU_UUID=%q\n' "${actual_gpu_uuid}"
   printf 'NVIDIA_GPU_NAME=%q\n' "${actual_gpu_name}"
   printf 'NVIDIA_DRIVER_VERSION=%q\n' "${actual_nvidia_driver_version}"
+  printf 'PYTHONWARNINGS=%q\n' "${NUMPYDANTIC_STUB_WARNING_FILTER}"
+  printf 'PREFLIGHT_PACKAGE_ENVIRONMENT_SHA256=%q\n' \
+    "${preflight_package_environment_sha256}"
   printf 'POLARIS_ENVIRONMENT=%q\n' "${POLARIS_ENVIRONMENT}"
   printf 'EXPECTED_PROMPT=%q\n' "${EXPECTED_PROMPT}"
   printf 'RESUME_FROM_TASK_DIR=%q\n' "${RESUME_FROM_TASK_DIR}"
@@ -625,8 +652,8 @@ video_validation_command=(
   printf 'cd %q\n' "${POLARIS_DIR}"
   printf '%q ' "${asset_manifest_command[@]}"
   printf '\n'
-  printf 'env OPENPI_DATA_HOME=%q PYTHONPATH=%q JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_MEM_FRACTION=0.35 XLA_PYTHON_CLIENT_PREALLOCATE=false ' \
-    "${OPENPI_DATA_HOME}" "${POLARIS_DIR}/src"
+  printf 'env OPENPI_DATA_HOME=%q PYTHONPATH=%q JAX_PLATFORMS=cuda PYTHONWARNINGS=%q XLA_PYTHON_CLIENT_MEM_FRACTION=0.35 XLA_PYTHON_CLIENT_PREALLOCATE=false ' \
+    "${OPENPI_DATA_HOME}" "${POLARIS_DIR}/src" "${NUMPYDANTIC_STUB_WARNING_FILTER}"
   printf '%q ' "${server_command[@]}"
   printf '\ncd %q\n' "${POLARIS_DIR}"
   printf '%q ' "${eval_command[@]}"
@@ -725,6 +752,7 @@ echo "[$(date -Iseconds)] Starting official pi0.5 policy server"
     OPENPI_DATA_HOME="${OPENPI_DATA_HOME}" \
     PYTHONPATH="${POLARIS_DIR}/src" \
     JAX_PLATFORMS=cuda \
+    PYTHONWARNINGS="${NUMPYDANTIC_STUB_WARNING_FILTER}" \
     XLA_PYTHON_CLIENT_MEM_FRACTION=0.35 \
     XLA_PYTHON_CLIENT_PREALLOCATE=false \
     PYTHONUNBUFFERED=1 \
@@ -1065,18 +1093,25 @@ done
   || die "Vulkan ICD changed type during evaluation"
 actual_vulkan_icd_sha256="$(sha256sum "${POLARIS_VULKAN_ICD_PATH}" | awk '{print $1}')"
 capture_gpu_runtime
+postrun_package_environment_sha256="$(capture_package_environment_sha256)" \
+  || die "Postrun OpenPI package/seal attestation failed"
 [[ "${actual_vulkan_icd_sha256}" == "${preflight_vulkan_icd_sha256}" \
    && "${actual_vulkan_icd_sha256}" == "${EXPECTED_VULKAN_ICD_SHA256}" \
    && "${actual_gpu_uuid}" == "${preflight_gpu_uuid}" \
    && "${actual_gpu_name}" == "${preflight_gpu_name}" \
    && "${actual_nvidia_driver_version}" == "${preflight_nvidia_driver_version}" ]] \
   || die "GPU/Vulkan runtime changed during evaluation"
+[[ "${postrun_package_environment_sha256}" == \
+   "${preflight_package_environment_sha256}" ]] \
+  || die "OpenPI package/seal environment changed during evaluation"
 {
   printf 'POSTRUN_POLARIS_VULKAN_ICD_SHA256=%q\n' "${actual_vulkan_icd_sha256}"
   printf 'POSTRUN_NVIDIA_GPU_UUID=%q\n' "${actual_gpu_uuid}"
   printf 'POSTRUN_NVIDIA_GPU_NAME=%q\n' "${actual_gpu_name}"
   printf 'POSTRUN_NVIDIA_DRIVER_VERSION=%q\n' \
     "${actual_nvidia_driver_version}"
+  printf 'POSTRUN_PACKAGE_ENVIRONMENT_SHA256=%q\n' \
+    "${postrun_package_environment_sha256}"
 } >> "${METADATA_FILE}"
 git -C "${POLARIS_DIR}" status --short --branch > "${RUN_DIR}/polaris_git_status.txt"
 git -C "${POLARIS_DIR}" submodule status --recursive \

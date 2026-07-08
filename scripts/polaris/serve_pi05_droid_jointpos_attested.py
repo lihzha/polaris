@@ -15,6 +15,7 @@ import sys
 from polaris.pi05_droid_jointpos_serving_contract import (
     PI05_DROID_JOINTPOS_BIND_HOST,
     PI05_DROID_JOINTPOS_METADATA_KEY,
+    PI05_DROID_JOINTPOS_REQUIRED_RUNTIME_ENVIRONMENT,
     attest_imported_openpi_modules,
     capture_openpi_host_runtime,
     expected_pi05_droid_jointpos_server_metadata,
@@ -28,6 +29,7 @@ from polaris.pi05_droid_jointpos_serving_contract import (
     validate_official_train_config,
     verify_paligemma_tokenizer_artifact,
     verify_openpi_git_checkout,
+    verify_openpi_package_environment,
     verify_pi05_droid_jointpos_checkpoint,
 )
 
@@ -121,10 +123,17 @@ def main() -> None:
         raise ValueError("WebSocket port must be in [1, 65535]")
     if args.expected_request_count <= 0:
         raise ValueError("Expected policy request count must be positive")
+    required_runtime_environment = {
+        key: os.environ.get(key)
+        for key in PI05_DROID_JOINTPOS_REQUIRED_RUNTIME_ENVIRONMENT
+    }
+    if required_runtime_environment != PI05_DROID_JOINTPOS_REQUIRED_RUNTIME_ENVIRONMENT:
+        raise ValueError("Required OpenPI runtime environment differs before imports")
 
     checkout = verify_openpi_git_checkout(args.openpi_dir)
     openpi_dir = Path(checkout["root"])
     _install_controlled_openpi_path(openpi_dir)
+    preimport_package_environment = verify_openpi_package_environment(openpi_dir)
 
     # These imports must stay after the controlled-path gate above.
     import jax
@@ -163,6 +172,7 @@ def main() -> None:
         jax_module=jax,
         expected_norm_values_sha256=checkpoint_report["normalization"]["values_sha256"],
     )
+    tokenizer_artifact = verify_paligemma_tokenizer_artifact(openpi_tokenizer.download)
 
     required_modules = (
         openpi_model,
@@ -186,8 +196,11 @@ def main() -> None:
         raise RuntimeError("Unexpected OpenPI module namespace")
     verify_openpi_git_checkout(openpi_dir)
     runtime_attestation = attest_imported_openpi_modules(openpi_dir)
-    host_runtime = capture_openpi_host_runtime(openpi_dir, jax)
-    tokenizer_artifact = verify_paligemma_tokenizer_artifact(openpi_tokenizer.download)
+    host_runtime = capture_openpi_host_runtime(
+        openpi_dir,
+        jax,
+        preimport_package_environment=preimport_package_environment,
+    )
     metadata = expected_pi05_droid_jointpos_server_metadata(runtime_attestation)
     if not metadata:
         raise RuntimeError("Attested WebSocket metadata must be nonempty")
