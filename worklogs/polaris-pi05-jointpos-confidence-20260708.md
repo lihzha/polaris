@@ -737,12 +737,29 @@
   check before and after the run. Model-runtime v3 and evidence profile v6 bind
   the equal pre-import/post-import/preflight/postrun digests and exact warning
   filter.
-- Current validation is `486 passed, 1 skipped` for the complete host-safe
-  suite and `50 passed` for focused serving/evidence tests. Ruff lint/format,
-  Bash syntax, Python compilation, and whitespace checks pass. The sole skip
-  requires Isaac and remains assigned to the live L40S canary. The byte-exact
+- Current validation is `487 passed` with all eight subtests passing for the
+  complete host-safe suite and `50 passed` for focused serving/evidence tests.
+  Ruff lint/format, Bash syntax, Python compilation, and whitespace checks
+  pass. The sole excluded test requires Isaac and remains assigned to the live
+  L40S canary. The byte-exact
   historical port is commit `4fa1d165def1f049a196c16eef6e976bc25b53c5`,
-  where `182 passed, 1 skipped` and the same focused 50 tests pass.
+  where `183 passed` with all eight subtests and the same focused 50 tests pass.
 - The next launch must use new frozen v11 source trees, unique setup/result
   namespaces, and freshly rebuilt virtual environments. Paired one-rollout
   L40S canaries remain the gate before paired FoodBussing50 evaluation.
+
+## 2026-07-08 — fresh v11 setup launch
+
+- Shared registry revision 24 records the exact reviewed v11 commits and
+  contracts before launch. Clean frozen checkout
+  `/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-pi05-confidence-current-4e6c0d1-20260708T221428Z`
+  has launch commit `4e6c0d1eae4d911a860f155acdbd724f356573b2`, tree
+  `327f98c04570c0fd5624453d39f39a726d5a5c9d`, OpenPI
+  `bd70b8f4011e85b3f3b0f039f12113f78718e7bf`, and no preexisting `.venv`.
+- Fresh CPU setup job `1101831` is running on `cpu-large-0001` under namespace
+  `pi05-confidence-final-v11-20260708T221428Z`; paired historical setup
+  `1101832` runs independently on `cpu-large-0002`. The exact immutable
+  submission script SHA-256 is
+  `4357677926fbe337d006e93b5f564e2aae389aa74eeb11927fd5458eee72b506`.
+  These jobs perform package/checkpoint setup only and contribute zero rollout
+  episodes. GPU canaries remain gated on both setup records completing.
