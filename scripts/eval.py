@@ -6,6 +6,7 @@ import tqdm
 import gymnasium as gym
 import torch
 import argparse
+import os
 import pandas as pd
 
 
@@ -13,14 +14,22 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 from polaris.config import EvalArgs
-from polaris.evaluation_seed import episode_environment_seed
+from polaris.evaluation_seed import (
+    episode_environment_seed,
+    validate_episode_seed_range,
+)
 
 
 def main(eval_args: EvalArgs):
     if eval_args.policy.client == "DroidJointPos":
         if eval_args.environment_seed is None:
             raise ValueError("DroidJointPos requires --environment-seed")
-        episode_environment_seed(eval_args.environment_seed, 0)
+        if eval_args.rollouts is not None:
+            validate_episode_seed_range(eval_args.environment_seed, eval_args.rollouts)
+        if not eval_args.runtime_contract_path or not eval_args.policy.trace_path:
+            raise ValueError(
+                "DroidJointPos requires --runtime-contract-path and --policy.trace-path"
+            )
     elif eval_args.environment_seed is not None:
         episode_environment_seed(eval_args.environment_seed, 0)
     if (
@@ -50,10 +59,21 @@ def main(eval_args: EvalArgs):
         ManagerBasedRLSplatEnv,
     )
     from polaris.environments.droid_cfg import EefPoseActionCfg
+    from polaris.environments.pi05_droid_jointpos_cfg import (
+        DroidJointPositionActionCfg,
+        DroidJointPositionObservationCfg,
+    )
     from polaris.evaluation_seed import (
         bind_environment_seed,
         format_environment_seed_contract,
         make_live_environment_seed_contract,
+    )
+    from polaris.pi05_droid_jointpos_runtime import (
+        PI05_DROID_JOINTPOS_OUTER_STEPS,
+        capture_jointpos_runtime,
+        configure_jointpos_timeout,
+        format_jointpos_runtime,
+        publish_jointpos_runtime,
     )
     from polaris.utils import load_eval_initial_conditions
     from polaris.policy import InferenceClient
@@ -63,6 +83,7 @@ def main(eval_args: EvalArgs):
     from polaris.robust_differential_ik import DifferentialIKNumericalError
     # from real2simeval.autoscoring import TASK_TO_SUCCESS_CHECKER
 
+    audited_jointpos = eval_args.policy.client == "DroidJointPos"
     env_cfg = parse_env_cfg(
         eval_args.environment,
         device="cuda",
@@ -75,6 +96,10 @@ def main(eval_args: EvalArgs):
         # Action managers are constructed by gym.make, so select the controller
         # on the config before creating the environment.
         env_cfg.actions = EefPoseActionCfg()
+    elif audited_jointpos:
+        env_cfg.actions = DroidJointPositionActionCfg()
+        env_cfg.observations = DroidJointPositionObservationCfg()
+        configure_jointpos_timeout(env_cfg)
     elif eval_args.control_mode != "joint-position":
         raise ValueError(f"Unsupported control mode: {eval_args.control_mode}")
     env: ManagerBasedRLSplatEnv = gym.make(  # type: ignore[assignment]
@@ -101,6 +126,8 @@ def main(eval_args: EvalArgs):
         else default_instruction
     )
     rollouts = len(initial_conditions)
+    if audited_jointpos:
+        validate_episode_seed_range(eval_args.environment_seed, rollouts)
     # Resume CSV logging
     run_folder = Path(eval_args.run_folder)
     run_folder.mkdir(parents=True, exist_ok=True)
@@ -130,29 +157,43 @@ def main(eval_args: EvalArgs):
         return
 
     policy_client: InferenceClient = InferenceClient.get_client(eval_args.policy)
-    if eval_args.policy.client == "DroidJointPos":
+    if audited_jointpos:
         if environment_seed_contract is None:
             raise RuntimeError("DroidJointPos environment seed contract is missing")
         policy_client.bind_environment_seed_contract(environment_seed_contract)
 
-    horizon = env.max_episode_length
+    horizon = (
+        PI05_DROID_JOINTPOS_OUTER_STEPS if audited_jointpos else env.max_episode_length
+    )
+    jointpos_runtime_sha256 = None
     while episode < rollouts:
         # Index the initial condition with the episode being started. The old
         # loop reset before incrementing ``episode``, repeating condition zero.
         episode_seed = None
         if eval_args.environment_seed is not None:
-            episode_seed = episode_environment_seed(
-                eval_args.environment_seed, episode
-            )
+            episode_seed = episode_environment_seed(eval_args.environment_seed, episode)
         obs, info = env.reset(
             seed=episode_seed,
             object_positions=initial_conditions[episode],
         )
-        if eval_args.policy.client == "DroidJointPos":
+        if audited_jointpos:
+            live_jointpos_runtime = capture_jointpos_runtime(env, obs)
+            if jointpos_runtime_sha256 is None:
+                print(format_jointpos_runtime(live_jointpos_runtime), flush=True)
+                publish_jointpos_runtime(
+                    Path(eval_args.runtime_contract_path), live_jointpos_runtime
+                )
+                jointpos_runtime_sha256 = live_jointpos_runtime["runtime_sha256"]
+            elif live_jointpos_runtime["runtime_sha256"] != jointpos_runtime_sha256:
+                raise ValueError(
+                    "live joint-position runtime drifted across episode reset"
+                )
+            policy_client.bind_jointpos_runtime(live_jointpos_runtime)
             policy_client.reset(
                 episode_index=episode,
                 episode_seed=episode_seed,
             )
+            policy_client.begin_rollout(env)
         else:
             policy_client.reset()
         video = []
@@ -179,7 +220,11 @@ def main(eval_args: EvalArgs):
             try:
                 obs, rew, term, trunc, info = env.step(
                     torch.as_tensor(action, device=env.device).reshape(1, -1),
-                    expensive=policy_client.rerender,
+                    expensive=(
+                        eval_args.policy.render_every_step or policy_client.rerender
+                        if audited_jointpos
+                        else policy_client.rerender
+                    ),
                 )
             except (DifferentialIKNumericalError, torch.linalg.LinAlgError) as error:
                 numerical_failure_reason = f"{type(error).__name__}: {error}"
@@ -191,11 +236,61 @@ def main(eval_args: EvalArgs):
                 # attempted action, so include it in the episode length.
                 bar.update(1)
                 break
+            if audited_jointpos:
+                policy_client.record_execution(
+                    obs,
+                    env,
+                    terminated=term,
+                    truncated=trunc,
+                    terminal_rubric=(
+                        info["rubric"]
+                        if bar.n + 1 == PI05_DROID_JOINTPOS_OUTER_STEPS
+                        else None
+                    ),
+                )
             bar.update(1)
-            if term[0] or trunc[0]:
+            if not audited_jointpos and (term[0] or trunc[0]):
                 break
 
         episode_length = bar.n
+        if audited_jointpos and episode_length != PI05_DROID_JOINTPOS_OUTER_STEPS:
+            raise RuntimeError(
+                "DroidJointPos did not complete the explicit 450-step horizon"
+            )
+        if audited_jointpos:
+            from PIL import Image
+
+            terminal_visualization = policy_client.final_terminal_visualization()
+            terminal_path = run_folder / f"episode_{episode}_terminal.png"
+            terminal_temporary = terminal_path.with_name(
+                f".{terminal_path.stem}.partial-{os.getpid()}.png"
+            )
+            if (
+                terminal_path.exists()
+                or terminal_path.is_symlink()
+                or terminal_temporary.exists()
+                or terminal_temporary.is_symlink()
+            ):
+                raise RuntimeError(
+                    "DroidJointPos terminal visualization already exists"
+                )
+            try:
+                with terminal_temporary.open("xb") as terminal_file:
+                    Image.fromarray(terminal_visualization).save(
+                        terminal_file, format="PNG"
+                    )
+                    terminal_file.flush()
+                    os.fsync(terminal_file.fileno())
+                os.link(terminal_temporary, terminal_path, follow_symlinks=False)
+                terminal_temporary.unlink()
+                directory = os.open(run_folder, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            finally:
+                if terminal_temporary.exists() and not terminal_temporary.is_symlink():
+                    terminal_temporary.unlink()
         bar.close()
 
         if video:

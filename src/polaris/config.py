@@ -65,6 +65,7 @@ class EvalArgs:
     rollouts: int | None = None  # Number of rollouts to evaluate
     environment_seed: int | None = None  # Explicit Isaac Lab environment seed
     control_mode: Literal["joint-position", "eef-pose"] = "joint-position"
+    runtime_contract_path: str | None = None
 
 
 @dataclass
