@@ -128,3 +128,18 @@
   use a fresh tree and setup from this deterministic script so both arms have
   the same setup provenance. The setup/test blobs remain byte-identical to the
   current arm, and the evaluator lifecycle remains intentionally historical.
+- Current-arm canary `1101815` then exposed a separate pre-rollout runtime pin:
+  the allocated L40S node uses NVIDIA driver `580.105.08` and Vulkan ICD
+  `1.4.312`, SHA-256
+  `7bdb6f27d35b66fc848df6f94b8773bba30ea3a7f06f114100d14154a235a34b`,
+  while the joint-position wrapper still expected the older login-host
+  `1.4.303` file. The job failed after five seconds before server, model, or
+  simulator startup; no scientific result was produced.
+- The paired evaluator now requires exactly one visible driver row equal to
+  `580.105.08` plus the exact upgraded ICD bytes, records both in its sealed run
+  evidence, and mounts the ICD read-only. This matches existing successful
+  PolaRiS L40S controller/image/runtime evidence and changes no model,
+  observation, action, normalization, or controller semantics. An independent
+  adversarial review found no blocking issue. The eval/test blobs are again
+  byte-identical to the current arm; the historical evaluator lifecycle remains
+  the only intended execution difference.

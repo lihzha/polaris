@@ -22,7 +22,8 @@ POLICY_CONFIG="${POLICY_CONFIG:-pi05_droid_jointpos_polaris}"
 EXPECTED_OPENPI_COMMIT="${EXPECTED_OPENPI_COMMIT:-bd70b8f4011e85b3f3b0f039f12113f78718e7bf}"
 EXPECTED_NORM_SHA256="${EXPECTED_NORM_SHA256:-57ce9956f9e07d65f8a8205aabec72d436a2c8927f53edb40c7a77b14a5a90c7}"
 EXPECTED_PYXIS_SHA256="${EXPECTED_PYXIS_SHA256:-ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d556b324a}"
-EXPECTED_VULKAN_ICD_SHA256="${EXPECTED_VULKAN_ICD_SHA256:-46cee75b42b43649839bc7f29820d36ac6e85782b792a97d5b91d9adbca8ca09}"
+EXPECTED_VULKAN_ICD_SHA256="${EXPECTED_VULKAN_ICD_SHA256:-7bdb6f27d35b66fc848df6f94b8773bba30ea3a7f06f114100d14154a235a34b}"
+EXPECTED_NVIDIA_DRIVER_VERSION="${EXPECTED_NVIDIA_DRIVER_VERSION:-580.105.08}"
 EXPECTED_MANIFEST_SHA256="${EXPECTED_MANIFEST_SHA256:-7abd0c2294d442d429a77655783232206b2b30d95c508d435503135a5523a11c}"
 CHECKPOINT_MANIFEST="${CHECKPOINT_MANIFEST:-${SCRIPT_DIR}/pi05_droid_jointpos_polaris_gcs_manifest.tsv}"
 EXPECTED_ACTION_HORIZON="${EXPECTED_ACTION_HORIZON:-15}"
@@ -86,6 +87,15 @@ fi
 actual_vulkan_icd_sha256="$(sha256sum "${POLARIS_VULKAN_ICD_PATH}" | awk '{print $1}')"
 [[ "${actual_vulkan_icd_sha256}" == "${EXPECTED_VULKAN_ICD_SHA256}" ]] \
   || die "Vulkan ICD SHA-256 mismatch: ${actual_vulkan_icd_sha256}"
+mapfile -t allocated_driver_versions < <(
+  nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits \
+    | sed '/^[[:space:]]*$/d'
+)
+(( ${#allocated_driver_versions[@]} == 1 )) \
+  || die "Expected exactly one allocated NVIDIA driver version"
+actual_nvidia_driver_version="$(xargs <<<"${allocated_driver_versions[0]}")"
+[[ "${actual_nvidia_driver_version}" == "${EXPECTED_NVIDIA_DRIVER_VERSION}" ]] \
+  || die "NVIDIA driver version mismatch: ${actual_nvidia_driver_version}"
 [[ -f "${CHECKPOINT_MANIFEST}" ]] || die "Missing checkpoint manifest: ${CHECKPOINT_MANIFEST}"
 
 case "${POLARIS_ENVIRONMENT}" in
@@ -462,6 +472,7 @@ PYXIS_IMAGE_SHA256="$(sha256sum "${POLARIS_PYXIS_IMAGE}" | awk '{print $1}')"
   printf 'POLARIS_PYXIS_IMAGE_SHA256=%q\n' "${PYXIS_IMAGE_SHA256}"
   printf 'POLARIS_VULKAN_ICD_PATH=%q\n' "${POLARIS_VULKAN_ICD_PATH}"
   printf 'POLARIS_VULKAN_ICD_SHA256=%q\n' "${actual_vulkan_icd_sha256}"
+  printf 'NVIDIA_DRIVER_VERSION=%q\n' "${actual_nvidia_driver_version}"
   printf 'POLARIS_ENVIRONMENT=%q\n' "${POLARIS_ENVIRONMENT}"
   printf 'EXPECTED_PROMPT=%q\n' "${EXPECTED_PROMPT}"
   printf 'RESUME_FROM_TASK_DIR=%q\n' "${RESUME_FROM_TASK_DIR}"
