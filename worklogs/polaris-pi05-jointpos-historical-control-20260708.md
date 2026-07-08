@@ -55,3 +55,12 @@
   reordered pairs, missing queries, swapped steps, stale metrics, noncanonical
   tolerance, and impossible state-valid counts. These additions remain
   analysis/evidence-only and do not change the historical rollout lifecycle.
+
+- Clean setup `1101806` exposed a shared Lustre path-alias false reject after
+  package installation; historical setup `1101807` was canceled once the
+  common cause was known. The paired interpreter attestation now proves the
+  resolved virtual-environment prefix plus executable inode, rejects a foreign
+  venv even when it shares the same base Python, and then persists the
+  canonical Git-root executable spelling for downstream runtime validation.
+  The serving contract and alias tests are byte-identical to the independently
+  reviewed current arm; rollout behavior remains unchanged.

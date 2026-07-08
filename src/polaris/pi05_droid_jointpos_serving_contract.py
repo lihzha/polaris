@@ -905,16 +905,31 @@ def _verify_distribution_record(
     }
 
 
+def _require_checkout_local_openpi_interpreter(root: Path) -> Path:
+    """Accept filesystem aliases only when both venv and executable are identical."""
+
+    root = Path(root)
+    expected_environment = (root / ".venv").resolve(strict=True)
+    active_environment = Path(sys.prefix).resolve(strict=True)
+    declared_executable = Path(sys.executable)
+    expected_executable = root / ".venv/bin/python"
+    try:
+        executable_matches = declared_executable.samefile(expected_executable)
+    except OSError:
+        executable_matches = False
+    if active_environment != expected_environment or not executable_matches:
+        raise ValueError(
+            "Package verification requires the checkout-local OpenPI interpreter"
+        )
+    return expected_executable
+
+
 def verify_openpi_package_environment(openpi_dir: Path) -> dict[str, Any]:
     """Verify every noneditable installed file against RECORD and uv.lock."""
 
     checkout = verify_openpi_git_checkout(openpi_dir)
     root = Path(checkout["root"])
-    declared_executable = Path(sys.executable)
-    if declared_executable != root / ".venv/bin/python":
-        raise ValueError(
-            "Package verification requires the checkout-local OpenPI interpreter"
-        )
+    _require_checkout_local_openpi_interpreter(root)
     environment_root = Path(sys.prefix).resolve()
     site_packages = environment_root / "lib/python3.11/site-packages"
     if not site_packages.is_dir():
@@ -998,12 +1013,7 @@ def capture_openpi_host_runtime(openpi_dir: Path, jax_module: object) -> dict[st
 
     checkout = verify_openpi_git_checkout(openpi_dir)
     root = Path(checkout["root"])
-    declared_executable = Path(sys.executable)
-    expected_executable = root / ".venv/bin/python"
-    if declared_executable != expected_executable:
-        raise ValueError(
-            "Attested server must run with the checkout-local OpenPI interpreter"
-        )
+    declared_executable = _require_checkout_local_openpi_interpreter(root)
     executable_target = declared_executable.resolve()
     executable = _regular_file_identity(executable_target)
     package_environment = verify_openpi_package_environment(root)
