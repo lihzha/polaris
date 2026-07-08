@@ -488,10 +488,10 @@ def test_execution_environment_pure_validator_is_closed():
 
 def test_production_graphics_table_and_canonical_digest_are_closed():
     value = _graphics_runtime()
-    assert len(runtime.PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES) == 14
-    assert len(value["libraries"]) == 14
+    assert len(runtime.PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES) == 15
+    assert len(value["libraries"]) == 15
     assert value["graphics_runtime_sha256"] == (
-        "cd0ae19f2ea2cbdd0b8371796acad34c6d1b36d38c26aca68e8715b663c2f9f5"
+        "f3ee6c8027f0cfea3c0f4875c2d3c0aba4c8cf41f8bde040a0bf236b81133a84"
     )
     assert (
         value["graphics_runtime_sha256"]
