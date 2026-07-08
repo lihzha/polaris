@@ -115,6 +115,43 @@ def _opencv_identity() -> dict[str, Any]:
     }
 
 
+def _loader_search_safety() -> dict[str, Any]:
+    working_directory = Path.cwd().resolve()
+    repository_root = Path(__file__).resolve().parents[2]
+    loader_value = os.environ.get("LD_LIBRARY_PATH")
+    first_element = loader_value.split(":", 1)[0] if loader_value is not None else None
+    normalized_target = (
+        str(Path(first_element).resolve(strict=False))
+        if first_element is not None
+        else None
+    )
+    root_elf_files = []
+    for entry in sorted(os.scandir(working_directory), key=lambda item: item.name):
+        if not entry.is_file(follow_symlinks=False):
+            continue
+        candidate = Path(entry.path)
+        with candidate.open("rb") as stream:
+            if stream.read(4) == b"\x7fELF":
+                root_elf_files.append(_file_identity(candidate))
+    return {
+        "profile": "cv2_empty_loader_element_readonly_workdir_v1",
+        "working_directory": str(working_directory),
+        "repository_root": str(repository_root),
+        "working_directory_equals_repository_root": (
+            working_directory == repository_root
+        ),
+        "working_directory_read_only": bool(
+            os.statvfs(working_directory).f_flag & os.ST_RDONLY
+        ),
+        "ld_library_path": loader_value,
+        "normalized_first_element": normalized_target,
+        "normalized_first_element_exists": (
+            Path(normalized_target).exists() if normalized_target is not None else None
+        ),
+        "working_directory_elf_files": root_elf_files,
+    }
+
+
 def _publish(path: Path, value: dict[str, Any]) -> None:
     payload = (
         json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -180,6 +217,7 @@ def main() -> None:
     )
     report["runtime_module"] = _file_identity(Path(runtime.__file__).resolve())
     report["opencv"] = _opencv_identity()
+    report["loader_search_safety"] = _loader_search_safety()
     report["sha256"] = hashlib.sha256(
         json.dumps(report, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
