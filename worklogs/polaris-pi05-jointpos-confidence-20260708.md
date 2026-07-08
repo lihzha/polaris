@@ -479,3 +479,25 @@
   package attestation. The resulting active runtime is deterministic and the
   already reviewed overlap profile remains narrow; accepting either provider
   nondeterministically is explicitly rejected.
+
+## 2026-07-08 — upgraded L40S driver/ICD runtime identity
+
+- Current v6 canary job `1101815` failed closed after five seconds on
+  `pool0-00016`, before server startup or simulator/model execution. The node
+  reports one NVIDIA L40S with driver `580.105.08` and the host Vulkan ICD
+  SHA-256
+  `7bdb6f27d35b66fc848df6f94b8773bba30ea3a7f06f114100d14154a235a34b`
+  (`api_version` `1.4.312`). The joint-position wrapper still pinned the older
+  login-host ICD hash
+  `46cee75b42b43649839bc7f29820d36ac6e85782b792a97d5b91d9adbca8ca09`
+  (`1.4.303`), so no rollout artifact was produced. The log is 291 bytes,
+  SHA-256
+  `dfa9433b9fd15f9dfc02aa4fa16217d212f7e70cd5c2f9b2f5869d602147cc02`.
+- Existing inspected PolaRiS L40S controller/image/runtime jobs already use
+  driver `580.105.08` and pin the `1.4.312` ICD digest. The joint-position
+  evaluator now pins that exact allocated-node pair as well: it requires one
+  visible driver version equal to `580.105.08`, requires the exact upgraded ICD
+  bytes, records both in run evidence, and still mounts the ICD read-only into
+  the pinned Pyxis image. Older or differently upgraded nodes continue to fail
+  rather than being treated as equivalent. The replacement full-horizon
+  canary is the model/simulator validation for this runtime profile.

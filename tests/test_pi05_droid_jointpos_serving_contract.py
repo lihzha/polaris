@@ -910,6 +910,16 @@ def test_worker_fail_closes_live_contract_hub_metadata_and_seed_range():
     assert "--runtime-contract" in source
     assert "runtime_contract_sha256" in source
     assert "ENVIRONMENT_SEED + ROLLOUTS - 1" in source
+    assert "7bdb6f27d35b66fc848df6f94b8773bba30ea3a7f06f114100d14154a235a34b" in source
+    assert (
+        'EXPECTED_NVIDIA_DRIVER_VERSION="${EXPECTED_NVIDIA_DRIVER_VERSION:-580.105.08}"'
+        in source
+    )
+    assert "--query-gpu=driver_version" in source
+    assert (
+        'actual_nvidia_driver_version}" == "${EXPECTED_NVIDIA_DRIVER_VERSION' in source
+    )
+    assert "NVIDIA_DRIVER_VERSION=%q" in source
     assert "852dd0345afb7e4d0c7526b5c327086b5132c40624ed97ff6942962126e90534" in source
     assert "accd9b67e90e510eb4ed44a789b9169df058e71ce557164f960de2d62a840e63" in source
     assert "208e0f85fc16fa32ffeca972aea0fd1b33b0c6c2a582e89ff3877823291a7754" in source
