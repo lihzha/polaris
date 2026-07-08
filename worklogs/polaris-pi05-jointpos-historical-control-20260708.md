@@ -272,3 +272,44 @@
   720x1280 client images with server-side 224x224 resize, 15x8 absolute
   joint-position output, eight-action execution horizon, and seed 0. They are
   runtime-validation canaries, not final scientific results.
+
+## 2026-07-08 — v10 canary failure and import-time mutation root cause
+
+- Historical canary `1101830` and current canary `1101829` both failed before
+  simulator/container launch and produced zero episodes, traces, or videos.
+  They restored the official checkpoint and loaded the global DROID
+  normalization successfully, then failed complete package RECORD
+  re-attestation. This is an infrastructure failure, not a model result.
+- Locked `numpydantic==1.6.9` deterministically rewrote its RECORD-tracked
+  `numpydantic/ndarray.pyi` during OpenPI import: the original wheel file is
+  705 bytes with SHA-256
+  `36e9708637fe45a17da721ff308ba7ba5f4f1ac7dda1ce7eeec615b29097ee00`,
+  while the generated file is 452 bytes with SHA-256
+  `954af1cf45ab82657347f8155fb26eef2ed6996e4a9dda915f9f83186a314cc4`.
+  No other RECORD-tracked environment file changed. Because v10 setup itself
+  imported OpenPI after its initial package report, both v10 environments are
+  retired and will not be reused.
+- Shared registry revision 23 preserves both failed v10 objects and their
+  exact artifacts. They contribute no rollout or success-rate observation.
+
+## 2026-07-08 — byte-exact v11 package-integrity closure
+
+- Historical fix commit
+  `4fa1d165def1f049a196c16eef6e976bc25b53c5` is byte-identical across all
+  seven evaluator/setup/serving/evidence/test blobs to current commit
+  `3178c03ba8632c2eb650e605460707bcdc010400`. The historical evaluator
+  lifecycle remains the only intended paired factor.
+- The fix pins the exact numpydantic wheel, RECORD claim, original stub bytes,
+  and observed fresh-install modes `0640`/`0644`, then seals only the typing
+  stub to canonical `0444`. No-follow descriptor reads, path/inode stability,
+  one-link ownership, and non-root execution are required. Setup reattests the
+  full package environment before sealing, after sealing, and after all
+  tokenizer/checkpoint/config imports. Serving and the outer evaluator add
+  matching pre/post checks, bound by model-runtime v3 and evidence profile v6.
+- Historical validation is `182 passed, 1 skipped` for the host-safe suite and
+  `50 passed` for focused serving/evidence tests. Ruff lint/format, Bash
+  syntax, Python compilation, and whitespace checks pass. The sole skip needs
+  Isaac and remains assigned to the paired live L40S canary.
+- Only fresh v11 frozen source trees, unique setup/result namespaces, and
+  rebuilt virtual environments are valid. Paired one-rollout canaries gate the
+  paired FoodBussing50 evaluation.
