@@ -36,12 +36,14 @@ def _write_inputs(root: Path, *, rollouts: int = 2):
     trace = paths["policy_trace"]
     trace.write_bytes(b'{"record":"synthetic"}\n')
     trace_sha = hashlib.sha256(trace.read_bytes()).hexdigest()
+    metrics_sha = hashlib.sha256(paths["metrics_csv"].read_bytes()).hexdigest()
     paths["trace_summary"].write_text(
         json.dumps(
             {
                 "schema_version": 4,
                 "status": "pass",
                 "trace_sha256": trace_sha,
+                "metrics_sha256": metrics_sha,
                 "reset_count": rollouts,
                 "episode_lengths": [450] * rollouts,
                 "episode_query_counts": [57] * rollouts,

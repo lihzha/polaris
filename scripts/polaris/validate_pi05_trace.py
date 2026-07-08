@@ -180,6 +180,14 @@ def _episode_lengths(metrics_csv: Path) -> list[int]:
     return lengths
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as input_file:
+        for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _audit_legacy_trace(
     trace_path: Path,
     expected_prompt: str | None = None,
@@ -454,6 +462,9 @@ def _audit_legacy_trace(
         "schema_version": 2,
         "trace_path": str(trace_path.resolve()),
         "trace_sha256": digest.hexdigest(),
+        "metrics_sha256": (
+            _sha256_file(metrics_csv) if metrics_csv is not None else None
+        ),
         "query_records": len(queries),
         "emitted_action_records": len(emissions),
         "reset_count": len(queries_by_reset),
@@ -1177,6 +1188,9 @@ def _audit_attested_trace(
         "schema_version": PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
         "trace_path": str(trace_path.resolve()),
         "trace_sha256": digest,
+        "metrics_sha256": (
+            _sha256_file(metrics_csv) if metrics_csv is not None else None
+        ),
         "query_records": len(queries),
         "emitted_action_records": len(actions),
         "execution_records": len(executions),

@@ -344,3 +344,37 @@
   mismatched action/execution targets are rejected, and legacy traces retain
   their lower-bound label. The analyzer also reproduced the existing
   query-only result on the retained two-episode canary trace.
+
+- A second adversarial review rejected the first analyzer fix before GPU
+  launch. Setup retry `1101798` was canceled after seven seconds. The review
+  showed that deleting every execution record could falsely downgrade a
+  schema-4 trace to legacy, orphaned query references and swapped execution
+  indices were not rejected, and the aggregate summarizer trusted stale audit
+  JSON. No evaluation ran from that commit.
+- The closed analyzer now requires one homogeneous trace schema, makes
+  execution records mandatory for schema 4, reconstructs every expected
+  `(episode, query, chunk)` key from the metrics, checks each emitted arm
+  target against its query response, and binds execution step `q*8+chunk`.
+  It hashes the source trace and CSV into audit schema 2. A realistic 450-step
+  test proves 57 queries, 450 actions/executions, and correct detection of a
+  violation present only in the post-action-450 state; downgrade, missing-
+  query, swapped-step, missing-legacy-action, and stale-target attacks fail.
+- The aggregate summarizer now re-hashes trace/CSV inputs and validates trace
+  and physical-audit status, schemas, episode lengths, query/action/execution
+  counts, success/numerical/state/target episode sets, and the state-valid
+  numerator before aggregation. State-OOB-minus-numerical is a set difference,
+  so the reported count cannot become negative, and impossible rates above
+  one are rejected upstream rather than rendered.
+- The final adversarial closure also binds the canonical Panda joint table and
+  exactly `1e-3` rad tolerance, prevents a schema-4 audit from claiming legacy
+  query-only coverage, and adds the sealed metrics-CSV SHA-256 to the primary
+  trace validator summary. Immutable evidence now joins that hash to the
+  separately sealed CSV identity, so editing metrics and rerunning only the
+  physical audit cannot preserve a passing trace-validation claim.
+- The physical analyzer additionally enforces contiguous JSONL query/action/
+  execution order, including rejecting reordered complete action/execution
+  pairs, and exact equality between each noninitial policy-query joint state
+  and the preceding post-action state. Final current-tree host regression after
+  these changes: 427 tests passed and one unrelated test was skipped with only the
+  Isaac-dependent test excluded; focused trace/physical/evidence tests passed
+  38/38, and Ruff format/lint, Python compilation, and whitespace checks pass.
