@@ -330,3 +330,36 @@
   `4357677926fbe337d006e93b5f564e2aae389aa74eeb11927fd5458eee72b506`.
   These jobs perform package/checkpoint setup only and contribute zero rollout
   episodes. GPU canaries remain gated on both setup records completing.
+
+## 2026-07-08 — v11 canary fail-closed and byte-exact mapped-runtime v2 port
+
+- Fresh historical setup `1101832` completed `0:0` after `00:13:07`. It
+  verified all 242 installed distributions and 240 RECORD inventories, the
+  sealed 705-byte numpydantic stub at mode `0444`/link-count 1, all 27
+  checkpoint objects by full MD5 (12,434,530,837 bytes), tokenizer,
+  checkpoint-global DROID normalization, official config, and clean sources.
+  Its sealed/final package canonical SHA-256 is
+  `560f9a7f1650a4c4cc0a02b8ceb24e86c0b1b4693709ae274276f6930f22224c`.
+- Historical canary `1101836` independently passed that package preflight,
+  policy construction, post-import package identity, checkpoint restore, and
+  live official serving/model-runtime contracts. At the same pre-rollout
+  simulator gate as current, it failed closed on the sole additional mapped
+  object
+  `/usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.580.105.08`.
+  No policy request, controller action, episode, trace, video, or metric was
+  produced. The invalid attempt was canceled after the diagnostic was durable
+  to avoid repeating the already observed stuck Isaac shutdown.
+- The allocated-node object identity is 39,422,584 bytes, SHA-256
+  `1ed129c4f703547fe5f8961dada7d53cb2981404fabdbfa9b9b3e3d83a04f6ac`,
+  GNU build ID `6257a5b3887eab41edd54343ea3623c373ab8e8e`.
+  Historical repair commit `4dd5082` is the byte-exact port of current
+  `6445392`: it advances the closed mapped set to 15 libraries under
+  `l401_pyxis_nvidia_580_105_08_mapped_graphics_v2` and pins digest
+  `f3ee6c8027f0cfea3c0f4875c2d3c0aba4c8cf41f8bde040a0bf236b81133a84`.
+  The historical lifecycle remains the only intended paired factor.
+- All nine runtime/setup/serving/evidence source and test blobs checked for
+  this repair are byte-identical across roles. Historical focused validation
+  passed 89 runtime/evidence/serving tests, with Ruff and whitespace checks
+  clean; current passed the full 487-test/eight-subtest host-safe suite. The
+  patch changes only evidence identity. Fresh frozen setup and paired canaries
+  remain mandatory before the FoodBussing50 comparison.
