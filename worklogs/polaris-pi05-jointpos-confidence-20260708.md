@@ -698,3 +698,51 @@
   contract, 720x1280 client images with server-side 224x224 resize, 15x8
   absolute joint-position output, eight-action execution horizon, and seed 0.
   They are runtime-validation canaries, not final scientific results.
+
+## 2026-07-08 — v10 canary failure and import-time mutation root cause
+
+- Current canary `1101829` and paired historical canary `1101830` both failed
+  before simulator/container launch and produced zero episodes, traces, or
+  videos. They restored the official checkpoint and loaded the global DROID
+  normalization successfully, then failed the full package RECORD
+  re-attestation. This is an infrastructure failure, not a model result.
+- Exact forensics showed that locked `numpydantic==1.6.9` rewrites its own
+  RECORD-tracked `numpydantic/ndarray.pyi` on import. The wheel owns 705 bytes
+  with SHA-256
+  `36e9708637fe45a17da721ff308ba7ba5f4f1ac7dda1ce7eeec615b29097ee00`;
+  the generated 452-byte file has SHA-256
+  `954af1cf45ab82657347f8155fb26eef2ed6996e4a9dda915f9f83186a314cc4`.
+  A whole-environment write census found no other RECORD-tracked mutation;
+  all other writes were untracked Python bytecode caches. Setup v10 had also
+  imported OpenPI after its initial package report, so both v10 environments
+  are intentionally retired rather than repaired.
+- Shared registry revision 23 preserves the failed v10 objects and exact
+  failure artifacts. No v10 result is counted as a rollout or success-rate
+  observation.
+
+## 2026-07-08 — v11 package-integrity closure ready for fresh setup
+
+- Independently reviewed fix commit
+  `3178c03ba8632c2eb650e605460707bcdc010400` pins the exact numpydantic wheel,
+  RECORD claim, original stub bytes, and accepted observed fresh-install modes
+  `0640`/`0644`; it seals only that typing stub to canonical mode `0444`.
+  Descriptor-level no-follow reads, path/inode stability, one-link ownership,
+  and non-root execution are required. This blocks only numpydantic's typing
+  metadata rewrite and does not alter policy inference.
+- Setup now performs full RECORD verification before sealing, immediately
+  after sealing, and again after tokenizer, checkpoint, and official config
+  imports. The sealed and final reports must be byte-identical. Serving
+  verifies the complete package environment before any OpenPI/JAX import and
+  after policy/tokenizer construction; the outer evaluator repeats the same
+  check before and after the run. Model-runtime v3 and evidence profile v6 bind
+  the equal pre-import/post-import/preflight/postrun digests and exact warning
+  filter.
+- Current validation is `486 passed, 1 skipped` for the complete host-safe
+  suite and `50 passed` for focused serving/evidence tests. Ruff lint/format,
+  Bash syntax, Python compilation, and whitespace checks pass. The sole skip
+  requires Isaac and remains assigned to the live L40S canary. The byte-exact
+  historical port is commit `4fa1d165def1f049a196c16eef6e976bc25b53c5`,
+  where `182 passed, 1 skipped` and the same focused 50 tests pass.
+- The next launch must use new frozen v11 source trees, unique setup/result
+  namespaces, and freshly rebuilt virtual environments. Paired one-rollout
+  L40S canaries remain the gate before paired FoodBussing50 evaluation.
