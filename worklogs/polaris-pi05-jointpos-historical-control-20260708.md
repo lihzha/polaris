@@ -99,3 +99,32 @@
   correction does not touch the intentionally historical evaluator lifecycle.
   Its complete host-safe suite passes 131 tests with one unrelated skip; Ruff
   format/lint, Python compilation, and Git whitespace checks pass.
+
+## 2026-07-08 — deterministic OpenCV provider setup
+
+- Parallel v5 setup proved that the full/headless OpenCV last writer was not
+  deterministic. Historical job `1101811` ended with the locked full
+  `opencv-python` files active, passed the complete 242-package/240-RECORD
+  audit, tokenizer generation/bytes/proto audit, all 27 checkpoint objects and
+  full MD5 verification, global DROID norm hash, and official config check.
+  It completed `0:0` in 9m11s. Its package environment canonical digest is
+  `3f8b25f9cc6472f3879d6c0f9996ca9e676ed33ba3ce5071dc1e91581bcc8f04`;
+  the JSON file SHA-256 is
+  `f15dfbe85464600152ef3beea89c4d7be8ba8ca7afa8b28c7babf20c2cabff86`.
+  The terminal log SHA-256 is
+  `a94113a89b3a011c2e232fa52c80b5b00b97d855bcb098496c87413eec6c6afa`.
+- Simultaneous current job `1101810`, using the byte-identical verifier and
+  same OpenPI lock, ended with the headless files active and correctly failed
+  the required full-provider profile. This paired evidence establishes an
+  installer-order ambiguity rather than checkpoint, branch, or content drift.
+- The setup script now performs a frozen, no-cache, copy-mode reinstall of the
+  direct OpenPI dependency `opencv-python` after the full sync and before the
+  editable OpenPI reinstall and strict audit. A target-surface diagnostic
+  transformed the headless-active failed environment into the exact required
+  state: 130 full-wheel direct claims plus 95 headless direct claims and the
+  three pinned loser-to-winner resolutions. The full and headless packages
+  both remain installed at `4.11.0.86`; no dependency is removed or exempted.
+- Although historical v5 setup artifacts are valid, the paired evaluation will
+  use a fresh tree and setup from this deterministic script so both arms have
+  the same setup provenance. The setup/test blobs remain byte-identical to the
+  current arm, and the evaluator lifecycle remains intentionally historical.
