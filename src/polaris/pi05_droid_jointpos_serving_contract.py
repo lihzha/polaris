@@ -35,12 +35,12 @@ PI05_DROID_JOINTPOS_SERVING_CONTRACT_FILENAME = (
 )
 PI05_DROID_JOINTPOS_MODEL_RUNTIME_FILENAME = "pi05_droid_jointpos_model_runtime.json"
 PI05_DROID_JOINTPOS_MODEL_RUNTIME_PROFILE = (
-    "openpi_pi05_droid_jointpos_polaris_model_runtime_v2"
+    "openpi_pi05_droid_jointpos_polaris_model_runtime_v3"
 )
 PI05_DROID_JOINTPOS_BIND_HOST = "127.0.0.1"
 PI05_DROID_JOINTPOS_RNG_STREAM_FILENAME = "pi05_droid_jointpos_rng_stream.json"
 PI05_DROID_JOINTPOS_RNG_STREAM_PROFILE = "openpi_pi05_droid_jointpos_jax_rng_stream_v1"
-PI05_DROID_JOINTPOS_HOST_RUNTIME_PROFILE = "openpi_pi05_droid_jointpos_host_runtime_v2"
+PI05_DROID_JOINTPOS_HOST_RUNTIME_PROFILE = "openpi_pi05_droid_jointpos_host_runtime_v3"
 PI05_DROID_JOINTPOS_NVIDIA_GPU_NAME = "NVIDIA L40S"
 PI05_DROID_JOINTPOS_NVIDIA_DRIVER_VERSION = "580.105.08"
 PI05_DROID_JOINTPOS_NVIDIA_SMI_QUERY = (
@@ -89,6 +89,7 @@ PI05_DROID_JOINTPOS_REQUIRED_PACKAGE_VERSIONS = {
     "jax-cuda12-pjrt": "0.5.3",
     "jax-cuda12-plugin": "0.5.3",
     "jaxlib": "0.5.3",
+    "numpydantic": "1.6.9",
     "numpy": "1.26.4",
     "openpi": "0.1.0",
     "openpi-client": "0.1.0",
@@ -100,6 +101,16 @@ PI05_DROID_JOINTPOS_REQUIRED_PACKAGE_VERSIONS = {
 PI05_DROID_JOINTPOS_RECORD_VERIFICATION_EXEMPTIONS = (
     "openpi",
     "openpi-client",
+)
+PI05_DROID_JOINTPOS_IMPORT_GENERATED_STUB_SEALS = (
+    (
+        "numpydantic",
+        "1.6.9",
+        "numpydantic/ndarray.pyi",
+        705,
+        "36e9708637fe45a17da721ff308ba7ba5f4f1ac7dda1ce7eeec615b29097ee00",
+        0o444,
+    ),
 )
 PI05_DROID_JOINTPOS_PINNED_HEX_RECORD_ENTRIES = (
     (
@@ -224,6 +235,13 @@ PI05_DROID_JOINTPOS_PINNED_WHEEL_ARTIFACTS = (
         17_299,
     ),
     (
+        "numpydantic",
+        "1.6.9",
+        "https://files.pythonhosted.org/packages/56/2a/46f1e3059b3bd899ab1335ae3a42f7cbff9a5a9ae9294cb1d7a3eb04a9ce/numpydantic-1.6.9-py3-none-any.whl",
+        "149ed4b7dfec907fb1e7c0874fd7d41bc95734c22764124d22c7c27aa8f059fd",
+        85_598,
+    ),
+    (
         "opencv-python",
         "4.11.0.86",
         "https://files.pythonhosted.org/packages/2c/8b/90eb44a40476fa0e71e05a0283947cfd74a5d36121a11d926ad6f3193cc4/opencv_python-4.11.0.86-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
@@ -243,8 +261,12 @@ PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES = (
     "sha256_lowercase_hex_pinned_upstream_direct",
     "sha256_pinned_coinstall_overlap_winner",
 )
+PI05_DROID_JOINTPOS_NUMPYDANTIC_WARNING_FILTER = (
+    "ignore:ndarray.pyi stub file could not be generated:ImportWarning:numpydantic.meta"
+)
 PI05_DROID_JOINTPOS_REQUIRED_RUNTIME_ENVIRONMENT = {
     "JAX_PLATFORMS": "cuda",
+    "PYTHONWARNINGS": PI05_DROID_JOINTPOS_NUMPYDANTIC_WARNING_FILTER,
     "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.35",
     "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
 }
@@ -1029,6 +1051,327 @@ def _sha256_base64_to_hex(value: str) -> str:
     return payload.hex()
 
 
+def _resolve_import_generated_stub(
+    profile: tuple[Any, ...], environment_root: Path
+) -> tuple[Path, Any, Any]:
+    (
+        distribution_name,
+        distribution_version,
+        relative_path,
+        expected_size,
+        expected_sha256,
+        expected_mode,
+    ) = profile
+    if (
+        not isinstance(distribution_name, str)
+        or not isinstance(distribution_version, str)
+        or not isinstance(relative_path, str)
+        or not isinstance(expected_size, int)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+        or expected_mode != 0o444
+    ):
+        raise ValueError("Import-generated stub seal profile is invalid")
+    distribution = importlib_metadata.distribution(distribution_name)
+    metadata_name = distribution.metadata.get("Name")
+    if (
+        not isinstance(metadata_name, str)
+        or _normalized_distribution_name(metadata_name) != distribution_name
+        or distribution.version != distribution_version
+    ):
+        raise ValueError("Import-generated stub distribution identity mismatch")
+    claims = [
+        package_path
+        for package_path in (distribution.files or ())
+        if str(package_path) == relative_path
+    ]
+    if len(claims) != 1:
+        raise ValueError("Import-generated stub RECORD claim mismatch")
+    claim = claims[0]
+    claim_hash = claim.hash
+    if (
+        claim_hash is None
+        or claim_hash.mode != "sha256"
+        or claim.size != expected_size
+        or _sha256_base64_to_hex(claim_hash.value) != expected_sha256
+    ):
+        raise ValueError("Import-generated stub RECORD identity mismatch")
+    raw_path = Path(distribution.locate_file(claim))
+    try:
+        preliminary = raw_path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise ValueError("Import-generated stub cannot be inspected") from error
+    if raw_path.is_symlink() or not stat.S_ISREG(preliminary.st_mode):
+        raise ValueError("Import-generated stub must be one regular file")
+    try:
+        raw_path.resolve().relative_to(environment_root)
+    except ValueError as error:
+        raise ValueError(
+            "Import-generated stub escaped the OpenPI environment"
+        ) from error
+    return raw_path, distribution, claim
+
+
+def _require_nonroot_stub_seal_process() -> None:
+    if os.geteuid() == 0:
+        raise ValueError("Import-generated stub sealing requires a non-root process")
+
+
+def _open_import_generated_stub(
+    raw_path: Path, environment_root: Path
+) -> tuple[int, os.stat_result, bytes]:
+    """Open and read one stable in-environment file without following its leaf."""
+
+    _require_nonroot_stub_seal_process()
+    try:
+        descriptor = os.open(raw_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as error:
+        raise ValueError("Import-generated stub cannot be opened safely") from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+        ):
+            raise ValueError("Import-generated stub must be one regular link")
+        opened_path = Path(f"/proc/self/fd/{descriptor}").resolve(strict=True)
+        try:
+            opened_path.relative_to(environment_root)
+        except ValueError as error:
+            raise ValueError(
+                "Opened import-generated stub escaped the OpenPI environment"
+            ) from error
+        path_identity = raw_path.stat(follow_symlinks=False)
+        if not stat.S_ISREG(path_identity.st_mode) or (
+            path_identity.st_dev,
+            path_identity.st_ino,
+        ) != (before.st_dev, before.st_ino):
+            raise ValueError("Import-generated stub path changed before read")
+        payload_parts = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            payload_parts.append(chunk)
+        payload = b"".join(payload_parts)
+        after = os.fstat(descriptor)
+        final_path_identity = raw_path.stat(follow_symlinks=False)
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_size",
+            "st_uid",
+            "st_gid",
+        )
+        if any(
+            getattr(before, field) != getattr(after, field) for field in stable_fields
+        ) or (final_path_identity.st_dev, final_path_identity.st_ino) != (
+            after.st_dev,
+            after.st_ino,
+        ):
+            raise ValueError("Import-generated stub changed during descriptor read")
+        return descriptor, after, payload
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _inspect_import_generated_stub_seal(
+    profile: tuple[Any, ...], environment_root: Path, *, require_sealed: bool
+) -> dict[str, Any]:
+    (
+        distribution_name,
+        distribution_version,
+        relative_path,
+        expected_size,
+        expected_sha256,
+        expected_mode,
+    ) = profile
+    raw_path, _distribution, _claim = _resolve_import_generated_stub(
+        profile, environment_root
+    )
+    descriptor, identity, payload = _open_import_generated_stub(
+        raw_path, environment_root
+    )
+    os.close(descriptor)
+    mode = stat.S_IMODE(identity.st_mode)
+    if (
+        len(payload) != expected_size
+        or hashlib.sha256(payload).hexdigest() != expected_sha256
+    ):
+        raise ValueError("Import-generated stub installed bytes are invalid")
+    if require_sealed and mode != expected_mode:
+        raise ValueError("Import-generated stub is not sealed read-only")
+    return {
+        "distribution": distribution_name,
+        "version": distribution_version,
+        "path": relative_path,
+        "size": len(payload),
+        "sha256": expected_sha256,
+        "record_sha256_urlsafe_base64": base64.urlsafe_b64encode(
+            bytes.fromhex(expected_sha256)
+        )
+        .rstrip(b"=")
+        .decode("ascii"),
+        "mode": f"{mode:04o}",
+        "link_count": identity.st_nlink,
+        "purpose": "block_numpydantic_import_time_stub_rewrite",
+    }
+
+
+def _seal_import_generated_stub_profile(
+    profile: tuple[Any, ...], environment_root: Path
+) -> dict[str, Any]:
+    expected_size, expected_sha256, expected_mode = profile[3:]
+    raw_path, _distribution, _claim = _resolve_import_generated_stub(
+        profile, environment_root
+    )
+    descriptor, before, payload = _open_import_generated_stub(
+        raw_path, environment_root
+    )
+    before_mode = stat.S_IMODE(before.st_mode)
+    try:
+        if (
+            len(payload) != expected_size
+            or hashlib.sha256(payload).hexdigest() != expected_sha256
+        ):
+            raise ValueError("Import-generated stub installed bytes are invalid")
+        # Copy-mode installers preserve either the wheel's conventional 0644
+        # mode or the workspace's group-restricted 0640 mode.  Both still have
+        # the exact wheel bytes above; the post-install mode is always 0444.
+        if before_mode not in {0o640, 0o644, expected_mode}:
+            raise ValueError("Import-generated stub has an unexpected pre-seal mode")
+        os.fchmod(descriptor, expected_mode)
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        after_parts = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            after_parts.append(chunk)
+        after_payload = b"".join(after_parts)
+        path_identity = raw_path.stat(follow_symlinks=False)
+        if (
+            (
+                before.st_dev,
+                before.st_ino,
+                before.st_nlink,
+                before.st_size,
+                before.st_uid,
+                before.st_gid,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_nlink,
+                after.st_size,
+                after.st_uid,
+                after.st_gid,
+            )
+            or stat.S_IMODE(after.st_mode) != expected_mode
+            or after_payload != payload
+            or (path_identity.st_dev, path_identity.st_ino)
+            != (after.st_dev, after.st_ino)
+        ):
+            raise ValueError("Import-generated stub identity changed while sealing")
+    finally:
+        os.close(descriptor)
+    directory_descriptor = os.open(
+        raw_path.parent,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        opened_directory = os.fstat(directory_descriptor)
+        directory_path = Path(f"/proc/self/fd/{directory_descriptor}").resolve(
+            strict=True
+        )
+        directory_path.relative_to(environment_root)
+        path_directory = raw_path.parent.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(opened_directory.st_mode) or (
+            opened_directory.st_dev,
+            opened_directory.st_ino,
+        ) != (path_directory.st_dev, path_directory.st_ino):
+            raise ValueError("Import-generated stub parent changed while sealing")
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+    return _inspect_import_generated_stub_seal(
+        profile, environment_root, require_sealed=True
+    )
+
+
+def seal_openpi_import_generated_stubs(openpi_dir: Path) -> dict[str, Any]:
+    """Seal exact wheel stubs whose import hooks otherwise rewrite site-packages."""
+
+    checkout = verify_openpi_git_checkout(openpi_dir)
+    root = Path(checkout["root"])
+    _require_checkout_local_openpi_interpreter(root)
+    environment_root = Path(sys.prefix).resolve()
+    seals = [
+        _seal_import_generated_stub_profile(profile, environment_root)
+        for profile in PI05_DROID_JOINTPOS_IMPORT_GENERATED_STUB_SEALS
+    ]
+    return {
+        "profile": "openpi_import_generated_stub_seal_v1",
+        "files": seals,
+        "all_wheel_bytes_preserved": True,
+        "sealed_read_only_required": True,
+        "nonroot_process_required": True,
+    }
+
+
+def _verify_openpi_import_generated_stub_seals(
+    environment_root: Path, *, require_sealed: bool
+) -> dict[str, Any]:
+    seals = [
+        _inspect_import_generated_stub_seal(
+            profile, environment_root, require_sealed=require_sealed
+        )
+        for profile in PI05_DROID_JOINTPOS_IMPORT_GENERATED_STUB_SEALS
+    ]
+    return {
+        "profile": "openpi_import_generated_stub_seal_v1",
+        "files": seals,
+        "all_wheel_bytes_preserved": True,
+        "sealed_read_only_required": require_sealed,
+        "nonroot_process_required": True,
+    }
+
+
+def _expected_openpi_import_generated_stub_seals() -> dict[str, Any]:
+    files = []
+    for (
+        distribution_name,
+        distribution_version,
+        relative_path,
+        expected_size,
+        expected_sha256,
+        expected_mode,
+    ) in PI05_DROID_JOINTPOS_IMPORT_GENERATED_STUB_SEALS:
+        files.append(
+            {
+                "distribution": distribution_name,
+                "version": distribution_version,
+                "path": relative_path,
+                "size": expected_size,
+                "sha256": expected_sha256,
+                "record_sha256_urlsafe_base64": base64.urlsafe_b64encode(
+                    bytes.fromhex(expected_sha256)
+                )
+                .rstrip(b"=")
+                .decode("ascii"),
+                "mode": f"{expected_mode:04o}",
+                "link_count": 1,
+                "purpose": "block_numpydantic_import_time_stub_rewrite",
+            }
+        )
+    return {
+        "profile": "openpi_import_generated_stub_seal_v1",
+        "files": files,
+        "all_wheel_bytes_preserved": True,
+        "sealed_read_only_required": True,
+        "nonroot_process_required": True,
+    }
+
+
 def _expected_record_overlap_resolution(profile: tuple[Any, ...]) -> dict[str, Any]:
     (
         losing_name,
@@ -1333,7 +1676,9 @@ def _require_checkout_local_openpi_interpreter(root: Path) -> Path:
     return expected_executable
 
 
-def verify_openpi_package_environment(openpi_dir: Path) -> dict[str, Any]:
+def verify_openpi_package_environment(
+    openpi_dir: Path, *, require_import_generated_stub_seals: bool = True
+) -> dict[str, Any]:
     """Verify every noneditable installed file against RECORD and uv.lock."""
 
     checkout = verify_openpi_git_checkout(openpi_dir)
@@ -1343,6 +1688,10 @@ def verify_openpi_package_environment(openpi_dir: Path) -> dict[str, Any]:
     site_packages = environment_root / "lib/python3.11/site-packages"
     if not site_packages.is_dir():
         raise ValueError("OpenPI site-packages directory is missing")
+    import_generated_stub_seals = _verify_openpi_import_generated_stub_seals(
+        environment_root,
+        require_sealed=require_import_generated_stub_seals,
+    )
     distributions = []
     for distribution in importlib_metadata.distributions():
         name = distribution.metadata.get("Name")
@@ -1415,6 +1764,7 @@ def verify_openpi_package_environment(openpi_dir: Path) -> dict[str, Any]:
         "pinned_wheel_artifacts": pinned_wheel_artifacts,
         "record_verified_distributions": record_verified_distributions,
         "record_verification_exemptions": record_verification_exemptions,
+        "import_generated_stub_seals": import_generated_stub_seals,
         "installed_distributions": distributions,
         "installed_distributions_sha256": hashlib.sha256(
             canonical_json_bytes(distributions)
@@ -1474,7 +1824,12 @@ def _capture_nvidia_smi_gpu_identity() -> dict[str, Any]:
     )
 
 
-def capture_openpi_host_runtime(openpi_dir: Path, jax_module: object) -> dict[str, Any]:
+def capture_openpi_host_runtime(
+    openpi_dir: Path,
+    jax_module: object,
+    *,
+    preimport_package_environment: dict[str, Any],
+) -> dict[str, Any]:
     """Seal the interpreter, lockfiles, package inventory, and live JAX host."""
 
     checkout = verify_openpi_git_checkout(openpi_dir)
@@ -1482,7 +1837,18 @@ def capture_openpi_host_runtime(openpi_dir: Path, jax_module: object) -> dict[st
     declared_executable = _require_checkout_local_openpi_interpreter(root)
     executable_target = declared_executable.resolve()
     executable = _regular_file_identity(executable_target)
+    preimport_package_environment_sha256 = hashlib.sha256(
+        canonical_json_bytes(preimport_package_environment)
+    ).hexdigest()
     package_environment = verify_openpi_package_environment(root)
+    postimport_package_environment_sha256 = hashlib.sha256(
+        canonical_json_bytes(package_environment)
+    ).hexdigest()
+    if (
+        package_environment != preimport_package_environment
+        or postimport_package_environment_sha256 != preimport_package_environment_sha256
+    ):
+        raise ValueError("OpenPI package environment changed during model imports")
     devices = [
         {
             "id": device.id,
@@ -1544,7 +1910,7 @@ def capture_openpi_host_runtime(openpi_dir: Path, jax_module: object) -> dict[st
         )
     backend = jax_module.lib.xla_bridge.get_backend()
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": PI05_DROID_JOINTPOS_HOST_RUNTIME_PROFILE,
         "python": {
             "declared_executable": str(declared_executable),
@@ -1566,6 +1932,11 @@ def capture_openpi_host_runtime(openpi_dir: Path, jax_module: object) -> dict[st
             ),
         },
         "packages": package_environment,
+        "package_import_stability": {
+            "preimport_sha256": preimport_package_environment_sha256,
+            "postimport_sha256": postimport_package_environment_sha256,
+            "unchanged": True,
+        },
         "process_environment": {
             "required": required_environment,
             "optional": optional_environment,
@@ -1595,12 +1966,13 @@ def validate_openpi_host_runtime(value: Any) -> dict[str, Any]:
         "python",
         "locked_source_environment",
         "packages",
+        "package_import_stability",
         "process_environment",
         "jax",
     }:
         raise ValueError("OpenPI host-runtime schema mismatch")
     if (
-        value["schema_version"] != 2
+        value["schema_version"] != 3
         or value["profile"] != PI05_DROID_JOINTPOS_HOST_RUNTIME_PROFILE
     ):
         raise ValueError("OpenPI host-runtime identity mismatch")
@@ -1651,6 +2023,7 @@ def validate_openpi_host_runtime(value: Any) -> dict[str, Any]:
         "pinned_wheel_artifacts",
         "record_verified_distributions",
         "record_verification_exemptions",
+        "import_generated_stub_seals",
         "installed_distributions",
         "installed_distributions_sha256",
     }:
@@ -1775,6 +2148,11 @@ def validate_openpi_host_runtime(value: Any) -> dict[str, Any]:
     if exemptions != expected_exemptions:
         raise ValueError("OpenPI RECORD verification exemptions mismatch")
     if (
+        packages["import_generated_stub_seals"]
+        != _expected_openpi_import_generated_stub_seals()
+    ):
+        raise ValueError("OpenPI import-generated stub seal mismatch")
+    if (
         packages["installed_distributions_sha256"]
         != hashlib.sha256(canonical_json_bytes(distributions)).hexdigest()
     ):
@@ -1784,6 +2162,16 @@ def validate_openpi_host_runtime(value: Any) -> dict[str, Any]:
         for name, version in PI05_DROID_JOINTPOS_REQUIRED_PACKAGE_VERSIONS.items()
     ):
         raise ValueError("OpenPI installed package lock mismatch")
+    package_import_stability = value["package_import_stability"]
+    package_environment_sha256 = hashlib.sha256(
+        canonical_json_bytes(packages)
+    ).hexdigest()
+    if package_import_stability != {
+        "preimport_sha256": package_environment_sha256,
+        "postimport_sha256": package_environment_sha256,
+        "unchanged": True,
+    }:
+        raise ValueError("OpenPI package import-stability mismatch")
     process_environment = value["process_environment"]
     if not isinstance(process_environment, dict) or set(process_environment) != {
         "required",
@@ -3022,7 +3410,7 @@ def make_pi05_droid_jointpos_model_runtime(
     if contract["openpi"]["runtime_attestation"] != runtime:
         raise ValueError("Serving and model-runtime OpenPI attestations differ")
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": PI05_DROID_JOINTPOS_MODEL_RUNTIME_PROFILE,
         "status": "pass",
         "checkpoint": checkpoint,
@@ -3087,7 +3475,7 @@ def _validate_model_runtime_value(
     if not isinstance(value, dict) or set(value) != required:
         raise ValueError("pi0.5 joint-position model-runtime schema mismatch")
     if (
-        value["schema_version"] != 2
+        value["schema_version"] != 3
         or value["profile"] != PI05_DROID_JOINTPOS_MODEL_RUNTIME_PROFILE
         or value["status"] != "pass"
     ):
@@ -3307,10 +3695,12 @@ __all__ = [
     "PI05_DROID_JOINTPOS_NVIDIA_DRIVER_VERSION",
     "PI05_DROID_JOINTPOS_NVIDIA_GPU_NAME",
     "PI05_DROID_JOINTPOS_NVIDIA_SMI_QUERY",
+    "PI05_DROID_JOINTPOS_NUMPYDANTIC_WARNING_FILTER",
     "PI05_DROID_JOINTPOS_NORM_SHA256",
     "PI05_DROID_JOINTPOS_NORM_VALUES_SHA256",
     "PI05_DROID_JOINTPOS_OPENPI_COMMIT",
     "PI05_DROID_JOINTPOS_HOST_RUNTIME_PROFILE",
+    "PI05_DROID_JOINTPOS_IMPORT_GENERATED_STUB_SEALS",
     "PI05_DROID_JOINTPOS_JAX_CONFIG",
     "PI05_DROID_JOINTPOS_OPTIONAL_RUNTIME_ENVIRONMENT",
     "PI05_DROID_JOINTPOS_PYPROJECT_SHA256",
@@ -3348,6 +3738,7 @@ __all__ = [
     "publish_pi05_droid_jointpos_model_runtime",
     "publish_pi05_droid_jointpos_rng_stream",
     "publish_pi05_droid_jointpos_serving_contract",
+    "seal_openpi_import_generated_stubs",
     "validate_official_data_config",
     "validate_official_policy_runtime",
     "validate_official_train_config",

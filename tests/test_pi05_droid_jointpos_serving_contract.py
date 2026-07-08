@@ -191,8 +191,28 @@ def _host_runtime(tmp_path):
         }
         for name in contract.PI05_DROID_JOINTPOS_RECORD_VERIFICATION_EXEMPTIONS
     ]
+    packages = {
+        "required_versions": dict(
+            contract.PI05_DROID_JOINTPOS_REQUIRED_PACKAGE_VERSIONS
+        ),
+        "all_installed_versions_allowed_by_uv_lock": True,
+        "all_noneditable_files_bound_to_locked_records_or_pinned_overlap": True,
+        "pinned_wheel_artifacts": contract._expected_pinned_wheel_artifacts(),
+        "record_verified_distributions": record_verified,
+        "record_verification_exemptions": record_exemptions,
+        "import_generated_stub_seals": (
+            contract._expected_openpi_import_generated_stub_seals()
+        ),
+        "installed_distributions": distributions,
+        "installed_distributions_sha256": contract.hashlib.sha256(
+            contract.canonical_json_bytes(distributions)
+        ).hexdigest(),
+    }
+    package_environment_sha256 = contract.hashlib.sha256(
+        contract.canonical_json_bytes(packages)
+    ).hexdigest()
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "profile": contract.PI05_DROID_JOINTPOS_HOST_RUNTIME_PROFILE,
         "python": {
             "declared_executable": str(
@@ -221,19 +241,11 @@ def _host_runtime(tmp_path):
                 "sha256": contract.PI05_DROID_JOINTPOS_PYPROJECT_SHA256,
             },
         },
-        "packages": {
-            "required_versions": dict(
-                contract.PI05_DROID_JOINTPOS_REQUIRED_PACKAGE_VERSIONS
-            ),
-            "all_installed_versions_allowed_by_uv_lock": True,
-            "all_noneditable_files_bound_to_locked_records_or_pinned_overlap": True,
-            "pinned_wheel_artifacts": contract._expected_pinned_wheel_artifacts(),
-            "record_verified_distributions": record_verified,
-            "record_verification_exemptions": record_exemptions,
-            "installed_distributions": distributions,
-            "installed_distributions_sha256": contract.hashlib.sha256(
-                contract.canonical_json_bytes(distributions)
-            ).hexdigest(),
+        "packages": packages,
+        "package_import_stability": {
+            "preimport_sha256": package_environment_sha256,
+            "postimport_sha256": package_environment_sha256,
+            "unchanged": True,
         },
         "process_environment": {
             "required": dict(contract.PI05_DROID_JOINTPOS_REQUIRED_RUNTIME_ENVIRONMENT),
@@ -776,8 +788,8 @@ def test_worker_joins_trace_to_complete_official_rng_stream(tmp_path, monkeypatc
 def test_host_runtime_seals_lockfiles_packages_python_and_jax(tmp_path):
     runtime = _host_runtime(tmp_path)
     assert contract.validate_openpi_host_runtime(runtime) == runtime
-    assert runtime["schema_version"] == 2
-    assert runtime["profile"].endswith("_v2")
+    assert runtime["schema_version"] == 3
+    assert runtime["profile"].endswith("_v3")
     assert runtime["jax"]["nvidia_smi"] == {
         "query": list(contract.PI05_DROID_JOINTPOS_NVIDIA_SMI_QUERY),
         "uuid": GPU_UUID,
@@ -809,6 +821,15 @@ def test_host_runtime_seals_lockfiles_packages_python_and_jax(tmp_path):
         ),
         lambda value: value["process_environment"]["required"].update(
             {"JAX_PLATFORMS": "cpu"}
+        ),
+        lambda value: value["packages"]["import_generated_stub_seals"]["files"][
+            0
+        ].update({"mode": "0644"}),
+        lambda value: value["package_import_stability"].update(
+            {"postimport_sha256": "0" * 64}
+        ),
+        lambda value: value["process_environment"]["required"].update(
+            {"PYTHONWARNINGS": "error"}
         ),
         lambda value: value["python"].update({"version": "3.12.0"}),
     ):
@@ -886,19 +907,19 @@ def test_nvidia_smi_capture_rejects_count_schema_and_identity_drift(
         contract._capture_nvidia_smi_gpu_identity()
 
 
-def test_model_runtime_v2_rejects_legacy_host_or_model_schema(tmp_path):
+def test_model_runtime_v3_rejects_legacy_host_or_model_schema(tmp_path):
     metadata = _metadata()
     runtime = _model_runtime(tmp_path, metadata)
-    assert runtime["schema_version"] == 2
+    assert runtime["schema_version"] == 3
     assert runtime["profile"] == contract.PI05_DROID_JOINTPOS_MODEL_RUNTIME_PROFILE
 
     legacy_model = copy.deepcopy(runtime)
-    legacy_model["schema_version"] = 1
+    legacy_model["schema_version"] = 2
     with pytest.raises(ValueError, match="model-runtime identity mismatch"):
         contract._validate_model_runtime_value(legacy_model, metadata)
 
     legacy_host = copy.deepcopy(runtime)
-    legacy_host["host_runtime"]["schema_version"] = 1
+    legacy_host["host_runtime"]["schema_version"] = 2
     with pytest.raises(ValueError, match="host-runtime identity mismatch"):
         contract._validate_model_runtime_value(legacy_host, metadata)
 
@@ -907,13 +928,35 @@ def test_server_loads_before_publication_and_uses_unwrapped_official_websocket()
     source = (ROOT / "scripts/polaris/serve_pi05_droid_jointpos_attested.py").read_text(
         encoding="utf-8"
     )
+    environment_preflight = source.index("required_runtime_environment =")
+    package_preflight = source.index(
+        "preimport_package_environment = verify_openpi_package_environment(openpi_dir)"
+    )
+    first_openpi_import = source.index("    import jax")
     checkpoint = source.index("verify_pi05_droid_jointpos_checkpoint(")
     policy = source.index("policy = policy_config.create_trained_policy(")
     runtime = source.index("validate_official_policy_runtime(")
+    tokenizer = source.index(
+        "tokenizer_artifact = verify_paligemma_tokenizer_artifact("
+    )
+    package_postcheck = source.index("host_runtime = capture_openpi_host_runtime(")
     publication = source.index("publish_pi05_droid_jointpos_serving_contract(")
     server = source.index("server = websocket_policy_server.WebsocketPolicyServer(")
     lifecycle = source.index("_serve_then_publish_final_rng(", server)
-    assert checkpoint < policy < runtime < publication < server < lifecycle
+    assert (
+        environment_preflight
+        < package_preflight
+        < first_openpi_import
+        < checkpoint
+        < policy
+        < runtime
+        < tokenizer
+        < package_postcheck
+        < publication
+        < server
+        < lifecycle
+    )
+    assert "preimport_package_environment=preimport_package_environment" in source
     assert "policy=policy" in source
     assert "metadata=metadata" in source
     assert "host=PI05_DROID_JOINTPOS_BIND_HOST" in source
@@ -1035,6 +1078,18 @@ def test_worker_fail_closes_live_contract_hub_metadata_and_seed_range():
         assert digest in source
     assert "nvidia_droid/noninstanceable.usd" in source
     assert "POLARIS_DATA_REVISION" in source
+    preflight_packages = source.index(
+        'preflight_package_environment_sha256="$(capture_package_environment_sha256)"'
+    )
+    first_openpi_import = source.index(
+        "from openpi.shared.download import maybe_download"
+    )
+    postrun_packages = source.index(
+        'postrun_package_environment_sha256="$(capture_package_environment_sha256)"'
+    )
+    evidence = source.index("evidence_result=")
+    assert preflight_packages < first_openpi_import < postrun_packages < evidence
+    assert contract.PI05_DROID_JOINTPOS_NUMPYDANTIC_WARNING_FILTER in source
 
 
 def test_setup_rebuilds_without_cache_and_cpu_verifies_packages_and_tokenizer():
@@ -1051,15 +1106,279 @@ def test_setup_rebuilds_without_cache_and_cpu_verifies_packages_and_tokenizer():
         source.index("--frozen --no-cache --reinstall --link-mode copy")
         < source.index("--reinstall-package opencv-python")
         < source.index("uv pip install")
-        < source.index("verify_openpi_package_environment")
+        < source.index("preseal_report = verify_openpi_package_environment(")
+        < source.index("seal_report = seal_openpi_import_generated_stubs(")
+        < source.index("\nreport = verify_openpi_package_environment(")
+        < source.index("tokenizer_identity=")
     )
     assert "verify_openpi_package_environment" in source
     assert "verify_paligemma_tokenizer_artifact" in source
     assert "attest_loaded_tokenizer_sentencepiece" in source
+    assert (
+        source.index("tokenizer_identity=")
+        < source.index("from openpi.training import config")
+        < source.index("package_final_identity=")
+        < source.index("printf 'setup_completed_at=%s")
+    )
+    assert "final_report != sealed_report" in source
+    assert "PACKAGE_FINAL_ENVIRONMENT_SHA256" in source
     assert contract.PI05_DROID_JOINTPOS_TOKENIZER_GENERATION in source
     assert str(contract.PI05_DROID_JOINTPOS_TOKENIZER_SIZE) in source
     assert contract.PI05_DROID_JOINTPOS_TOKENIZER_MD5_BASE64 in source
     assert contract.PI05_DROID_JOINTPOS_TOKENIZER_SHA256 in source
+    assert contract.PI05_DROID_JOINTPOS_NUMPYDANTIC_WARNING_FILTER in source
+
+
+def _fake_import_generated_stub_distribution(
+    monkeypatch, path, profile, *, claim_hash=None, claim_size=None
+):
+    name, version, relative_path, size, digest, _mode = profile
+
+    class FakePackagePath:
+        def __init__(self):
+            self.size = size if claim_size is None else claim_size
+            self.hash = SimpleNamespace(
+                mode="sha256",
+                value=(
+                    contract.base64.urlsafe_b64encode(bytes.fromhex(digest))
+                    .rstrip(b"=")
+                    .decode("ascii")
+                    if claim_hash is None
+                    else claim_hash
+                ),
+            )
+
+        def __str__(self):
+            return relative_path
+
+    claim = FakePackagePath()
+
+    class FakeDistribution:
+        metadata = {"Name": name}
+
+        def __init__(self):
+            self.version = version
+            self.files = [claim]
+            self.path = path
+
+        def locate_file(self, _claim):
+            return self.path
+
+    distribution = FakeDistribution()
+    monkeypatch.setattr(
+        contract.importlib_metadata,
+        "distribution",
+        lambda requested: distribution if requested == name else None,
+    )
+    return distribution, claim
+
+
+def test_numpydantic_stub_seal_profile_is_exact():
+    assert contract.PI05_DROID_JOINTPOS_IMPORT_GENERATED_STUB_SEALS == (
+        (
+            "numpydantic",
+            "1.6.9",
+            "numpydantic/ndarray.pyi",
+            705,
+            "36e9708637fe45a17da721ff308ba7ba5f4f1ac7dda1ce7eeec615b29097ee00",
+            0o444,
+        ),
+    )
+    expected = contract._expected_openpi_import_generated_stub_seals()
+    assert expected["nonroot_process_required"] is True
+    assert expected["files"] == [
+        {
+            "distribution": "numpydantic",
+            "version": "1.6.9",
+            "path": "numpydantic/ndarray.pyi",
+            "size": 705,
+            "sha256": (
+                "36e9708637fe45a17da721ff308ba7ba5f4f1ac7dda1ce7eeec615b29097ee00"
+            ),
+            "record_sha256_urlsafe_base64": (
+                "Nulwhjf-RaF9pyH_MIunul9PGsfdoc5-7sYVspCX7gA"
+            ),
+            "mode": "0444",
+            "link_count": 1,
+            "purpose": "block_numpydantic_import_time_stub_rewrite",
+        }
+    ]
+
+
+def test_numpydantic_warning_filter_ignores_only_bound_import_warning():
+    command = (
+        "import warnings; "
+        "warnings.warn_explicit("
+        "'ndarray.pyi stub file could not be generated: permission denied', "
+        "ImportWarning, 'numpydantic/meta.py', 1, module='numpydantic.meta'); "
+        "print('continued')"
+    )
+    environment = dict(os.environ)
+    environment["PYTHONWARNINGS"] = "error::ImportWarning," + (
+        contract.PI05_DROID_JOINTPOS_NUMPYDANTIC_WARNING_FILTER
+    )
+    result = contract.subprocess.run(
+        [os.sys.executable, "-c", command],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert result.stdout == "continued\n"
+    assert result.stderr == ""
+    nonmatching = contract.subprocess.run(
+        [
+            os.sys.executable,
+            "-c",
+            command.replace("module='numpydantic.meta'", "module='other.module'"),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert nonmatching.returncode != 0
+    assert "ImportWarning" in nonmatching.stderr
+
+
+def test_import_generated_stub_sealing_rejects_root(monkeypatch):
+    monkeypatch.setattr(contract.os, "geteuid", lambda: 0)
+    with pytest.raises(ValueError, match="non-root"):
+        contract._require_nonroot_stub_seal_process()
+
+
+def test_import_generated_stub_seal_is_exact_idempotent_and_read_only(
+    monkeypatch, tmp_path
+):
+    payload = b"wheel-owned static typing stub\n"
+    stub = tmp_path / "site-packages/numpydantic/ndarray.pyi"
+    stub.parent.mkdir(parents=True)
+    stub.write_bytes(payload)
+    stub.chmod(0o644)
+    profile = (
+        "numpydantic",
+        "1.6.9",
+        "numpydantic/ndarray.pyi",
+        len(payload),
+        contract.hashlib.sha256(payload).hexdigest(),
+        0o444,
+    )
+    _fake_import_generated_stub_distribution(monkeypatch, stub, profile)
+    # Match the restrictive umask used by the production cluster setup.
+    stub.chmod(0o640)
+    before = stub.stat()
+    assert (
+        contract._inspect_import_generated_stub_seal(
+            profile, tmp_path, require_sealed=False
+        )["mode"]
+        == "0640"
+    )
+    sealed = contract._seal_import_generated_stub_profile(profile, tmp_path)
+    after = stub.stat()
+    assert sealed["mode"] == "0444"
+    assert (before.st_dev, before.st_ino, before.st_nlink, before.st_size) == (
+        after.st_dev,
+        after.st_ino,
+        after.st_nlink,
+        after.st_size,
+    )
+    assert stub.read_bytes() == payload
+    assert contract._seal_import_generated_stub_profile(profile, tmp_path) == sealed
+    with pytest.raises(PermissionError):
+        descriptor = os.open(stub, os.O_WRONLY | os.O_TRUNC)
+        os.close(descriptor)
+
+
+def test_import_generated_stub_seal_rejects_identity_and_filesystem_drift(
+    monkeypatch, tmp_path
+):
+    payload = b"wheel-owned static typing stub\n"
+    environment = tmp_path / "environment"
+    stub = environment / "numpydantic/ndarray.pyi"
+    stub.parent.mkdir(parents=True)
+    stub.write_bytes(payload)
+    profile = (
+        "numpydantic",
+        "1.6.9",
+        "numpydantic/ndarray.pyi",
+        len(payload),
+        contract.hashlib.sha256(payload).hexdigest(),
+        0o444,
+    )
+    distribution, claim = _fake_import_generated_stub_distribution(
+        monkeypatch, stub, profile
+    )
+
+    distribution.version = "1.6.10"
+    with pytest.raises(ValueError, match="distribution identity"):
+        contract._inspect_import_generated_stub_seal(
+            profile, environment, require_sealed=False
+        )
+    distribution.version = "1.6.9"
+    claim.hash.value = "A" * 43
+    with pytest.raises(ValueError, match="RECORD identity"):
+        contract._inspect_import_generated_stub_seal(
+            profile, environment, require_sealed=False
+        )
+    claim.hash.value = (
+        contract.base64.urlsafe_b64encode(bytes.fromhex(profile[4]))
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    stub.write_bytes(b"mutated")
+    with pytest.raises(ValueError, match="installed bytes"):
+        contract._inspect_import_generated_stub_seal(
+            profile, environment, require_sealed=False
+        )
+    stub.write_bytes(payload)
+    hardlink = environment / "numpydantic/ndarray-copy.pyi"
+    os.link(stub, hardlink)
+    with pytest.raises(ValueError, match="regular link"):
+        contract._inspect_import_generated_stub_seal(
+            profile, environment, require_sealed=False
+        )
+    hardlink.unlink()
+    stub.chmod(0o600)
+    with pytest.raises(ValueError, match="unexpected pre-seal mode"):
+        contract._seal_import_generated_stub_profile(profile, environment)
+
+
+def test_import_generated_stub_seal_rejects_symlink_escape_and_duplicate_claim(
+    monkeypatch, tmp_path
+):
+    payload = b"wheel-owned static typing stub\n"
+    environment = tmp_path / "environment"
+    environment.mkdir()
+    outside = tmp_path / "outside.pyi"
+    outside.write_bytes(payload)
+    profile = (
+        "numpydantic",
+        "1.6.9",
+        "numpydantic/ndarray.pyi",
+        len(payload),
+        contract.hashlib.sha256(payload).hexdigest(),
+        0o444,
+    )
+    distribution, claim = _fake_import_generated_stub_distribution(
+        monkeypatch, outside, profile
+    )
+    with pytest.raises(ValueError, match="escaped"):
+        contract._inspect_import_generated_stub_seal(
+            profile, environment, require_sealed=False
+        )
+    symlink = environment / "ndarray.pyi"
+    symlink.symlink_to(outside)
+    distribution.path = symlink
+    with pytest.raises(ValueError, match="regular file"):
+        contract._inspect_import_generated_stub_seal(
+            profile, environment, require_sealed=False
+        )
+    distribution.path = outside
+    distribution.files = [claim, claim]
+    with pytest.raises(ValueError, match="RECORD claim"):
+        contract._inspect_import_generated_stub_seal(
+            profile, environment, require_sealed=False
+        )
 
 
 def test_record_hash_classifier_accepts_only_pinned_augmax_hex_entries():
@@ -1257,6 +1576,12 @@ def test_pinned_wheel_artifacts_match_attested_openpi_lock():
             "0.4.1",
             "60f9711a4ffc08f27d1ff0783f7c51c01e6f78e20d4581d075ebf2d904ab2d14",
             17_299,
+        ),
+        (
+            "numpydantic",
+            "1.6.9",
+            "149ed4b7dfec907fb1e7c0874fd7d41bc95734c22764124d22c7c27aa8f059fd",
+            85_598,
         ),
         (
             "opencv-python",

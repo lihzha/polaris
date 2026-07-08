@@ -326,6 +326,52 @@ def test_gpu_vulkan_contract_requires_model_simulator_agreement():
             evidence._validate_gpu_vulkan_runtime_agreement(model, simulator)
 
 
+def test_run_metadata_binds_outer_package_probes_to_model_runtime(tmp_path):
+    packages = {
+        "required_versions": {"numpydantic": "1.6.9"},
+        "import_generated_stub_seals": {"sealed_read_only_required": True},
+    }
+    digest = hashlib.sha256(evidence._canonical_json_bytes(packages)).hexdigest()
+    host_runtime = {
+        "packages": packages,
+        "package_import_stability": {
+            "preimport_sha256": digest,
+            "postimport_sha256": digest,
+            "unchanged": True,
+        },
+    }
+    warning_filter = evidence.PI05_DROID_JOINTPOS_NUMPYDANTIC_WARNING_FILTER
+    quoted_warning_filter = warning_filter.replace(" ", "\\ ")
+    metadata = tmp_path / "run_metadata.env"
+
+    def write(*, pre=digest, post=digest, warning=quoted_warning_filter):
+        metadata.write_text(
+            f"PYTHONWARNINGS={warning}\n"
+            f"PREFLIGHT_PACKAGE_ENVIRONMENT_SHA256={pre}\n"
+            f"POSTRUN_PACKAGE_ENVIRONMENT_SHA256={post}\n",
+            encoding="utf-8",
+        )
+
+    write()
+    assert evidence._validate_package_run_metadata(metadata, host_runtime) == {
+        "openpi_package_environment_sha256": digest,
+        "openpi_package_preflight_postrun_unchanged": True,
+        "numpydantic_warning_filter": warning_filter,
+    }
+
+    write(post="0" * 64)
+    with pytest.raises(ValueError, match="outer evaluation package probes"):
+        evidence._validate_package_run_metadata(metadata, host_runtime)
+    write(warning="error")
+    with pytest.raises(ValueError, match="warning filter"):
+        evidence._validate_package_run_metadata(metadata, host_runtime)
+    write()
+    with metadata.open("a", encoding="utf-8") as stream:
+        stream.write(f"POSTRUN_PACKAGE_ENVIRONMENT_SHA256={digest}\n")
+    with pytest.raises(ValueError, match="duplicate run metadata"):
+        evidence._validate_package_run_metadata(metadata, host_runtime)
+
+
 def test_gpu_vulkan_contract_rejects_noncanonical_shared_runtime():
     model, simulator = _gpu_vulkan_contracts()
     model["jax"]["nvidia_smi"]["driver_version"] = "580.159.03"

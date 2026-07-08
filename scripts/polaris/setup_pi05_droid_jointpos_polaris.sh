@@ -17,7 +17,11 @@ SETUP_RECORD_DIR="${SETUP_RECORD_DIR:-}"
 CHECKPOINT_MANIFEST="${CHECKPOINT_MANIFEST:-${SCRIPT_DIR}/pi05_droid_jointpos_polaris_gcs_manifest.tsv}"
 EXPECTED_MANIFEST_SHA256="${EXPECTED_MANIFEST_SHA256:-7abd0c2294d442d429a77655783232206b2b30d95c508d435503135a5523a11c}"
 TOKENIZER_VERIFICATION_FILE="${SETUP_RECORD_DIR}/paligemma_tokenizer_verification.json"
+PACKAGE_PRESEAL_VERIFICATION_FILE="${SETUP_RECORD_DIR}/openpi_package_environment_preseal.json"
 PACKAGE_VERIFICATION_FILE="${SETUP_RECORD_DIR}/openpi_package_environment.json"
+PACKAGE_FINAL_VERIFICATION_FILE="${SETUP_RECORD_DIR}/openpi_package_environment_final.json"
+NUMPYDANTIC_STUB_WARNING_FILTER='ignore:ndarray.pyi stub file could not be generated:ImportWarning:numpydantic.meta'
+export PYTHONWARNINGS="${NUMPYDANTIC_STUB_WARNING_FILTER}"
 
 die() {
   echo "ERROR: $*" >&2
@@ -69,7 +73,8 @@ fi
 package_identity="$(
   PYTHONPATH="${POLARIS_DIR}/src" \
     "${OPENPI_DIR}/.venv/bin/python" - \
-    "${OPENPI_DIR}" "${PACKAGE_VERIFICATION_FILE}" <<'PY'
+    "${OPENPI_DIR}" "${PACKAGE_PRESEAL_VERIFICATION_FILE}" \
+    "${PACKAGE_VERIFICATION_FILE}" <<'PY'
 import hashlib
 import json
 from pathlib import Path
@@ -77,27 +82,56 @@ import sys
 
 from polaris.pi05_droid_jointpos_serving_contract import (
     canonical_json_bytes,
+    seal_openpi_import_generated_stubs,
     verify_openpi_package_environment,
 )
 
-report = verify_openpi_package_environment(Path(sys.argv[1]))
+preseal_report = verify_openpi_package_environment(
+    Path(sys.argv[1]), require_import_generated_stub_seals=False
+)
 Path(sys.argv[2]).write_text(
+    json.dumps(preseal_report, indent=2, sort_keys=True, allow_nan=False) + "\n",
+    encoding="utf-8",
+)
+seal_report = seal_openpi_import_generated_stubs(Path(sys.argv[1]))
+report = verify_openpi_package_environment(Path(sys.argv[1]))
+if report["import_generated_stub_seals"] != seal_report:
+    raise RuntimeError("Import-generated stub seal changed before package attestation")
+if {
+    key: value
+    for key, value in preseal_report.items()
+    if key != "import_generated_stub_seals"
+} != {
+    key: value
+    for key, value in report.items()
+    if key != "import_generated_stub_seals"
+}:
+    raise RuntimeError("Package environment changed while sealing typing stub")
+Path(sys.argv[3]).write_text(
     json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n",
     encoding="utf-8",
 )
 print(
+    hashlib.sha256(canonical_json_bytes(preseal_report)).hexdigest(),
     hashlib.sha256(canonical_json_bytes(report)).hexdigest(),
     len(report["installed_distributions"]),
     len(report["record_verified_distributions"]),
+    hashlib.sha256(canonical_json_bytes(seal_report)).hexdigest(),
 )
 PY
 )" || die "Hermetic OpenPI package RECORD/uv.lock verification failed"
-read -r PACKAGE_ENVIRONMENT_SHA256 PACKAGE_COUNT RECORD_VERIFIED_COUNT \
+read -r PACKAGE_PRESEAL_ENVIRONMENT_SHA256 PACKAGE_ENVIRONMENT_SHA256 \
+  PACKAGE_COUNT RECORD_VERIFIED_COUNT \
+  IMPORT_GENERATED_STUB_SEAL_SHA256 \
   <<<"${package_identity}"
 [[ "${PACKAGE_ENVIRONMENT_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
   || die "Invalid OpenPI package-environment identity"
+[[ "${PACKAGE_PRESEAL_ENVIRONMENT_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+  || die "Invalid pre-seal OpenPI package-environment identity"
 (( RECORD_VERIFIED_COUNT == PACKAGE_COUNT - 2 )) \
   || die "OpenPI package RECORD verification did not cover every noneditable package"
+[[ "${IMPORT_GENERATED_STUB_SEAL_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+  || die "Invalid import-generated stub seal identity"
 
 tokenizer_identity="$(
   OPENPI_DATA_HOME="${OPENPI_DATA_HOME}" \
@@ -179,6 +213,42 @@ assert resolved.data.assets.asset_id == "droid"
 print("resolved_config=pi05_droid_jointpos_polaris action_horizon=15 model_action_dim=32 asset_id=droid")
 PY
 
+package_final_identity="$(
+  PYTHONPATH="${POLARIS_DIR}/src" \
+    "${OPENPI_DIR}/.venv/bin/python" - \
+    "${OPENPI_DIR}" "${PACKAGE_VERIFICATION_FILE}" \
+    "${PACKAGE_FINAL_VERIFICATION_FILE}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+from polaris.pi05_droid_jointpos_serving_contract import (
+    canonical_json_bytes,
+    verify_openpi_package_environment,
+)
+
+sealed_report = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+final_report = verify_openpi_package_environment(Path(sys.argv[1]))
+if final_report != sealed_report:
+    raise RuntimeError(
+        "OpenPI package environment changed during tokenizer/checkpoint/config imports"
+    )
+Path(sys.argv[3]).write_text(
+    json.dumps(final_report, indent=2, sort_keys=True, allow_nan=False) + "\n",
+    encoding="utf-8",
+)
+print(hashlib.sha256(canonical_json_bytes(final_report)).hexdigest())
+PY
+)" || die "Final OpenPI package/seal re-attestation failed"
+read -r PACKAGE_FINAL_ENVIRONMENT_SHA256 <<<"${package_final_identity}"
+[[ "${PACKAGE_FINAL_ENVIRONMENT_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+  || die "Invalid final OpenPI package-environment identity"
+[[ "${PACKAGE_FINAL_ENVIRONMENT_SHA256}" == "${PACKAGE_ENVIRONMENT_SHA256}" ]] \
+  || die "Final OpenPI package environment differs from sealed setup identity"
+cmp -s "${PACKAGE_VERIFICATION_FILE}" "${PACKAGE_FINAL_VERIFICATION_FILE}" \
+  || die "Final OpenPI package report differs byte-for-byte from sealed report"
+
 {
   printf 'setup_completed_at=%s\n' "$(date -Iseconds)"
   printf 'host=%s\n' "$(hostname)"
@@ -198,9 +268,21 @@ PY
   printf 'tokenizer_md5_base64=%s\n' "${TOKENIZER_MD5_BASE64}"
   printf 'tokenizer_sha256=%s\n' "${TOKENIZER_SHA256}"
   printf 'package_verification=%s\n' "${PACKAGE_VERIFICATION_FILE}"
+  printf 'package_preseal_verification=%s\n' \
+    "${PACKAGE_PRESEAL_VERIFICATION_FILE}"
+  printf 'package_preseal_environment_sha256=%s\n' \
+    "${PACKAGE_PRESEAL_ENVIRONMENT_SHA256}"
   printf 'package_environment_sha256=%s\n' "${PACKAGE_ENVIRONMENT_SHA256}"
+  printf 'package_final_verification=%s\n' \
+    "${PACKAGE_FINAL_VERIFICATION_FILE}"
+  printf 'package_final_environment_sha256=%s\n' \
+    "${PACKAGE_FINAL_ENVIRONMENT_SHA256}"
+  printf 'package_environment_unchanged_after_imports=true\n'
   printf 'package_count=%s\n' "${PACKAGE_COUNT}"
   printf 'record_verified_count=%s\n' "${RECORD_VERIFIED_COUNT}"
+  printf 'import_generated_stub_seal_sha256=%s\n' \
+    "${IMPORT_GENERATED_STUB_SEAL_SHA256}"
+  printf 'pythonwarnings=%s\n' "${NUMPYDANTIC_STUB_WARNING_FILTER}"
   printf 'openpi_data_home=%s\n' "${OPENPI_DATA_HOME}"
   printf 'uv_version=%s\n' "$(uv --version)"
   printf 'uv_cache_mode=%s\n' no-cache

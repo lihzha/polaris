@@ -15,6 +15,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 from typing import Any
 
@@ -27,6 +28,7 @@ from polaris.pi05_droid_jointpos_runtime import (
 from polaris.pi05_droid_jointpos_serving_contract import (
     PI05_DROID_JOINTPOS_CHECKPOINT_URI,
     PI05_DROID_JOINTPOS_NVIDIA_DRIVER_VERSION,
+    PI05_DROID_JOINTPOS_NUMPYDANTIC_WARNING_FILTER,
     PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE,
     PI05_DROID_JOINTPOS_VULKAN_ICD_CONTAINER_PATH,
     PI05_DROID_JOINTPOS_VULKAN_ICD_SHA256,
@@ -48,7 +50,7 @@ from polaris.pi05_droid_jointpos_immutable import (
 
 
 PI05_DROID_JOINTPOS_EVIDENCE_PROFILE = (
-    "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v5"
+    "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v6"
 )
 PI05_DROID_JOINTPOS_EVIDENCE_MANIFEST = "pi05_droid_jointpos_evidence_manifest.json"
 
@@ -121,6 +123,82 @@ def _canonical_json_bytes(value: Any) -> bytes:
         ensure_ascii=True,
         allow_nan=False,
     ).encode("ascii")
+
+
+def _validate_package_run_metadata(
+    path: Path, model_host_runtime: Any
+) -> dict[str, Any]:
+    """Bind the outer evaluation package probes to the attested model process."""
+
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError("run metadata is not readable UTF-8") from error
+    _require(text.endswith("\n"), "run metadata must end in one newline")
+    encoded: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, raw_value = line.partition("=")
+        _require(
+            separator == "="
+            and key
+            and key[0].isalpha()
+            and key.replace("_", "A").isalnum()
+            and key.upper() == key,
+            "run metadata assignment schema mismatch",
+        )
+        _require(key not in encoded, f"duplicate run metadata assignment: {key}")
+        encoded[key] = raw_value
+
+    required = (
+        "PYTHONWARNINGS",
+        "PREFLIGHT_PACKAGE_ENVIRONMENT_SHA256",
+        "POSTRUN_PACKAGE_ENVIRONMENT_SHA256",
+    )
+    decoded: dict[str, str] = {}
+    for key in required:
+        _require(key in encoded, f"run metadata is missing {key}")
+        try:
+            words = shlex.split(encoded[key], comments=False, posix=True)
+        except ValueError as error:
+            raise ValueError(
+                f"run metadata {key} is not valid shell quoting"
+            ) from error
+        _require(len(words) == 1, f"run metadata {key} must encode one value")
+        decoded[key] = words[0]
+
+    _require(
+        isinstance(model_host_runtime, dict)
+        and isinstance(model_host_runtime.get("packages"), dict)
+        and isinstance(model_host_runtime.get("package_import_stability"), dict),
+        "model runtime lacks package-import stability",
+    )
+    package_sha256 = hashlib.sha256(
+        _canonical_json_bytes(model_host_runtime["packages"])
+    ).hexdigest()
+    stability = model_host_runtime["package_import_stability"]
+    _require(
+        stability
+        == {
+            "preimport_sha256": package_sha256,
+            "postimport_sha256": package_sha256,
+            "unchanged": True,
+        },
+        "model package-import stability differs from package report",
+    )
+    _require(
+        decoded["PREFLIGHT_PACKAGE_ENVIRONMENT_SHA256"] == package_sha256
+        and decoded["POSTRUN_PACKAGE_ENVIRONMENT_SHA256"] == package_sha256,
+        "outer evaluation package probes differ from model runtime",
+    )
+    _require(
+        decoded["PYTHONWARNINGS"] == PI05_DROID_JOINTPOS_NUMPYDANTIC_WARNING_FILTER,
+        "run metadata warning filter mismatch",
+    )
+    return {
+        "openpi_package_environment_sha256": package_sha256,
+        "openpi_package_preflight_postrun_unchanged": True,
+        "numpydantic_warning_filter": decoded["PYTHONWARNINGS"],
+    }
 
 
 def _regular_single_link(path: Path, field: str) -> os.stat_result:
@@ -409,6 +487,9 @@ def _validate_specialized_contracts(
     gpu_vulkan = _validate_gpu_vulkan_runtime_agreement(
         model["value"]["host_runtime"], runtime["execution_environment"]
     )
+    package_runtime = _validate_package_run_metadata(
+        paths["run_metadata"], model["value"]["host_runtime"]
+    )
     return {
         "asset_manifest_sha256": asset["manifest_sha256"],
         "asset_tree_sha256": asset["tree_sha256"],
@@ -421,6 +502,7 @@ def _validate_specialized_contracts(
         "video_ffprobe_sha256": media_tools["ffprobe"]["sha256"],
         "video_ffmpeg_sha256": media_tools["ffmpeg"]["sha256"],
         **gpu_vulkan,
+        **package_runtime,
     }
 
 
