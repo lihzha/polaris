@@ -146,9 +146,9 @@
 
 ## 2026-07-08 — final paired clean setup retry
 
-- Historical v6 setup job `1101813` was canceled at 14:00:20 PDT after 14:10,
-  before setup completion, because its source was superseded by the reviewed
-  driver/ICD runtime pin. It consumed no GPU and produced no policy rollout.
+- Historical v6 setup job `1101813` was externally canceled at 14:00:20 PDT
+  after 14:10, before setup completion. It consumed no GPU and produced no
+  policy rollout; no cancellation reason is claimed by this record.
 - Independent L40S runtime probe `1101818` then completed successfully on
   `pool0-00016`: the exact upgraded ICD was mounted into the pinned image and
   `SimulationApp` started and closed cleanly. Its 44,079-byte log has SHA-256
@@ -181,12 +181,25 @@
   (5,498 bytes); current log SHA-256 is
   `7a581e5bd9bbaeb4c463d35c1b6e9c7e43b126c4dbd9ff6074b49189927b85df`
   (12,280 bytes).
-- The paired setup is now serialized to isolate cancellation ownership:
-  current-only `1101824` is running first under
-  `pi05-confidence-final-v9-20260708T211229Z` with an explicit immutable owner
-  record and Slurm `do-not-cancel` comment. Historical clean setup will launch
-  only after current setup attests successfully. Registry revision 17 preserves
-  all failed/canceled history and leaves scientific result counts unchanged.
+- The paired setup was serialized to isolate cancellation ownership.
+  Current-only `1101824` completed `0:0` in 8:51 under
+  `pi05-confidence-final-v9-20260708T211229Z`, validating all 242 packages,
+  checkpoint, tokenizer, DROID normalization, and policy config. It remains
+  setup-only evidence from pre-attestation commit `1dcdde6` and cannot support
+  final evaluation. Historical clean setup still requires a fresh launch from
+  the final commit. Registry revision 17 preserves all failed/canceled history
+  and leaves scientific result counts unchanged.
+
+## 2026-07-08 — mapped graphics-runtime parity
+
+- Source commit `2d0597f` applies the exact seven source/test blobs from current
+  commit `1684777`; the historical evaluator lifecycle remains the only intended
+  execution difference. Runtime schema 3 now seals the exact L40S GPU, driver,
+  Vulkan ICD, and the 14 mapped Vulkan/NVIDIA ELF objects identified by bounded
+  probe `1101825`. The stable graphics-runtime digest is
+  `cd0ae19f2ea2cbdd0b8371796acad34c6d1b36d38c26aca68e8715b663c2f9f5`.
+- A fresh historical setup and live full-horizon canary are mandatory. No result
+  from the earlier source revisions will be reused as final evidence.
 
 ## 2026-07-08 — mapped-runtime closure port and final setup gate
 
