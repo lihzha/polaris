@@ -11,7 +11,7 @@
   `NativeEvaluatorLifecycle` integration. It is therefore not a copy of the
   current evaluator.
 - Portable contract commit
-  `5a575e6` carries the exact official checkpoint/config, global checkpoint
+  `5a575e6194b8bdf3a3a25e6b5d39bf8802d0e0eb` carries the exact official checkpoint/config, global checkpoint
   DROID normalization, native-image/server-PIL resize probe, tokenizer and
   package attestation, joint-position client/controller/runtime checks,
   schema-4 trace/RNG closure, pinned asset/media validation, terminal PNG, and
@@ -28,3 +28,5 @@
   compilation, and Git whitespace checks pass. The portable shell surface was
   already validated with Bash syntax and ShellCheck before cherry-pick. No GPU
   job has yet been launched from this final control candidate.
+- Branch-local integration commit:
+  `94c48f525a53a67fb8c03841682b9e9bf16db3a2`.
