@@ -88,6 +88,148 @@ PI05_DROID_JOINTPOS_RECORD_VERIFICATION_EXEMPTIONS = (
     "openpi",
     "openpi-client",
 )
+PI05_DROID_JOINTPOS_PINNED_HEX_RECORD_ENTRIES = (
+    (
+        "augmax",
+        "0.4.1",
+        "augmax-0.4.1.dist-info/METADATA",
+        2885,
+        "01ce08dbb27610123f88e90704f36387ebeb28894544b2a8ab2cdba6d9811816",
+    ),
+    (
+        "augmax",
+        "0.4.1",
+        "augmax-0.4.1.dist-info/WHEEL",
+        78,
+        "11319513b72fe7d4379f6f9f7984b3cca85f688201c09325839a04908e107b75",
+    ),
+    (
+        "augmax",
+        "0.4.1",
+        "augmax/__init__.py",
+        1404,
+        "86b22c45f793d8038838c4561ee01f014e7604fad0b9bb538e5f0440b03e4909",
+    ),
+    (
+        "augmax",
+        "0.4.1",
+        "augmax/base.py",
+        3786,
+        "eab29ac85eaeffc6696661799b22edc1ad240605aeea82136b9f89b3433f565e",
+    ),
+    (
+        "augmax",
+        "0.4.1",
+        "augmax/colorspace.py",
+        14122,
+        "23f9cd15389cb039e5fdecc37a771b4e577974b929f8f5c57a039a32a2932069",
+    ),
+    (
+        "augmax",
+        "0.4.1",
+        "augmax/functional/__init__.py",
+        25,
+        "3a8fe1fed50cedb0bc1651c18b60016179fb4d62ca98fff73b4c0fcc1be2145c",
+    ),
+    (
+        "augmax",
+        "0.4.1",
+        "augmax/functional/colorspace.py",
+        1103,
+        "3808087c7ff52578e36276c1b1ea6c78e3f7d8c6ee33983f7130fa0fcbedc643",
+    ),
+    (
+        "augmax",
+        "0.4.1",
+        "augmax/geometric.py",
+        19804,
+        "07cb87add2e1cff1f7798528f0b49b3483a2b92fb628b29370a54726f9caca94",
+    ),
+    (
+        "augmax",
+        "0.4.1",
+        "augmax/imagelevel.py",
+        5530,
+        "73ac636b8173e884cc1d40063690e41270e7eac99945d4c3a07f338ddf54e717",
+    ),
+    (
+        "augmax",
+        "0.4.1",
+        "augmax/optimized.py",
+        3199,
+        "3ac27f3338be443d7d2e3ca1677b13182ece9ccc50588e0dc714a0128ffe7d04",
+    ),
+    (
+        "augmax",
+        "0.4.1",
+        "augmax/utils.py",
+        2880,
+        "0fda539e990e6d621faed610a3ad56f0fa95445154a8bce1a54c627d34d80193",
+    ),
+)
+PI05_DROID_JOINTPOS_PINNED_RECORD_OVERLAP_RESOLUTIONS = (
+    (
+        "opencv-python-headless",
+        "4.11.0.86",
+        "cv2/cv2.abi3.so",
+        66_106_617,
+        "aP7knSZqlecwwcsX2ROjmpOrXFC-4VgWAPRTAm-ce40",
+        "opencv-python",
+        "4.11.0.86",
+        66_322_321,
+        "GI04rORxanRTTd9N1PfXegZkG9CQi_Eushijwv7zXzg",
+    ),
+    (
+        "opencv-python-headless",
+        "4.11.0.86",
+        "cv2/typing/__init__.py",
+        5339,
+        "OcpcWCPgPFdmAKQ9RuwEavViTFzC6E5CdyoxpzUMZIw",
+        "opencv-python",
+        "4.11.0.86",
+        5339,
+        "WVIPWJREoW72Swb0Z8XIgW2nkky2HjzDOmp5wFDjUjs",
+    ),
+    (
+        "opencv-python-headless",
+        "4.11.0.86",
+        "cv2/version.py",
+        92,
+        "OwdJIWnmB5lA9xYWI2jFG22-5FvjbJxG-2-eVrBElzk",
+        "opencv-python",
+        "4.11.0.86",
+        93,
+        "hs5yqDhdH_81iiowYjH4a3adZU6JvspqFkycNndPflo",
+    ),
+)
+PI05_DROID_JOINTPOS_PINNED_WHEEL_ARTIFACTS = (
+    (
+        "augmax",
+        "0.4.1",
+        "https://files.pythonhosted.org/packages/f3/3e/1cc3a97f3adbca740310de33ff41fd141f7cd9b2b5baafdfbc3dd6526255/augmax-0.4.1-py3-none-any.whl",
+        "60f9711a4ffc08f27d1ff0783f7c51c01e6f78e20d4581d075ebf2d904ab2d14",
+        17_299,
+    ),
+    (
+        "opencv-python",
+        "4.11.0.86",
+        "https://files.pythonhosted.org/packages/2c/8b/90eb44a40476fa0e71e05a0283947cfd74a5d36121a11d926ad6f3193cc4/opencv_python-4.11.0.86-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "6b02611523803495003bd87362db3e1d2a0454a6a63025dc6658a9830570aa0d",
+        62_986_597,
+    ),
+    (
+        "opencv-python-headless",
+        "4.11.0.86",
+        "https://files.pythonhosted.org/packages/dd/5c/c139a7876099916879609372bfa513b7f1257f7f1a908b0bdc1c2328241b/opencv_python_headless-4.11.0.86-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "0e0a27c19dd1f40ddff94976cfe43066fbbe9dfbb2ec1907d66c19caef42a57b",
+        49_969_856,
+    ),
+)
+PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES = (
+    "sha256_urlsafe_base64_nopad_direct",
+    "sha256_lowercase_hex_pinned_upstream_direct",
+    "sha256_pinned_coinstall_overlap_winner",
+)
 PI05_DROID_JOINTPOS_REQUIRED_RUNTIME_ENVIRONMENT = {
     "JAX_PLATFORMS": "cuda",
     "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.35",
@@ -831,17 +973,165 @@ def _normalized_distribution_name(name: str) -> str:
     return name.lower().replace("_", "-").replace(".", "-")
 
 
+def _classify_distribution_record_hash(
+    *,
+    distribution_name: str,
+    distribution_version: str,
+    relative_path: str,
+    expected_size: int | None,
+    expected_hash: str,
+    actual_size: int,
+    digest: bytes,
+) -> str:
+    base64_digest = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    if expected_hash == base64_digest and expected_size == actual_size:
+        return PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES[0]
+    hex_digest = digest.hex()
+    pinned_entry = (
+        distribution_name,
+        distribution_version,
+        relative_path,
+        actual_size,
+        hex_digest,
+    )
+    if (
+        expected_hash == hex_digest
+        and expected_size == actual_size
+        and (pinned_entry in PI05_DROID_JOINTPOS_PINNED_HEX_RECORD_ENTRIES)
+    ):
+        return PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES[1]
+    raise ValueError(
+        f"Installed distribution RECORD mismatch: {distribution_name} {relative_path}"
+    )
+
+
+def _sha256_base64_to_hex(value: str) -> str:
+    try:
+        payload = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except (ValueError, TypeError) as error:
+        raise ValueError("Invalid URL-safe base64 SHA-256") from error
+    canonical = base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+    if len(payload) != 32 or canonical != value:
+        raise ValueError("Invalid URL-safe base64 SHA-256")
+    return payload.hex()
+
+
+def _expected_record_overlap_resolution(profile: tuple[Any, ...]) -> dict[str, Any]:
+    (
+        losing_name,
+        losing_version,
+        relative_path,
+        losing_size,
+        losing_hash,
+        active_name,
+        active_version,
+        active_size,
+        active_hash,
+    ) = profile
+    return {
+        "path": relative_path,
+        "losing_record": {
+            "distribution": losing_name,
+            "version": losing_version,
+            "size": losing_size,
+            "sha256_urlsafe_base64": losing_hash,
+        },
+        "active_record": {
+            "distribution": active_name,
+            "version": active_version,
+            "size": active_size,
+            "sha256_urlsafe_base64": active_hash,
+            "sha256": _sha256_base64_to_hex(active_hash),
+        },
+    }
+
+
+def _verify_pinned_record_overlap(
+    *,
+    distribution_name: str,
+    distribution_version: str,
+    relative_path: str,
+    expected_size: int | None,
+    expected_hash: str,
+    raw_path: Path,
+    actual_size: int,
+    digest: bytes,
+) -> dict[str, Any] | None:
+    matches = [
+        profile
+        for profile in PI05_DROID_JOINTPOS_PINNED_RECORD_OVERLAP_RESOLUTIONS
+        if profile[:5]
+        == (
+            distribution_name,
+            distribution_version,
+            relative_path,
+            expected_size,
+            expected_hash,
+        )
+        and profile[7] == actual_size
+        and profile[8] == base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    ]
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise ValueError("Pinned RECORD overlap profile is ambiguous")
+    profile = matches[0]
+    active_name, active_version, active_size, active_hash = profile[5:]
+    active_distribution = importlib_metadata.distribution(active_name)
+    active_metadata_name = active_distribution.metadata.get("Name")
+    if (
+        not isinstance(active_metadata_name, str)
+        or _normalized_distribution_name(active_metadata_name) != active_name
+        or active_distribution.version != active_version
+    ):
+        raise ValueError("Pinned RECORD overlap active distribution mismatch")
+    active_claims = [
+        package_path
+        for package_path in (active_distribution.files or ())
+        if str(package_path) == relative_path
+    ]
+    if len(active_claims) != 1:
+        raise ValueError("Pinned RECORD overlap active claim mismatch")
+    active_claim = active_claims[0]
+    active_claim_hash = active_claim.hash
+    if (
+        active_claim_hash is None
+        or active_claim_hash.mode != "sha256"
+        or active_claim_hash.value != active_hash
+        or active_claim.size != active_size
+    ):
+        raise ValueError("Pinned RECORD overlap active hash mismatch")
+    active_path = Path(active_distribution.locate_file(active_claim))
+    try:
+        same_active_file = active_path.samefile(raw_path)
+    except OSError:
+        same_active_file = False
+    if not same_active_file:
+        raise ValueError("Pinned RECORD overlap does not resolve to one active file")
+    return _expected_record_overlap_resolution(profile)
+
+
 def _verify_distribution_record(
     distribution_name: str, environment_root: Path
 ) -> dict[str, Any]:
-    """Verify every installed wheel file against its RECORD hash."""
+    """Bind every installed file to its RECORD or one exact co-install winner."""
 
     distribution = importlib_metadata.distribution(distribution_name)
     files = list(distribution.files or ())
     if not files:
         raise ValueError(f"Installed distribution has no RECORD: {distribution_name}")
+    relative_paths = [str(package_path) for package_path in files]
+    if len(relative_paths) != len(set(relative_paths)):
+        raise ValueError(
+            f"Installed distribution has duplicate RECORD paths: {distribution_name}"
+        )
     identities = []
     unhashed = []
+    validation_counts = {
+        mode: 0 for mode in PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES
+    }
+    pinned_hex_paths = set()
+    overlap_resolutions = []
     for package_path in files:
         relative_path = str(package_path)
         expected_hash = package_path.hash
@@ -866,18 +1156,66 @@ def _verify_distribution_record(
             ) from error
         payload = raw_path.read_bytes()
         digest = hashlib.sha256(payload).digest()
-        record_digest = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-        if record_digest != expected_hash.value:
-            raise ValueError(
-                f"Installed distribution RECORD mismatch: {distribution_name} "
-                f"{relative_path}"
+        try:
+            validation_mode = _classify_distribution_record_hash(
+                distribution_name=distribution_name,
+                distribution_version=distribution.version,
+                relative_path=relative_path,
+                expected_size=package_path.size,
+                expected_hash=expected_hash.value,
+                actual_size=len(payload),
+                digest=digest,
             )
+            overlap_resolution = None
+        except ValueError as direct_error:
+            overlap_resolution = _verify_pinned_record_overlap(
+                distribution_name=distribution_name,
+                distribution_version=distribution.version,
+                relative_path=relative_path,
+                expected_size=package_path.size,
+                expected_hash=expected_hash.value,
+                raw_path=raw_path,
+                actual_size=len(payload),
+                digest=digest,
+            )
+            if overlap_resolution is None:
+                raise direct_error
+            validation_mode = PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES[2]
+            overlap_resolutions.append(overlap_resolution)
+        validation_counts[validation_mode] += 1
+        if validation_mode == PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES[1]:
+            pinned_hex_paths.add(relative_path)
         identities.append(
             {
                 "path": relative_path,
                 "size": len(payload),
                 "sha256": digest.hex(),
+                "record_validation_mode": validation_mode,
             }
+        )
+    expected_pinned_hex_paths = {
+        relative_path
+        for name, version, relative_path, _size, _digest in (
+            PI05_DROID_JOINTPOS_PINNED_HEX_RECORD_ENTRIES
+        )
+        if name == distribution_name and version == distribution.version
+    }
+    if pinned_hex_paths != expected_pinned_hex_paths:
+        raise ValueError(
+            "Installed distribution pinned hexadecimal RECORD coverage mismatch: "
+            f"{distribution_name}"
+        )
+    expected_overlap_resolutions = [
+        _expected_record_overlap_resolution(profile)
+        for profile in PI05_DROID_JOINTPOS_PINNED_RECORD_OVERLAP_RESOLUTIONS
+        if profile[0] == distribution_name and profile[1] == distribution.version
+    ]
+    overlap_resolutions.sort(key=lambda item: item["path"])
+    expected_overlap_resolutions.sort(key=lambda item: item["path"])
+    if overlap_resolutions != expected_overlap_resolutions:
+        raise ValueError(
+            f"Installed distribution RECORD overlap coverage mismatch: "
+            f"{distribution_name}"
         )
     if len(unhashed) != 1 or not unhashed[0].endswith(".dist-info/RECORD"):
         raise ValueError(
@@ -898,11 +1236,69 @@ def _verify_distribution_record(
         "version": distribution.version,
         "file_count": len(files),
         "hashed_file_count": len(identities),
+        "record_validation_counts": validation_counts,
+        "record_overlap_resolutions": overlap_resolutions,
         "record": _regular_file_identity(record_path),
         "verified_files_sha256": hashlib.sha256(
             canonical_json_bytes(identities)
         ).hexdigest(),
     }
+
+
+def _expected_pinned_wheel_artifacts() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": name,
+            "version": version,
+            "url": url,
+            "sha256": digest,
+            "size": size,
+        }
+        for name, version, url, digest, size in (
+            PI05_DROID_JOINTPOS_PINNED_WHEEL_ARTIFACTS
+        )
+    ]
+
+
+def _verify_pinned_wheel_artifacts(lock: dict[str, Any]) -> list[dict[str, Any]]:
+    expected = _expected_pinned_wheel_artifacts()
+    packages = lock.get("package")
+    if not isinstance(packages, list):
+        raise ValueError("OpenPI uv.lock package inventory is invalid")
+    for artifact in expected:
+        matching_packages = [
+            package
+            for package in packages
+            if isinstance(package, dict)
+            and _normalized_distribution_name(package.get("name", ""))
+            == artifact["name"]
+            and package.get("version") == artifact["version"]
+        ]
+        if len(matching_packages) != 1:
+            raise ValueError("Pinned OpenPI wheel package identity mismatch")
+        expected_wheel = {
+            "url": artifact["url"],
+            "hash": f"sha256:{artifact['sha256']}",
+            "size": artifact["size"],
+        }
+        if expected_wheel not in matching_packages[0].get("wheels", []):
+            raise ValueError("Pinned OpenPI wheel artifact mismatch")
+    return expected
+
+
+def _require_pinned_wheel_distributions_installed(
+    installed_versions: dict[str, str], artifacts: list[dict[str, Any]]
+) -> None:
+    missing_or_drifted = [
+        {"name": artifact["name"], "version": artifact["version"]}
+        for artifact in artifacts
+        if installed_versions.get(artifact["name"]) != artifact["version"]
+    ]
+    if missing_or_drifted:
+        raise ValueError(
+            "Pinned OpenPI wheel distributions are missing or version-drifted: "
+            f"{missing_or_drifted}"
+        )
 
 
 def _require_checkout_local_openpi_interpreter(root: Path) -> Path:
@@ -963,6 +1359,7 @@ def verify_openpi_package_environment(openpi_dir: Path) -> dict[str, Any]:
         for package in lock["package"]:
             name = _normalized_distribution_name(package["name"])
             locked_versions.setdefault(name, set()).add(package["version"])
+        pinned_wheel_artifacts = _verify_pinned_wheel_artifacts(lock)
     except (
         OSError,
         UnicodeDecodeError,
@@ -971,6 +1368,9 @@ def verify_openpi_package_environment(openpi_dir: Path) -> dict[str, Any]:
         TypeError,
     ) as error:
         raise ValueError("Cannot parse the attested OpenPI uv.lock") from error
+    _require_pinned_wheel_distributions_installed(
+        installed_versions, pinned_wheel_artifacts
+    )
     unlocked_distributions = [
         item
         for item in distributions
@@ -998,7 +1398,8 @@ def verify_openpi_package_environment(openpi_dir: Path) -> dict[str, Any]:
     return {
         "required_versions": required_versions,
         "all_installed_versions_allowed_by_uv_lock": True,
-        "all_noneditable_record_hashes_verified": True,
+        "all_noneditable_files_bound_to_locked_records_or_pinned_overlap": True,
+        "pinned_wheel_artifacts": pinned_wheel_artifacts,
         "record_verified_distributions": record_verified_distributions,
         "record_verification_exemptions": record_verification_exemptions,
         "installed_distributions": distributions,
@@ -1175,7 +1576,8 @@ def validate_openpi_host_runtime(value: Any) -> dict[str, Any]:
     if not isinstance(packages, dict) or set(packages) != {
         "required_versions",
         "all_installed_versions_allowed_by_uv_lock",
-        "all_noneditable_record_hashes_verified",
+        "all_noneditable_files_bound_to_locked_records_or_pinned_overlap",
+        "pinned_wheel_artifacts",
         "record_verified_distributions",
         "record_verification_exemptions",
         "installed_distributions",
@@ -1185,7 +1587,8 @@ def validate_openpi_host_runtime(value: Any) -> dict[str, Any]:
     if (
         packages["required_versions"] != PI05_DROID_JOINTPOS_REQUIRED_PACKAGE_VERSIONS
         or packages["all_installed_versions_allowed_by_uv_lock"] is not True
-        or packages["all_noneditable_record_hashes_verified"] is not True
+        or packages["all_noneditable_files_bound_to_locked_records_or_pinned_overlap"]
+        is not True
     ):
         raise ValueError("OpenPI required package versions mismatch")
     distributions = packages["installed_distributions"]
@@ -1207,6 +1610,11 @@ def validate_openpi_host_runtime(value: Any) -> dict[str, Any]:
     ):
         raise ValueError("OpenPI installed package inventory mismatch")
     installed = {item["name"]: item["version"] for item in distributions}
+    if packages["pinned_wheel_artifacts"] != _expected_pinned_wheel_artifacts() or any(
+        installed.get(artifact["name"]) != artifact["version"]
+        for artifact in packages["pinned_wheel_artifacts"]
+    ):
+        raise ValueError("OpenPI pinned wheel artifact inventory mismatch")
     record_verified = packages["record_verified_distributions"]
     expected_record_names = [
         item["name"]
@@ -1227,6 +1635,8 @@ def validate_openpi_host_runtime(value: Any) -> dict[str, Any]:
                 "version",
                 "file_count",
                 "hashed_file_count",
+                "record_validation_counts",
+                "record_overlap_resolutions",
                 "record",
                 "verified_files_sha256",
             }
@@ -1237,6 +1647,43 @@ def validate_openpi_host_runtime(value: Any) -> dict[str, Any]:
             or item["hashed_file_count"] != item["file_count"] - 1
         ):
             raise ValueError("OpenPI RECORD-verified package identity mismatch")
+        expected_pinned_hex_count = sum(
+            1
+            for name, version, _path, _size, _digest in (
+                PI05_DROID_JOINTPOS_PINNED_HEX_RECORD_ENTRIES
+            )
+            if name == item["name"] and version == item["version"]
+        )
+        expected_overlap_resolutions = [
+            _expected_record_overlap_resolution(profile)
+            for profile in PI05_DROID_JOINTPOS_PINNED_RECORD_OVERLAP_RESOLUTIONS
+            if profile[0] == item["name"] and profile[1] == item["version"]
+        ]
+        expected_overlap_resolutions.sort(key=lambda resolution: resolution["path"])
+        expected_overlap_count = len(expected_overlap_resolutions)
+        expected_direct_count = (
+            item["hashed_file_count"]
+            - expected_pinned_hex_count
+            - expected_overlap_count
+        )
+        if (
+            expected_direct_count < 0
+            or not isinstance(item["record_validation_counts"], dict)
+            or any(
+                type(count) is not int or count < 0
+                for count in item["record_validation_counts"].values()
+            )
+            or item["record_validation_counts"]
+            != {
+                PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES[0]: expected_direct_count,
+                PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES[
+                    1
+                ]: expected_pinned_hex_count,
+                PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES[2]: expected_overlap_count,
+            }
+            or item["record_overlap_resolutions"] != expected_overlap_resolutions
+        ):
+            raise ValueError("OpenPI RECORD validation inventory mismatch")
         _validate_file_identity_record(item["record"], f"{item['name']} RECORD")
         digest = item["verified_files_sha256"]
         if (
@@ -2788,6 +3235,10 @@ __all__ = [
     "PI05_DROID_JOINTPOS_JAX_CONFIG",
     "PI05_DROID_JOINTPOS_OPTIONAL_RUNTIME_ENVIRONMENT",
     "PI05_DROID_JOINTPOS_PYPROJECT_SHA256",
+    "PI05_DROID_JOINTPOS_PINNED_HEX_RECORD_ENTRIES",
+    "PI05_DROID_JOINTPOS_PINNED_RECORD_OVERLAP_RESOLUTIONS",
+    "PI05_DROID_JOINTPOS_PINNED_WHEEL_ARTIFACTS",
+    "PI05_DROID_JOINTPOS_RECORD_VALIDATION_MODES",
     "PI05_DROID_JOINTPOS_RECORD_VERIFICATION_EXEMPTIONS",
     "PI05_DROID_JOINTPOS_REQUIRED_PACKAGE_VERSIONS",
     "PI05_DROID_JOINTPOS_REQUIRED_RUNTIME_ENVIRONMENT",

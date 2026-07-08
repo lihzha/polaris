@@ -64,3 +64,38 @@
   canonical Git-root executable spelling for downstream runtime validation.
   The serving contract and alias tests are byte-identical to the independently
   reviewed current arm; rollout behavior remains unchanged.
+
+## 2026-07-08 — v4 setup cancellation after shared integrity-gate failure
+
+- Historical setup job `1101809`, from immutable PolaRiS commit
+  `4cc64030d575723ae0ba7194e0cc72bb87cf7ca4` and OpenPI commit
+  `bd70b8f4011e85b3f3b0f039f12113f78718e7bf`, ran from
+  `2026-07-08T20:05:46Z` until user cancellation at
+  `2026-07-08T20:09:37Z`. It prepared 242 packages but did not finish
+  installation or independently reach the package-RECORD verifier.
+- The cancellation followed current setup `1101808` failing on the shared
+  pinned `augmax==0.4.1` integrity gate. The historical log is
+  `/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris-pi05/pi05-confidence-final-v4-20260708T200401Z/setup-historical-1101809.out`,
+  5,498 bytes, SHA-256
+  `7ab30ee0db94b54effeee9529f1bc3fb8aaeefbd3da55adcfd3e92147003f4e8`.
+  Its setup-record directory is empty and no GPU evaluation launched.
+- The current-arm forensic result identifies an upstream RECORD-encoding
+  defect in the exact locked wheel, not an observed historical-only outcome.
+  The same fail-closed, exact-entry correction will be copied byte-identically
+  before another paired setup. There are no active jobs or namespace
+  processes from this attempt.
+- The final package-integrity correction is copied byte-identically from the
+  independently reviewed current arm. It pins the exact Augmax and both
+  OpenCV Linux x86_64 wheel artifacts; requires all three distributions to be
+  installed at their exact versions; permits the malformed hexadecimal hash
+  encoding only for Augmax's exact 11 path/size/digest tuples; and explicitly
+  seals the three `opencv-python-headless` claims whose live files are the
+  exact co-installed `opencv-python` winner bytes. Missing/extra entries,
+  reversed install order, path/version/size/digest drift, or any other overlap
+  fails closed. The complete clean-environment census found no discrepancy
+  outside those pinned cases.
+- The historical source and contract-test blobs exactly match current commit
+  `9e6a7ce60494594d54d268db03ea939480297833`. This package-only attestation
+  correction does not touch the intentionally historical evaluator lifecycle.
+  Its complete host-safe suite passes 131 tests with one unrelated skip; Ruff
+  format/lint, Python compilation, and Git whitespace checks pass.
