@@ -306,10 +306,27 @@
   full package environment before sealing, after sealing, and after all
   tokenizer/checkpoint/config imports. Serving and the outer evaluator add
   matching pre/post checks, bound by model-runtime v3 and evidence profile v6.
-- Historical validation is `182 passed, 1 skipped` for the host-safe suite and
-  `50 passed` for focused serving/evidence tests. Ruff lint/format, Bash
-  syntax, Python compilation, and whitespace checks pass. The sole skip needs
-  Isaac and remains assigned to the paired live L40S canary.
+- Historical validation is `183 passed` with all eight subtests passing for
+  the host-safe suite and `50 passed` for focused serving/evidence tests. Ruff
+  lint/format, Bash syntax, Python compilation, and whitespace checks pass.
+  The sole excluded test needs Isaac and remains assigned to the paired live
+  L40S canary.
 - Only fresh v11 frozen source trees, unique setup/result namespaces, and
   rebuilt virtual environments are valid. Paired one-rollout canaries gate the
   paired FoodBussing50 evaluation.
+
+## 2026-07-08 — fresh v11 setup launch
+
+- Shared registry revision 24 records the exact reviewed v11 commits and
+  contracts before launch. Clean frozen checkout
+  `/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-pi05-confidence-historical-a126bb3-20260708T221428Z`
+  has launch commit `a126bb3fc66de2afed4a091b2b620abfca52084e`, tree
+  `cb8703904e808e32b02b4b4d321e76583637e25e`, OpenPI
+  `bd70b8f4011e85b3f3b0f039f12113f78718e7bf`, and no preexisting `.venv`.
+- Fresh CPU setup job `1101832` is running on `cpu-large-0002` under namespace
+  `pi05-confidence-final-v11-20260708T221428Z`; paired current setup `1101831`
+  runs independently on `cpu-large-0001`. The exact immutable submission
+  script SHA-256 is
+  `4357677926fbe337d006e93b5f564e2aae389aa74eeb11927fd5458eee72b506`.
+  These jobs perform package/checkpoint setup only and contribute zero rollout
+  episodes. GPU canaries remain gated on both setup records completing.
