@@ -937,6 +937,15 @@ def test_setup_rebuilds_without_cache_and_cpu_verifies_packages_and_tokenizer():
     assert 'rm -rf -- "${OPENPI_DIR}/.venv"' in source
     assert "uv sync" in source
     assert "--frozen --no-cache --reinstall --link-mode copy" in source
+    assert "--frozen --no-cache --reinstall-package opencv-python --link-mode copy" in (
+        source
+    )
+    assert (
+        source.index("--frozen --no-cache --reinstall --link-mode copy")
+        < source.index("--reinstall-package opencv-python")
+        < source.index("uv pip install")
+        < source.index("verify_openpi_package_environment")
+    )
     assert "verify_openpi_package_environment" in source
     assert "verify_paligemma_tokenizer_artifact" in source
     assert "attest_loaded_tokenizer_sentencepiece" in source

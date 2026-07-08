@@ -458,3 +458,24 @@
   OpenCV overlap resolutions; that older environment separately fails closed
   on an unrelated stale `numpydantic` file, as expected rather than being
   silently accepted.
+
+## 2026-07-08 — deterministic OpenCV active-provider closure
+
+- Clean setup v5 current job `1101810` rebuilt all 242 packages and then
+  failed closed on `opencv-python cv2/cv2.abi3.so`. This was the reverse of
+  the preceding clean v4 environment: v5 ended with the locked headless wheel
+  active at all three shared paths, while v4 ended with the locked full wheel
+  active. Exact inspection showed every live path matched the headless RECORD;
+  no byte was outside the two locked artifacts. The failure therefore exposed
+  nondeterministic last-writer order in `uv sync`, not corruption.
+- A diagnostic frozen-lock reinstall using
+  `uv sync --frozen --no-cache --reinstall-package opencv-python --link-mode
+  copy` deterministically restored the direct OpenPI dependency as the active
+  provider. The full wheel then verifies 130/130 direct hashes, and the
+  headless wheel verifies 95 direct hashes plus exactly the three sealed
+  overlap resolutions. No package is exempted or removed.
+- Clean setup now performs that exact lock-bound one-package reinstall after
+  the complete 242-package rebuild and before editable OpenPI reinstall and
+  package attestation. The resulting active runtime is deterministic and the
+  already reviewed overlap profile remains narrow; accepting either provider
+  nondeterministically is explicitly rejected.

@@ -56,6 +56,12 @@ fi
   cd "${OPENPI_DIR}"
   GIT_LFS_SKIP_SMUDGE=1 uv sync \
     --frozen --no-cache --reinstall --link-mode copy
+  # OpenPI and LeRobot lock the full and headless OpenCV wheels, which claim
+  # three different bytes at the same cv2 paths.  Reinstall the direct OpenPI
+  # dependency last from this exact frozen lock so the active provider is
+  # deterministic before the package-overlap attestation runs.
+  GIT_LFS_SKIP_SMUDGE=1 uv sync \
+    --frozen --no-cache --reinstall-package opencv-python --link-mode copy
   GIT_LFS_SKIP_SMUDGE=1 uv pip install \
     --no-cache --reinstall --link-mode copy --no-deps -e .
 )
