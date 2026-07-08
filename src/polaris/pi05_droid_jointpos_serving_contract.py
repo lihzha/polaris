@@ -18,6 +18,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import stat
 import subprocess
 import sys
@@ -34,12 +35,24 @@ PI05_DROID_JOINTPOS_SERVING_CONTRACT_FILENAME = (
 )
 PI05_DROID_JOINTPOS_MODEL_RUNTIME_FILENAME = "pi05_droid_jointpos_model_runtime.json"
 PI05_DROID_JOINTPOS_MODEL_RUNTIME_PROFILE = (
-    "openpi_pi05_droid_jointpos_polaris_model_runtime_v1"
+    "openpi_pi05_droid_jointpos_polaris_model_runtime_v2"
 )
 PI05_DROID_JOINTPOS_BIND_HOST = "127.0.0.1"
 PI05_DROID_JOINTPOS_RNG_STREAM_FILENAME = "pi05_droid_jointpos_rng_stream.json"
 PI05_DROID_JOINTPOS_RNG_STREAM_PROFILE = "openpi_pi05_droid_jointpos_jax_rng_stream_v1"
-PI05_DROID_JOINTPOS_HOST_RUNTIME_PROFILE = "openpi_pi05_droid_jointpos_host_runtime_v1"
+PI05_DROID_JOINTPOS_HOST_RUNTIME_PROFILE = "openpi_pi05_droid_jointpos_host_runtime_v2"
+PI05_DROID_JOINTPOS_NVIDIA_GPU_NAME = "NVIDIA L40S"
+PI05_DROID_JOINTPOS_NVIDIA_DRIVER_VERSION = "580.105.08"
+PI05_DROID_JOINTPOS_NVIDIA_SMI_QUERY = (
+    "/usr/bin/nvidia-smi",
+    "--query-gpu=uuid,name,driver_version",
+    "--format=csv,noheader,nounits",
+)
+PI05_DROID_JOINTPOS_VULKAN_ICD_SHA256 = (
+    "7bdb6f27d35b66fc848df6f94b8773bba30ea3a7f06f114100d14154a235a34b"
+)
+PI05_DROID_JOINTPOS_VULKAN_ICD_SIZE = 140
+PI05_DROID_JOINTPOS_VULKAN_ICD_CONTAINER_PATH = "/etc/vulkan/icd.d/nvidia_icd.json"
 PI05_DROID_JOINTPOS_CHECKPOINT_URI = (
     "gs://openpi-assets/checkpoints/polaris/pi05_droid_jointpos_polaris"
 )
@@ -1409,6 +1422,58 @@ def verify_openpi_package_environment(openpi_dir: Path) -> dict[str, Any]:
     }
 
 
+def _validate_nvidia_smi_gpu_identity(value: Any) -> dict[str, Any]:
+    expected_query = list(PI05_DROID_JOINTPOS_NVIDIA_SMI_QUERY)
+    if not isinstance(value, dict) or set(value) != {
+        "query",
+        "uuid",
+        "name",
+        "driver_version",
+    }:
+        raise ValueError("NVIDIA GPU identity schema mismatch")
+    if (
+        value["query"] != expected_query
+        or not isinstance(value["uuid"], str)
+        or re.fullmatch(
+            r"GPU-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+            r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
+            value["uuid"],
+        )
+        is None
+        or value["name"] != PI05_DROID_JOINTPOS_NVIDIA_GPU_NAME
+        or value["driver_version"] != PI05_DROID_JOINTPOS_NVIDIA_DRIVER_VERSION
+    ):
+        raise ValueError("NVIDIA GPU identity mismatch")
+    return copy.deepcopy(value)
+
+
+def _capture_nvidia_smi_gpu_identity() -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            list(PI05_DROID_JOINTPOS_NVIDIA_SMI_QUERY),
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise ValueError("Cannot capture the allocated NVIDIA GPU identity") from error
+    rows = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(rows) != 1:
+        raise ValueError("OpenPI host runtime requires exactly one NVIDIA GPU")
+    fields = [field.strip() for field in rows[0].split(",")]
+    if len(fields) != 3 or any(not field for field in fields):
+        raise ValueError("Cannot parse the allocated NVIDIA GPU identity")
+    return _validate_nvidia_smi_gpu_identity(
+        {
+            "query": list(PI05_DROID_JOINTPOS_NVIDIA_SMI_QUERY),
+            "uuid": fields[0],
+            "name": fields[1],
+            "driver_version": fields[2],
+        }
+    )
+
+
 def capture_openpi_host_runtime(openpi_dir: Path, jax_module: object) -> dict[str, Any]:
     """Seal the interpreter, lockfiles, package inventory, and live JAX host."""
 
@@ -1431,11 +1496,12 @@ def capture_openpi_host_runtime(openpi_dir: Path, jax_module: object) -> dict[st
         {
             "id": 0,
             "platform": "gpu",
-            "device_kind": "NVIDIA L40S",
+            "device_kind": PI05_DROID_JOINTPOS_NVIDIA_GPU_NAME,
             "process_index": 0,
         }
     ]:
         raise ValueError(f"Attested JAX device must be one NVIDIA L40S: {devices}")
+    nvidia_smi = _capture_nvidia_smi_gpu_identity()
     required_environment = {
         name: os.environ.get(name)
         for name in PI05_DROID_JOINTPOS_REQUIRED_RUNTIME_ENVIRONMENT
@@ -1459,6 +1525,10 @@ def capture_openpi_host_runtime(openpi_dir: Path, jax_module: object) -> dict[st
             "Semantics-changing JAX/CUDA environment variables must be unset: "
             f"{sorted(forbidden_environment)}"
         )
+    if optional_environment["NVIDIA_VISIBLE_DEVICES"] != nvidia_smi["uuid"]:
+        raise ValueError(
+            "NVIDIA_VISIBLE_DEVICES does not select the attested NVIDIA GPU UUID"
+        )
     jax_config = {
         "default_prng_impl": jax_module.config.jax_default_prng_impl,
         "legacy_prng_key": jax_module.config.jax_legacy_prng_key,
@@ -1474,7 +1544,7 @@ def capture_openpi_host_runtime(openpi_dir: Path, jax_module: object) -> dict[st
         )
     backend = jax_module.lib.xla_bridge.get_backend()
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": PI05_DROID_JOINTPOS_HOST_RUNTIME_PROFILE,
         "python": {
             "declared_executable": str(declared_executable),
@@ -1512,6 +1582,7 @@ def capture_openpi_host_runtime(openpi_dir: Path, jax_module: object) -> dict[st
             "default_backend": jax_module.default_backend(),
             "platform_version": backend.platform_version,
             "devices": devices,
+            "nvidia_smi": nvidia_smi,
         },
     }
     return validate_openpi_host_runtime(report)
@@ -1529,7 +1600,7 @@ def validate_openpi_host_runtime(value: Any) -> dict[str, Any]:
     }:
         raise ValueError("OpenPI host-runtime schema mismatch")
     if (
-        value["schema_version"] != 1
+        value["schema_version"] != 2
         or value["profile"] != PI05_DROID_JOINTPOS_HOST_RUNTIME_PROFILE
     ):
         raise ValueError("OpenPI host-runtime identity mismatch")
@@ -1747,8 +1818,12 @@ def validate_openpi_host_runtime(value: Any) -> dict[str, Any]:
         "default_backend",
         "platform_version",
         "devices",
+        "nvidia_smi",
     }:
         raise ValueError("OpenPI JAX runtime schema mismatch")
+    nvidia_smi = _validate_nvidia_smi_gpu_identity(jax["nvidia_smi"])
+    if process_environment["optional"]["NVIDIA_VISIBLE_DEVICES"] != nvidia_smi["uuid"]:
+        raise ValueError("OpenPI NVIDIA_VISIBLE_DEVICES identity mismatch")
     if (
         jax["jax_version"] != "0.5.3"
         or jax["jaxlib_version"] != "0.5.3"
@@ -1764,7 +1839,7 @@ def validate_openpi_host_runtime(value: Any) -> dict[str, Any]:
             {
                 "id": 0,
                 "platform": "gpu",
-                "device_kind": "NVIDIA L40S",
+                "device_kind": PI05_DROID_JOINTPOS_NVIDIA_GPU_NAME,
                 "process_index": 0,
             }
         ]
@@ -2947,7 +3022,7 @@ def make_pi05_droid_jointpos_model_runtime(
     if contract["openpi"]["runtime_attestation"] != runtime:
         raise ValueError("Serving and model-runtime OpenPI attestations differ")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": PI05_DROID_JOINTPOS_MODEL_RUNTIME_PROFILE,
         "status": "pass",
         "checkpoint": checkpoint,
@@ -3012,7 +3087,7 @@ def _validate_model_runtime_value(
     if not isinstance(value, dict) or set(value) != required:
         raise ValueError("pi0.5 joint-position model-runtime schema mismatch")
     if (
-        value["schema_version"] != 1
+        value["schema_version"] != 2
         or value["profile"] != PI05_DROID_JOINTPOS_MODEL_RUNTIME_PROFILE
         or value["status"] != "pass"
     ):
@@ -3228,6 +3303,10 @@ __all__ = [
     "PI05_DROID_JOINTPOS_MANIFEST_SHA256",
     "PI05_DROID_JOINTPOS_METADATA_KEY",
     "PI05_DROID_JOINTPOS_MODEL_RUNTIME_FILENAME",
+    "PI05_DROID_JOINTPOS_MODEL_RUNTIME_PROFILE",
+    "PI05_DROID_JOINTPOS_NVIDIA_DRIVER_VERSION",
+    "PI05_DROID_JOINTPOS_NVIDIA_GPU_NAME",
+    "PI05_DROID_JOINTPOS_NVIDIA_SMI_QUERY",
     "PI05_DROID_JOINTPOS_NORM_SHA256",
     "PI05_DROID_JOINTPOS_NORM_VALUES_SHA256",
     "PI05_DROID_JOINTPOS_OPENPI_COMMIT",
@@ -3255,6 +3334,9 @@ __all__ = [
     "PI05_DROID_JOINTPOS_TOKENIZER_URI",
     "PI05_DROID_JOINTPOS_TOKENIZER_VOCAB_SIZE",
     "PI05_DROID_JOINTPOS_UV_LOCK_SHA256",
+    "PI05_DROID_JOINTPOS_VULKAN_ICD_CONTAINER_PATH",
+    "PI05_DROID_JOINTPOS_VULKAN_ICD_SHA256",
+    "PI05_DROID_JOINTPOS_VULKAN_ICD_SIZE",
     "attest_imported_openpi_modules",
     "attest_loaded_tokenizer_sentencepiece",
     "attest_openpi_resize_transform",

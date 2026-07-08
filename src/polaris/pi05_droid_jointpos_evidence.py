@@ -19,11 +19,17 @@ import stat
 from typing import Any
 
 from polaris.pi05_droid_jointpos_runtime import (
+    PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES,
+    PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE,
+    PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_SHA256,
     validate_jointpos_runtime_artifact,
 )
 from polaris.pi05_droid_jointpos_serving_contract import (
     PI05_DROID_JOINTPOS_CHECKPOINT_URI,
+    PI05_DROID_JOINTPOS_NVIDIA_DRIVER_VERSION,
     PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE,
+    PI05_DROID_JOINTPOS_VULKAN_ICD_CONTAINER_PATH,
+    PI05_DROID_JOINTPOS_VULKAN_ICD_SHA256,
     validate_persisted_pi05_droid_jointpos_model_runtime,
     validate_persisted_pi05_droid_jointpos_rng_stream,
     validate_persisted_pi05_droid_jointpos_serving_contract,
@@ -42,7 +48,7 @@ from polaris.pi05_droid_jointpos_immutable import (
 
 
 PI05_DROID_JOINTPOS_EVIDENCE_PROFILE = (
-    "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v3"
+    "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v5"
 )
 PI05_DROID_JOINTPOS_EVIDENCE_MANIFEST = "pi05_droid_jointpos_evidence_manifest.json"
 
@@ -330,7 +336,7 @@ def _validate_specialized_contracts(
     video_identities: list[dict[str, Any]],
     terminal_image_identities: list[dict[str, Any]],
     terminal_pixel_sha256: list[str],
-) -> dict[str, str]:
+) -> dict[str, Any]:
     serving = validate_persisted_pi05_droid_jointpos_serving_contract(
         paths["serving_contract"]
     )
@@ -400,6 +406,9 @@ def _validate_specialized_contracts(
         expected_terminal_pixel_sha256=terminal_pixel_sha256,
     )
     media_tools = video["value"]["execution_environment"]["tools"]
+    gpu_vulkan = _validate_gpu_vulkan_runtime_agreement(
+        model["value"]["host_runtime"], runtime["execution_environment"]
+    )
     return {
         "asset_manifest_sha256": asset["manifest_sha256"],
         "asset_tree_sha256": asset["tree_sha256"],
@@ -411,6 +420,71 @@ def _validate_specialized_contracts(
         "video_container_image_sha256": PI05_DROID_JOINTPOS_PYXIS_SHA256,
         "video_ffprobe_sha256": media_tools["ffprobe"]["sha256"],
         "video_ffmpeg_sha256": media_tools["ffmpeg"]["sha256"],
+        **gpu_vulkan,
+    }
+
+
+def _validate_gpu_vulkan_runtime_agreement(
+    model_host_runtime: Any, simulator_execution_environment: Any
+) -> dict[str, Any]:
+    """Bind the model and simulator to one allocated GPU and Vulkan runtime."""
+
+    _require(
+        isinstance(model_host_runtime, dict)
+        and isinstance(model_host_runtime.get("jax"), dict)
+        and isinstance(model_host_runtime["jax"].get("nvidia_smi"), dict),
+        "model runtime lacks NVIDIA identity",
+    )
+    _require(
+        isinstance(simulator_execution_environment, dict)
+        and isinstance(simulator_execution_environment.get("nvidia_smi"), dict)
+        and isinstance(simulator_execution_environment.get("vulkan"), dict),
+        "simulator runtime lacks GPU/Vulkan identity",
+    )
+    model_gpu = model_host_runtime["jax"]["nvidia_smi"]
+    simulator_gpu = simulator_execution_environment["nvidia_smi"]
+    identity_fields = ("uuid", "name", "driver_version")
+    _require(
+        all(
+            model_gpu.get(field) == simulator_gpu.get(field)
+            for field in identity_fields
+        ),
+        "model and simulator NVIDIA identities differ",
+    )
+    _require(
+        model_gpu.get("name") == "NVIDIA L40S"
+        and model_gpu.get("driver_version")
+        == PI05_DROID_JOINTPOS_NVIDIA_DRIVER_VERSION,
+        "evaluation did not use the canonical L40S driver runtime",
+    )
+    vulkan = simulator_execution_environment["vulkan"]
+    _require(
+        vulkan.get("vk_driver_files") == PI05_DROID_JOINTPOS_VULKAN_ICD_CONTAINER_PATH
+        and isinstance(vulkan.get("icd"), dict)
+        and vulkan["icd"].get("path") == PI05_DROID_JOINTPOS_VULKAN_ICD_CONTAINER_PATH
+        and vulkan["icd"].get("sha256") == PI05_DROID_JOINTPOS_VULKAN_ICD_SHA256,
+        "simulator Vulkan ICD identity differs from the canonical runtime",
+    )
+    graphics = simulator_execution_environment.get("graphics_runtime")
+    _require(
+        isinstance(graphics, dict)
+        and graphics.get("profile") == PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE
+        and isinstance(graphics.get("libraries"), list)
+        and len(graphics["libraries"])
+        == len(PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES)
+        and graphics.get("graphics_runtime_sha256")
+        == PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_SHA256,
+        "simulator mapped graphics-runtime identity differs from the canonical runtime",
+    )
+    return {
+        "nvidia_gpu_uuid": model_gpu["uuid"],
+        "nvidia_gpu_name": model_gpu["name"],
+        "nvidia_driver_version": model_gpu["driver_version"],
+        "vulkan_icd_container_path": vulkan["icd"]["path"],
+        "vulkan_icd_sha256": vulkan["icd"]["sha256"],
+        "graphics_runtime_profile": graphics["profile"],
+        "graphics_runtime_sha256": graphics["graphics_runtime_sha256"],
+        "graphics_library_count": len(graphics["libraries"]),
     }
 
 
@@ -424,7 +498,7 @@ def _validate_closed_contracts(
     environment: str,
     expected_environment_seed: int,
     expected_rollouts: int,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     summary_candidate = _strict_json(paths["trace_summary"], "trace summary")
     _require(
         isinstance(summary_candidate, dict)
@@ -473,7 +547,7 @@ def _manifest_value(
     artifacts: dict[str, dict[str, Any]],
     videos: list[dict[str, Any]],
     terminal_images: list[dict[str, Any]],
-    contracts: dict[str, str],
+    contracts: dict[str, Any],
 ) -> dict[str, Any]:
     _require(
         isinstance(environment, str) and environment.startswith("DROID-"),

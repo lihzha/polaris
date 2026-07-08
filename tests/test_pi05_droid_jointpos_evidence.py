@@ -10,6 +10,7 @@ import polaris.pi05_droid_jointpos_evidence as evidence
 SERVER_SHA = "1" * 64
 RUNTIME_SHA = "2" * 64
 COMMIT = "3" * 40
+GPU_UUID = "GPU-12345678-1234-1234-1234-123456789abc"
 
 
 def _write_inputs(root: Path, *, rollouts: int = 2):
@@ -98,6 +99,45 @@ def _stub_sealed_trace_audit(paths, **_kwargs):
     for name in ("policy_trace", "metrics_csv"):
         assert paths[name].stat().st_mode & 0o777 == 0o444
     return json.loads(paths["trace_summary"].read_text())
+
+
+def _gpu_vulkan_contracts():
+    gpu = {
+        "query": [
+            "/usr/bin/nvidia-smi",
+            "--query-gpu=uuid,name,driver_version",
+            "--format=csv,noheader,nounits",
+        ],
+        "uuid": GPU_UUID,
+        "name": "NVIDIA L40S",
+        "driver_version": "580.105.08",
+    }
+    return (
+        {"jax": {"nvidia_smi": dict(gpu)}},
+        {
+            "nvidia_smi": dict(gpu),
+            "vulkan": {
+                "vk_driver_files": "/etc/vulkan/icd.d/nvidia_icd.json",
+                "icd": {
+                    "path": "/etc/vulkan/icd.d/nvidia_icd.json",
+                    "size": 140,
+                    "sha256": (
+                        "7bdb6f27d35b66fc848df6f94b8773b"
+                        "ba30ea3a7f06f114100d14154a235a34b"
+                    ),
+                },
+            },
+            "graphics_runtime": {
+                "profile": evidence.PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE,
+                "libraries": [
+                    {} for _ in evidence.PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES
+                ],
+                "graphics_runtime_sha256": (
+                    evidence.PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_SHA256
+                ),
+            },
+        },
+    )
 
 
 def _patch_closed_contracts(monkeypatch):
@@ -252,6 +292,75 @@ def test_worker_finalizes_server_rng_then_evidence_before_success_marker():
         < finalized
         < success
     )
+
+
+def test_gpu_vulkan_contract_requires_model_simulator_agreement():
+    model, simulator = _gpu_vulkan_contracts()
+    assert evidence._validate_gpu_vulkan_runtime_agreement(model, simulator) == {
+        "nvidia_gpu_uuid": GPU_UUID,
+        "nvidia_gpu_name": "NVIDIA L40S",
+        "nvidia_driver_version": "580.105.08",
+        "vulkan_icd_container_path": "/etc/vulkan/icd.d/nvidia_icd.json",
+        "vulkan_icd_sha256": (
+            "7bdb6f27d35b66fc848df6f94b8773bba30ea3a7f06f114100d14154a235a34b"
+        ),
+        "graphics_runtime_profile": (
+            evidence.PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE
+        ),
+        "graphics_runtime_sha256": (
+            evidence.PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_SHA256
+        ),
+        "graphics_library_count": len(
+            evidence.PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES
+        ),
+    }
+
+    for field, replacement in (
+        ("uuid", "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        ("name", "NVIDIA A100-SXM4-80GB"),
+        ("driver_version", "580.159.03"),
+    ):
+        model, simulator = _gpu_vulkan_contracts()
+        simulator["nvidia_smi"][field] = replacement
+        with pytest.raises(ValueError, match="NVIDIA identities differ"):
+            evidence._validate_gpu_vulkan_runtime_agreement(model, simulator)
+
+
+def test_gpu_vulkan_contract_rejects_noncanonical_shared_runtime():
+    model, simulator = _gpu_vulkan_contracts()
+    model["jax"]["nvidia_smi"]["driver_version"] = "580.159.03"
+    simulator["nvidia_smi"]["driver_version"] = "580.159.03"
+    with pytest.raises(ValueError, match="canonical L40S driver"):
+        evidence._validate_gpu_vulkan_runtime_agreement(model, simulator)
+
+    model, simulator = _gpu_vulkan_contracts()
+    simulator["vulkan"]["icd"]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="Vulkan ICD identity"):
+        evidence._validate_gpu_vulkan_runtime_agreement(model, simulator)
+
+    model, simulator = _gpu_vulkan_contracts()
+    simulator["vulkan"]["vk_driver_files"] = "/tmp/nvidia_icd.json"
+    with pytest.raises(ValueError, match="Vulkan ICD identity"):
+        evidence._validate_gpu_vulkan_runtime_agreement(model, simulator)
+
+    model, simulator = _gpu_vulkan_contracts()
+    simulator["graphics_runtime"]["libraries"].pop()
+    with pytest.raises(ValueError, match="mapped graphics-runtime identity"):
+        evidence._validate_gpu_vulkan_runtime_agreement(model, simulator)
+
+
+def test_worker_rechecks_gpu_vulkan_runtime_before_evidence():
+    source = (
+        Path(__file__).parents[1]
+        / "scripts/polaris/eval_pi05_droid_jointpos_polaris.sh"
+    ).read_text()
+    post_run = source.rindex("capture_gpu_runtime")
+    evaluator_success = source.index("printf 'EVALUATOR_EXIT_CODE=0\\n'")
+    finalize = source.index("-m polaris.pi05_droid_jointpos_evidence")
+    assert post_run < evaluator_success < finalize
+    assert 'EXPECTED_NVIDIA_DRIVER_VERSION="580.105.08"' in source
+    assert 'EXPECTED_VULKAN_ICD_SHA256="7bdb6f27' in source
+    assert "/usr/bin/env -i" in source
 
 
 def test_finalizer_rejects_persisted_summary_that_differs_from_sealed_reaudit(
