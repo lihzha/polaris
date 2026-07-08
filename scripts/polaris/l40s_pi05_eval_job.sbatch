@@ -26,6 +26,7 @@ export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-${NFS_ROOT}/cache/openpi-polaris}"
 export OUTPUT_ROOT="${OUTPUT_ROOT:-${NFS_ROOT}/results/polaris-pi05}"
 export POLARIS_CACHE_DIR="${POLARIS_CACHE_DIR:-${NFS_ROOT}/cache/polaris/runtime/${SLURM_JOB_ID}}"
 export ROLLOUTS="${ROLLOUTS:-50}"
+export ENVIRONMENT_SEED="${ENVIRONMENT_SEED:-0}"
 export RUN_LABEL=official-pi05-polaris
 export PORT="$((20000 + SLURM_JOB_ID % 20000))"
 export CHECKPOINT_URI=gs://openpi-assets/checkpoints/polaris/pi05_droid_jointpos_polaris
@@ -42,7 +43,7 @@ mapfile -t allocated_gpu_uuids < <(
 export NVIDIA_VISIBLE_DEVICES="${allocated_gpu_uuids[0]}"
 export PYTHONUNBUFFERED=1 SLURM_EXPORT_ENV=ALL
 
-echo "[$(date -Iseconds)] job=${SLURM_JOB_ID} host=$(hostname) task=${POLARIS_ENVIRONMENT} rollouts=${ROLLOUTS}"
+echo "[$(date -Iseconds)] job=${SLURM_JOB_ID} host=$(hostname) task=${POLARIS_ENVIRONMENT} rollouts=${ROLLOUTS} environment_seed=${ENVIRONMENT_SEED}"
 nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader
 
 exec "${POLARIS_DIR}/scripts/polaris/eval_pi05_droid_jointpos_polaris.sh"

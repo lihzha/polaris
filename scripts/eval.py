@@ -16,6 +16,7 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 from polaris.config import EvalArgs
+from polaris.evaluation_seed import make_environment_seed_contract
 
 
 def main(eval_args: EvalArgs):
@@ -24,6 +25,12 @@ def main(eval_args: EvalArgs):
     )
 
     position_adapter = eval_args.policy.client == "DroidDeltaJointPosition"
+    if eval_args.policy.client == "DroidJointPos":
+        if eval_args.environment_seed is None:
+            raise ValueError("DroidJointPos requires --environment-seed")
+        make_environment_seed_contract(eval_args.environment_seed)
+    elif eval_args.environment_seed is not None:
+        make_environment_seed_contract(eval_args.environment_seed)
     if (
         eval_args.policy.client == "EgoLAPEefPose"
         and eval_args.control_mode != "eef-pose"
@@ -128,6 +135,10 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         print_joint_velocity_runtime,
         validate_joint_velocity_runtime,
     )
+    from polaris.evaluation_seed import (
+        bind_environment_seed,
+        format_environment_seed_contract,
+    )
     from polaris.pi05_droid_native_eval_contract import (
         PI05_DROID_NATIVE_EPISODE_STEPS,
         configure_native_environment_timeout,
@@ -169,6 +180,14 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         num_envs=1,
         use_fabric=True,
     )
+    if eval_args.environment_seed is not None:
+        environment_seed_contract = bind_environment_seed(
+            env_cfg, eval_args.environment_seed
+        )
+        print(
+            format_environment_seed_contract(environment_seed_contract),
+            flush=True,
+        )
     configured_episode_length_seconds = None
     if eval_args.control_mode == "eef-pose":
         # Action managers are constructed by gym.make, so select the controller
