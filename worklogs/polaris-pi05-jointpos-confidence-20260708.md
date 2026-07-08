@@ -501,3 +501,151 @@
   the pinned Pyxis image. Older or differently upgraded nodes continue to fail
   rather than being treated as equivalent. The replacement full-horizon
   canary is the model/simulator validation for this runtime profile.
+
+## 2026-07-08 — runtime probe and final clean setup retry
+
+- Independent L40S runtime probe `1101818` completed successfully on
+  `pool0-00016` in 3:26. It verified one L40S at driver `580.105.08`, the exact
+  host ICD, and the pinned simulator image, then started and cleanly closed
+  `SimulationApp` with the ICD mounted read-only. The 44,079-byte log is
+  `/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris-pi05/pi05-vulkan-icd-audit-v3-20260708T205834Z-1101818.out`,
+  SHA-256
+  `82bedb51d14d8b6c268438d4e5c5e601397759ca0d461b36603cac45c0330c7f`.
+- Setup jobs `1101819` and `1101820` failed closed in 3 and 2 seconds,
+  respectively, before package setup, simulator use, or rollout. The
+  orchestrator had pre-created each `SETUP_RECORD_DIR`; the setup contract
+  correctly requires a unique nonexistent path and returned exit `2` with
+  `SETUP_RECORD_DIR must be a unique, previously unused path`. This is a
+  submission-only error and is preserved as a failed attempt.
+- Replacement clean setup jobs used new untouched record paths under namespace
+  `pi05-confidence-final-v8-20260708T210352Z`: current job `1101822` from
+  commit `1dcdde6fe702a3966110abb77e6022a79de53871` / tree
+  `9ed22d52879e162b0c0ef20a1b5f534115d17cd5`, and historical job `1101823`
+  from commit `68899317fa8dfe8c86abe47a59e2f75e37abfd6a` / tree
+  `c6abf07fb21d111d1fc26ab332caf09ca9afa1ff`. Both bind OpenPI
+  `bd70b8f4011e85b3f3b0f039f12113f78718e7bf`. The immutable submission
+  manifest is
+  `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris-pi05/pi05-confidence-final-v8-20260708T210352Z/setup_submission.env`,
+  SHA-256
+  `4f0d56d0670f56fa0b27f75bcdee36dd42ba1fde62681f5cdd795bb69bca535e`.
+
+## 2026-07-08 — unexplained v8 cancellation and isolated v9 setup
+
+- Jobs `1101822` and `1101823` were simultaneously canceled by user UID
+  `158351` at 14:07:51 PDT after 3:46. The orchestrator and both assigned
+  agents independently deny issuing `scancel`, a signal, or any mutating
+  cluster command; workstation Codex tool-call logs around the exact timestamp
+  contain no such command. The cancellation actor therefore remains
+  unidentified. Current had finished the deterministic OpenCV and editable
+  OpenPI reinstall, while historical had only prepared the 242 packages;
+  neither reached package attestation. Both setup-record directories are empty,
+  and neither job used a GPU or produced a rollout. Current log SHA-256 is
+  `7a581e5bd9bbaeb4c463d35c1b6e9c7e43b126c4dbd9ff6074b49189927b85df`
+  (12,280 bytes); historical is
+  `e8496038f3c53ef4a0d7df8bf347a2e0fb77b4a2dc80152ce93b3f5b4d538e2e`
+  (5,498 bytes).
+- A second, deeper driver-library audit `1101821` attempted to hash every
+  Vulkan/NVIDIA library mapped by the simulator. Unlike successful basic probe
+  `1101818`, it stalled during a second `SimulationApp` startup and timed out
+  after 8:03 without publishing its JSON report. It is explicitly
+  non-authoritative. Its 44,677-byte log SHA-256 is
+  `01e68f1630c5074c6fe1db00a50331c8ef8f4d10d6f497bc5d5dde7e6a0f3610`.
+- With all task subagents stopped and no remaining task jobs, current setup was
+  relaunched alone as `1101824` under namespace
+  `pi05-confidence-final-v9-20260708T211229Z`. The job carries Slurm comment
+  `codex-root-pi05-confidence-do-not-cancel`; immutable ownership record
+  `ACTIVE_JOB_OWNERSHIP.env` has SHA-256
+  `d5932193a7481bab2ccd384c47b7b3f32c4d0e47007da2b2c495399755b5b62a`.
+  Submission-manifest SHA-256 is
+  `4dd166d8ced559272603aae9f9b53394c2258833cb6bbb78f624dec5a0ef2bd6`.
+  Shared registry revision 17 records the v8 cancellations, both runtime probes,
+  and running v9 setup without changing evaluation counts or results.
+  Both were intentionally canceled after 3:46 when the independent runtime
+  review required a stronger completion-gated GPU/Vulkan attestation. Their
+  pre-attestation source commits cannot be used for the final evaluation.
+
+## 2026-07-08 — completion-gated model/simulator GPU and Vulkan identity
+
+- Clean v6 current setup `1101812` completed `0:0` in 6:24 and passed the
+  checkpoint, tokenizer, package-RECORD, source, and deterministic OpenCV
+  gates. Its package canonical digest is
+  `a377e158fd03dc833f4d3359bda5a5c243add9dae1c505382cde86304395dd82`.
+  The 14,805-byte setup log is
+  `/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris-pi05/pi05-confidence-final-v6-20260708T204356Z/setup-current-1101812.out`,
+  SHA-256
+  `38c51e06ffa61cfba08633bb325a6a6ce010d3580555baef64fbd4e96bc0cd41`.
+  Historical setup `1101813` was externally canceled after 14:10 while still
+  installing, so it produced no validated setup record and will be retried.
+- Canary jobs `1101814` and `1101815` both failed closed in five seconds on the
+  same stale login-host ICD pin, before checkpoint loading, server startup, or
+  simulator execution. Their respective logs are 291 bytes with SHA-256
+  `5d7acd4b0fcffc8450d66950d7b3216496f32e00f625f91c82850176e3cf6d18`
+  and
+  `dfa9433b9fd15f9dfc02aa4fa16217d212f7e70cd5c2f9b2f5869d602147cc02`.
+  They contain zero episodes and are infrastructure diagnostics, not model
+  failures.
+- Forensics proved the rejected `46cee75b...` ICD came from the GPU-less l401,
+  l402, and l403 login hosts at NVIDIA `570.133.20`, whereas the L40S compute
+  nodes use driver `580.105.08` and ICD `7bdb6f27...`. Because identical ICD
+  JSON can accompany different NVIDIA drivers, the correction binds both
+  identities rather than treating the JSON hash as a driver identity.
+- The official model host runtime and simulator runtime now independently
+  query exactly one GPU and require the same canonical UUID, `NVIDIA L40S`, and
+  driver `580.105.08`. The simulator additionally requires
+  `VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json`, opens that mounted file
+  without following symlinks, and requires its exact 140 bytes and SHA-256
+  `7bdb6f27d35b66fc848df6f94b8773bba30ea3a7f06f114100d14154a235a34b`.
+  Those values are inside the runtime digest, cross-checked against the model
+  runtime by the immutable evidence finalizer, and exposed in the final
+  manifest contracts. The worker re-queries the GPU and re-hashes the host ICD
+  after evaluation and video validation but before declaring evaluator success
+  or finalizing evidence; standard expected values are no longer overridable.
+- Host validation after the initial driver/ICD closure was 451 passed with
+  eight subtests passed;
+  the sole Isaac-dependent unit is excluded locally and is covered by the live
+  L40S canary. Focused runtime/evidence/serving tests pass 53/53, including
+  adversarial mutations for GPU count, UUID, name, driver, ICD bytes, symlink,
+  `VK_DRIVER_FILES`, model/simulator disagreement, and legacy schema. Ruff,
+  shell syntax, compilation, and whitespace checks pass.
+
+## 2026-07-08 — mapped NVIDIA/Vulkan user-space closure
+
+- Independent review rejected driver-version plus ICD-JSON identity as
+  insufficient: the JSON names `libGLX_nvidia.so.0`, but without inspecting
+  the mapped object a mismatched or preloaded user-space driver could still
+  execute. This is provenance hardening and does not change the policy,
+  action, image, normalization, state, gripper, sampler, or scoring paths.
+- Bounded L40S probe `1101825` completed `0:0` in 1:06 on `pool0-00016` and
+  published a mode-0444 canonical report of all 778 unique mapped ELF shared
+  objects. The 375,900-byte report is
+  `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris-pi05/vulkan-mapped-elf-closure-20260708T211500Z/graphics_runtime.json`,
+  SHA-256
+  `9c870463dfad67b23526a64ab044e7203a60a7730d3aaa25ffbc6369aa058207`.
+  Its exact submitted batch script is immutable with SHA-256
+  `b10f6403cbac186f69301f6193bd344da6ff999f92a9821ade209119a0517d9f`.
+- The simulator runtime now requires the exact mapped set of the pinned
+  image's bundled Vulkan loader plus all 13 injected NVIDIA driver objects
+  observed by that closed probe. Each object is bound by absolute container
+  path, byte count, SHA-256, and ELF GNU build ID; the live map device/inode
+  must match the non-symlink regular file opened without following links.
+  Missing, extra, deleted, replaced, or reordered candidates fail. The stable
+  closure digest is
+  `cd0ae19f2ea2cbdd0b8371796acad34c6d1b36d38c26aca68e8715b663c2f9f5`.
+- The simulator now launches through `env -i` with only an explicit baseline.
+  It requires `NVIDIA_VISIBLE_DEVICES` to equal the queried UUID,
+  `NVIDIA_DRIVER_CAPABILITIES=all`, and the sole Vulkan selector to be the
+  canonical `VK_DRIVER_FILES`; LD preload/audit/library-path, Vulkan layer/
+  alternate-driver selectors, and GLX/EGL vendor overrides must all be absent.
+  The graphics closure is inside the joint-position runtime digest and is
+  explicitly exposed by the immutable evidence manifest.
+- Owned setup `1101824` completed `0:0` in 8:51 and independently revalidated
+  all 242 packages, 240 RECORD inventories, tokenizer, checkpoint, global
+  DROID normalization, and policy config. Its package-environment digest is
+  `625a36473ce47f3a677b9224ee16c759c4e06eab37ae6d39efbbf309a16ef69f`.
+  It is deliberately marked setup-only and superseded for final evaluation
+  because commit `1dcdde6` predates this mapped-library attestation.
+- Final host-safe regression after the mapped closure is 480 passed with all
+  eight subtests passed; the sole local Isaac-dependent unit remains excluded
+  and is covered by the live L40S canary. Runtime/evidence focused tests pass
+  50/50. Ruff format/lint, Python compilation, Bash syntax, and whitespace
+  checks pass.
