@@ -7,6 +7,10 @@ from openpi_client import image_tools
 from openpi_client import websocket_client_policy
 
 from polaris.policy.abstract_client import InferenceClient, PolicyArgs
+from polaris.evaluation_seed import (
+    make_episode_environment_rng,
+    validate_live_environment_seed_contract,
+)
 
 
 PI05_DROID_CONTRACT_MARKER = "POLARIS_PI05_DROID_CONTRACT="
@@ -110,6 +114,8 @@ class DroidJointPosClient(InferenceClient):
         self.open_loop_horizon = args.open_loop_horizon
         self.query_index = 0
         self.active_query_index = None
+        self.environment_seed_contract = None
+        self.active_environment_rng = None
         self.trace_path = Path(args.trace_path) if args.trace_path else None
         if self.trace_path is not None:
             self.trace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -156,10 +162,40 @@ class DroidJointPosClient(InferenceClient):
         combined = np.concatenate([base_img, wrist_img], axis=1)
         return combined
 
-    def reset(self):
+    def bind_environment_seed_contract(self, contract: dict) -> None:
+        if self.environment_seed_contract is not None:
+            raise RuntimeError("Environment seed contract was bound more than once")
+        self.environment_seed_contract = validate_live_environment_seed_contract(
+            contract
+        )
+
+    def reset(
+        self,
+        *,
+        episode_index: int | None = None,
+        episode_seed: int | None = None,
+    ):
+        next_reset_index = self.reset_index + 1
+        if self.environment_seed_contract is None:
+            if episode_index is not None or episode_seed is not None:
+                raise ValueError(
+                    "Episode seed values require a bound environment contract"
+                )
+            self.active_environment_rng = None
+        else:
+            if episode_index != next_reset_index:
+                raise ValueError(
+                    "Episode index does not match the next trace reset index"
+                )
+            expected_rng = make_episode_environment_rng(
+                self.environment_seed_contract, episode_index
+            )
+            if episode_seed != expected_rng["episode_seed"]:
+                raise ValueError("Episode seed does not match the bound seed scheme")
+            self.active_environment_rng = expected_rng
         self.actions_from_chunk_completed = 0
         self.pred_action_chunk = None
-        self.reset_index += 1
+        self.reset_index = next_reset_index
         self.query_index = 0
         self.active_query_index = None
 
@@ -226,12 +262,17 @@ class DroidJointPosClient(InferenceClient):
     def _trace_query(self, request: dict, action_chunk: np.ndarray) -> None:
         if self.trace_path is None:
             return
+        if self.active_environment_rng is None:
+            raise RuntimeError(
+                "Cannot trace a query without environment RNG provenance"
+            )
         planned_action_chunk = _binarize_gripper(action_chunk[: self.open_loop_horizon])
         record = {
-            "schema_version": 1,
+            "schema_version": 2,
             "record_type": "openpi_joint_position_query",
             "reset_index": self.reset_index,
             "query_index": self.query_index,
+            "environment_rng": self.active_environment_rng,
             "prompt": request["prompt"],
             "state": {
                 "joint_position": np.asarray(
@@ -263,7 +304,7 @@ class DroidJointPosClient(InferenceClient):
         if self.active_query_index is None:
             raise RuntimeError("Cannot trace an emitted action without an active query")
         record = {
-            "schema_version": 1,
+            "schema_version": 2,
             "record_type": "openpi_joint_position_action",
             "reset_index": self.reset_index,
             "query_index": self.active_query_index,

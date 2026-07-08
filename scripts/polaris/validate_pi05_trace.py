@@ -10,6 +10,12 @@ from collections import defaultdict
 from pathlib import Path
 
 
+ENVIRONMENT_SEED_PROFILE = "isaaclab_env_seed_base_plus_episode_v1"
+ENVIRONMENT_SEED_SCHEME = "base_plus_episode_index_v1"
+ENVIRONMENT_DETERMINISM_CLAIM = "rng_bound_not_bitwise"
+MAX_ENVIRONMENT_SEED = 2**32 - 1
+
+
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
@@ -34,6 +40,73 @@ def _finite_matrix(value, rows: int, columns: int, name: str) -> list[list[float
     )
     for row_index, row in enumerate(value):
         _finite_vector(row, columns, f"{name}[{row_index}]")
+    return value
+
+
+def _uint32(value, name: str) -> int:
+    _require(
+        type(value) is int and 0 <= value <= MAX_ENVIRONMENT_SEED,
+        f"{name} must be a uint32 integer",
+    )
+    return value
+
+
+def _environment_rng(
+    value, *, reset_index: int, expected_base_seed: int | None, prefix: str
+) -> dict:
+    expected_keys = {
+        "schema_version",
+        "profile",
+        "base_seed",
+        "scheme",
+        "episode_index",
+        "episode_seed",
+        "live_cfg_seed",
+        "physx_enhanced_determinism",
+        "determinism_claim",
+    }
+    _require(
+        isinstance(value, dict) and set(value) == expected_keys,
+        f"{prefix}: environment_rng fields are not canonical",
+    )
+    base_seed = _uint32(value.get("base_seed"), f"{prefix} base seed")
+    episode_index = _uint32(
+        value.get("episode_index"), f"{prefix} episode index"
+    )
+    episode_seed = _uint32(value.get("episode_seed"), f"{prefix} episode seed")
+    live_cfg_seed = _uint32(value.get("live_cfg_seed"), f"{prefix} live cfg seed")
+    _require(value.get("schema_version") == 1, f"{prefix}: RNG schema mismatch")
+    _require(
+        value.get("profile") == ENVIRONMENT_SEED_PROFILE,
+        f"{prefix}: environment seed profile mismatch",
+    )
+    _require(
+        value.get("scheme") == ENVIRONMENT_SEED_SCHEME,
+        f"{prefix}: environment seed scheme mismatch",
+    )
+    _require(
+        value.get("determinism_claim") == ENVIRONMENT_DETERMINISM_CLAIM,
+        f"{prefix}: environment determinism claim mismatch",
+    )
+    _require(
+        type(value.get("physx_enhanced_determinism")) is bool,
+        f"{prefix}: PhysX determinism flag must be boolean",
+    )
+    _require(
+        episode_index == reset_index,
+        f"{prefix}: episode index does not match reset index",
+    )
+    _require(live_cfg_seed == base_seed, f"{prefix}: live cfg seed mismatch")
+    _require(
+        base_seed + episode_index <= MAX_ENVIRONMENT_SEED
+        and episode_seed == base_seed + episode_index,
+        f"{prefix}: derived episode seed mismatch",
+    )
+    if expected_base_seed is not None:
+        _require(
+            base_seed == expected_base_seed,
+            f"{prefix}: expected environment base seed {expected_base_seed}, got {base_seed}",
+        )
     return value
 
 
@@ -65,7 +138,10 @@ def audit_trace(
     trace_path: Path,
     expected_prompt: str | None = None,
     metrics_csv: Path | None = None,
+    expected_environment_seed: int | None = None,
 ) -> dict:
+    if expected_environment_seed is not None:
+        _uint32(expected_environment_seed, "expected environment base seed")
     records = []
     digest = hashlib.sha256()
     with trace_path.open("rb") as trace_file:
@@ -88,12 +164,26 @@ def audit_trace(
     wrist_hashes = set()
     raw_joint_min = [math.inf] * 7
     raw_joint_max = [-math.inf] * 7
+    environment_base_seeds = set()
+    environment_seed_schemes = set()
+    environment_live_cfg_seeds = set()
+    environment_physx_flags = set()
+    environment_determinism_claims = set()
+    episode_seeds = {}
 
     for record_index, record in enumerate(records):
         prefix = f"record {record_index}"
-        _require(
-            record.get("schema_version") == 1, f"{prefix}: schema_version must be 1"
-        )
+        schema_version = record.get("schema_version")
+        if expected_environment_seed is None:
+            _require(
+                schema_version in {1, 2},
+                f"{prefix}: schema_version must be 1 or 2",
+            )
+        else:
+            _require(
+                schema_version == 2,
+                f"{prefix}: seeded trace schema_version must be 2",
+            )
         reset_index = record.get("reset_index")
         query_index = record.get("query_index")
         _require(
@@ -155,6 +245,26 @@ def audit_trace(
             record.get("execution_horizon") == 8,
             f"{prefix}: execution horizon must be 8",
         )
+
+        if schema_version == 2 or expected_environment_seed is not None:
+            rng = _environment_rng(
+                record.get("environment_rng"),
+                reset_index=reset_index,
+                expected_base_seed=expected_environment_seed,
+                prefix=prefix,
+            )
+            environment_base_seeds.add(rng["base_seed"])
+            environment_seed_schemes.add(rng["scheme"])
+            environment_live_cfg_seeds.add(rng["live_cfg_seed"])
+            environment_physx_flags.add(rng["physx_enhanced_determinism"])
+            environment_determinism_claims.add(rng["determinism_claim"])
+            previous_episode_seed = episode_seeds.setdefault(
+                reset_index, rng["episode_seed"]
+            )
+            _require(
+                previous_episode_seed == rng["episode_seed"],
+                f"{prefix}: mixed episode seeds within one reset",
+            )
 
         state = record.get("state", {})
         _finite_vector(state.get("joint_position"), 7, f"{prefix} joint state")
@@ -223,6 +333,11 @@ def audit_trace(
         queries[query_key] = record
 
     _require(queries, "Trace contains no query records")
+    if expected_environment_seed is not None:
+        _require(
+            environment_base_seeds == {expected_environment_seed},
+            "Seeded trace did not bind the expected environment base seed",
+        )
     if expected_prompt is not None:
         _require(
             prompts == {expected_prompt},
@@ -306,6 +421,34 @@ def audit_trace(
         "distinct_wrist_frames": len(wrist_hashes),
         "raw_joint_target_min": raw_joint_min,
         "raw_joint_target_max": raw_joint_max,
+        "environment_base_seed": (
+            next(iter(environment_base_seeds))
+            if len(environment_base_seeds) == 1
+            else None
+        ),
+        "environment_seed_scheme": (
+            next(iter(environment_seed_schemes))
+            if len(environment_seed_schemes) == 1
+            else None
+        ),
+        "environment_live_cfg_seed": (
+            next(iter(environment_live_cfg_seeds))
+            if len(environment_live_cfg_seeds) == 1
+            else None
+        ),
+        "environment_physx_enhanced_determinism": (
+            next(iter(environment_physx_flags))
+            if len(environment_physx_flags) == 1
+            else None
+        ),
+        "environment_determinism_claim": (
+            next(iter(environment_determinism_claims))
+            if len(environment_determinism_claims) == 1
+            else None
+        ),
+        "environment_episode_seeds": [
+            episode_seeds[index] for index in sorted(episode_seeds)
+        ],
         "status": "pass",
     }
 
@@ -315,6 +458,7 @@ def main() -> None:
     parser.add_argument("trace", type=Path)
     parser.add_argument("--expected-prompt")
     parser.add_argument("--metrics-csv", type=Path)
+    parser.add_argument("--expected-environment-seed", type=int)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -322,6 +466,7 @@ def main() -> None:
         args.trace,
         expected_prompt=args.expected_prompt,
         metrics_csv=args.metrics_csv,
+        expected_environment_seed=args.expected_environment_seed,
     )
     rendered = json.dumps(summary, indent=2, sort_keys=True) + "\n"
     if args.output is not None:

@@ -6,8 +6,8 @@ set -Eeuo pipefail
 
 MODE="${1:-}"
 case "${MODE}" in
-  canary|full) ;;
-  *) echo "Usage: $0 {canary|full}" >&2; exit 2 ;;
+  canary|foodbussing50|full) ;;
+  *) echo "Usage: $0 {canary|foodbussing50|full}" >&2; exit 2 ;;
 esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,6 +26,11 @@ if [[ "${MODE}" == canary ]]; then
   rollouts="${ROLLOUTS:-1}"
   time_limit="${SBATCH_TIME:-01:00:00}"
   job_prefix="pi05-canary"
+elif [[ "${MODE}" == foodbussing50 ]]; then
+  tasks=(DROID-FoodBussing)
+  rollouts="${ROLLOUTS:-50}"
+  time_limit="${SBATCH_TIME:-03:50:00}"
+  job_prefix="pi05-food50-seed${ENVIRONMENT_SEED}"
 else
   tasks=(
     DROID-BlockStackKitchen
@@ -49,8 +54,12 @@ fi
 mkdir -p "${SBATCH_LOG_ROOT}" "$(dirname "${SUBMISSION_MANIFEST}")"
 exec 9>"${SUBMISSION_MANIFEST}.lock"
 flock -n 9 || { echo "Another submitter holds ${SUBMISSION_MANIFEST}.lock" >&2; exit 4; }
+expected_header=$'job_id\tmode\ttask\trollouts\tenvironment_seed\trun_namespace\tsubmitted_at'
 if [[ ! -e "${SUBMISSION_MANIFEST}" ]]; then
-  printf 'job_id\tmode\ttask\trollouts\tenvironment_seed\trun_namespace\tsubmitted_at\n' > "${SUBMISSION_MANIFEST}"
+  printf '%s\n' "${expected_header}" > "${SUBMISSION_MANIFEST}"
+else
+  [[ "$(head -n 1 "${SUBMISSION_MANIFEST}")" == "${expected_header}" ]] \
+    || { echo "Submission manifest header mismatch" >&2; exit 2; }
 fi
 
 job_ids=()

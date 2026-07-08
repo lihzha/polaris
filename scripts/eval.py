@@ -16,7 +16,7 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 from polaris.config import EvalArgs
-from polaris.evaluation_seed import make_environment_seed_contract
+from polaris.evaluation_seed import episode_environment_seed
 
 
 def main(eval_args: EvalArgs):
@@ -28,9 +28,9 @@ def main(eval_args: EvalArgs):
     if eval_args.policy.client == "DroidJointPos":
         if eval_args.environment_seed is None:
             raise ValueError("DroidJointPos requires --environment-seed")
-        make_environment_seed_contract(eval_args.environment_seed)
+        episode_environment_seed(eval_args.environment_seed, 0)
     elif eval_args.environment_seed is not None:
-        make_environment_seed_contract(eval_args.environment_seed)
+        episode_environment_seed(eval_args.environment_seed, 0)
     if (
         eval_args.policy.client == "EgoLAPEefPose"
         and eval_args.control_mode != "eef-pose"
@@ -137,7 +137,9 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
     )
     from polaris.evaluation_seed import (
         bind_environment_seed,
+        episode_environment_seed,
         format_environment_seed_contract,
+        make_live_environment_seed_contract,
     )
     from polaris.pi05_droid_native_eval_contract import (
         PI05_DROID_NATIVE_EPISODE_STEPS,
@@ -181,13 +183,7 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         use_fabric=True,
     )
     if eval_args.environment_seed is not None:
-        environment_seed_contract = bind_environment_seed(
-            env_cfg, eval_args.environment_seed
-        )
-        print(
-            format_environment_seed_contract(environment_seed_contract),
-            flush=True,
-        )
+        bind_environment_seed(env_cfg, eval_args.environment_seed)
     configured_episode_length_seconds = None
     if eval_args.control_mode == "eef-pose":
         # Action managers are constructed by gym.make, so select the controller
@@ -215,6 +211,15 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         eval_args.environment, cfg=env_cfg
     )
     lifecycle.bind_environment(env)
+    environment_seed_contract = None
+    if eval_args.environment_seed is not None:
+        environment_seed_contract = make_live_environment_seed_contract(
+            env, eval_args.environment_seed
+        )
+        print(
+            format_environment_seed_contract(environment_seed_contract),
+            flush=True,
+        )
     runtime_artifact = None
     environment_runtime_contract = None
     if eval_args.control_mode == "joint-velocity":
@@ -289,6 +294,10 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         return
 
     policy_client: InferenceClient = InferenceClient.get_client(eval_args.policy)
+    if eval_args.policy.client == "DroidJointPos":
+        if environment_seed_contract is None:
+            raise RuntimeError("DroidJointPos environment seed contract is missing")
+        policy_client.bind_environment_seed_contract(environment_seed_contract)
     if eval_args.control_mode == "joint-velocity":
         policy_client.bind_evaluation_runtime(environment_runtime_contract)
     elif position_adapter:
@@ -305,8 +314,22 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
     while episode < rollouts:
         # Index the initial condition with the episode being started. The old
         # loop reset before incrementing ``episode``, repeating condition zero.
-        obs, info = env.reset(object_positions=initial_conditions[episode])
-        policy_client.reset()
+        episode_seed = None
+        if eval_args.environment_seed is not None:
+            episode_seed = episode_environment_seed(
+                eval_args.environment_seed, episode
+            )
+        obs, info = env.reset(
+            seed=episode_seed,
+            object_positions=initial_conditions[episode],
+        )
+        if eval_args.policy.client == "DroidJointPos":
+            policy_client.reset(
+                episode_index=episode,
+                episode_seed=episode_seed,
+            )
+        else:
+            policy_client.reset()
         native_arm_term = None
         if audited_droid:
             native_arm_term = getattr(env, "unwrapped", env).action_manager._terms[

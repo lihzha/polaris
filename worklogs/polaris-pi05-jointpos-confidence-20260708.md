@@ -49,3 +49,34 @@
 - Local validation: Ruff passed; `bash -n` and ShellCheck passed; 61 focused
   tests passed using the Ego-LAP test environment, covering the new seed
   contract plus native client, lifecycle, and evaluator-contract behavior.
+
+## 2026-07-08 — prelaunch hardening after independent review
+
+- Independent review confirmed that construction-time `env_cfg.seed=0` is a
+  useful control but cannot by itself prove a resumable or bitwise-deterministic
+  protocol. Isaac seeds logical RNGs with nondeterministic torch settings,
+  PhysX enhanced determinism remains false, and RTX/CUDA splat rendering may
+  still vary at the pixel level.
+- Replaced the minimal marker with live post-`gym.make` readback. The evaluator
+  now requires the constructed environment to retain the base seed, records
+  the live PhysX flag, and truthfully labels the claim `rng_bound_not_bitwise`.
+- Added `base_plus_episode_index_v1`: every rollout explicitly calls
+  `env.reset(seed=base_seed+episode_index, ...)`. The client binds the live
+  contract, requires the matching episode/reset index and derived seed, and
+  writes closed seed provenance on every schema-2 policy query.
+- The trace validator now requires schema 2 and the expected base seed for
+  seeded runs, rejects missing/mixed/tampered provenance, and reports the
+  ordered episode seeds. Completion also rejects the old Isaac `Seed not set`
+  warning and requires Isaac's own live `Environment seed: 0` report.
+- Seeded resume is deliberately disabled: restarting the separate OpenPI
+  server would restart its JAX request RNG stream, so a copied episode prefix
+  would not yet be an exact continuation. A failed full run must restart in a
+  fresh attempt rather than silently combine policy-noise streams.
+- Added exact task asset SHA checks and the pinned PolaRiS-Hub revision to run
+  metadata, an honest single-task `foodbussing50` submitter mode, manifest
+  header validation, and a one-job/two-process sequential repeatability wrapper
+  so the first seed test uses the same physical L40S.
+- Updated validation: Ruff, `bash -n`, ShellCheck, and `git diff --check` pass;
+  73 focused tests pass across environment seed derivation/live readback,
+  client trace binding, trace rejection cases, native lifecycle, and evaluator
+  contracts.
