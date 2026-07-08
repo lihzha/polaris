@@ -74,6 +74,12 @@ def _graphics_runtime():
                 name: None
                 for name in runtime.PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT
             },
+            **{
+                name: ""
+                for name in (
+                    runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT
+                )
+            },
         },
         "libraries": libraries,
     }
@@ -132,6 +138,8 @@ def _prepare_graphics_capture(
     monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", "all")
     for name in runtime.PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT:
         monkeypatch.delenv(name, raising=False)
+    for name in runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT:
+        monkeypatch.setenv(name, "")
     device = f"{os.major(metadata.st_dev):x}:{os.minor(metadata.st_dev):x}"
     value = {
         "profile": runtime.PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE,
@@ -490,6 +498,13 @@ def test_production_graphics_table_and_canonical_digest_are_closed():
     value = _graphics_runtime()
     assert len(runtime.PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES) == 15
     assert len(value["libraries"]) == 15
+    assert runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT == (
+        "VK_SDK_PATH",
+        "VULKAN_SDK",
+        "VK_LAYER_PATH",
+        "VK_INSTANCE_LAYERS",
+        "VULKAN_HEADERS_INSTALL_DIR",
+    )
     assert (
         "/usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.580.105.08",
         39_422_584,
@@ -497,7 +512,7 @@ def test_production_graphics_table_and_canonical_digest_are_closed():
         "6257a5b3887eab41edd54343ea3623c373ab8e8e",
     ) in runtime.PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES
     assert value["graphics_runtime_sha256"] == (
-        "f3ee6c8027f0cfea3c0f4875c2d3c0aba4c8cf41f8bde040a0bf236b81133a84"
+        "06af774bf60104e67a4e12681747623fb419f8a11ff330a740f798945b58a53f"
     )
     assert (
         value["graphics_runtime_sha256"]
@@ -595,6 +610,22 @@ def test_mapped_graphics_capture_rejects_loader_override_environment(
     _prepare_graphics_capture(tmp_path, monkeypatch)
     monkeypatch.setenv(name, "/tmp/injected")
     with pytest.raises(ValueError, match="override environment"):
+        runtime._capture_graphics_runtime(expected_gpu_uuid=GPU_UUID)
+
+
+@pytest.mark.parametrize(
+    "name", runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT
+)
+@pytest.mark.parametrize("value", [None, "/tmp/injected"])
+def test_mapped_graphics_capture_requires_exact_kit_cleared_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, value: str | None
+):
+    _prepare_graphics_capture(tmp_path, monkeypatch)
+    if value is None:
+        monkeypatch.delenv(name)
+    else:
+        monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=rf'"{name}"'):
         runtime._capture_graphics_runtime(expected_gpu_uuid=GPU_UUID)
 
 

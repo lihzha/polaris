@@ -44,7 +44,7 @@ PI05_DROID_JOINTPOS_SENSOR_NAMES = ("external_cam", "wrist_cam")
 PI05_DROID_JOINTPOS_NATIVE_IMAGE_SHAPE = (720, 1280, 3)
 PI05_DROID_JOINTPOS_BOUNDARY_PROFILE = "outer450_internal451_no_autoreset"
 PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE = (
-    "l401_pyxis_nvidia_580_105_08_mapped_graphics_v2"
+    "l401_pyxis_nvidia_580_105_08_mapped_graphics_v3"
 )
 PI05_DROID_JOINTPOS_GRAPHICS_PROC_MAPS_PATH = "/proc/self/maps"
 PI05_DROID_JOINTPOS_GRAPHICS_EXPECTED_LD_LIBRARY_PATH: str | None = None
@@ -56,9 +56,7 @@ PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT = (
     "LD_DEBUG_OUTPUT",
     "VK_ADD_DRIVER_FILES",
     "VK_ICD_FILENAMES",
-    "VK_LAYER_PATH",
     "VK_ADD_LAYER_PATH",
-    "VK_INSTANCE_LAYERS",
     "VK_DEVICE_LAYERS",
     "VK_LOADER_DRIVERS_SELECT",
     "VK_LOADER_DRIVERS_DISABLE",
@@ -68,6 +66,13 @@ PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT = (
     "__GLX_VENDOR_LIBRARY_NAME",
     "__EGL_VENDOR_LIBRARY_FILENAMES",
     "LIBGL_DRIVERS_PATH",
+)
+PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT = (
+    "VK_SDK_PATH",
+    "VULKAN_SDK",
+    "VK_LAYER_PATH",
+    "VK_INSTANCE_LAYERS",
+    "VULKAN_HEADERS_INSTALL_DIR",
 )
 PI05_DROID_JOINTPOS_GRAPHICS_CANDIDATE_BASENAME_PREFIXES = (
     "libvulkan.so",
@@ -177,7 +182,7 @@ PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES: tuple[
     ),
 )
 PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_SHA256 = (
-    "f3ee6c8027f0cfea3c0f4875c2d3c0aba4c8cf41f8bde040a0bf236b81133a84"
+    "06af774bf60104e67a4e12681747623fb419f8a11ff330a740f798945b58a53f"
 )
 
 _ACTION_TERM_CLASS = (
@@ -497,6 +502,7 @@ def _graphics_environment() -> dict[str, str | None]:
         "NVIDIA_VISIBLE_DEVICES",
         "NVIDIA_DRIVER_CAPABILITIES",
         *PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT,
+        *PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT,
     )
     return {name: os.environ.get(name) for name in names}
 
@@ -689,9 +695,21 @@ def _validate_graphics_runtime(value: Any, *, expected_gpu_uuid: str) -> dict[st
         "NVIDIA_VISIBLE_DEVICES": expected_gpu_uuid,
         "NVIDIA_DRIVER_CAPABILITIES": "all",
         **{name: None for name in PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT},
+        **{name: "" for name in PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT},
     }
     if value["environment"] != expected_environment:
-        raise ValueError("simulator graphics override environment mismatch")
+        differences = {
+            name: {
+                "actual": value["environment"].get(name),
+                "expected": expected_environment.get(name),
+            }
+            for name in sorted(set(value["environment"]) | set(expected_environment))
+            if value["environment"].get(name) != expected_environment.get(name)
+        }
+        raise ValueError(
+            "simulator graphics override environment mismatch: "
+            + json.dumps(differences, sort_keys=True, separators=(",", ":"))
+        )
     libraries = value["libraries"]
     expected = _expected_graphics_library_records()
     if (
