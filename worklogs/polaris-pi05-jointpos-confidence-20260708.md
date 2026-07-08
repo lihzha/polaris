@@ -378,3 +378,21 @@
   these changes: 427 tests passed and one unrelated test was skipped with only the
   Isaac-dependent test excluded; focused trace/physical/evidence tests passed
   38/38, and Ruff format/lint, Python compilation, and whitespace checks pass.
+
+## 2026-07-08 — Lustre checkout-alias attestation fix
+
+- Final clean setup job `1101806` rebuilt all 242 locked packages, then failed
+  closed before checkpoint evaluation because Git canonicalized the checkout
+  from `/lustre/fsw/...` to its identical `/lustre/fs11/...` backing path while
+  `sys.executable` retained the `/lustre/fsw/...` spelling. The verifier used a
+  lexical path comparison. Historical setup `1101807` was canceled after the
+  current failure established the shared cause; no GPU evaluation launched.
+- Checkout-local interpreter verification now requires both the resolved
+  `sys.prefix` to equal the resolved checkout `.venv` and `samefile()` identity
+  between the declared and expected interpreter. This accepts only aliases of
+  the same environment while still rejecting a different virtual environment
+  whose Python symlink happens to share the same base interpreter. After that
+  proof, it canonicalizes the persisted declared-executable path to the Git
+  checkout root, preserving downstream model-runtime lexical binding.
+  Dedicated helper and end-to-end model-runtime alias/adversarial tests pass;
+  full current host regression is 429 passed and one unrelated test skipped.

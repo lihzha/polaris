@@ -229,6 +229,56 @@ def _host_runtime(tmp_path):
     }
 
 
+def test_checkout_local_interpreter_accepts_resolved_lustre_alias(
+    tmp_path, monkeypatch
+):
+    real_root = tmp_path / "openpi"
+    expected_bin = real_root / ".venv/bin"
+    expected_bin.mkdir(parents=True)
+    python_target = tmp_path / "python3.11"
+    python_target.write_bytes(b"python")
+    (expected_bin / "python").symlink_to(python_target)
+    alias_root = tmp_path / "alias-openpi"
+    alias_root.symlink_to(real_root, target_is_directory=True)
+
+    monkeypatch.setattr(contract.sys, "prefix", str(alias_root / ".venv"))
+    monkeypatch.setattr(
+        contract.sys, "executable", str(alias_root / ".venv/bin/python")
+    )
+    declared = contract._require_checkout_local_openpi_interpreter(real_root)
+    assert declared == real_root / ".venv/bin/python"
+
+    metadata = _metadata()
+    runtime = _model_runtime(tmp_path, metadata)
+    runtime["host_runtime"]["python"]["declared_executable"] = str(declared)
+    output = tmp_path / contract.PI05_DROID_JOINTPOS_MODEL_RUNTIME_FILENAME
+    published = contract.publish_pi05_droid_jointpos_model_runtime(
+        output, runtime, metadata
+    )
+    assert published["value"]["host_runtime"]["python"]["declared_executable"] == str(
+        real_root / ".venv/bin/python"
+    )
+
+
+def test_checkout_local_interpreter_rejects_other_venv_with_same_python(
+    tmp_path, monkeypatch
+):
+    real_root = tmp_path / "real/openpi"
+    expected_bin = real_root / ".venv/bin"
+    expected_bin.mkdir(parents=True)
+    python_target = tmp_path / "python3.11"
+    python_target.write_bytes(b"python")
+    (expected_bin / "python").symlink_to(python_target)
+    other_bin = tmp_path / "other/.venv/bin"
+    other_bin.mkdir(parents=True)
+    (other_bin / "python").symlink_to(python_target)
+
+    monkeypatch.setattr(contract.sys, "prefix", str(other_bin.parent))
+    monkeypatch.setattr(contract.sys, "executable", str(other_bin / "python"))
+    with pytest.raises(ValueError, match="checkout-local OpenPI interpreter"):
+        contract._require_checkout_local_openpi_interpreter(real_root)
+
+
 def _tokenizer_artifact(tmp_path):
     return {
         "schema_version": 1,
