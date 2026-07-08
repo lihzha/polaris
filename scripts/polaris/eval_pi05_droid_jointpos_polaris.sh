@@ -22,8 +22,9 @@ POLICY_CONFIG="${POLICY_CONFIG:-pi05_droid_jointpos_polaris}"
 EXPECTED_OPENPI_COMMIT="${EXPECTED_OPENPI_COMMIT:-bd70b8f4011e85b3f3b0f039f12113f78718e7bf}"
 EXPECTED_NORM_SHA256="${EXPECTED_NORM_SHA256:-57ce9956f9e07d65f8a8205aabec72d436a2c8927f53edb40c7a77b14a5a90c7}"
 EXPECTED_PYXIS_SHA256="${EXPECTED_PYXIS_SHA256:-ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d556b324a}"
-EXPECTED_VULKAN_ICD_SHA256="${EXPECTED_VULKAN_ICD_SHA256:-7bdb6f27d35b66fc848df6f94b8773bba30ea3a7f06f114100d14154a235a34b}"
-EXPECTED_NVIDIA_DRIVER_VERSION="${EXPECTED_NVIDIA_DRIVER_VERSION:-580.105.08}"
+EXPECTED_VULKAN_ICD_SHA256="7bdb6f27d35b66fc848df6f94b8773bba30ea3a7f06f114100d14154a235a34b"
+EXPECTED_NVIDIA_DRIVER_VERSION="580.105.08"
+EXPECTED_NVIDIA_GPU_NAME="NVIDIA L40S"
 EXPECTED_MANIFEST_SHA256="${EXPECTED_MANIFEST_SHA256:-7abd0c2294d442d429a77655783232206b2b30d95c508d435503135a5523a11c}"
 CHECKPOINT_MANIFEST="${CHECKPOINT_MANIFEST:-${SCRIPT_DIR}/pi05_droid_jointpos_polaris_gcs_manifest.tsv}"
 EXPECTED_ACTION_HORIZON="${EXPECTED_ACTION_HORIZON:-15}"
@@ -47,6 +48,28 @@ EXPECTED_ROBOT_METADATA_SHA256=208e0f85fc16fa32ffeca972aea0fd1b33b0c6c2a582e89ff
 die() {
   echo "ERROR: $*" >&2
   exit 2
+}
+
+capture_gpu_runtime() {
+  local -a rows
+  mapfile -t rows < <(
+    nvidia-smi --query-gpu=uuid,name,driver_version \
+      --format=csv,noheader,nounits | sed '/^[[:space:]]*$/d'
+  )
+  (( ${#rows[@]} == 1 )) || die "Expected exactly one allocated NVIDIA GPU"
+  IFS=, read -r actual_gpu_uuid actual_gpu_name \
+    actual_nvidia_driver_version <<<"${rows[0]}"
+  actual_gpu_uuid="$(xargs <<<"${actual_gpu_uuid}")"
+  actual_gpu_name="$(xargs <<<"${actual_gpu_name}")"
+  actual_nvidia_driver_version="$(xargs <<<"${actual_nvidia_driver_version}")"
+  [[ "${actual_gpu_uuid}" =~ ^GPU-[0-9a-fA-F-]+$ ]] \
+    || die "Invalid allocated NVIDIA GPU UUID: ${actual_gpu_uuid}"
+  [[ "${actual_gpu_name}" == "${EXPECTED_NVIDIA_GPU_NAME}" ]] \
+    || die "NVIDIA GPU name mismatch: ${actual_gpu_name}"
+  [[ "${actual_nvidia_driver_version}" == "${EXPECTED_NVIDIA_DRIVER_VERSION}" ]] \
+    || die "NVIDIA driver version mismatch: ${actual_nvidia_driver_version}"
+  [[ "${NVIDIA_VISIBLE_DEVICES:-}" == "${actual_gpu_uuid}" ]] \
+    || die "NVIDIA_VISIBLE_DEVICES does not identify the allocated GPU"
 }
 
 [[ -n "${SLURM_JOB_ID:-}" || "${DRY_RUN}" == 1 ]] \
@@ -83,19 +106,16 @@ fi
 [[ -d "${POLARIS_DATA_DIR}" && ! -L "${POLARIS_DATA_DIR}" ]] \
   || die "Missing regular PolaRiS data: ${POLARIS_DATA_DIR}"
 [[ -f "${POLARIS_PYXIS_IMAGE}" ]] || die "Missing Pyxis image: ${POLARIS_PYXIS_IMAGE}"
-[[ -f "${POLARIS_VULKAN_ICD_PATH}" ]] || die "Missing Vulkan ICD: ${POLARIS_VULKAN_ICD_PATH}"
+[[ -f "${POLARIS_VULKAN_ICD_PATH}" && ! -L "${POLARIS_VULKAN_ICD_PATH}" ]] \
+  || die "Vulkan ICD must be a regular non-symlink file: ${POLARIS_VULKAN_ICD_PATH}"
 actual_vulkan_icd_sha256="$(sha256sum "${POLARIS_VULKAN_ICD_PATH}" | awk '{print $1}')"
 [[ "${actual_vulkan_icd_sha256}" == "${EXPECTED_VULKAN_ICD_SHA256}" ]] \
   || die "Vulkan ICD SHA-256 mismatch: ${actual_vulkan_icd_sha256}"
-mapfile -t allocated_driver_versions < <(
-  nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits \
-    | sed '/^[[:space:]]*$/d'
-)
-(( ${#allocated_driver_versions[@]} == 1 )) \
-  || die "Expected exactly one allocated NVIDIA driver version"
-actual_nvidia_driver_version="$(xargs <<<"${allocated_driver_versions[0]}")"
-[[ "${actual_nvidia_driver_version}" == "${EXPECTED_NVIDIA_DRIVER_VERSION}" ]] \
-  || die "NVIDIA driver version mismatch: ${actual_nvidia_driver_version}"
+capture_gpu_runtime
+preflight_vulkan_icd_sha256="${actual_vulkan_icd_sha256}"
+preflight_gpu_uuid="${actual_gpu_uuid}"
+preflight_gpu_name="${actual_gpu_name}"
+preflight_nvidia_driver_version="${actual_nvidia_driver_version}"
 [[ -f "${CHECKPOINT_MANIFEST}" ]] || die "Missing checkpoint manifest: ${CHECKPOINT_MANIFEST}"
 
 case "${POLARIS_ENVIRONMENT}" in
@@ -472,6 +492,8 @@ PYXIS_IMAGE_SHA256="$(sha256sum "${POLARIS_PYXIS_IMAGE}" | awk '{print $1}')"
   printf 'POLARIS_PYXIS_IMAGE_SHA256=%q\n' "${PYXIS_IMAGE_SHA256}"
   printf 'POLARIS_VULKAN_ICD_PATH=%q\n' "${POLARIS_VULKAN_ICD_PATH}"
   printf 'POLARIS_VULKAN_ICD_SHA256=%q\n' "${actual_vulkan_icd_sha256}"
+  printf 'NVIDIA_GPU_UUID=%q\n' "${actual_gpu_uuid}"
+  printf 'NVIDIA_GPU_NAME=%q\n' "${actual_gpu_name}"
   printf 'NVIDIA_DRIVER_VERSION=%q\n' "${actual_nvidia_driver_version}"
   printf 'POLARIS_ENVIRONMENT=%q\n' "${POLARIS_ENVIRONMENT}"
   printf 'EXPECTED_PROMPT=%q\n' "${EXPECTED_PROMPT}"
@@ -567,7 +589,11 @@ eval_command=(
   "--container-workdir=${POLARIS_DIR}"
   --no-container-entrypoint --no-container-mount-home --container-remap-root --container-writable
   "--container-env=NVIDIA_VISIBLE_DEVICES,NVIDIA_DRIVER_CAPABILITIES" --export=ALL
-  /usr/bin/env
+  /usr/bin/env -i
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  LANG=C.UTF-8 LC_ALL=C.UTF-8
+  "NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES}"
+  "NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES}"
   VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json
   ACCEPT_EULA=Y OMNI_KIT_ACCEPT_EULA=YES PRIVACY_CONSENT=Y OMNI_KIT_ALLOW_ROOT=1
   PYTHONUNBUFFERED=1
@@ -1035,6 +1061,23 @@ done
   || die "OpenPI commit changed during evaluation"
 [[ -z "$(git -C "${OPENPI_DIR}" status --porcelain=v1 --untracked-files=all)" ]] \
   || die "OpenPI source changed during evaluation"
+[[ -f "${POLARIS_VULKAN_ICD_PATH}" && ! -L "${POLARIS_VULKAN_ICD_PATH}" ]] \
+  || die "Vulkan ICD changed type during evaluation"
+actual_vulkan_icd_sha256="$(sha256sum "${POLARIS_VULKAN_ICD_PATH}" | awk '{print $1}')"
+capture_gpu_runtime
+[[ "${actual_vulkan_icd_sha256}" == "${preflight_vulkan_icd_sha256}" \
+   && "${actual_vulkan_icd_sha256}" == "${EXPECTED_VULKAN_ICD_SHA256}" \
+   && "${actual_gpu_uuid}" == "${preflight_gpu_uuid}" \
+   && "${actual_gpu_name}" == "${preflight_gpu_name}" \
+   && "${actual_nvidia_driver_version}" == "${preflight_nvidia_driver_version}" ]] \
+  || die "GPU/Vulkan runtime changed during evaluation"
+{
+  printf 'POSTRUN_POLARIS_VULKAN_ICD_SHA256=%q\n' "${actual_vulkan_icd_sha256}"
+  printf 'POSTRUN_NVIDIA_GPU_UUID=%q\n' "${actual_gpu_uuid}"
+  printf 'POSTRUN_NVIDIA_GPU_NAME=%q\n' "${actual_gpu_name}"
+  printf 'POSTRUN_NVIDIA_DRIVER_VERSION=%q\n' \
+    "${actual_nvidia_driver_version}"
+} >> "${METADATA_FILE}"
 git -C "${POLARIS_DIR}" status --short --branch > "${RUN_DIR}/polaris_git_status.txt"
 git -C "${POLARIS_DIR}" submodule status --recursive \
   > "${RUN_DIR}/polaris_submodules.txt"

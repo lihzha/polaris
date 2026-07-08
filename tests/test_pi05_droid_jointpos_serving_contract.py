@@ -14,6 +14,7 @@ import polaris.pi05_droid_jointpos_serving_contract as contract
 
 
 ROOT = Path(__file__).resolve().parents[1]
+GPU_UUID = "GPU-01234567-89ab-cdef-0123-456789abcdef"
 RNG_VERIFIER_PATH = ROOT / "scripts/polaris/verify_pi05_droid_jointpos_rng_stream.py"
 RNG_VERIFIER_SPEC = importlib.util.spec_from_file_location(
     "verify_pi05_droid_jointpos_rng_stream", RNG_VERIFIER_PATH
@@ -191,7 +192,7 @@ def _host_runtime(tmp_path):
         for name in contract.PI05_DROID_JOINTPOS_RECORD_VERIFICATION_EXEMPTIONS
     ]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": contract.PI05_DROID_JOINTPOS_HOST_RUNTIME_PROFILE,
         "python": {
             "declared_executable": str(
@@ -237,7 +238,7 @@ def _host_runtime(tmp_path):
         "process_environment": {
             "required": dict(contract.PI05_DROID_JOINTPOS_REQUIRED_RUNTIME_ENVIRONMENT),
             "optional": {
-                name: None
+                name: GPU_UUID if name == "NVIDIA_VISIBLE_DEVICES" else None
                 for name in contract.PI05_DROID_JOINTPOS_OPTIONAL_RUNTIME_ENVIRONMENT
             },
         },
@@ -254,10 +255,16 @@ def _host_runtime(tmp_path):
                 {
                     "id": 0,
                     "platform": "gpu",
-                    "device_kind": "NVIDIA L40S",
+                    "device_kind": contract.PI05_DROID_JOINTPOS_NVIDIA_GPU_NAME,
                     "process_index": 0,
                 }
             ],
+            "nvidia_smi": {
+                "query": list(contract.PI05_DROID_JOINTPOS_NVIDIA_SMI_QUERY),
+                "uuid": GPU_UUID,
+                "name": contract.PI05_DROID_JOINTPOS_NVIDIA_GPU_NAME,
+                "driver_version": (contract.PI05_DROID_JOINTPOS_NVIDIA_DRIVER_VERSION),
+            },
         },
     }
 
@@ -769,6 +776,14 @@ def test_worker_joins_trace_to_complete_official_rng_stream(tmp_path, monkeypatc
 def test_host_runtime_seals_lockfiles_packages_python_and_jax(tmp_path):
     runtime = _host_runtime(tmp_path)
     assert contract.validate_openpi_host_runtime(runtime) == runtime
+    assert runtime["schema_version"] == 2
+    assert runtime["profile"].endswith("_v2")
+    assert runtime["jax"]["nvidia_smi"] == {
+        "query": list(contract.PI05_DROID_JOINTPOS_NVIDIA_SMI_QUERY),
+        "uuid": GPU_UUID,
+        "name": contract.PI05_DROID_JOINTPOS_NVIDIA_GPU_NAME,
+        "driver_version": contract.PI05_DROID_JOINTPOS_NVIDIA_DRIVER_VERSION,
+    }
     assert runtime["packages"]["required_versions"]["sentencepiece"] == "0.2.0"
     assert runtime["packages"]["required_versions"]["tensorstore"] == "0.1.74"
     assert len(runtime["packages"]["record_verification_exemptions"]) == 2
@@ -784,6 +799,14 @@ def test_host_runtime_seals_lockfiles_packages_python_and_jax(tmp_path):
             {"sha256": "0" * 64}
         ),
         lambda value: value["jax"].update({"default_backend": "cpu"}),
+        lambda value: value["jax"]["nvidia_smi"].update(
+            {"driver_version": "580.95.05"}
+        ),
+        lambda value: value["jax"]["nvidia_smi"].update({"name": "NVIDIA A40"}),
+        lambda value: value["jax"]["nvidia_smi"].update({"query": ["nvidia-smi"]}),
+        lambda value: value["process_environment"]["optional"].update(
+            {"NVIDIA_VISIBLE_DEVICES": "GPU-fedcba98-7654-3210-fedc-ba9876543210"}
+        ),
         lambda value: value["process_environment"]["required"].update(
             {"JAX_PLATFORMS": "cpu"}
         ),
@@ -802,6 +825,82 @@ def test_host_runtime_seals_lockfiles_packages_python_and_jax(tmp_path):
     headless["record_overlap_resolutions"][0]["active_record"]["size"] += 1
     with pytest.raises(ValueError, match="RECORD validation inventory mismatch"):
         contract.validate_openpi_host_runtime(tampered)
+
+
+def test_nvidia_smi_capture_uses_exact_query_and_binds_one_gpu(monkeypatch):
+    observed = {}
+
+    def fake_run(argv, **kwargs):
+        observed["argv"] = argv
+        observed["kwargs"] = kwargs
+        return SimpleNamespace(
+            stdout=(
+                f" {GPU_UUID}, {contract.PI05_DROID_JOINTPOS_NVIDIA_GPU_NAME}, "
+                f"{contract.PI05_DROID_JOINTPOS_NVIDIA_DRIVER_VERSION} \n"
+            )
+        )
+
+    monkeypatch.setattr(contract.subprocess, "run", fake_run)
+    identity = contract._capture_nvidia_smi_gpu_identity()
+    assert observed == {
+        "argv": list(contract.PI05_DROID_JOINTPOS_NVIDIA_SMI_QUERY),
+        "kwargs": {
+            "check": True,
+            "capture_output": True,
+            "text": True,
+            "timeout": 30,
+        },
+    }
+    assert identity == {
+        "query": list(contract.PI05_DROID_JOINTPOS_NVIDIA_SMI_QUERY),
+        "uuid": GPU_UUID,
+        "name": contract.PI05_DROID_JOINTPOS_NVIDIA_GPU_NAME,
+        "driver_version": contract.PI05_DROID_JOINTPOS_NVIDIA_DRIVER_VERSION,
+    }
+
+
+@pytest.mark.parametrize(
+    ("stdout", "message"),
+    [
+        ("", "exactly one NVIDIA GPU"),
+        (
+            f"{GPU_UUID}, NVIDIA L40S, 580.105.08\n"
+            "GPU-fedcba98-7654-3210-fedc-ba9876543210, NVIDIA L40S, 580.105.08\n",
+            "exactly one NVIDIA GPU",
+        ),
+        (f"{GPU_UUID}, NVIDIA L40S\n", "Cannot parse"),
+        ("GPU-not-a-uuid, NVIDIA L40S, 580.105.08\n", "identity mismatch"),
+        (f"{GPU_UUID}, NVIDIA A40, 580.105.08\n", "identity mismatch"),
+        (f"{GPU_UUID}, NVIDIA L40S, 580.95.05\n", "identity mismatch"),
+    ],
+)
+def test_nvidia_smi_capture_rejects_count_schema_and_identity_drift(
+    monkeypatch, stdout, message
+):
+    monkeypatch.setattr(
+        contract.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=stdout),
+    )
+    with pytest.raises(ValueError, match=message):
+        contract._capture_nvidia_smi_gpu_identity()
+
+
+def test_model_runtime_v2_rejects_legacy_host_or_model_schema(tmp_path):
+    metadata = _metadata()
+    runtime = _model_runtime(tmp_path, metadata)
+    assert runtime["schema_version"] == 2
+    assert runtime["profile"] == contract.PI05_DROID_JOINTPOS_MODEL_RUNTIME_PROFILE
+
+    legacy_model = copy.deepcopy(runtime)
+    legacy_model["schema_version"] = 1
+    with pytest.raises(ValueError, match="model-runtime identity mismatch"):
+        contract._validate_model_runtime_value(legacy_model, metadata)
+
+    legacy_host = copy.deepcopy(runtime)
+    legacy_host["host_runtime"]["schema_version"] = 1
+    with pytest.raises(ValueError, match="host-runtime identity mismatch"):
+        contract._validate_model_runtime_value(legacy_host, metadata)
 
 
 def test_server_loads_before_publication_and_uses_unwrapped_official_websocket():
@@ -911,11 +1010,9 @@ def test_worker_fail_closes_live_contract_hub_metadata_and_seed_range():
     assert "runtime_contract_sha256" in source
     assert "ENVIRONMENT_SEED + ROLLOUTS - 1" in source
     assert "7bdb6f27d35b66fc848df6f94b8773bba30ea3a7f06f114100d14154a235a34b" in source
-    assert (
-        'EXPECTED_NVIDIA_DRIVER_VERSION="${EXPECTED_NVIDIA_DRIVER_VERSION:-580.105.08}"'
-        in source
-    )
-    assert "--query-gpu=driver_version" in source
+    assert 'EXPECTED_NVIDIA_DRIVER_VERSION="580.105.08"' in source
+    assert 'EXPECTED_NVIDIA_GPU_NAME="NVIDIA L40S"' in source
+    assert "--query-gpu=uuid,name,driver_version" in source
     assert (
         'actual_nvidia_driver_version}" == "${EXPECTED_NVIDIA_DRIVER_VERSION' in source
     )
