@@ -21,6 +21,9 @@ POLARIS_COMMIT="$(git -C "${POLARIS_DIR}" rev-parse HEAD)"
 ALLOW_RESUBMIT="${ALLOW_RESUBMIT:-0}"
 ENVIRONMENT_SEED="${ENVIRONMENT_SEED:-0}"
 
+[[ -z "$(git -C "${POLARIS_DIR}" status --porcelain=v1 --untracked-files=all)" ]] \
+  || { echo "PolaRiS source has tracked or untracked modifications" >&2; exit 2; }
+
 if [[ "${MODE}" == canary ]]; then
   tasks=(DROID-FoodBussing)
   rollouts="${ROLLOUTS:-1}"
@@ -54,7 +57,7 @@ fi
 mkdir -p "${SBATCH_LOG_ROOT}" "$(dirname "${SUBMISSION_MANIFEST}")"
 exec 9>"${SUBMISSION_MANIFEST}.lock"
 flock -n 9 || { echo "Another submitter holds ${SUBMISSION_MANIFEST}.lock" >&2; exit 4; }
-expected_header=$'job_id\tmode\ttask\trollouts\tenvironment_seed\trun_namespace\tsubmitted_at'
+expected_header=$'job_id\tmode\ttask\trollouts\tenvironment_seed\trun_namespace\tsubmitted_at\tbatch_script_sha256\tsubmission_argv_sha256\tprovenance_dir'
 if [[ ! -e "${SUBMISSION_MANIFEST}" ]]; then
   printf '%s\n' "${expected_header}" > "${SUBMISSION_MANIFEST}"
 else
@@ -77,16 +80,36 @@ for task in "${tasks[@]}"; do
   short_task="${task#DROID-}"
   job_name="${job_prefix}_${short_task}"
   export_vars="PATH=${PATH},HOME=${HOME},POLARIS_DIR=${POLARIS_DIR},EXPECTED_POLARIS_COMMIT=${POLARIS_COMMIT},POLARIS_ENVIRONMENT=${task},ROLLOUTS=${rollouts},ENVIRONMENT_SEED=${ENVIRONMENT_SEED},RUN_NAMESPACE=${RUN_NAMESPACE}"
-  job_id="$(sbatch --parsable \
+  sbatch_argv=(sbatch --parsable \
     --job-name="${job_name}" \
     --time="${time_limit}" \
     --output="${SBATCH_LOG_ROOT}/%x-%j.out" \
     --export="${export_vars}" \
-    "${SBATCH_SCRIPT}")"
+    "${SBATCH_SCRIPT}")
+  printf -v submission_argv '%q ' "${sbatch_argv[@]}"
+  job_id="$("${sbatch_argv[@]}")"
   [[ "${job_id}" =~ ^[0-9]+$ ]] || { echo "Invalid job ID: ${job_id}" >&2; exit 3; }
+  provenance_dir="$(dirname "${SUBMISSION_MANIFEST}")/submission_provenance/job_${job_id}"
+  batch_script_path="${provenance_dir}/batch_script.sbatch"
+  submission_argv_path="${provenance_dir}/submission_argv.sh"
+  capture_submission_provenance() {
+    mkdir -p "$(dirname "${provenance_dir}")" || return
+    mkdir -m 0755 "${provenance_dir}" || return
+    scontrol write batch_script "${job_id}" "${batch_script_path}" || return
+    printf '%s\n' "${submission_argv}" > "${submission_argv_path}" || return
+    chmod 0444 "${batch_script_path}" "${submission_argv_path}" || return
+    batch_script_sha256="$(sha256sum "${batch_script_path}" | awk '{print $1}')" || return
+    submission_argv_sha256="$(sha256sum "${submission_argv_path}" | awk '{print $1}')" || return
+  }
+  if ! capture_submission_provenance; then
+    scancel "${job_id}" || true
+    echo "Canceled job ${job_id}: failed to preserve submission provenance" >&2
+    exit 5
+  fi
   job_ids+=("${job_id}")
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "${job_id}" "${MODE}" "${task}" "${rollouts}" "${ENVIRONMENT_SEED}" "${RUN_NAMESPACE}" "$(date -Iseconds)" \
+    "${batch_script_sha256}" "${submission_argv_sha256}" "${provenance_dir}" \
     | tee -a "${SUBMISSION_MANIFEST}"
 done
 

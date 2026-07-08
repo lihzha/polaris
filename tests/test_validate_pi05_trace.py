@@ -3,6 +3,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+import numpy as np
+
+from polaris.evaluation_seed import environment_seed_contract_sha256
 
 
 SCRIPT_PATH = Path(__file__).parents[1] / "scripts/polaris/validate_pi05_trace.py"
@@ -78,24 +83,244 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
     path.write_text("".join(json.dumps(record) + "\n" for record in records))
 
 
+def _attested_records(base_seed: int = 7) -> list[dict]:
+    seed_contract = {
+        "schema_version": 1,
+        "profile": "isaaclab_env_seed_base_plus_episode_v1",
+        "base_seed": base_seed,
+        "scheme": "base_plus_episode_index_v1",
+        "live_cfg_seed": base_seed,
+        "physx_enhanced_determinism": False,
+        "determinism_claim": "rng_bound_not_bitwise",
+        "binding": "env_cfg_seed_before_gym_make_and_reset_seed_per_episode",
+    }
+    seed_hash = environment_seed_contract_sha256(seed_contract)
+    identity = {
+        "schema_version": 4,
+        "profile": "openpi_pi05_droid_native_joint_position_v1",
+        "reset_index": 0,
+        "server_contract_sha256": "c" * 64,
+        "environment_seed_contract_sha256": seed_hash,
+        "runtime_contract_sha256": "d" * 64,
+        "physx_enhanced_determinism": False,
+    }
+    rng = {
+        "schema_version": 2,
+        "profile": seed_contract["profile"],
+        "base_seed": base_seed,
+        "scheme": seed_contract["scheme"],
+        "episode_index": 0,
+        "episode_seed": base_seed,
+        "live_cfg_seed": base_seed,
+        "physx_enhanced_determinism": False,
+        "determinism_claim": "rng_bound_not_bitwise",
+        "environment_seed_contract_sha256": seed_hash,
+    }
+    response = [[0.1] * 7 + [0.0] for _ in range(15)]
+    processed = np.asarray([0.1] * 7, dtype=np.float32).tolist()
+    records = []
+    sim_base = 100
+    sensor_base = 5
+    for outer_step in range(450):
+        query_index = outer_step // 8
+        chunk_index = outer_step % 8
+        global_query_index = query_index
+        if chunk_index == 0:
+            records.append(
+                {
+                    **identity,
+                    "record_type": "openpi_joint_position_query",
+                    "query_index": query_index,
+                    "global_query_index": global_query_index,
+                    "environment_rng": rng,
+                    "sensor_frame_counters": {
+                        "external_cam": sensor_base + outer_step,
+                        "wrist_cam": sensor_base + outer_step,
+                    },
+                    "prompt": "put all foods in the bowl",
+                    "state": {
+                        "joint_position": [0.0] * 7,
+                        "gripper_position": [0.0],
+                    },
+                    "images": {
+                        "native_external": {
+                            "shape": [720, 1280, 3],
+                            "dtype": "uint8",
+                            "sha256": "a" * 64,
+                        },
+                        "native_wrist": {
+                            "shape": [720, 1280, 3],
+                            "dtype": "uint8",
+                            "sha256": "b" * 64,
+                        },
+                        "request_external": {
+                            "shape": [720, 1280, 3],
+                            "dtype": "uint8",
+                            "sha256": "a" * 64,
+                        },
+                        "request_wrist": {
+                            "shape": [720, 1280, 3],
+                            "dtype": "uint8",
+                            "sha256": "b" * 64,
+                        },
+                        "visualization_external": {
+                            "shape": [224, 224, 3],
+                            "dtype": "uint8",
+                            "sha256": "e" * 64,
+                        },
+                        "visualization_wrist": {
+                            "shape": [224, 224, 3],
+                            "dtype": "uint8",
+                            "sha256": "f" * 64,
+                        },
+                        "model_order": [
+                            "base_0_rgb",
+                            "left_wrist_0_rgb",
+                            "right_wrist_0_rgb_masked",
+                        ],
+                        "client_model_spatial_transform": None,
+                        "server_model_resize": (
+                            MODULE.PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE
+                        ),
+                        "masked_third_slot": (
+                            "server_DroidInputs_zeros_like_base_mask_false"
+                        ),
+                        "visualization_spatial_transform": (
+                            "openpi_client.image_tools.resize_with_pad_"
+                            "PIL_bilinear_non_model"
+                        ),
+                        "wrist_rotation_degrees": 0,
+                    },
+                    "response_action_shape": [15, 8],
+                    "response_action_dtype": "float64",
+                    "response_action_chunk": response,
+                    "execution_horizon": 8,
+                    "planned_action_chunk": response[:8],
+                }
+            )
+        action_identity = {
+            **identity,
+            "query_index": query_index,
+            "global_query_index": global_query_index,
+            "chunk_action_index": chunk_index,
+        }
+        emitted = response[chunk_index]
+        records.append(
+            {
+                **action_identity,
+                "record_type": "openpi_joint_position_action",
+                "raw_action": emitted,
+                "emitted_action": emitted,
+            }
+        )
+        before = {
+            "boundary_profile": "outer450_internal451_no_autoreset",
+            "live_max_episode_length": 451,
+            "episode_length": outer_step,
+            "sim_step_counter": sim_base + outer_step * 8,
+            "common_step_counter": outer_step,
+            "sensor_frame_counters": {
+                "external_cam": sensor_base + outer_step,
+                "wrist_cam": sensor_base + outer_step,
+            },
+        }
+        after = {
+            **before,
+            "episode_length": outer_step + 1,
+            "sim_step_counter": sim_base + (outer_step + 1) * 8,
+            "common_step_counter": outer_step + 1,
+            "sensor_frame_counters": {
+                "external_cam": sensor_base + outer_step + 1,
+                "wrist_cam": sensor_base + outer_step + 1,
+            },
+        }
+        records.append(
+            {
+                **action_identity,
+                "record_type": "openpi_joint_position_execution",
+                "outer_step_index": outer_step,
+                "emitted_action": emitted,
+                "action_execution": {
+                    "schema_version": 1,
+                    "processing": (
+                        "upstream_joint_position_action_scale1_offset0_no_clip"
+                    ),
+                    "raw_action_buffer": processed,
+                    "processed_action_buffer": processed,
+                    "apply_target_holds": [processed] * 8,
+                    "apply_target_hold_count": 8,
+                    "post_step_articulation_target": processed,
+                },
+                "processed_finger_position_target": [0.0],
+                "articulation_finger_position_target": [0.0],
+                "measured_joint_position_after": [0.0] * 7,
+                "measured_closed_positive_gripper_after": [0.0],
+                "environment_before": before,
+                "environment_after": after,
+                "terminated": False,
+                "truncated": False,
+                "terminal_rubric": (
+                    {"success": True, "progress": 0.5, "metrics": {}}
+                    if outer_step == 449
+                    else None
+                ),
+                "terminal_visualization": (
+                    {
+                        "shape": [224, 448, 3],
+                        "dtype": "uint8",
+                        "sha256": "7" * 64,
+                        "source": (
+                            "post_action450_returned_expensive_splat_observation"
+                        ),
+                    }
+                    if outer_step == 449
+                    else None
+                ),
+            }
+        )
+    return records
+
+
 class TraceAuditTest(unittest.TestCase):
     def test_valid_seeded_trace_binds_expected_episode_rng(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             trace_path = Path(temporary_directory) / "trace.jsonl"
             metrics_path = Path(temporary_directory) / "eval_results.csv"
-            _write_jsonl(trace_path, _records(seeded=True, base_seed=7))
-            metrics_path.write_text("episode,episode_length\n0,8\n")
-            summary = MODULE.audit_trace(
-                trace_path,
-                metrics_csv=metrics_path,
-                expected_environment_seed=7,
+            _write_jsonl(trace_path, _attested_records(base_seed=7))
+            metrics_path.write_text(
+                "episode,episode_length,success,progress,numerical_failure,"
+                "numerical_failure_reason\n0,450,True,0.5,False,\n"
             )
+            with mock.patch(
+                "polaris.pi05_droid_jointpos_runtime."
+                "validate_jointpos_runtime_artifact",
+                return_value={"runtime_sha256": "d" * 64},
+            ):
+                summary = MODULE.audit_trace(
+                    trace_path,
+                    metrics_csv=metrics_path,
+                    expected_environment_seed=7,
+                    expected_server_contract_sha256="c" * 64,
+                    runtime_contract_path=Path(temporary_directory) / "runtime.json",
+                )
 
         self.assertEqual(summary["environment_base_seed"], 7)
         self.assertEqual(
             summary["environment_seed_scheme"], "base_plus_episode_index_v1"
         )
         self.assertEqual(summary["environment_episode_seeds"], [7])
+        self.assertEqual(summary["episode_query_counts"], [57])
+        self.assertEqual(summary["cumulative_query_counts"], [57])
+        self.assertEqual(summary["request_image_shape"], [720, 1280, 3])
+        self.assertEqual(summary["request_image_dtype"], "uint8")
+        self.assertIsNone(summary["client_model_spatial_transform"])
+        self.assertEqual(
+            summary["server_model_resize"],
+            MODULE.PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE,
+        )
+        self.assertFalse(summary["visualization_is_model_input"])
+        self.assertEqual(summary["terminal_visualization_shape"], [224, 448, 3])
+        self.assertEqual(summary["terminal_visualization_sha256"], ["7" * 64])
         self.assertFalse(summary["environment_physx_enhanced_determinism"])
         self.assertEqual(
             summary["environment_determinism_claim"], "rng_bound_not_bitwise"
@@ -157,28 +382,99 @@ class TraceAuditTest(unittest.TestCase):
                 MODULE.audit_trace(trace_path, metrics_csv=metrics_path)
 
     def test_seeded_trace_rejects_missing_or_wrong_rng_provenance(self):
-        records = _records(seeded=True, base_seed=7)
+        records = _attested_records(base_seed=7)
         del records[0]["environment_rng"]
         with tempfile.TemporaryDirectory() as temporary_directory:
             trace_path = Path(temporary_directory) / "trace.jsonl"
             _write_jsonl(trace_path, records)
-            with self.assertRaisesRegex(ValueError, "environment_rng fields"):
-                MODULE.audit_trace(trace_path, expected_environment_seed=7)
+            with self.assertRaisesRegex(ValueError, "query schema"):
+                MODULE.audit_trace(
+                    trace_path,
+                    expected_environment_seed=7,
+                    expected_server_contract_sha256="c" * 64,
+                    runtime_contract_path=Path(temporary_directory) / "runtime.json",
+                )
 
-        records = _records(seeded=True, base_seed=7)
+        records = _attested_records(base_seed=7)
         records[0]["environment_rng"]["episode_seed"] = 8
         with tempfile.TemporaryDirectory() as temporary_directory:
             trace_path = Path(temporary_directory) / "trace.jsonl"
             _write_jsonl(trace_path, records)
             with self.assertRaisesRegex(ValueError, "derived episode seed"):
-                MODULE.audit_trace(trace_path, expected_environment_seed=7)
+                MODULE.audit_trace(
+                    trace_path,
+                    expected_environment_seed=7,
+                    expected_server_contract_sha256="c" * 64,
+                    runtime_contract_path=Path(temporary_directory) / "runtime.json",
+                )
 
-        records = _records(seeded=True, base_seed=7)
+        records = _attested_records(base_seed=7)
         with tempfile.TemporaryDirectory() as temporary_directory:
             trace_path = Path(temporary_directory) / "trace.jsonl"
             _write_jsonl(trace_path, records)
             with self.assertRaisesRegex(ValueError, "expected environment base seed"):
-                MODULE.audit_trace(trace_path, expected_environment_seed=8)
+                MODULE.audit_trace(
+                    trace_path,
+                    expected_environment_seed=8,
+                    expected_server_contract_sha256="c" * 64,
+                    runtime_contract_path=Path(temporary_directory) / "runtime.json",
+                )
+
+    def test_attested_numeric_vectors_reject_boolean_values(self):
+        records = _attested_records()
+        records[0]["state"]["joint_position"][0] = True
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trace_path = Path(temporary_directory) / "trace.jsonl"
+            _write_jsonl(trace_path, records)
+            with self.assertRaisesRegex(ValueError, "non-finite or non-numeric"):
+                MODULE.audit_trace(
+                    trace_path,
+                    expected_environment_seed=7,
+                    expected_server_contract_sha256="c" * 64,
+                    runtime_contract_path=Path(temporary_directory) / "runtime.json",
+                )
+
+    def test_attested_trace_rejects_client_resized_model_request(self):
+        records = _attested_records()
+        records[0]["images"]["request_external"]["shape"] = [224, 224, 3]
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trace_path = Path(temporary_directory) / "trace.jsonl"
+            _write_jsonl(trace_path, records)
+            with self.assertRaisesRegex(ValueError, "image shape/dtype mismatch"):
+                MODULE.audit_trace(
+                    trace_path,
+                    expected_environment_seed=7,
+                    expected_server_contract_sha256="c" * 64,
+                    runtime_contract_path=Path(temporary_directory) / "runtime.json",
+                )
+
+    def test_attested_trace_requires_byte_identical_native_model_request(self):
+        records = _attested_records()
+        records[0]["images"]["request_wrist"]["sha256"] = "9" * 64
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trace_path = Path(temporary_directory) / "trace.jsonl"
+            _write_jsonl(trace_path, records)
+            with self.assertRaisesRegex(ValueError, "byte-identical native imagery"):
+                MODULE.audit_trace(
+                    trace_path,
+                    expected_environment_seed=7,
+                    expected_server_contract_sha256="c" * 64,
+                    runtime_contract_path=Path(temporary_directory) / "runtime.json",
+                )
+
+    def test_attested_trace_requires_post_action450_terminal_visualization(self):
+        records = _attested_records()
+        records[-1]["terminal_visualization"] = None
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trace_path = Path(temporary_directory) / "trace.jsonl"
+            _write_jsonl(trace_path, records)
+            with self.assertRaisesRegex(ValueError, "terminal visualization schema"):
+                MODULE.audit_trace(
+                    trace_path,
+                    expected_environment_seed=7,
+                    expected_server_contract_sha256="c" * 64,
+                    runtime_contract_path=Path(temporary_directory) / "runtime.json",
+                )
 
 
 if __name__ == "__main__":

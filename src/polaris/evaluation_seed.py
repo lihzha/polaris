@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 
@@ -15,9 +16,7 @@ MAX_ENVIRONMENT_SEED = 2**32 - 1
 
 def _uint32(value: Any, name: str) -> int:
     if type(value) is not int or not 0 <= value <= MAX_ENVIRONMENT_SEED:
-        raise ValueError(
-            f"{name} must be an integer in [0, {MAX_ENVIRONMENT_SEED}]"
-        )
+        raise ValueError(f"{name} must be an integer in [0, {MAX_ENVIRONMENT_SEED}]")
     return value
 
 
@@ -30,6 +29,15 @@ def episode_environment_seed(base_seed: int, episode_index: int) -> int:
     if episode_seed > MAX_ENVIRONMENT_SEED:
         raise ValueError("derived episode seed exceeds the uint32 range")
     return episode_seed
+
+
+def validate_episode_seed_range(base_seed: int, episode_count: int) -> int:
+    """Prevalidate every episode-derived seed before simulator construction."""
+
+    base_seed = _uint32(base_seed, "environment base seed")
+    if type(episode_count) is not int or episode_count <= 0:
+        raise ValueError("episode count must be a positive integer")
+    return episode_environment_seed(base_seed, episode_count - 1)
 
 
 def bind_environment_seed(env_cfg: Any, base_seed: int) -> None:
@@ -77,9 +85,7 @@ def _canonical_live_contract(contract: dict[str, Any]) -> dict[str, Any]:
     return dict(contract)
 
 
-def make_live_environment_seed_contract(
-    env: Any, base_seed: int
-) -> dict[str, Any]:
+def make_live_environment_seed_contract(env: Any, base_seed: int) -> dict[str, Any]:
     """Read back the constructed environment and bind its live seed settings."""
 
     base_seed = _uint32(base_seed, "environment base seed")
@@ -113,6 +119,20 @@ def validate_live_environment_seed_contract(
     return _canonical_live_contract(contract)
 
 
+def environment_seed_contract_sha256(contract: dict[str, Any]) -> str:
+    """Hash one canonical live seed contract for trace cross-binding."""
+
+    canonical = validate_live_environment_seed_contract(contract)
+    return hashlib.sha256(
+        json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("ascii")
+    ).hexdigest()
+
+
 def make_episode_environment_rng(
     live_contract: dict[str, Any], episode_index: int
 ) -> dict[str, Any]:
@@ -121,17 +141,16 @@ def make_episode_environment_rng(
     live = validate_live_environment_seed_contract(live_contract)
     episode_index = _uint32(episode_index, "episode index")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": live["profile"],
         "base_seed": live["base_seed"],
         "scheme": live["scheme"],
         "episode_index": episode_index,
-        "episode_seed": episode_environment_seed(
-            live["base_seed"], episode_index
-        ),
+        "episode_seed": episode_environment_seed(live["base_seed"], episode_index),
         "live_cfg_seed": live["live_cfg_seed"],
         "physx_enhanced_determinism": live["physx_enhanced_determinism"],
         "determinism_claim": live["determinism_claim"],
+        "environment_seed_contract_sha256": environment_seed_contract_sha256(live),
     }
 
 
