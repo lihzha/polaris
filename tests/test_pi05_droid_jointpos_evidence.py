@@ -1,0 +1,296 @@
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+
+import polaris.pi05_droid_jointpos_evidence as evidence
+
+
+SERVER_SHA = "1" * 64
+RUNTIME_SHA = "2" * 64
+COMMIT = "3" * 40
+
+
+def _write_inputs(root: Path, *, rollouts: int = 2):
+    run_dir = root / "run"
+    task_dir = run_dir / "DROID-FoodBussing"
+    task_dir.mkdir(parents=True)
+    paths = {
+        **{
+            name: run_dir / relative
+            for name, relative in evidence._RUN_ARTIFACTS.items()
+        },
+        **{
+            name: task_dir / relative
+            for name, relative in evidence._TASK_ARTIFACTS.items()
+        },
+    }
+    videos = [task_dir / f"episode_{index}.mp4" for index in range(rollouts)]
+    terminal_images = [
+        task_dir / f"episode_{index}_terminal.png" for index in range(rollouts)
+    ]
+    for name, path in paths.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"synthetic {name}\n".encode())
+    trace = paths["policy_trace"]
+    trace.write_bytes(b'{"record":"synthetic"}\n')
+    trace_sha = hashlib.sha256(trace.read_bytes()).hexdigest()
+    paths["trace_summary"].write_text(
+        json.dumps(
+            {
+                "schema_version": 4,
+                "status": "pass",
+                "trace_sha256": trace_sha,
+                "reset_count": rollouts,
+                "episode_lengths": [450] * rollouts,
+                "episode_query_counts": [57] * rollouts,
+                "cumulative_query_counts": [
+                    57 * (index + 1) for index in range(rollouts)
+                ],
+                "query_records": 57 * rollouts,
+                "global_query_indices_contiguous": True,
+                "native_image_shape": [720, 1280, 3],
+                "request_image_shape": [720, 1280, 3],
+                "request_image_dtype": "uint8",
+                "client_model_spatial_transform": None,
+                "server_model_resize": (
+                    evidence.PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE
+                ),
+                "model_image_shape": [224, 224, 3],
+                "visualization_image_shape": [224, 224, 3],
+                "visualization_is_model_input": False,
+                "terminal_visualization_shape": [224, 448, 3],
+                "terminal_visualization_dtype": "uint8",
+                "terminal_visualization_source": (
+                    "post_action450_returned_expensive_splat_observation"
+                ),
+                "terminal_visualization_sha256": ["7" * 64] * rollouts,
+                "server_contract_sha256": SERVER_SHA,
+                "runtime_contract_sha256": RUNTIME_SHA,
+            }
+        )
+        + "\n"
+    )
+    for index, path in enumerate(videos):
+        path.write_bytes(f"video {index}\n".encode())
+    for index, path in enumerate(terminal_images):
+        path.write_bytes(f"terminal image {index}\n".encode())
+    return run_dir, task_dir, paths, videos, terminal_images
+
+
+def _stub_contracts(
+    _paths,
+    _expected_rollouts,
+    _video_identities,
+    _terminal_image_identities,
+    _terminal_pixel_sha256,
+):
+    return {
+        "server_contract_sha256": SERVER_SHA,
+        "runtime_contract_sha256": RUNTIME_SHA,
+    }
+
+
+def _stub_sealed_trace_audit(paths, **_kwargs):
+    for name in ("policy_trace", "metrics_csv"):
+        assert paths[name].stat().st_mode & 0o777 == 0o444
+    return json.loads(paths["trace_summary"].read_text())
+
+
+def _patch_closed_contracts(monkeypatch):
+    monkeypatch.setattr(evidence, "_validate_specialized_contracts", _stub_contracts)
+    monkeypatch.setattr(
+        evidence, "_independently_audit_sealed_trace", _stub_sealed_trace_audit
+    )
+
+
+def test_finalize_seals_every_output_and_revalidates_manifest(tmp_path, monkeypatch):
+    run_dir, task_dir, paths, videos, terminal_images = _write_inputs(tmp_path)
+    _patch_closed_contracts(monkeypatch)
+
+    result = evidence.finalize_evidence(
+        run_dir=run_dir,
+        task_dir=task_dir,
+        environment="DROID-FoodBussing",
+        expected_environment_seed=0,
+        expected_rollouts=2,
+        polaris_commit=COMMIT,
+    )
+
+    manifest_path = run_dir / evidence.PI05_DROID_JOINTPOS_EVIDENCE_MANIFEST
+    assert result["manifest"]["path"] == str(manifest_path.resolve())
+    assert result["value"]["contracts"] == {
+        **_stub_contracts(
+            paths,
+            2,
+            result["value"]["videos"],
+            result["value"]["terminal_images"],
+            ["7" * 64] * 2,
+        ),
+        "sealed_trace_csv_reaudit_sha256": hashlib.sha256(
+            evidence._canonical_json_bytes(
+                json.loads(paths["trace_summary"].read_text())
+            )
+        ).hexdigest(),
+    }
+    assert set(result["value"]["artifacts"]) == set(paths)
+    assert len(result["value"]["videos"]) == 2
+    assert len(result["value"]["terminal_images"]) == 2
+    for path in [*paths.values(), *videos, *terminal_images, manifest_path]:
+        stat = path.stat()
+        assert stat.st_mode & 0o777 == 0o444
+        assert stat.st_nlink == 1
+
+    again = evidence.validate_evidence_manifest(
+        manifest_path,
+        run_dir=run_dir,
+        task_dir=task_dir,
+        environment="DROID-FoodBussing",
+        expected_environment_seed=0,
+        expected_rollouts=2,
+        polaris_commit=COMMIT,
+    )
+    assert again == result
+
+
+def test_manifest_revalidation_rejects_post_close_mutation(tmp_path, monkeypatch):
+    run_dir, task_dir, paths, _videos, _terminal_images = _write_inputs(
+        tmp_path, rollouts=1
+    )
+    _patch_closed_contracts(monkeypatch)
+    evidence.finalize_evidence(
+        run_dir=run_dir,
+        task_dir=task_dir,
+        environment="DROID-FoodBussing",
+        expected_environment_seed=0,
+        expected_rollouts=1,
+        polaris_commit=COMMIT,
+    )
+    paths["metrics_csv"].chmod(0o644)
+
+    with pytest.raises(ValueError, match="Immutable file identity mismatch"):
+        evidence.validate_evidence_manifest(
+            run_dir / evidence.PI05_DROID_JOINTPOS_EVIDENCE_MANIFEST,
+            run_dir=run_dir,
+            task_dir=task_dir,
+            environment="DROID-FoodBussing",
+            expected_environment_seed=0,
+            expected_rollouts=1,
+            polaris_commit=COMMIT,
+        )
+
+
+def test_finalize_rejects_extra_or_missing_video_before_publication(tmp_path):
+    run_dir, task_dir, _paths, _videos, _terminal_images = _write_inputs(
+        tmp_path, rollouts=1
+    )
+    (task_dir / "episode_7.mp4").write_bytes(b"substitution\n")
+
+    with pytest.raises(ValueError, match="video filename/count mismatch"):
+        evidence.finalize_evidence(
+            run_dir=run_dir,
+            task_dir=task_dir,
+            environment="DROID-FoodBussing",
+            expected_environment_seed=0,
+            expected_rollouts=1,
+            polaris_commit=COMMIT,
+        )
+    assert not (run_dir / evidence.PI05_DROID_JOINTPOS_EVIDENCE_MANIFEST).exists()
+
+
+def test_finalize_rejects_missing_terminal_image_before_publication(tmp_path):
+    run_dir, task_dir, _paths, _videos, terminal_images = _write_inputs(
+        tmp_path, rollouts=1
+    )
+    terminal_images[0].unlink()
+
+    with pytest.raises(ValueError, match="terminal-image filename/count mismatch"):
+        evidence.finalize_evidence(
+            run_dir=run_dir,
+            task_dir=task_dir,
+            environment="DROID-FoodBussing",
+            expected_environment_seed=0,
+            expected_rollouts=1,
+            polaris_commit=COMMIT,
+        )
+    assert not (run_dir / evidence.PI05_DROID_JOINTPOS_EVIDENCE_MANIFEST).exists()
+
+
+def test_jointpos_launchers_reject_untracked_source():
+    root = Path(__file__).parents[1]
+    for relative in (
+        "scripts/polaris/eval_pi05_droid_jointpos_polaris.sh",
+        "scripts/polaris/l40s_pi05_eval_job.sbatch",
+        "scripts/polaris/l40s_pi05_jointpos_seed_repeat.sbatch",
+        "scripts/polaris/submit_pi05_droid_jointpos_polaris.sh",
+        "scripts/polaris/submit_pi05_jointpos_seed_repeat.sh",
+    ):
+        source = (root / relative).read_text()
+        assert "status --porcelain=v1 --untracked-files=all" in source
+        assert "diff-index --quiet HEAD" not in source
+
+
+def test_worker_finalizes_server_rng_then_evidence_before_success_marker():
+    root = Path(__file__).parents[1]
+    source = (root / "scripts/polaris/eval_pi05_droid_jointpos_polaris.sh").read_text()
+    final_attestation = source.index("final_server_attestation_line=")
+    signal = source.index('kill -USR1 "${rng_server_pid}"', final_attestation)
+    rng_proof = source.index("verify_pi05_droid_jointpos_rng_stream.py", signal)
+    video_decode = source.index('"${video_validation_command[@]}"', rng_proof)
+    finalize = source.index("-m polaris.pi05_droid_jointpos_evidence", video_decode)
+    finalized = source.index("EVIDENCE_FINALIZED=1", finalize)
+    success = source.index('publish_terminal_marker "${TASK_DIR}/SUCCESS"', finalized)
+    assert (
+        final_attestation
+        < signal
+        < rng_proof
+        < video_decode
+        < finalize
+        < finalized
+        < success
+    )
+
+
+def test_finalizer_rejects_persisted_summary_that_differs_from_sealed_reaudit(
+    tmp_path, monkeypatch
+):
+    run_dir, task_dir, _paths, _videos, _terminal_images = _write_inputs(
+        tmp_path, rollouts=1
+    )
+    monkeypatch.setattr(evidence, "_validate_specialized_contracts", _stub_contracts)
+
+    def mismatched_audit(paths, **_kwargs):
+        value = json.loads(paths["trace_summary"].read_text())
+        value["query_records"] -= 1
+        return value
+
+    monkeypatch.setattr(evidence, "_independently_audit_sealed_trace", mismatched_audit)
+    with pytest.raises(ValueError, match="sealed trace/CSV re-audit differs"):
+        evidence.finalize_evidence(
+            run_dir=run_dir,
+            task_dir=task_dir,
+            environment="DROID-FoodBussing",
+            expected_environment_seed=0,
+            expected_rollouts=1,
+            polaris_commit=COMMIT,
+        )
+    assert not (run_dir / evidence.PI05_DROID_JOINTPOS_EVIDENCE_MANIFEST).exists()
+
+
+def test_worker_dry_run_cannot_publish_normal_success_and_markers_are_atomic():
+    source = (
+        Path(__file__).parents[1]
+        / "scripts/polaris/eval_pi05_droid_jointpos_polaris.sh"
+    ).read_text()
+    dry_branch = source[
+        source.index('if (( final_code == 0 )) && [[ "${DRY_RUN}" == 1 ]]') :
+    ]
+    dry_branch = dry_branch[: dry_branch.index("elif (( final_code == 0 ))")]
+    assert 'publish_terminal_marker "${RUN_DIR}/DRY_RUN"' in dry_branch
+    assert '"${RUN_DIR}/SUCCESS"' not in dry_branch
+    assert '[[ "${EVIDENCE_FINALIZED}" == 1 ]]' in source
+    assert "os.O_CREAT | os.O_EXCL" in source
+    assert "os.link(temporary, destination" in source
+    assert "os.fsync(directory)" in source
+    assert "marker_code=$?" in source

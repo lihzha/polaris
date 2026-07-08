@@ -33,7 +33,7 @@ export NVIDIA_DRIVER_CAPABILITIES=all
 export PYTHONUNBUFFERED=1 SLURM_EXPORT_ENV=ALL
 
 [[ "$(git -C "${POLARIS_DIR}" rev-parse HEAD)" == "${EXPECTED_POLARIS_COMMIT}" ]]
-git -C "${POLARIS_DIR}" diff-index --quiet HEAD --
+[[ -z "$(git -C "${POLARIS_DIR}" status --porcelain=v1 --untracked-files=all)" ]]
 mapfile -t allocated_gpu_uuids < <(
   nvidia-smi --query-gpu=uuid --format=csv,noheader | sed '/^[[:space:]]*$/d'
 )

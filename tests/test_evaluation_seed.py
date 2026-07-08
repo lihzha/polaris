@@ -10,11 +10,13 @@ from polaris.evaluation_seed import (
     ENVIRONMENT_SEED_SCHEME,
     MAX_ENVIRONMENT_SEED,
     bind_environment_seed,
+    environment_seed_contract_sha256,
     episode_environment_seed,
     format_environment_seed_contract,
     make_episode_environment_rng,
     make_live_environment_seed_contract,
     validate_episode_environment_rng,
+    validate_episode_seed_range,
 )
 
 
@@ -25,9 +27,7 @@ def _env(seed=0, enhanced_determinism=False):
     cfg = SimpleNamespace(
         seed=seed,
         sim=SimpleNamespace(
-            physx=SimpleNamespace(
-                enable_enhanced_determinism=enhanced_determinism
-            )
+            physx=SimpleNamespace(enable_enhanced_determinism=enhanced_determinism)
         ),
     )
     return SimpleNamespace(unwrapped=SimpleNamespace(cfg=cfg))
@@ -61,7 +61,14 @@ def test_episode_seed_is_resume_invariant_and_bound_in_query_provenance():
     episode_rng = make_episode_environment_rng(contract, 7)
     assert episode_rng["episode_seed"] == 18
     assert episode_rng["episode_index"] == 7
+    assert episode_rng["schema_version"] == 2
+    assert episode_rng["environment_seed_contract_sha256"] == (
+        environment_seed_contract_sha256(contract)
+    )
     assert validate_episode_environment_rng(episode_rng, contract, 7) == episode_rng
+    assert validate_episode_seed_range(11, 8) == 18
+    with pytest.raises(ValueError, match="derived episode seed"):
+        validate_episode_seed_range(MAX_ENVIRONMENT_SEED, 2)
 
 
 @pytest.mark.parametrize(
@@ -103,14 +110,14 @@ def test_native_eval_binds_seed_before_environment_construction_and_reads_live()
     gym_call = "env: ManagerBasedRLSplatEnv = gym.make("
     live_call = "environment_seed_contract = make_live_environment_seed_contract("
     assert source.index(bind_call) < source.index(gym_call) < source.index(live_call)
-    assert 'DroidJointPos requires --environment-seed' in source
+    assert "DroidJointPos requires --environment-seed" in source
     assert "seed=episode_seed" in source
 
 
 def test_native_launcher_persists_and_completion_gates_seed_contract():
-    worker = (
-        ROOT / "scripts/polaris/eval_pi05_droid_jointpos_polaris.sh"
-    ).read_text(encoding="utf-8")
+    worker = (ROOT / "scripts/polaris/eval_pi05_droid_jointpos_polaris.sh").read_text(
+        encoding="utf-8"
+    )
     submitter = (
         ROOT / "scripts/polaris/submit_pi05_droid_jointpos_polaris.sh"
     ).read_text(encoding="utf-8")

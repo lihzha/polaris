@@ -33,6 +33,8 @@ export CHECKPOINT_URI=gs://openpi-assets/checkpoints/polaris/pi05_droid_jointpos
 export POLICY_CONFIG=pi05_droid_jointpos_polaris
 export DRY_RUN=0
 export NVIDIA_DRIVER_CAPABILITIES=all
+[[ "$(git -C "${POLARIS_DIR}" rev-parse HEAD)" == "${EXPECTED_POLARIS_COMMIT}" ]]
+[[ -z "$(git -C "${POLARIS_DIR}" status --porcelain=v1 --untracked-files=all)" ]]
 mapfile -t allocated_gpu_uuids < <(
   nvidia-smi --query-gpu=uuid --format=csv,noheader | sed '/^[[:space:]]*$/d'
 )
