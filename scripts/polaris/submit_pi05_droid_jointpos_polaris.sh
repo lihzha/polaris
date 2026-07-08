@@ -19,6 +19,7 @@ SBATCH_LOG_ROOT="${SBATCH_LOG_ROOT:-${NFS_ROOT}/slurm_logs/polaris-pi05/${RUN_NA
 SUBMISSION_MANIFEST="${SUBMISSION_MANIFEST:-${NFS_ROOT}/results/polaris-pi05/${RUN_NAMESPACE}/${MODE}_jobs.tsv}"
 POLARIS_COMMIT="$(git -C "${POLARIS_DIR}" rev-parse HEAD)"
 ALLOW_RESUBMIT="${ALLOW_RESUBMIT:-0}"
+ENVIRONMENT_SEED="${ENVIRONMENT_SEED:-0}"
 
 if [[ "${MODE}" == canary ]]; then
   tasks=(DROID-FoodBussing)
@@ -40,12 +41,16 @@ else
 fi
 
 [[ "${rollouts}" =~ ^[1-9][0-9]*$ ]] || { echo "ROLLOUTS must be positive" >&2; exit 2; }
+[[ "${ENVIRONMENT_SEED}" =~ ^(0|[1-9][0-9]*)$ ]] \
+  || { echo "ENVIRONMENT_SEED must be a non-negative integer" >&2; exit 2; }
+(( ENVIRONMENT_SEED <= 4294967295 )) \
+  || { echo "ENVIRONMENT_SEED must be at most 4294967295" >&2; exit 2; }
 [[ -f "${SBATCH_SCRIPT}" ]] || { echo "Missing sbatch script: ${SBATCH_SCRIPT}" >&2; exit 2; }
 mkdir -p "${SBATCH_LOG_ROOT}" "$(dirname "${SUBMISSION_MANIFEST}")"
 exec 9>"${SUBMISSION_MANIFEST}.lock"
 flock -n 9 || { echo "Another submitter holds ${SUBMISSION_MANIFEST}.lock" >&2; exit 4; }
 if [[ ! -e "${SUBMISSION_MANIFEST}" ]]; then
-  printf 'job_id\tmode\ttask\trollouts\trun_namespace\tsubmitted_at\n' > "${SUBMISSION_MANIFEST}"
+  printf 'job_id\tmode\ttask\trollouts\tenvironment_seed\trun_namespace\tsubmitted_at\n' > "${SUBMISSION_MANIFEST}"
 fi
 
 job_ids=()
@@ -62,7 +67,7 @@ for task in "${tasks[@]}"; do
   fi
   short_task="${task#DROID-}"
   job_name="${job_prefix}_${short_task}"
-  export_vars="PATH=${PATH},HOME=${HOME},POLARIS_DIR=${POLARIS_DIR},EXPECTED_POLARIS_COMMIT=${POLARIS_COMMIT},POLARIS_ENVIRONMENT=${task},ROLLOUTS=${rollouts},RUN_NAMESPACE=${RUN_NAMESPACE}"
+  export_vars="PATH=${PATH},HOME=${HOME},POLARIS_DIR=${POLARIS_DIR},EXPECTED_POLARIS_COMMIT=${POLARIS_COMMIT},POLARIS_ENVIRONMENT=${task},ROLLOUTS=${rollouts},ENVIRONMENT_SEED=${ENVIRONMENT_SEED},RUN_NAMESPACE=${RUN_NAMESPACE}"
   job_id="$(sbatch --parsable \
     --job-name="${job_name}" \
     --time="${time_limit}" \
@@ -71,8 +76,8 @@ for task in "${tasks[@]}"; do
     "${SBATCH_SCRIPT}")"
   [[ "${job_id}" =~ ^[0-9]+$ ]] || { echo "Invalid job ID: ${job_id}" >&2; exit 3; }
   job_ids+=("${job_id}")
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "${job_id}" "${MODE}" "${task}" "${rollouts}" "${RUN_NAMESPACE}" "$(date -Iseconds)" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${job_id}" "${MODE}" "${task}" "${rollouts}" "${ENVIRONMENT_SEED}" "${RUN_NAMESPACE}" "$(date -Iseconds)" \
     | tee -a "${SUBMISSION_MANIFEST}"
 done
 

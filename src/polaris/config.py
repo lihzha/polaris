@@ -63,6 +63,7 @@ class EvalArgs:
     initial_conditions_file: str | None = None  # Path to initial conditions file
     instruction: str | None = None  # Override language instruction
     rollouts: int | None = None  # Number of rollouts to evaluate
+    environment_seed: int | None = None  # Explicit Isaac Lab environment seed
     control_mode: Literal["joint-position", "eef-pose"] = "joint-position"
 
 

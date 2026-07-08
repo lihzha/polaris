@@ -27,6 +27,7 @@ CHECKPOINT_MANIFEST="${CHECKPOINT_MANIFEST:-${SCRIPT_DIR}/pi05_droid_jointpos_po
 EXPECTED_ACTION_HORIZON="${EXPECTED_ACTION_HORIZON:-15}"
 EXPECTED_ACTION_DIM="${EXPECTED_ACTION_DIM:-8}"
 OPEN_LOOP_HORIZON="${OPEN_LOOP_HORIZON:-8}"
+ENVIRONMENT_SEED="${ENVIRONMENT_SEED:-0}"
 POLARIS_ENVIRONMENT="${POLARIS_ENVIRONMENT:-DROID-FoodBussing}"
 ROLLOUTS="${ROLLOUTS:-1}"
 RUN_NAMESPACE="${RUN_NAMESPACE:-pi05-polaris-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -45,6 +46,10 @@ die() {
   || die "A Slurm allocation is required unless DRY_RUN=1"
 : "${EXPECTED_POLARIS_COMMIT:?Set EXPECTED_POLARIS_COMMIT to the immutable launch commit}"
 [[ "${ROLLOUTS}" =~ ^[1-9][0-9]*$ ]] || die "ROLLOUTS must be positive"
+[[ "${ENVIRONMENT_SEED}" =~ ^(0|[1-9][0-9]*)$ ]] \
+  || die "ENVIRONMENT_SEED must be a non-negative integer"
+(( ENVIRONMENT_SEED <= 4294967295 )) \
+  || die "ENVIRONMENT_SEED must be at most 4294967295"
 if [[ ! "${PORT}" =~ ^[1-9][0-9]*$ ]] || (( PORT > 65535 )); then
   die "Invalid PORT=${PORT}"
 fi
@@ -193,6 +198,8 @@ PYXIS_IMAGE_SHA256="$(sha256sum "${POLARIS_PYXIS_IMAGE}" | awk '{print $1}')"
   printf 'EXPECTED_PROMPT=%q\n' "${EXPECTED_PROMPT}"
   printf 'RESUME_FROM_TASK_DIR=%q\n' "${RESUME_FROM_TASK_DIR}"
   printf 'ROLLOUTS=%q\n' "${ROLLOUTS}"
+  printf 'ENVIRONMENT_SEED=%q\n' "${ENVIRONMENT_SEED}"
+  printf 'ENVIRONMENT_SEED_PROFILE=isaaclab_env_cfg_seed_v1\n'
   printf 'CONTROL_MODE=joint-position\n'
   printf 'STATE_CONTRACT=7_joint_radians_plus_closed_positive_gripper\n'
   printf 'ACTION_CONTRACT=15x8_absolute_joint_targets_plus_closed_positive_gripper\n'
@@ -230,6 +237,7 @@ eval_args=(
   --policy.trace-path "${TRACE_PATH}"
   --run-folder "${TASK_DIR}"
   --rollouts "${ROLLOUTS}"
+  --environment-seed "${ENVIRONMENT_SEED}"
   --headless
 )
 
@@ -316,6 +324,8 @@ tee_code="${pipeline_codes[1]}"
 
 grep -Fq 'POLARIS_PI05_DROID_CONTRACT=' "${EVAL_LOG}" \
   || die "Missing pi0.5 client contract marker"
+grep -Fq 'POLARIS_ENVIRONMENT_SEED_CONTRACT={"binding":"env_cfg.seed_before_gym_make","profile":"isaaclab_env_cfg_seed_v1","schema_version":1,"seed":'"${ENVIRONMENT_SEED}"'}' "${EVAL_LOG}" \
+  || die "Missing exact environment-seed contract marker"
 grep -Fq '"expected_action_horizon": 15' "${EVAL_LOG}" \
   || die "Client did not enforce a 15-step response"
 grep -Fq '"expected_action_dim": 8' "${EVAL_LOG}" \

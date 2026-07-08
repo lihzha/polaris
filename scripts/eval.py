@@ -13,9 +13,16 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 from polaris.config import EvalArgs
+from polaris.evaluation_seed import make_environment_seed_contract
 
 
 def main(eval_args: EvalArgs):
+    if eval_args.policy.client == "DroidJointPos":
+        if eval_args.environment_seed is None:
+            raise ValueError("DroidJointPos requires --environment-seed")
+        make_environment_seed_contract(eval_args.environment_seed)
+    elif eval_args.environment_seed is not None:
+        make_environment_seed_contract(eval_args.environment_seed)
     if (
         eval_args.policy.client == "EgoLAPEefPose"
         and eval_args.control_mode != "eef-pose"
@@ -43,6 +50,10 @@ def main(eval_args: EvalArgs):
         ManagerBasedRLSplatEnv,
     )
     from polaris.environments.droid_cfg import EefPoseActionCfg
+    from polaris.evaluation_seed import (
+        bind_environment_seed,
+        format_environment_seed_contract,
+    )
     from polaris.utils import load_eval_initial_conditions
     from polaris.policy import InferenceClient
     from polaris.policy.droid_jointpos_client import (
@@ -57,6 +68,14 @@ def main(eval_args: EvalArgs):
         num_envs=1,
         use_fabric=True,
     )
+    if eval_args.environment_seed is not None:
+        environment_seed_contract = bind_environment_seed(
+            env_cfg, eval_args.environment_seed
+        )
+        print(
+            format_environment_seed_contract(environment_seed_contract),
+            flush=True,
+        )
     if eval_args.control_mode == "eef-pose":
         # Action managers are constructed by gym.make, so select the controller
         # on the config before creating the environment.
