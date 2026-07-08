@@ -390,3 +390,50 @@
   `pi05-confidence-final-v12-20260708T225010Z` using immutable script SHA-256
   `a31ebd3c0ffc687bcbe51fcc0d5e77d4aca2cdf4259dd826f8454de83dd0cd9b`.
   No v12 GPU evaluation is launched until both setup records pass.
+
+## 2026-07-08 — v12 setup completion and Kit-cleared Vulkan diagnosis
+
+- Fresh setup jobs `1101842` (historical) and `1101841` (current) completed
+  `0:0` in 12:39 and 11:22. Both passed 242 distributions, 240 noneditable
+  RECORD inventories, 45,714 hashed files, exact numpydantic sealing,
+  checkpoint full MD5, tokenizer, global DROID normalization, official config,
+  and clean-source gates. Historical sealed/final package canonical SHA-256 is
+  `222b9bd6bab9505ff5e285d207158fbc98910141d1d9f8b27878f547df5d1f87`;
+  current is
+  `914d94968b69ddc0a053cc8aacae9ab148ad5a25acb106b9f247c8c2b2ef1aec`.
+- Historical canary `1101848` and current canary `1101847` ran on independent
+  L40S nodes `pool0-00034` and `pool0-00025`. They passed package,
+  checkpoint, model-runtime, serving, GPU/driver, global-normalization,
+  image/action, and live-handshake gates. The corrected exact 15-library table
+  also passed. Both then failed before query 0 because Isaac Kit canonically
+  changes `VK_LAYER_PATH` and `VK_INSTANCE_LAYERS` from absent at launch to
+  empty strings after startup, while graphics profile v2 required `None`.
+- Live Kit logs independently record those exact empty-string overrides on
+  both nodes. The jobs were externally canceled by UID 158351 during hung
+  Isaac teardown and are zero-query, zero-episode infrastructure diagnostics.
+  Neither produced a runtime JSON, trace, CSV, RNG proof, video, terminal PNG,
+  evidence manifest, or success marker; stale `RUNNING` markers left by forced
+  cancellation are invalid. Full terminal identities are preserved in the
+  shared evaluation registry.
+
+## 2026-07-08 — graphics profile v3 ready for fresh setup
+
+- Historical fix commit `a9ce3af10440528f020a92f7e3cbc2743a909702`
+  requires the five Vulkan variables that Kit explicitly clears
+  (`VK_SDK_PATH`, `VULKAN_SDK`, `VK_LAYER_PATH`, `VK_INSTANCE_LAYERS`, and
+  `VULKAN_HEADERS_INSTALL_DIR`) to equal the empty string after initialization.
+  All remaining loader/layer overrides must remain absent, the exact 15 mapped
+  libraries are unchanged, and any future mismatch reports its exact field
+  difference. Graphics profile v3 canonical SHA-256 is
+  `06af774bf60104e67a4e12681747623fb419f8a11ff330a740f798945b58a53f`.
+- Historical and current runtime/test blobs remain byte-identical at
+  `ea00ae58a0674306120f010a2010d1bc8c460e01` and
+  `734d8feb4931641f94a1f6ce2254825bec19212c`. Historical validation is 191
+  passed plus eight subtests; current is 495 plus eight; focused
+  runtime/evidence/serving validation is 97/97 on each arm. Fresh frozen v13
+  checkouts are clean at historical commit/tree
+  `a9ce3af10440528f020a92f7e3cbc2743a909702`/
+  `a31ae20d91e0bed34a6a8e505160610852340919` and current commit/tree
+  `52423d3f04949ecf619e8f58a8912299d4f1c2ec`/
+  `fcd31b611db6188dae28f31ee3633c637b5642cf`. Fresh setup remains the next
+  gate; no v13 GPU job exists at this record.
