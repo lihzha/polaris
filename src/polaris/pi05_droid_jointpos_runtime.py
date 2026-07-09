@@ -164,7 +164,10 @@ PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT = (
     "QT_QPA_PLATFORM_PLUGIN_PATH",
     "QT_QPA_FONTDIR",
 )
-PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT = (
+# The exact env -i/Pyxis/Isaac full-task lifecycle leaves these Vulkan SDK and
+# layer variables absent both at process start and after the first reset.
+# Empty strings are not equivalent: accepting them would hide launcher drift.
+PI05_DROID_JOINTPOS_GRAPHICS_VULKAN_SDK_REQUIRED_ABSENT_ENVIRONMENT = (
     "VK_SDK_PATH",
     "VULKAN_SDK",
     "VK_LAYER_PATH",
@@ -599,7 +602,7 @@ def _graphics_environment() -> dict[str, str | None]:
         "NVIDIA_VISIBLE_DEVICES",
         "NVIDIA_DRIVER_CAPABILITIES",
         *PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT,
-        *PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT,
+        *PI05_DROID_JOINTPOS_GRAPHICS_VULKAN_SDK_REQUIRED_ABSENT_ENVIRONMENT,
     )
     return {name: os.environ.get(name) for name in names}
 
@@ -654,7 +657,7 @@ def _initial_graphics_environment() -> dict[str, str | None]:
         "NVIDIA_DRIVER_CAPABILITIES",
         "VK_DRIVER_FILES",
         *PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT,
-        *PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT,
+        *PI05_DROID_JOINTPOS_GRAPHICS_VULKAN_SDK_REQUIRED_ABSENT_ENVIRONMENT,
     )
     return {name: initial.get(name) for name in names}
 
@@ -1106,7 +1109,12 @@ def _validate_graphics_runtime(value: Any, *, expected_gpu_uuid: str) -> dict[st
         "NVIDIA_VISIBLE_DEVICES": expected_gpu_uuid,
         "NVIDIA_DRIVER_CAPABILITIES": "all",
         **{name: None for name in PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT},
-        **{name: None for name in PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT},
+        **{
+            name: None
+            for name in (
+                PI05_DROID_JOINTPOS_GRAPHICS_VULKAN_SDK_REQUIRED_ABSENT_ENVIRONMENT
+            )
+        },
     }
     expected_initial_environment = {
         "LD_LIBRARY_PATH": None,
@@ -1114,7 +1122,12 @@ def _validate_graphics_runtime(value: Any, *, expected_gpu_uuid: str) -> dict[st
         "NVIDIA_DRIVER_CAPABILITIES": "all",
         "VK_DRIVER_FILES": PI05_DROID_JOINTPOS_VULKAN_ICD_CONTAINER_PATH,
         **{name: None for name in PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT},
-        **{name: None for name in PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT},
+        **{
+            name: None
+            for name in (
+                PI05_DROID_JOINTPOS_GRAPHICS_VULKAN_SDK_REQUIRED_ABSENT_ENVIRONMENT
+            )
+        },
     }
     if value["initial_environment"] != expected_initial_environment:
         raise ValueError("simulator initial graphics environment mismatch")
@@ -1122,10 +1135,16 @@ def _validate_graphics_runtime(value: Any, *, expected_gpu_uuid: str) -> dict[st
         differences = {
             name: {
                 "actual": value["environment"].get(name),
+                "actual_present": name in value["environment"],
                 "expected": expected_environment.get(name),
+                "expected_present": name in expected_environment,
             }
             for name in sorted(set(value["environment"]) | set(expected_environment))
-            if value["environment"].get(name) != expected_environment.get(name)
+            if (
+                name not in value["environment"]
+                or name not in expected_environment
+                or value["environment"][name] != expected_environment[name]
+            )
         }
         raise ValueError(
             "simulator graphics override environment mismatch: "

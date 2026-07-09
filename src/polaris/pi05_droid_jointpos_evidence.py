@@ -52,7 +52,7 @@ from polaris.pi05_droid_jointpos_immutable import (
 
 
 PI05_DROID_JOINTPOS_EVIDENCE_PROFILE = (
-    "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v7"
+    "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v8"
 )
 PI05_DROID_JOINTPOS_EVIDENCE_MANIFEST = "pi05_droid_jointpos_evidence_manifest.json"
 

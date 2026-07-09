@@ -79,7 +79,7 @@ def _graphics_runtime():
             **{
                 name: None
                 for name in (
-                    runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT
+                    runtime.PI05_DROID_JOINTPOS_GRAPHICS_VULKAN_SDK_REQUIRED_ABSENT_ENVIRONMENT
                 )
             },
         },
@@ -96,7 +96,7 @@ def _graphics_runtime():
             **{
                 name: None
                 for name in (
-                    runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT
+                    runtime.PI05_DROID_JOINTPOS_GRAPHICS_VULKAN_SDK_REQUIRED_ABSENT_ENVIRONMENT
                 )
             },
         },
@@ -264,7 +264,9 @@ def _prepare_graphics_capture(
     monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", "all")
     for name in runtime.PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT:
         monkeypatch.delenv(name, raising=False)
-    for name in runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT:
+    for (
+        name
+    ) in runtime.PI05_DROID_JOINTPOS_GRAPHICS_VULKAN_SDK_REQUIRED_ABSENT_ENVIRONMENT:
         monkeypatch.delenv(name, raising=False)
     device = f"{os.major(metadata.st_dev):x}:{os.minor(metadata.st_dev):x}"
     value = {
@@ -737,19 +739,26 @@ def test_production_graphics_table_and_canonical_digest_are_closed():
         "QT_QPA_PLATFORM_PLUGIN_PATH",
         "QT_QPA_FONTDIR",
     )
-    assert runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT == (
-        "VK_SDK_PATH",
-        "VULKAN_SDK",
-        "VK_LAYER_PATH",
-        "VK_INSTANCE_LAYERS",
-        "VULKAN_HEADERS_INSTALL_DIR",
+    assert (
+        runtime.PI05_DROID_JOINTPOS_GRAPHICS_VULKAN_SDK_REQUIRED_ABSENT_ENVIRONMENT
+        == (
+            "VK_SDK_PATH",
+            "VULKAN_SDK",
+            "VK_LAYER_PATH",
+            "VK_INSTANCE_LAYERS",
+            "VULKAN_HEADERS_INSTALL_DIR",
+        )
     )
     assert {
         name: value["environment"][name]
-        for name in runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT
+        for name in (
+            runtime.PI05_DROID_JOINTPOS_GRAPHICS_VULKAN_SDK_REQUIRED_ABSENT_ENVIRONMENT
+        )
     } == {
         name: None
-        for name in runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT
+        for name in (
+            runtime.PI05_DROID_JOINTPOS_GRAPHICS_VULKAN_SDK_REQUIRED_ABSENT_ENVIRONMENT
+        )
     }
     assert (
         "/usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.580.105.08",
@@ -1153,16 +1162,28 @@ def test_graphics_capture_rejects_cv2_loader_search_safety_drift_during_hashing(
 
 
 @pytest.mark.parametrize(
-    "name", runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT
+    "name",
+    runtime.PI05_DROID_JOINTPOS_GRAPHICS_VULKAN_SDK_REQUIRED_ABSENT_ENVIRONMENT,
 )
 @pytest.mark.parametrize("value", ["", "/tmp/injected"])
-def test_mapped_graphics_capture_requires_exact_kit_cleared_environment(
+def test_mapped_graphics_capture_requires_vulkan_sdk_environment_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, value: str
 ):
     _prepare_graphics_capture(tmp_path, monkeypatch)
     monkeypatch.setenv(name, value)
     with pytest.raises(ValueError, match=rf'"{name}"'):
         runtime._capture_graphics_runtime(expected_gpu_uuid=GPU_UUID)
+
+
+@pytest.mark.parametrize(
+    "name",
+    runtime.PI05_DROID_JOINTPOS_GRAPHICS_VULKAN_SDK_REQUIRED_ABSENT_ENVIRONMENT,
+)
+def test_mapped_graphics_validator_rejects_missing_absent_environment_key(name: str):
+    value = _graphics_runtime()
+    value["environment"].pop(name)
+    with pytest.raises(ValueError, match=rf'"{name}".*"actual_present":false'):
+        runtime._validate_graphics_runtime(value, expected_gpu_uuid=GPU_UUID)
 
 
 def test_mapped_graphics_capture_rejects_expected_hash_or_build_id_drift(
