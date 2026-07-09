@@ -23,11 +23,15 @@ from polaris.evaluation_seed import (
 
 
 def main(eval_args: EvalArgs):
-    from polaris.pi05_droid_jointvelocity_contract import (
-        NATIVE_GRIPPER_DRIVE_PROFILE,
-    )
-
     position_adapter = eval_args.policy.client == "DroidDeltaJointPosition"
+    native_drive_contract = (
+        eval_args.control_mode == "joint-velocity" or position_adapter
+    )
+    if native_drive_contract:
+        from polaris.pi05_droid_jointvelocity_contract import (
+            NATIVE_GRIPPER_DRIVE_PROFILE,
+        )
+
     if eval_args.policy.client == "DroidJointPos":
         if eval_args.environment_seed is None:
             raise ValueError("DroidJointPos requires --environment-seed")

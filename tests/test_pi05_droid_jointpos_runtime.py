@@ -94,7 +94,7 @@ def _graphics_runtime():
                 for name in runtime.PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT
             },
             **{
-                name: ""
+                name: None
                 for name in (
                     runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT
                 )
@@ -265,7 +265,7 @@ def _prepare_graphics_capture(
     for name in runtime.PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT:
         monkeypatch.delenv(name, raising=False)
     for name in runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT:
-        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name, raising=False)
     device = f"{os.major(metadata.st_dev):x}:{os.minor(metadata.st_dev):x}"
     value = {
         "profile": runtime.PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE,
@@ -655,7 +655,7 @@ def test_production_graphics_table_and_canonical_digest_are_closed():
     value = _graphics_runtime()
     assert runtime.PI05_DROID_JOINTPOS_RUNTIME_SCHEMA_VERSION == 4
     assert runtime.PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE == (
-        "l401_pyxis_nvidia_580_105_08_mapped_graphics_v4"
+        "l401_pyxis_nvidia_580_105_08_mapped_graphics_v5"
     )
     assert runtime.PI05_DROID_JOINTPOS_GRAPHICS_PROC_ENVIRON_PATH == (
         "/proc/self/environ"
@@ -744,6 +744,13 @@ def test_production_graphics_table_and_canonical_digest_are_closed():
         "VK_INSTANCE_LAYERS",
         "VULKAN_HEADERS_INSTALL_DIR",
     )
+    assert {
+        name: value["environment"][name]
+        for name in runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT
+    } == {
+        name: None
+        for name in runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT
+    }
     assert (
         "/usr/lib/x86_64-linux-gnu/libnvidia-ptxjitcompiler.so.580.105.08",
         39_422_584,
@@ -751,7 +758,7 @@ def test_production_graphics_table_and_canonical_digest_are_closed():
         "6257a5b3887eab41edd54343ea3623c373ab8e8e",
     ) in runtime.PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES
     assert value["graphics_runtime_sha256"] == (
-        "d251727e38315050a25b79954ed77984fa5cc4649b954e7789bfcbb0a77e3629"
+        "f08522c21472c7a42a726952f0bdce5119a31744cd35cb4cb81e37a24faa2eb7"
     )
     assert (
         value["graphics_runtime_sha256"]
@@ -1148,15 +1155,12 @@ def test_graphics_capture_rejects_cv2_loader_search_safety_drift_during_hashing(
 @pytest.mark.parametrize(
     "name", runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT
 )
-@pytest.mark.parametrize("value", [None, "/tmp/injected"])
+@pytest.mark.parametrize("value", ["", "/tmp/injected"])
 def test_mapped_graphics_capture_requires_exact_kit_cleared_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, value: str | None
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, value: str
 ):
     _prepare_graphics_capture(tmp_path, monkeypatch)
-    if value is None:
-        monkeypatch.delenv(name)
-    else:
-        monkeypatch.setenv(name, value)
+    monkeypatch.setenv(name, value)
     with pytest.raises(ValueError, match=rf'"{name}"'):
         runtime._capture_graphics_runtime(expected_gpu_uuid=GPU_UUID)
 
