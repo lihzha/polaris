@@ -16,6 +16,7 @@ import re
 import stat
 import struct
 import subprocess
+import sys
 from typing import Any
 
 import numpy as np
@@ -32,7 +33,7 @@ from polaris.pi05_droid_jointpos_serving_contract import (
 
 PANDA_ARM_JOINT_NAMES = tuple(f"panda_joint{index}" for index in range(1, 8))
 PI05_DROID_JOINTPOS_PROFILE = "openpi_pi05_droid_native_joint_position_v1"
-PI05_DROID_JOINTPOS_RUNTIME_SCHEMA_VERSION = 3
+PI05_DROID_JOINTPOS_RUNTIME_SCHEMA_VERSION = 4
 PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION = 4
 PI05_DROID_JOINTPOS_RUNTIME_MARKER = "POLARIS_PI05_DROID_JOINTPOS_RUNTIME="
 PI05_DROID_JOINTPOS_OUTER_STEPS = 450
@@ -44,10 +45,104 @@ PI05_DROID_JOINTPOS_SENSOR_NAMES = ("external_cam", "wrist_cam")
 PI05_DROID_JOINTPOS_NATIVE_IMAGE_SHAPE = (720, 1280, 3)
 PI05_DROID_JOINTPOS_BOUNDARY_PROFILE = "outer450_internal451_no_autoreset"
 PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE = (
-    "l401_pyxis_nvidia_580_105_08_mapped_graphics_v3"
+    "l401_pyxis_nvidia_580_105_08_mapped_graphics_v4"
 )
 PI05_DROID_JOINTPOS_GRAPHICS_PROC_MAPS_PATH = "/proc/self/maps"
-PI05_DROID_JOINTPOS_GRAPHICS_EXPECTED_LD_LIBRARY_PATH: str | None = None
+PI05_DROID_JOINTPOS_GRAPHICS_PROC_ENVIRON_PATH = "/proc/self/environ"
+# The pinned active opencv-python-headless 4.11.0.86 Linux loader imports after
+# AppLauncher and writes this exact value from its sole BINARIES_PATHS entry.
+# The launch starts with LD_LIBRARY_PATH absent; accepting any other post-import
+# value remains closed.  Both Qt environment variables stay absent.
+PI05_DROID_JOINTPOS_GRAPHICS_EXPECTED_LD_LIBRARY_PATH = (
+    "/.venv/lib/python3.11/site-packages/cv2/../../lib64:"
+)
+PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_PROFILE = (
+    "opencv_python_headless_4_11_0_86_linux_loader_v1"
+)
+PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_SEARCH_SAFETY_PROFILE = (
+    "cv2_empty_loader_element_readonly_workdir_v1"
+)
+PI05_DROID_JOINTPOS_GRAPHICS_CV2_MODULE_IDENTITY = (
+    (
+        "python_module_path",
+        "/.venv/lib/python3.11/site-packages/cv2/__init__.py",
+    ),
+    (
+        "python_module_spec_origin",
+        "/.venv/lib/python3.11/site-packages/cv2/__init__.py",
+    ),
+    (
+        "native_module_path",
+        "/.venv/lib/python3.11/site-packages/cv2/cv2.abi3.so",
+    ),
+    (
+        "native_module_spec_origin",
+        "/.venv/lib/python3.11/site-packages/cv2/cv2.abi3.so",
+    ),
+    (
+        "load_config_module_path",
+        "/.venv/lib/python3.11/site-packages/cv2/load_config_py3.py",
+    ),
+    (
+        "version_module_path",
+        "/.venv/lib/python3.11/site-packages/cv2/version.py",
+    ),
+    ("opencv_version", "4.11.0"),
+    ("package_version", "4.11.0.86"),
+    ("ci_build", True),
+    ("headless", True),
+    ("contrib", False),
+    ("rolling", False),
+    ("python_executable", "/.venv/bin/python"),
+    ("python_implementation", "cpython"),
+    ("python_cache_tag", "cpython-311"),
+    ("python_major", 3),
+    ("python_minor", 11),
+    (
+        "higher_priority_config_path",
+        "/.venv/lib/python3.11/site-packages/cv2/config-3.11.py",
+    ),
+    ("higher_priority_config_exists", False),
+    (
+        "selected_config_path",
+        "/.venv/lib/python3.11/site-packages/cv2/config-3.py",
+    ),
+)
+# Exact evaluator-container files responsible for the post-import loader
+# environment and cv2 image operations.  These are independent of the OpenPI
+# server venv package report and are captured from the live Pyxis process.
+PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_FILES = (
+    (
+        "/.venv/lib/python3.11/site-packages/cv2/__init__.py",
+        6_612,
+        "936bd94c5a5debf0212fc751af79d3a163652f3e850259df2159db6aa3ed8ad8",
+    ),
+    (
+        "/.venv/lib/python3.11/site-packages/cv2/config-3.py",
+        724,
+        "9a7aadf724b822001f5e963b01fd4e375d45e2cbbe328d2ca7b42a440c083a1c",
+    ),
+    (
+        "/.venv/lib/python3.11/site-packages/cv2/config.py",
+        111,
+        "974e2d4096ee1a9a9a341df1bf33e16973683bf1ac733006de27ff2f23bc584d",
+    ),
+    (
+        "/.venv/lib/python3.11/site-packages/cv2/cv2.abi3.so",
+        66_106_617,
+        "68fee49d266a95e730c1cb17d913a39a93ab5c50bee1581600f453026f9c7b8d",
+    ),
+    (
+        "/.venv/lib/python3.11/site-packages/cv2/load_config_py3.py",
+        262,
+        "03dc1f11374a667c9b7db10dd5276d640b0c2d5b2e7866b4ccef772732bd3852",
+    ),
+    (
+        "/.venv/lib/python3.11/site-packages/cv2/version.py",
+        92,
+        "3b07492169e6079940f716162368c51b6dbee45be36c9c46fb6f9e56b0449739",
+    ),
+)
 PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT = (
     "LD_PRELOAD",
     "LD_AUDIT",
@@ -66,6 +161,8 @@ PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT = (
     "__GLX_VENDOR_LIBRARY_NAME",
     "__EGL_VENDOR_LIBRARY_FILENAMES",
     "LIBGL_DRIVERS_PATH",
+    "QT_QPA_PLATFORM_PLUGIN_PATH",
+    "QT_QPA_FONTDIR",
 )
 PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT = (
     "VK_SDK_PATH",
@@ -182,7 +279,7 @@ PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES: tuple[
     ),
 )
 PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_SHA256 = (
-    "06af774bf60104e67a4e12681747623fb419f8a11ff330a740f798945b58a53f"
+    "d251727e38315050a25b79954ed77984fa5cc4649b954e7789bfcbb0a77e3629"
 )
 
 _ACTION_TERM_CLASS = (
@@ -507,6 +604,61 @@ def _graphics_environment() -> dict[str, str | None]:
     return {name: os.environ.get(name) for name in names}
 
 
+def _read_proc_initial_environment() -> dict[str, str]:
+    try:
+        descriptor = os.open(
+            PI05_DROID_JOINTPOS_GRAPHICS_PROC_ENVIRON_PATH,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError as error:
+        raise ValueError("Cannot open the simulator initial environment") from error
+    try:
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 1024 * 1024:
+                raise ValueError("Simulator initial environment is too large")
+            chunks.append(chunk)
+    except OSError as error:
+        raise ValueError("Cannot read the simulator initial environment") from error
+    finally:
+        os.close(descriptor)
+    payload = b"".join(chunks)
+    if payload and not payload.endswith(b"\0"):
+        raise ValueError("Simulator initial environment is truncated")
+    result: dict[str, str] = {}
+    for raw in payload.rstrip(b"\0").split(b"\0") if payload else ():
+        if b"=" not in raw:
+            raise ValueError("Simulator initial environment entry is invalid")
+        raw_name, raw_value = raw.split(b"=", 1)
+        try:
+            name = raw_name.decode("utf-8", errors="strict")
+            value = raw_value.decode("utf-8", errors="strict")
+        except UnicodeError as error:
+            raise ValueError("Simulator initial environment is not UTF-8") from error
+        if not name or name in result:
+            raise ValueError("Simulator initial environment has duplicate keys")
+        result[name] = value
+    return result
+
+
+def _initial_graphics_environment() -> dict[str, str | None]:
+    initial = _read_proc_initial_environment()
+    names = (
+        "LD_LIBRARY_PATH",
+        "NVIDIA_VISIBLE_DEVICES",
+        "NVIDIA_DRIVER_CAPABILITIES",
+        "VK_DRIVER_FILES",
+        *PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT,
+        *PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT,
+    )
+    return {name: initial.get(name) for name in names}
+
+
 def _expected_graphics_library_records() -> list[dict[str, Any]]:
     records = [
         {
@@ -538,6 +690,179 @@ def _expected_graphics_library_records() -> list[dict[str, Any]]:
     ):
         raise ValueError("Pinned mapped graphics-library table is invalid")
     return records
+
+
+def _expected_graphics_cv2_loader_records() -> list[dict[str, Any]]:
+    records = [
+        {"path": path, "size": size, "sha256": sha256}
+        for path, size, sha256 in PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_FILES
+    ]
+    if (
+        not records
+        or records != sorted(records, key=lambda item: item["path"])
+        or len({item["path"] for item in records}) != len(records)
+        or any(
+            not isinstance(item["path"], str)
+            or not os.path.isabs(item["path"])
+            or type(item["size"]) is not int
+            or item["size"] <= 0
+            or not isinstance(item["sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) is None
+            for item in records
+        )
+    ):
+        raise ValueError("Pinned graphics cv2-loader table is invalid")
+    return records
+
+
+def expected_graphics_cv2_loader_identity() -> dict[str, Any]:
+    return {
+        "profile": PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_PROFILE,
+        "module": dict(PI05_DROID_JOINTPOS_GRAPHICS_CV2_MODULE_IDENTITY),
+        "files": _expected_graphics_cv2_loader_records(),
+    }
+
+
+def _parse_proc_maps_identity_for_path(path: str) -> tuple[str, int]:
+    try:
+        lines = open(
+            PI05_DROID_JOINTPOS_GRAPHICS_PROC_MAPS_PATH,
+            encoding="utf-8",
+            errors="strict",
+        )
+    except (OSError, UnicodeError) as error:
+        raise ValueError("Cannot read simulator maps for cv2 native module") from error
+    identities: set[tuple[str, int]] = set()
+    try:
+        for line in lines:
+            fields = line.rstrip("\n").split(maxsplit=5)
+            if len(fields) != 6:
+                continue
+            raw_path = fields[5]
+            if raw_path == f"{path} (deleted)":
+                raise ValueError("Mapped cv2 native module has been deleted")
+            if raw_path != path:
+                continue
+            device = fields[3].lower()
+            if re.fullmatch(r"[0-9a-f]+:[0-9a-f]+", device) is None:
+                raise ValueError("Mapped cv2 native-module device is invalid")
+            device = ":".join(
+                f"{int(component, 16):x}" for component in device.split(":")
+            )
+            try:
+                inode = int(fields[4], 10)
+            except ValueError as error:
+                raise ValueError("Mapped cv2 native-module inode is invalid") from error
+            if inode <= 0:
+                raise ValueError("Mapped cv2 native-module inode must be positive")
+            identities.add((device, inode))
+    except (OSError, UnicodeError) as error:
+        raise ValueError("Cannot parse simulator maps for cv2 native module") from error
+    finally:
+        lines.close()
+    if len(identities) != 1:
+        raise ValueError("cv2 native module must have one live maps identity")
+    return next(iter(identities))
+
+
+def _capture_graphics_cv2_module_identity() -> dict[str, Any]:
+    try:
+        import cv2
+
+        native = cv2._native
+        version = cv2.version
+        load_config = sys.modules["cv2.load_config_py3"]
+        module = {
+            "python_module_path": os.path.realpath(cv2.__file__),
+            "python_module_spec_origin": os.path.realpath(cv2.__spec__.origin),
+            "native_module_path": os.path.realpath(native.__file__),
+            "native_module_spec_origin": os.path.realpath(native.__spec__.origin),
+            "load_config_module_path": os.path.realpath(load_config.__file__),
+            "version_module_path": os.path.realpath(version.__file__),
+            "opencv_version": cv2.__version__,
+            "package_version": version.opencv_version,
+            "ci_build": version.ci_build,
+            "headless": version.headless,
+            "contrib": version.contrib,
+            "rolling": version.rolling,
+            "python_executable": os.path.abspath(sys.executable),
+            "python_implementation": sys.implementation.name,
+            "python_cache_tag": sys.implementation.cache_tag,
+            "python_major": sys.version_info.major,
+            "python_minor": sys.version_info.minor,
+            "higher_priority_config_path": (
+                "/.venv/lib/python3.11/site-packages/cv2/config-3.11.py"
+            ),
+            "higher_priority_config_exists": os.path.lexists(
+                "/.venv/lib/python3.11/site-packages/cv2/config-3.11.py"
+            ),
+            "selected_config_path": (
+                "/.venv/lib/python3.11/site-packages/cv2/config-3.py"
+            ),
+        }
+    except (AttributeError, KeyError, TypeError) as error:
+        raise ValueError("Cannot resolve the live cv2 module identity") from error
+    if module != dict(PI05_DROID_JOINTPOS_GRAPHICS_CV2_MODULE_IDENTITY):
+        raise ValueError("Live cv2 module identity differs from the pinned loader")
+    maps_device, maps_inode = _parse_proc_maps_identity_for_path(
+        module["native_module_path"]
+    )
+    return {
+        **module,
+        "native_maps_device": maps_device,
+        "native_maps_inode": maps_inode,
+    }
+
+
+def _capture_graphics_cv2_loader_search_safety() -> dict[str, Any]:
+    working_directory = os.path.realpath(os.getcwd())
+    repository_root = os.path.realpath(os.path.join(os.path.dirname(__file__), "../.."))
+    normalized_target = os.path.realpath(
+        PI05_DROID_JOINTPOS_GRAPHICS_EXPECTED_LD_LIBRARY_PATH.split(":", 1)[0]
+    )
+    candidates = []
+    try:
+        with os.scandir(working_directory) as iterator:
+            entries = sorted(iterator, key=lambda item: item.name)
+    except OSError as error:
+        raise ValueError("Cannot inspect the evaluator working directory") from error
+    for entry in entries:
+        candidate_name = ".so" in entry.name
+        is_elf = False
+        if entry.is_file(follow_symlinks=False):
+            flags = (
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                descriptor = os.open(entry.path, flags)
+            except OSError as error:
+                raise ValueError("Cannot inspect evaluator workdir file") from error
+            try:
+                is_elf = os.read(descriptor, 4) == b"\x7fELF"
+            finally:
+                os.close(descriptor)
+        if candidate_name or is_elf:
+            candidates.append(entry.name)
+    report = {
+        "profile": PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_SEARCH_SAFETY_PROFILE,
+        "working_directory": working_directory,
+        "working_directory_binding": "equals_runtime_module_repository_root",
+        "working_directory_read_only": bool(
+            os.statvfs(working_directory).f_flag & os.ST_RDONLY
+        ),
+        "normalized_cv2_binary_path": normalized_target,
+        "normalized_cv2_binary_path_exists": os.path.lexists(normalized_target),
+        "working_directory_library_candidates": candidates,
+    }
+    if (
+        working_directory != repository_root
+        or not report["working_directory_read_only"]
+        or normalized_target != "/.venv/lib/python3.11/lib64"
+        or report["normalized_cv2_binary_path_exists"]
+        or candidates
+    ):
+        raise ValueError("cv2 loader search safety differs from the pinned runtime")
+    return report
 
 
 def _parse_graphics_proc_maps() -> dict[str, tuple[str, int]]:
@@ -654,17 +979,99 @@ def _capture_mapped_graphics_library(
     }
 
 
+def _capture_graphics_cv2_loader_file(
+    path: str, *, maps_identity: tuple[str, int] | None = None
+) -> dict[str, Any]:
+    try:
+        before = os.lstat(path)
+    except OSError as error:
+        raise ValueError(f"Cannot inspect graphics cv2-loader file: {path}") from error
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("Graphics cv2-loader file must be regular and non-symlink")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError(
+            "Cannot open graphics cv2-loader file without symlinks"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            before.st_dev,
+            before.st_ino,
+        ):
+            raise ValueError("Graphics cv2-loader file changed before capture")
+        if maps_identity is not None:
+            device = f"{os.major(opened.st_dev):x}:{os.minor(opened.st_dev):x}"
+            if (device, opened.st_ino) != maps_identity:
+                raise ValueError("Loaded cv2 native module differs from process maps")
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+    finally:
+        os.close(descriptor)
+    try:
+        after = os.lstat(path)
+    except OSError as error:
+        raise ValueError("Graphics cv2-loader file disappeared") from error
+    if (
+        stat.S_ISLNK(after.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+        or (after.st_dev, after.st_ino, after.st_size)
+        != (before.st_dev, before.st_ino, before.st_size)
+        or size != opened.st_size
+    ):
+        raise ValueError("Graphics cv2-loader file changed during capture")
+    return {"path": path, "size": size, "sha256": digest.hexdigest()}
+
+
 def _graphics_runtime_sha256(value: dict[str, Any]) -> str:
     stable_environment = {
         name: item
         for name, item in value["environment"].items()
         if name != "NVIDIA_VISIBLE_DEVICES"
     }
+    stable_initial_environment = {
+        name: item
+        for name, item in value["initial_environment"].items()
+        if name != "NVIDIA_VISIBLE_DEVICES"
+    }
+    cv2_loader = value["cv2_loader"]
+    stable_cv2_module = {
+        name: item
+        for name, item in cv2_loader["module"].items()
+        if name not in {"native_maps_device", "native_maps_inode"}
+    }
+    stable_cv2_module["native_maps_identity_binding"] = (
+        "equals_live_proc_maps_and_open_file_stat"
+    )
+    stable_loader_search_safety = {
+        name: item
+        for name, item in cv2_loader["loader_search_safety"].items()
+        if name != "working_directory"
+    }
     stable = {
         "profile": value["profile"],
         "proc_maps_path": value["proc_maps_path"],
+        "proc_environ_path": value["proc_environ_path"],
+        "initial_environment": stable_initial_environment,
+        "initial_nvidia_visible_devices_binding": (
+            "equals_execution_environment.nvidia_smi.uuid"
+        ),
         "environment": stable_environment,
         "nvidia_visible_devices_binding": "equals_execution_environment.nvidia_smi.uuid",
+        "cv2_loader": {
+            "profile": cv2_loader["profile"],
+            "module": stable_cv2_module,
+            "loader_search_safety": stable_loader_search_safety,
+            "files": cv2_loader["files"],
+        },
         "libraries": [
             {
                 name: item[name]
@@ -680,7 +1087,10 @@ def _validate_graphics_runtime(value: Any, *, expected_gpu_uuid: str) -> dict[st
     if not isinstance(value, dict) or set(value) != {
         "profile",
         "proc_maps_path",
+        "proc_environ_path",
+        "initial_environment",
         "environment",
+        "cv2_loader",
         "libraries",
         "graphics_runtime_sha256",
     }:
@@ -688,6 +1098,7 @@ def _validate_graphics_runtime(value: Any, *, expected_gpu_uuid: str) -> dict[st
     if (
         value["profile"] != PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE
         or value["proc_maps_path"] != PI05_DROID_JOINTPOS_GRAPHICS_PROC_MAPS_PATH
+        or value["proc_environ_path"] != PI05_DROID_JOINTPOS_GRAPHICS_PROC_ENVIRON_PATH
     ):
         raise ValueError("simulator mapped graphics-runtime identity mismatch")
     expected_environment = {
@@ -697,6 +1108,16 @@ def _validate_graphics_runtime(value: Any, *, expected_gpu_uuid: str) -> dict[st
         **{name: None for name in PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT},
         **{name: "" for name in PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT},
     }
+    expected_initial_environment = {
+        "LD_LIBRARY_PATH": None,
+        "NVIDIA_VISIBLE_DEVICES": expected_gpu_uuid,
+        "NVIDIA_DRIVER_CAPABILITIES": "all",
+        "VK_DRIVER_FILES": PI05_DROID_JOINTPOS_VULKAN_ICD_CONTAINER_PATH,
+        **{name: None for name in PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT},
+        **{name: None for name in PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT},
+    }
+    if value["initial_environment"] != expected_initial_environment:
+        raise ValueError("simulator initial graphics environment mismatch")
     if value["environment"] != expected_environment:
         differences = {
             name: {
@@ -710,6 +1131,64 @@ def _validate_graphics_runtime(value: Any, *, expected_gpu_uuid: str) -> dict[st
             "simulator graphics override environment mismatch: "
             + json.dumps(differences, sort_keys=True, separators=(",", ":"))
         )
+    cv2_loader = value["cv2_loader"]
+    expected_cv2_loader = expected_graphics_cv2_loader_identity()
+    if not isinstance(cv2_loader, dict) or set(cv2_loader) != {
+        "profile",
+        "module",
+        "loader_search_safety",
+        "files",
+    }:
+        raise ValueError("simulator graphics cv2-loader schema mismatch")
+    module = cv2_loader["module"]
+    loader_search_safety = cv2_loader["loader_search_safety"]
+    if (
+        not isinstance(module, dict)
+        or set(module)
+        != {
+            *dict(PI05_DROID_JOINTPOS_GRAPHICS_CV2_MODULE_IDENTITY),
+            "native_maps_device",
+            "native_maps_inode",
+        }
+        or {
+            name: item
+            for name, item in module.items()
+            if name not in {"native_maps_device", "native_maps_inode"}
+        }
+        != expected_cv2_loader["module"]
+        or not isinstance(module["native_maps_device"], str)
+        or re.fullmatch(r"[0-9a-f]+:[0-9a-f]+", module["native_maps_device"]) is None
+        or type(module["native_maps_inode"]) is not int
+        or module["native_maps_inode"] <= 0
+        or cv2_loader["profile"] != expected_cv2_loader["profile"]
+        or cv2_loader["files"] != expected_cv2_loader["files"]
+    ):
+        raise ValueError("simulator graphics cv2-loader identity mismatch")
+    if (
+        not isinstance(loader_search_safety, dict)
+        or set(loader_search_safety)
+        != {
+            "profile",
+            "working_directory",
+            "working_directory_binding",
+            "working_directory_read_only",
+            "normalized_cv2_binary_path",
+            "normalized_cv2_binary_path_exists",
+            "working_directory_library_candidates",
+        }
+        or loader_search_safety["profile"]
+        != PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_SEARCH_SAFETY_PROFILE
+        or not isinstance(loader_search_safety["working_directory"], str)
+        or not os.path.isabs(loader_search_safety["working_directory"])
+        or loader_search_safety["working_directory_binding"]
+        != "equals_runtime_module_repository_root"
+        or loader_search_safety["working_directory_read_only"] is not True
+        or loader_search_safety["normalized_cv2_binary_path"]
+        != "/.venv/lib/python3.11/lib64"
+        or loader_search_safety["normalized_cv2_binary_path_exists"] is not False
+        or loader_search_safety["working_directory_library_candidates"] != []
+    ):
+        raise ValueError("simulator graphics cv2-loader search safety mismatch")
     libraries = value["libraries"]
     expected = _expected_graphics_library_records()
     if (
@@ -750,15 +1229,55 @@ def _validate_graphics_runtime(value: Any, *, expected_gpu_uuid: str) -> dict[st
 
 
 def _capture_graphics_runtime(*, expected_gpu_uuid: str) -> dict[str, Any]:
+    initial_environment = _initial_graphics_environment()
+    environment = _graphics_environment()
     maps = _parse_graphics_proc_maps()
+    cv2_module = _capture_graphics_cv2_module_identity()
+    loader_search_safety = _capture_graphics_cv2_loader_search_safety()
+    native_maps_identity = (
+        cv2_module["native_maps_device"],
+        cv2_module["native_maps_inode"],
+    )
     report = {
         "profile": PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE,
         "proc_maps_path": PI05_DROID_JOINTPOS_GRAPHICS_PROC_MAPS_PATH,
-        "environment": _graphics_environment(),
+        "proc_environ_path": PI05_DROID_JOINTPOS_GRAPHICS_PROC_ENVIRON_PATH,
+        "initial_environment": initial_environment,
+        "environment": environment,
+        "cv2_loader": {
+            "profile": PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_PROFILE,
+            "module": cv2_module,
+            "loader_search_safety": loader_search_safety,
+            "files": [
+                _capture_graphics_cv2_loader_file(
+                    path,
+                    maps_identity=(
+                        native_maps_identity
+                        if path == cv2_module["native_module_path"]
+                        else None
+                    ),
+                )
+                for path, _size, _sha256 in (
+                    PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_FILES
+                )
+            ],
+        },
         "libraries": [
             _capture_mapped_graphics_library(path, maps[path]) for path in sorted(maps)
         ],
     }
+    if initial_environment != _initial_graphics_environment():
+        raise ValueError(
+            "Simulator initial graphics environment changed during capture"
+        )
+    if environment != _graphics_environment():
+        raise ValueError("Simulator graphics environment changed during capture")
+    if maps != _parse_graphics_proc_maps():
+        raise ValueError("Simulator graphics maps changed during capture")
+    if cv2_module != _capture_graphics_cv2_module_identity():
+        raise ValueError("Simulator cv2 module identity changed during capture")
+    if loader_search_safety != _capture_graphics_cv2_loader_search_safety():
+        raise ValueError("Simulator cv2 loader search safety changed during capture")
     report["graphics_runtime_sha256"] = _graphics_runtime_sha256(report)
     return _validate_graphics_runtime(report, expected_gpu_uuid=expected_gpu_uuid)
 

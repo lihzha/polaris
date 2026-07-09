@@ -4,6 +4,8 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -64,6 +66,23 @@ def _graphics_runtime():
     value = {
         "profile": runtime.PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE,
         "proc_maps_path": runtime.PI05_DROID_JOINTPOS_GRAPHICS_PROC_MAPS_PATH,
+        "proc_environ_path": runtime.PI05_DROID_JOINTPOS_GRAPHICS_PROC_ENVIRON_PATH,
+        "initial_environment": {
+            "LD_LIBRARY_PATH": None,
+            "NVIDIA_VISIBLE_DEVICES": GPU_UUID,
+            "NVIDIA_DRIVER_CAPABILITIES": "all",
+            "VK_DRIVER_FILES": (runtime.PI05_DROID_JOINTPOS_VULKAN_ICD_CONTAINER_PATH),
+            **{
+                name: None
+                for name in runtime.PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT
+            },
+            **{
+                name: None
+                for name in (
+                    runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT
+                )
+            },
+        },
         "environment": {
             "LD_LIBRARY_PATH": (
                 runtime.PI05_DROID_JOINTPOS_GRAPHICS_EXPECTED_LD_LIBRARY_PATH
@@ -80,6 +99,31 @@ def _graphics_runtime():
                     runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT
                 )
             },
+        },
+        "cv2_loader": {
+            "profile": runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_PROFILE,
+            "module": {
+                **dict(runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_MODULE_IDENTITY),
+                "native_maps_device": "0:1",
+                "native_maps_inode": 1000,
+            },
+            "loader_search_safety": {
+                "profile": (
+                    runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_SEARCH_SAFETY_PROFILE
+                ),
+                "working_directory": "/immutable/polaris",
+                "working_directory_binding": ("equals_runtime_module_repository_root"),
+                "working_directory_read_only": True,
+                "normalized_cv2_binary_path": "/.venv/lib/python3.11/lib64",
+                "normalized_cv2_binary_path_exists": False,
+                "working_directory_library_candidates": [],
+            },
+            "files": [
+                {"path": path, "size": size, "sha256": sha256}
+                for path, size, sha256 in (
+                    runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_FILES
+                )
+            ],
         },
         "libraries": libraries,
     }
@@ -128,12 +172,94 @@ def _prepare_graphics_capture(
     monkeypatch.setattr(
         runtime, "PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES", (identity,)
     )
+    cv2_dir = tmp_path / "cv2"
+    cv2_dir.mkdir()
+    cv2_loader_identities = []
+    for name, payload in (
+        ("__init__.py", b"cv2-init"),
+        ("config-3.py", b"cv2-config-3"),
+        ("config.py", b"cv2-config"),
+        ("cv2.abi3.so", b"cv2-native"),
+        ("load_config_py3.py", b"cv2-load-config"),
+        ("version.py", b"cv2-version"),
+    ):
+        path = cv2_dir / name
+        path.write_bytes(payload)
+        cv2_loader_identities.append(
+            (str(path), len(payload), hashlib.sha256(payload).hexdigest())
+        )
+    monkeypatch.setattr(
+        runtime,
+        "PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_FILES",
+        tuple(cv2_loader_identities),
+    )
+    module_identity = dict(runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_MODULE_IDENTITY)
+    module_identity.update(
+        {
+            "python_module_path": str(cv2_dir / "__init__.py"),
+            "python_module_spec_origin": str(cv2_dir / "__init__.py"),
+            "native_module_path": str(cv2_dir / "cv2.abi3.so"),
+            "native_module_spec_origin": str(cv2_dir / "cv2.abi3.so"),
+            "load_config_module_path": str(cv2_dir / "load_config_py3.py"),
+            "version_module_path": str(cv2_dir / "version.py"),
+            "higher_priority_config_path": str(cv2_dir / "config-3.11.py"),
+            "selected_config_path": str(cv2_dir / "config-3.py"),
+        }
+    )
+    monkeypatch.setattr(
+        runtime,
+        "PI05_DROID_JOINTPOS_GRAPHICS_CV2_MODULE_IDENTITY",
+        tuple(module_identity.items()),
+    )
+    native_metadata = (cv2_dir / "cv2.abi3.so").stat()
+    module_capture = {
+        **module_identity,
+        "native_maps_device": (
+            f"{os.major(native_metadata.st_dev):x}:{os.minor(native_metadata.st_dev):x}"
+        ),
+        "native_maps_inode": native_metadata.st_ino,
+    }
+    monkeypatch.setattr(
+        runtime,
+        "_capture_graphics_cv2_module_identity",
+        lambda: copy.deepcopy(module_capture),
+    )
+    loader_search_safety = {
+        "profile": (
+            runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_SEARCH_SAFETY_PROFILE
+        ),
+        "working_directory": str(tmp_path),
+        "working_directory_binding": "equals_runtime_module_repository_root",
+        "working_directory_read_only": True,
+        "normalized_cv2_binary_path": "/.venv/lib/python3.11/lib64",
+        "normalized_cv2_binary_path_exists": False,
+        "working_directory_library_candidates": [],
+    }
+    monkeypatch.setattr(
+        runtime,
+        "_capture_graphics_cv2_loader_search_safety",
+        lambda: copy.deepcopy(loader_search_safety),
+    )
     maps = tmp_path / "maps"
     _write_maps(maps, library)
     monkeypatch.setattr(
         runtime, "PI05_DROID_JOINTPOS_GRAPHICS_PROC_MAPS_PATH", str(maps)
     )
-    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    environ = tmp_path / "environ"
+    environ.write_bytes(
+        (
+            f"NVIDIA_VISIBLE_DEVICES={GPU_UUID}\0"
+            "NVIDIA_DRIVER_CAPABILITIES=all\0"
+            f"VK_DRIVER_FILES={runtime.PI05_DROID_JOINTPOS_VULKAN_ICD_CONTAINER_PATH}\0"
+        ).encode("utf-8")
+    )
+    monkeypatch.setattr(
+        runtime, "PI05_DROID_JOINTPOS_GRAPHICS_PROC_ENVIRON_PATH", str(environ)
+    )
+    monkeypatch.setenv(
+        "LD_LIBRARY_PATH",
+        runtime.PI05_DROID_JOINTPOS_GRAPHICS_EXPECTED_LD_LIBRARY_PATH,
+    )
     monkeypatch.setenv("NVIDIA_VISIBLE_DEVICES", GPU_UUID)
     monkeypatch.setenv("NVIDIA_DRIVER_CAPABILITIES", "all")
     for name in runtime.PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT:
@@ -144,7 +270,18 @@ def _prepare_graphics_capture(
     value = {
         "profile": runtime.PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE,
         "proc_maps_path": str(maps),
+        "proc_environ_path": str(environ),
+        "initial_environment": runtime._initial_graphics_environment(),
         "environment": runtime._graphics_environment(),
+        "cv2_loader": {
+            "profile": runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_PROFILE,
+            "module": module_capture,
+            "loader_search_safety": loader_search_safety,
+            "files": [
+                {"path": path, "size": size, "sha256": sha256}
+                for path, size, sha256 in cv2_loader_identities
+            ],
+        },
         "libraries": [
             {
                 "path": str(library),
@@ -342,6 +479,20 @@ def test_execution_environment_capture_binds_single_gpu_and_exact_icd(
         runtime, "PI05_DROID_JOINTPOS_VULKAN_ICD_CONTAINER_PATH", str(icd)
     )
     monkeypatch.setenv("VK_DRIVER_FILES", str(icd))
+    environ_path = Path(runtime.PI05_DROID_JOINTPOS_GRAPHICS_PROC_ENVIRON_PATH)
+    environ_path.write_bytes(
+        environ_path.read_bytes().replace(
+            b"VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json\0",
+            f"VK_DRIVER_FILES={icd}\0".encode(),
+        )
+    )
+    graphics["initial_environment"]["VK_DRIVER_FILES"] = str(icd)
+    graphics["graphics_runtime_sha256"] = runtime._graphics_runtime_sha256(graphics)
+    monkeypatch.setattr(
+        runtime,
+        "PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_SHA256",
+        graphics["graphics_runtime_sha256"],
+    )
 
     def fake_run(argv, **kwargs):
         assert argv == list(runtime.PI05_DROID_JOINTPOS_NVIDIA_SMI_QUERY)
@@ -470,6 +621,12 @@ def test_execution_environment_pure_validator_is_closed():
             "graphics-library identity",
         ),
         (
+            lambda value: value["graphics_runtime"]["cv2_loader"]["files"][0].update(
+                {"sha256": "0" * 64}
+            ),
+            "cv2-loader identity",
+        ),
+        (
             lambda value: value["graphics_runtime"]["environment"].update(
                 {"LD_PRELOAD": "/tmp/injected.so"}
             ),
@@ -496,8 +653,90 @@ def test_execution_environment_pure_validator_is_closed():
 
 def test_production_graphics_table_and_canonical_digest_are_closed():
     value = _graphics_runtime()
+    assert runtime.PI05_DROID_JOINTPOS_RUNTIME_SCHEMA_VERSION == 4
+    assert runtime.PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE == (
+        "l401_pyxis_nvidia_580_105_08_mapped_graphics_v4"
+    )
+    assert runtime.PI05_DROID_JOINTPOS_GRAPHICS_PROC_ENVIRON_PATH == (
+        "/proc/self/environ"
+    )
     assert len(runtime.PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES) == 15
     assert len(value["libraries"]) == 15
+    assert runtime.PI05_DROID_JOINTPOS_GRAPHICS_EXPECTED_LD_LIBRARY_PATH == (
+        "/.venv/lib/python3.11/site-packages/cv2/../../lib64:"
+    )
+    assert runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_PROFILE == (
+        "opencv_python_headless_4_11_0_86_linux_loader_v1"
+    )
+    assert runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_SEARCH_SAFETY_PROFILE == (
+        "cv2_empty_loader_element_readonly_workdir_v1"
+    )
+    assert dict(runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_MODULE_IDENTITY) == {
+        "python_module_path": "/.venv/lib/python3.11/site-packages/cv2/__init__.py",
+        "python_module_spec_origin": (
+            "/.venv/lib/python3.11/site-packages/cv2/__init__.py"
+        ),
+        "native_module_path": ("/.venv/lib/python3.11/site-packages/cv2/cv2.abi3.so"),
+        "native_module_spec_origin": (
+            "/.venv/lib/python3.11/site-packages/cv2/cv2.abi3.so"
+        ),
+        "load_config_module_path": (
+            "/.venv/lib/python3.11/site-packages/cv2/load_config_py3.py"
+        ),
+        "version_module_path": ("/.venv/lib/python3.11/site-packages/cv2/version.py"),
+        "opencv_version": "4.11.0",
+        "package_version": "4.11.0.86",
+        "ci_build": True,
+        "headless": True,
+        "contrib": False,
+        "rolling": False,
+        "python_executable": "/.venv/bin/python",
+        "python_implementation": "cpython",
+        "python_cache_tag": "cpython-311",
+        "python_major": 3,
+        "python_minor": 11,
+        "higher_priority_config_path": (
+            "/.venv/lib/python3.11/site-packages/cv2/config-3.11.py"
+        ),
+        "higher_priority_config_exists": False,
+        "selected_config_path": ("/.venv/lib/python3.11/site-packages/cv2/config-3.py"),
+    }
+    assert runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_FILES == (
+        (
+            "/.venv/lib/python3.11/site-packages/cv2/__init__.py",
+            6_612,
+            "936bd94c5a5debf0212fc751af79d3a163652f3e850259df2159db6aa3ed8ad8",
+        ),
+        (
+            "/.venv/lib/python3.11/site-packages/cv2/config-3.py",
+            724,
+            "9a7aadf724b822001f5e963b01fd4e375d45e2cbbe328d2ca7b42a440c083a1c",
+        ),
+        (
+            "/.venv/lib/python3.11/site-packages/cv2/config.py",
+            111,
+            "974e2d4096ee1a9a9a341df1bf33e16973683bf1ac733006de27ff2f23bc584d",
+        ),
+        (
+            "/.venv/lib/python3.11/site-packages/cv2/cv2.abi3.so",
+            66_106_617,
+            "68fee49d266a95e730c1cb17d913a39a93ab5c50bee1581600f453026f9c7b8d",
+        ),
+        (
+            "/.venv/lib/python3.11/site-packages/cv2/load_config_py3.py",
+            262,
+            "03dc1f11374a667c9b7db10dd5276d640b0c2d5b2e7866b4ccef772732bd3852",
+        ),
+        (
+            "/.venv/lib/python3.11/site-packages/cv2/version.py",
+            92,
+            "3b07492169e6079940f716162368c51b6dbee45be36c9c46fb6f9e56b0449739",
+        ),
+    )
+    assert runtime.PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT[-2:] == (
+        "QT_QPA_PLATFORM_PLUGIN_PATH",
+        "QT_QPA_FONTDIR",
+    )
     assert runtime.PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT == (
         "VK_SDK_PATH",
         "VULKAN_SDK",
@@ -512,12 +751,32 @@ def test_production_graphics_table_and_canonical_digest_are_closed():
         "6257a5b3887eab41edd54343ea3623c373ab8e8e",
     ) in runtime.PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES
     assert value["graphics_runtime_sha256"] == (
-        "06af774bf60104e67a4e12681747623fb419f8a11ff330a740f798945b58a53f"
+        "d251727e38315050a25b79954ed77984fa5cc4649b954e7789bfcbb0a77e3629"
     )
     assert (
         value["graphics_runtime_sha256"]
         == runtime.PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_SHA256
     )
+
+
+def test_graphics_digest_excludes_only_bound_per_process_identities():
+    value = _graphics_runtime()
+    baseline = runtime._graphics_runtime_sha256(value)
+    value["environment"]["NVIDIA_VISIBLE_DEVICES"] = (
+        "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    )
+    value["initial_environment"]["NVIDIA_VISIBLE_DEVICES"] = (
+        "GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    )
+    value["cv2_loader"]["module"]["native_maps_device"] = "ff:1"
+    value["cv2_loader"]["module"]["native_maps_inode"] += 1
+    value["cv2_loader"]["loader_search_safety"]["working_directory"] = (
+        "/another/immutable/polaris"
+    )
+    for item in value["libraries"]:
+        item["maps_device"] = "ff:1"
+        item["maps_inode"] += 1
+    assert runtime._graphics_runtime_sha256(value) == baseline
 
 
 def test_mapped_graphics_capture_binds_maps_file_hash_and_build_id(
@@ -610,6 +869,264 @@ def test_mapped_graphics_capture_rejects_loader_override_environment(
     _prepare_graphics_capture(tmp_path, monkeypatch)
     monkeypatch.setenv(name, "/tmp/injected")
     with pytest.raises(ValueError, match="override environment"):
+        runtime._capture_graphics_runtime(expected_gpu_uuid=GPU_UUID)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "",
+        "/.venv/lib/python3.11/site-packages/cv2/../../lib64",
+        "/.venv/lib/python3.11/site-packages/cv2/../../lib64:/tmp/injected",
+        "/tmp/injected:/.venv/lib/python3.11/site-packages/cv2/../../lib64:",
+    ],
+)
+def test_mapped_graphics_capture_requires_exact_cv2_loader_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str | None
+):
+    _prepare_graphics_capture(tmp_path, monkeypatch)
+    if value is None:
+        monkeypatch.delenv("LD_LIBRARY_PATH")
+    else:
+        monkeypatch.setenv("LD_LIBRARY_PATH", value)
+    with pytest.raises(ValueError, match='"LD_LIBRARY_PATH"'):
+        runtime._capture_graphics_runtime(expected_gpu_uuid=GPU_UUID)
+
+
+def test_mapped_graphics_capture_rejects_cv2_loader_file_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _prepare_graphics_capture(tmp_path, monkeypatch)
+    path = Path(runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_FILES[0][0])
+    path.write_bytes(b"changed")
+    with pytest.raises(ValueError, match="cv2-loader identity"):
+        runtime._capture_graphics_runtime(expected_gpu_uuid=GPU_UUID)
+
+
+def test_mapped_graphics_capture_rejects_cv2_loader_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _prepare_graphics_capture(tmp_path, monkeypatch)
+    path = Path(runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_FILES[0][0])
+    target = tmp_path / "cv2-loader-target.py"
+    path.rename(target)
+    path.symlink_to(target)
+    with pytest.raises(ValueError, match="regular and non-symlink"):
+        runtime._capture_graphics_runtime(expected_gpu_uuid=GPU_UUID)
+
+
+def test_mapped_graphics_capture_rejects_missing_cv2_loader_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _prepare_graphics_capture(tmp_path, monkeypatch)
+    path = Path(runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_FILES[0][0])
+    path.unlink()
+    with pytest.raises(ValueError, match="Cannot inspect graphics cv2-loader file"):
+        runtime._capture_graphics_runtime(expected_gpu_uuid=GPU_UUID)
+
+
+@pytest.mark.parametrize(
+    "field,replacement",
+    [("path", "/tmp/cv2.py"), ("size", 1), ("sha256", "0" * 64)],
+)
+def test_mapped_graphics_validator_rejects_cv2_loader_identity_drift(
+    field: str, replacement: int | str
+):
+    value = _graphics_runtime()
+    value["cv2_loader"]["files"][0][field] = replacement
+    with pytest.raises(ValueError, match="cv2-loader identity"):
+        runtime._validate_graphics_runtime(value, expected_gpu_uuid=GPU_UUID)
+
+
+def test_mapped_graphics_validator_rejects_cv2_loader_order_drift():
+    value = _graphics_runtime()
+    value["cv2_loader"]["files"].reverse()
+    with pytest.raises(ValueError, match="cv2-loader identity"):
+        runtime._validate_graphics_runtime(value, expected_gpu_uuid=GPU_UUID)
+
+
+@pytest.mark.parametrize(
+    "field,replacement",
+    [
+        ("python_module_path", "/tmp/cv2/__init__.py"),
+        ("native_module_path", "/tmp/cv2.abi3.so"),
+        ("opencv_version", "4.10.0"),
+        ("package_version", "4.10.0.84"),
+        ("python_cache_tag", "cpython-312"),
+        ("higher_priority_config_exists", True),
+    ],
+)
+def test_mapped_graphics_validator_rejects_loaded_cv2_module_drift(
+    field: str, replacement: str | bool
+):
+    value = _graphics_runtime()
+    value["cv2_loader"]["module"][field] = replacement
+    with pytest.raises(ValueError, match="cv2-loader identity"):
+        runtime._validate_graphics_runtime(value, expected_gpu_uuid=GPU_UUID)
+
+
+def test_live_cv2_capture_rejects_wrong_loaded_module_origin(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    cv2 = types.ModuleType("cv2")
+    cv2.__file__ = "/tmp/cv2/__init__.py"
+    cv2.__spec__ = types.SimpleNamespace(origin=cv2.__file__)
+    cv2.__version__ = "4.11.0"
+    native = types.ModuleType("cv2")
+    native.__file__ = "/tmp/cv2/cv2.abi3.so"
+    native.__spec__ = types.SimpleNamespace(origin=native.__file__)
+    version = types.ModuleType("cv2.version")
+    version.__file__ = "/tmp/cv2/version.py"
+    version.opencv_version = "4.11.0.86"
+    version.ci_build = True
+    version.headless = True
+    version.contrib = False
+    version.rolling = False
+    load_config = types.ModuleType("cv2.load_config_py3")
+    load_config.__file__ = "/tmp/cv2/load_config_py3.py"
+    cv2._native = native
+    cv2.version = version
+    monkeypatch.setitem(sys.modules, "cv2", cv2)
+    monkeypatch.setitem(sys.modules, "cv2.load_config_py3", load_config)
+    with pytest.raises(ValueError, match="Live cv2 module identity"):
+        runtime._capture_graphics_cv2_module_identity()
+
+
+def test_mapped_graphics_validator_rejects_cv2_loader_profile_or_extra_key():
+    value = _graphics_runtime()
+    value["cv2_loader"]["profile"] = "unbound"
+    with pytest.raises(ValueError, match="cv2-loader identity"):
+        runtime._validate_graphics_runtime(value, expected_gpu_uuid=GPU_UUID)
+
+
+@pytest.mark.parametrize(
+    "field,replacement",
+    [
+        ("working_directory_read_only", False),
+        ("normalized_cv2_binary_path_exists", True),
+        ("normalized_cv2_binary_path", "/tmp/lib64"),
+        ("working_directory_library_candidates", ["libcuda.so"]),
+    ],
+)
+def test_mapped_graphics_validator_rejects_cv2_loader_search_safety_drift(
+    field: str, replacement: bool | str | list[str]
+):
+    value = _graphics_runtime()
+    value["cv2_loader"]["loader_search_safety"][field] = replacement
+    with pytest.raises(ValueError, match="cv2-loader search safety"):
+        runtime._validate_graphics_runtime(value, expected_gpu_uuid=GPU_UUID)
+    value = _graphics_runtime()
+    value["cv2_loader"]["unexpected"] = True
+    with pytest.raises(ValueError, match="cv2-loader schema"):
+        runtime._validate_graphics_runtime(value, expected_gpu_uuid=GPU_UUID)
+    value = _graphics_runtime()
+    value["cv2_loader"]["module"]["unexpected"] = True
+    with pytest.raises(ValueError, match="cv2-loader identity"):
+        runtime._validate_graphics_runtime(value, expected_gpu_uuid=GPU_UUID)
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("LD_LIBRARY_PATH", ""),
+        ("LD_LIBRARY_PATH", "/tmp/injected"),
+        ("QT_QPA_PLATFORM_PLUGIN_PATH", "/tmp/plugins"),
+        ("QT_QPA_FONTDIR", "/tmp/fonts"),
+        ("VK_LAYER_PATH", ""),
+    ],
+)
+def test_mapped_graphics_capture_rejects_nonabsent_initial_loader_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str, value: str
+):
+    _prepare_graphics_capture(tmp_path, monkeypatch)
+    environ_path = Path(runtime.PI05_DROID_JOINTPOS_GRAPHICS_PROC_ENVIRON_PATH)
+    payload = environ_path.read_bytes() + f"{name}={value}\0".encode()
+    environ_path.write_bytes(payload)
+    with pytest.raises(ValueError, match="initial graphics environment mismatch"):
+        runtime._capture_graphics_runtime(expected_gpu_uuid=GPU_UUID)
+
+
+def test_initial_environment_parser_rejects_duplicate_or_truncated_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    environ_path = tmp_path / "environ"
+    monkeypatch.setattr(
+        runtime, "PI05_DROID_JOINTPOS_GRAPHICS_PROC_ENVIRON_PATH", str(environ_path)
+    )
+    environ_path.write_bytes(b"A=1\0A=2\0")
+    with pytest.raises(ValueError, match="duplicate keys"):
+        runtime._read_proc_initial_environment()
+    environ_path.write_bytes(b"A=1")
+    with pytest.raises(ValueError, match="truncated"):
+        runtime._read_proc_initial_environment()
+
+
+def test_graphics_capture_rejects_live_environment_drift_during_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _prepare_graphics_capture(tmp_path, monkeypatch)
+    first = runtime._graphics_environment()
+    second = copy.deepcopy(first)
+    second["QT_QPA_FONTDIR"] = "/tmp/drift"
+    values = iter((first, second))
+    monkeypatch.setattr(runtime, "_graphics_environment", lambda: next(values))
+    with pytest.raises(ValueError, match="environment changed during capture"):
+        runtime._capture_graphics_runtime(expected_gpu_uuid=GPU_UUID)
+
+
+def test_graphics_capture_rejects_initial_environment_drift_during_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _prepare_graphics_capture(tmp_path, monkeypatch)
+    first = runtime._initial_graphics_environment()
+    second = copy.deepcopy(first)
+    second["LD_LIBRARY_PATH"] = ""
+    values = iter((first, second))
+    monkeypatch.setattr(runtime, "_initial_graphics_environment", lambda: next(values))
+    with pytest.raises(ValueError, match="initial graphics environment changed"):
+        runtime._capture_graphics_runtime(expected_gpu_uuid=GPU_UUID)
+
+
+def test_graphics_capture_rejects_maps_drift_during_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _prepare_graphics_capture(tmp_path, monkeypatch)
+    first = runtime._parse_graphics_proc_maps()
+    second = {path: (device, inode + 1) for path, (device, inode) in first.items()}
+    values = iter((first, second))
+    monkeypatch.setattr(runtime, "_parse_graphics_proc_maps", lambda: next(values))
+    with pytest.raises(ValueError, match="graphics maps changed during capture"):
+        runtime._capture_graphics_runtime(expected_gpu_uuid=GPU_UUID)
+
+
+def test_graphics_capture_rejects_cv2_module_drift_during_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _prepare_graphics_capture(tmp_path, monkeypatch)
+    first = runtime._capture_graphics_cv2_module_identity()
+    second = copy.deepcopy(first)
+    second["native_maps_inode"] += 1
+    values = iter((first, second))
+    monkeypatch.setattr(
+        runtime, "_capture_graphics_cv2_module_identity", lambda: next(values)
+    )
+    with pytest.raises(ValueError, match="cv2 module identity changed"):
+        runtime._capture_graphics_runtime(expected_gpu_uuid=GPU_UUID)
+
+
+def test_graphics_capture_rejects_cv2_loader_search_safety_drift_during_hashing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _prepare_graphics_capture(tmp_path, monkeypatch)
+    first = runtime._capture_graphics_cv2_loader_search_safety()
+    second = copy.deepcopy(first)
+    second["working_directory_read_only"] = False
+    values = iter((first, second))
+    monkeypatch.setattr(
+        runtime, "_capture_graphics_cv2_loader_search_safety", lambda: next(values)
+    )
+    with pytest.raises(ValueError, match="loader search safety changed"):
         runtime._capture_graphics_runtime(expected_gpu_uuid=GPU_UUID)
 
 

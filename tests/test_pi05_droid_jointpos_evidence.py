@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 import polaris.pi05_droid_jointpos_evidence as evidence
+import polaris.pi05_droid_jointpos_runtime as runtime
 
 
 SERVER_SHA = "1" * 64
@@ -129,6 +130,37 @@ def _gpu_vulkan_contracts():
             },
             "graphics_runtime": {
                 "profile": evidence.PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE,
+                "cv2_loader": {
+                    "profile": (
+                        runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_PROFILE
+                    ),
+                    "files": [
+                        {"path": path, "size": size, "sha256": sha256}
+                        for path, size, sha256 in (
+                            runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_FILES
+                        )
+                    ],
+                    "module": {
+                        **dict(
+                            runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_MODULE_IDENTITY
+                        ),
+                        "native_maps_device": "0:1",
+                        "native_maps_inode": 1000,
+                    },
+                    "loader_search_safety": {
+                        "profile": (
+                            runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_SEARCH_SAFETY_PROFILE
+                        ),
+                        "working_directory": "/immutable/polaris",
+                        "working_directory_binding": (
+                            "equals_runtime_module_repository_root"
+                        ),
+                        "working_directory_read_only": True,
+                        "normalized_cv2_binary_path": ("/.venv/lib/python3.11/lib64"),
+                        "normalized_cv2_binary_path_exists": False,
+                        "working_directory_library_candidates": [],
+                    },
+                },
                 "libraries": [
                     {} for _ in evidence.PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES
                 ],
@@ -295,6 +327,9 @@ def test_worker_finalizes_server_rng_then_evidence_before_success_marker():
 
 
 def test_gpu_vulkan_contract_requires_model_simulator_agreement():
+    assert evidence.PI05_DROID_JOINTPOS_EVIDENCE_PROFILE == (
+        "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v7"
+    )
     model, simulator = _gpu_vulkan_contracts()
     assert evidence._validate_gpu_vulkan_runtime_agreement(model, simulator) == {
         "nvidia_gpu_uuid": GPU_UUID,
@@ -310,6 +345,31 @@ def test_gpu_vulkan_contract_requires_model_simulator_agreement():
         "graphics_runtime_sha256": (
             evidence.PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_SHA256
         ),
+        "graphics_cv2_loader_profile": (
+            runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_PROFILE
+        ),
+        "graphics_cv2_module_identity": {
+            **dict(runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_MODULE_IDENTITY),
+            "native_maps_device": "0:1",
+            "native_maps_inode": 1000,
+        },
+        "graphics_cv2_loader_search_safety": {
+            "profile": (
+                runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_SEARCH_SAFETY_PROFILE
+            ),
+            "working_directory": "/immutable/polaris",
+            "working_directory_binding": "equals_runtime_module_repository_root",
+            "working_directory_read_only": True,
+            "normalized_cv2_binary_path": "/.venv/lib/python3.11/lib64",
+            "normalized_cv2_binary_path_exists": False,
+            "working_directory_library_candidates": [],
+        },
+        "graphics_cv2_loader_files": [
+            {"path": path, "size": size, "sha256": sha256}
+            for path, size, sha256 in (
+                runtime.PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_FILES
+            )
+        ],
         "graphics_library_count": len(
             evidence.PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES
         ),
@@ -391,6 +451,18 @@ def test_gpu_vulkan_contract_rejects_noncanonical_shared_runtime():
 
     model, simulator = _gpu_vulkan_contracts()
     simulator["graphics_runtime"]["libraries"].pop()
+    with pytest.raises(ValueError, match="mapped graphics-runtime identity"):
+        evidence._validate_gpu_vulkan_runtime_agreement(model, simulator)
+
+    model, simulator = _gpu_vulkan_contracts()
+    simulator["graphics_runtime"]["cv2_loader"]["files"][0]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="mapped graphics-runtime identity"):
+        evidence._validate_gpu_vulkan_runtime_agreement(model, simulator)
+
+    model, simulator = _gpu_vulkan_contracts()
+    simulator["graphics_runtime"]["cv2_loader"]["loader_search_safety"][
+        "working_directory_read_only"
+    ] = False
     with pytest.raises(ValueError, match="mapped graphics-runtime identity"):
         evidence._validate_gpu_vulkan_runtime_agreement(model, simulator)
 
