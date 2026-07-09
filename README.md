@@ -121,6 +121,75 @@ binding detects persistent mutation and path replacement; malicious transient
 mutation or process tampering by the same Unix uid remains outside its threat
 model.
 
+The governed submitter and spooled batch script both disable Slurm requeue.
+Before release, the submitter seals the controller's held record and requires
+`Requeue=0`, `Restarts=0`, the expected transaction comment, and a user-held
+pending state. The worker independently seals the corresponding running record
+into the evaluation evidence manifest. After the allocation is terminal, join
+those records to the allocation-level accounting row before accepting the run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$POLARIS_SOURCE_SNAPSHOT/src" \
+  "$POLARIS_OPENPI_RUNTIME_DIR/.venv/bin/python" -B -m \
+  polaris.pi05_droid_jointpos_scheduler attest-terminal \
+  --job-id "$JOB_ID" --transaction-id "$SUBMISSION_TRANSACTION_ID" \
+  --held-record "$PROVENANCE_DIR/scheduler_held.json" \
+  --running-record "$RUN_DIR/pi05_droid_jointpos_scheduler_running.json" \
+  --evidence-manifest "$RUN_DIR/pi05_droid_jointpos_evidence_manifest.json" \
+  --task-success "$RUN_DIR/$POLARIS_ENVIRONMENT/SUCCESS" \
+  --output "$RUN_DIR/pi05_droid_jointpos_scheduler_terminal.json"
+```
+
+The terminal attestation requires `COMPLETED`, exit code `0:0`, and Slurm's
+allocation-level `Restarts=0`; it immutably binds the held record, running
+record, evaluator evidence manifest, and task success marker.
+
+AppLauncher-only diagnostics intentionally stop at a sealed
+`preterminal_attestation.json`; they create no task/run `SUCCESS` marker and
+are not authoritative while the allocation is live. After the job terminates,
+promote exactly one 16-column app-manifest row from outside the allocation:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$POLARIS_SOURCE_SNAPSHOT/src" \
+  "$POLARIS_OPENPI_RUNTIME_DIR/.venv/bin/python" -B \
+  "$POLARIS_SOURCE_SNAPSHOT/scripts/polaris/finalize_pi05_app_launcher_only.py" \
+  --manifest "$APP_SUBMISSION_MANIFEST" --job-id "$JOB_ID"
+```
+
+Submission must bind `POLARIS_SACCT_RUNTIME_APPROVAL` and
+`POLARIS_SACCT_RUNTIME_APPROVAL_SHA256` to the independently agent-reviewed
+external `sacct` runtime approval-v2. This contract does not claim or fabricate
+human review. The immutable candidate and capture terminal precede a separate
+review-v2 artifact; that artifact pins a structured `codex-agent` reviewer
+distinct from the capture producer, the review scope and verdict, candidate and
+capture hashes, and five distinct evidence paths. The final approval binds all
+three without changing the audited source package. An unpinned reviewer or the
+legacy external-human label is rejected. Before `sbatch`, and again immediately
+before releasing the held job, the submitter performs the full live approval
+validation and binds its no-replace receipt into submission provenance. The
+finalizer must run on the approval's exact L40S login-host surface; a
+compute-node closure or another login host is rejected.
+
+The finalizer derives the sealed task and provenance paths, verifies the held
+and running no-requeue records, source approval, Pyxis image, exact step
+closure, and live pinned `sacct`, then requires one allocation row with
+`COMPLETED|0:0|Restarts=0`. It publishes the no-replace external
+`app_launcher_allocation_promotion.json`. Watchers must use `--verify-only` on
+that artifact before reporting lifecycle completion; cluster-registry
+publication remains a separate operation. Promotion has no captured-accounting
+mode: the finalizer revalidates the approved `sacct`, Slurm configuration, and
+Slurm library identities plus the complete reviewed ELF/plugin/configuration,
+symlink, and declared ambient dependency closure. It invokes the exact
+allocation query with only the approved `PATH`, `SLURM_CONF`, and
+`LD_LIBRARY_PATH` and the attested 10-second subprocess timeout; it never
+shortens that subprocess timeout while claiming ten seconds. Every query has
+before/after closure validation, including exceptional exits. A successful
+live query first publishes immutable raw output and a producer-bound query
+receipt; the promotion contains only that receipt identity and the parsed
+result, never caller-supplied accounting text. Publication and `--verify-only`
+repeat the live surface, identity, trace-review, receipt, command, and
+environment checks.
+
 ### Run Ego-LAP with end-effector pose control
 
 PolaRiS also includes an `EgoLAPEefPose` client and selectable absolute

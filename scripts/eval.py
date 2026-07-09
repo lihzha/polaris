@@ -1,8 +1,18 @@
+# ruff: noqa: E402
+
 import tyro
 import mediapy
 
 # import wandb
 import tqdm
+
+_PROCESS_EVAL_MODE = __import__("os").environ.get("POLARIS_EVAL_MODE")
+if _PROCESS_EVAL_MODE != "app_launcher_only":
+    # Preserve the public evaluator's original import timing and failure
+    # behavior for every standard invocation.  The closed AppLauncher-only
+    # process deliberately excludes evaluation imports and returns before any
+    # reference to ``gym``.
+    import gymnasium as gym
 import torch
 import argparse
 import os
@@ -37,6 +47,13 @@ def _validate_startup_diagnostic_args(eval_args: EvalArgs) -> None:
     )
     if mode not in {None, "app_launcher_only"}:
         raise ValueError(f"unsupported startup diagnostic: {mode!r}")
+    if _PROCESS_EVAL_MODE not in {None, "standard", "app_launcher_only"}:
+        raise ValueError(f"unsupported POLARIS_EVAL_MODE: {_PROCESS_EVAL_MODE!r}")
+    if (_PROCESS_EVAL_MODE == "app_launcher_only") != (mode == "app_launcher_only"):
+        raise ValueError(
+            "POLARIS_EVAL_MODE=app_launcher_only and "
+            "--startup-diagnostic app_launcher_only must be selected together"
+        )
     if mode is None:
         if any(value is not None for value in values):
             raise ValueError(
@@ -184,8 +201,6 @@ def main(eval_args: EvalArgs):
 
 
 def _run_evaluation(eval_args: EvalArgs, lifecycle):
-    import gymnasium as gym
-
     position_adapter = eval_args.policy.client == "DroidDeltaJointPosition"
     audited_jointpos = eval_args.policy.client == "DroidJointPos"
     audited_droid = eval_args.control_mode == "joint-velocity" or position_adapter

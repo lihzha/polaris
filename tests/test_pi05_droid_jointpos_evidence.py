@@ -358,7 +358,7 @@ def test_worker_finalizes_server_rng_then_evidence_before_success_marker():
 
 def test_gpu_vulkan_contract_requires_model_simulator_agreement():
     assert evidence.PI05_DROID_JOINTPOS_EVIDENCE_PROFILE == (
-        "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v10"
+        "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v11"
     )
     model, simulator = _gpu_vulkan_contracts()
     assert evidence._validate_gpu_vulkan_runtime_agreement(model, simulator) == {
@@ -437,7 +437,9 @@ def test_run_metadata_binds_outer_package_probes_to_model_runtime(tmp_path):
         "source_tree_sha256": "1" * 64,
         "source_implementation_commit": "2" * 40,
         "source_approval_artifact_sha256": "3" * 64,
-        "source_approval_path": str((tmp_path / "polaris_source_approval.json").resolve()),
+        "source_approval_path": str(
+            (tmp_path / "polaris_source_approval.json").resolve()
+        ),
         "trusted_source_hasher_sha256": "4" * 64,
         "consumer_binding_sha256": "5" * 64,
         "polaris_base_commit": "6" * 40,
@@ -457,14 +459,16 @@ def test_run_metadata_binds_outer_package_probes_to_model_runtime(tmp_path):
             "TRUSTED_SOURCE_HASHER_SHA256": source_contracts[
                 "trusted_source_hasher_sha256"
             ],
-            "CONSUMER_BINDING_SHA256": source_contracts[
-                "consumer_binding_sha256"
-            ],
+            "CONSUMER_BINDING_SHA256": source_contracts["consumer_binding_sha256"],
             "FINAL_CONSUMER_BINDING_SHA256": source_contracts[
                 "consumer_binding_sha256"
             ],
             "POLARIS_COMMIT": source_contracts["polaris_base_commit"],
             "OPENPI_COMMIT": source_contracts["source_openpi_commit"],
+            "SLURM_JOB_ID": "4242",
+            "SUBMISSION_TRANSACTION_ID": (
+                "pi05-0123456789abcdef0123456789abcdef01234567"
+            ),
         }
         source_values.update(drift)
         metadata.write_text(
@@ -482,14 +486,20 @@ def test_run_metadata_binds_outer_package_probes_to_model_runtime(tmp_path):
         "openpi_package_environment_sha256": digest,
         "openpi_package_preflight_postrun_unchanged": True,
         "numpydantic_warning_filter": warning_filter,
+        "scheduler_job_id": 4242,
+        "scheduler_transaction_id": ("pi05-0123456789abcdef0123456789abcdef01234567"),
     }
 
     write(post="0" * 64)
     with pytest.raises(ValueError, match="outer evaluation package probes"):
-        evidence._validate_package_run_metadata(metadata, host_runtime, source_contracts)
+        evidence._validate_package_run_metadata(
+            metadata, host_runtime, source_contracts
+        )
     write(warning="error")
     with pytest.raises(ValueError, match="warning filter"):
-        evidence._validate_package_run_metadata(metadata, host_runtime, source_contracts)
+        evidence._validate_package_run_metadata(
+            metadata, host_runtime, source_contracts
+        )
     for key in (
         "POLARIS_SOURCE_TREE_SHA256",
         "POLARIS_IMPLEMENTATION_COMMIT",
@@ -506,11 +516,23 @@ def test_run_metadata_binds_outer_package_probes_to_model_runtime(tmp_path):
             evidence._validate_package_run_metadata(
                 metadata, host_runtime, source_contracts
             )
+    write(SLURM_JOB_ID="not-a-job")
+    with pytest.raises(ValueError, match="Slurm job ID"):
+        evidence._validate_package_run_metadata(
+            metadata, host_runtime, source_contracts
+        )
+    write(SUBMISSION_TRANSACTION_ID="pi05-invalid")
+    with pytest.raises(ValueError, match="submission transaction ID"):
+        evidence._validate_package_run_metadata(
+            metadata, host_runtime, source_contracts
+        )
     write()
     with metadata.open("a", encoding="utf-8") as stream:
         stream.write(f"POSTRUN_PACKAGE_ENVIRONMENT_SHA256={digest}\n")
     with pytest.raises(ValueError, match="duplicate run metadata"):
-        evidence._validate_package_run_metadata(metadata, host_runtime, source_contracts)
+        evidence._validate_package_run_metadata(
+            metadata, host_runtime, source_contracts
+        )
 
 
 def test_gpu_vulkan_contract_rejects_noncanonical_shared_runtime():

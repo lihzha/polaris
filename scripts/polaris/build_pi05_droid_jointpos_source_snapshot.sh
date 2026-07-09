@@ -78,8 +78,11 @@ git -C "${SOURCE_CHECKOUT}/third_party/openpi" archive --format=tar \
 for required_path in \
   scripts/eval.py \
   scripts/polaris/eval_pi05_droid_jointpos_polaris.sh \
+  scripts/polaris/finalize_pi05_app_launcher_only.py \
   scripts/polaris/serve_pi05_droid_jointpos_attested.py \
+  src/polaris/app_launcher_startup_diagnostic.py \
   src/polaris/pi05_droid_jointpos_consumer_binding.py \
+  src/polaris/pi05_droid_jointpos_scheduler.py \
   src/polaris/policy/droid_jointpos_client.py \
   third_party/openpi/packages/openpi-client/src/openpi_client/image_tools.py \
   third_party/openpi/packages/openpi-client/src/openpi_client/websocket_client_policy.py; do

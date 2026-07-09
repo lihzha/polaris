@@ -1,9 +1,18 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash -p
 
 # Launch the exact official pi0.5-DROID-Polaris server and one bounded task eval.
 # This script runs inside one ordinary one-GPU Slurm allocation.
 
 set -Eeuo pipefail
+[[ -o privileged ]] || { echo "Privileged Bash mode (-p) is required" >&2; exit 2; }
+INHERITED_PATH="${PATH:-/usr/bin:/bin}"
+unset BASH_ENV ENV LD_AUDIT LD_PRELOAD PYTHONHOME PYTHONPATH PYTHONUSERBASE
+POLARIS_EVAL_MODE="${POLARIS_EVAL_MODE:-standard}"
+if [[ "${POLARIS_EVAL_MODE}" == app_launcher_only ]]; then
+  export PATH=/cm/local/apps/slurm/24.11/bin:/usr/bin:/bin
+else
+  export PATH="${INHERITED_PATH}"
+fi
 export PYTHONDONTWRITEBYTECODE=1
 
 SCRIPT_DIR="$(readlink -f -- "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")"
@@ -50,8 +59,8 @@ RUN_LABEL="${RUN_LABEL:-pi05-polaris}"
 PORT="${PORT:-$((20000 + ${SLURM_JOB_ID:-1} % 20000))}"
 SERVER_START_TIMEOUT_SECS="${SERVER_START_TIMEOUT_SECS:-2400}"
 DRY_RUN="${DRY_RUN:-0}"
-POLARIS_EVAL_MODE="${POLARIS_EVAL_MODE:-standard}"
 RESUME_FROM_TASK_DIR="${RESUME_FROM_TASK_DIR:-}"
+SUBMISSION_TRANSACTION_ID="${SUBMISSION_TRANSACTION_ID:-dryrun}"
 ENVIRONMENT_SEED_SCHEME=base_plus_episode_index_v1
 ENVIRONMENT_DETERMINISM_CLAIM=rng_bound_not_bitwise
 POLARIS_DATA_REVISION=8c7e4103e266ef83d8b1ad2e9a63116edd5f155b
@@ -81,10 +90,21 @@ require_canonical_existing_path "${POLARIS_DIR}" "POLARIS_DIR"
 require_canonical_existing_path "${OPENPI_DIR}" "OPENPI_DIR"
 require_canonical_existing_path "${POLARIS_SOURCE_APPROVAL}" "POLARIS_SOURCE_APPROVAL"
 require_canonical_existing_path "${TRUSTED_SOURCE_HASHER_PATH}" "trusted source hasher"
-mkdir -p "${OPENPI_DATA_HOME}" "${OUTPUT_ROOT}" "${POLARIS_CACHE_DIR}"
-OPENPI_DATA_HOME="$(readlink -f -- "${OPENPI_DATA_HOME}")"
-OUTPUT_ROOT="$(readlink -f -- "${OUTPUT_ROOT}")"
-POLARIS_CACHE_DIR="$(readlink -f -- "${POLARIS_CACHE_DIR}")"
+if [[ "${POLARIS_EVAL_MODE}" == app_launcher_only ]]; then
+  : "${POLARIS_RUNTIME_CLOSURE_APPROVAL:?Missing runtime-closure approval path}"
+  require_canonical_existing_path \
+    "${POLARIS_RUNTIME_CLOSURE_APPROVAL}" "runtime-closure approval"
+fi
+if [[ "${POLARIS_EVAL_MODE}" == app_launcher_only && "${DRY_RUN}" == 1 ]]; then
+  OPENPI_DATA_HOME="$(readlink -m -- "${OPENPI_DATA_HOME}")"
+  OUTPUT_ROOT="$(readlink -m -- "${OUTPUT_ROOT}")"
+  POLARIS_CACHE_DIR="$(readlink -m -- "${POLARIS_CACHE_DIR}")"
+else
+  mkdir -p "${OPENPI_DATA_HOME}" "${OUTPUT_ROOT}" "${POLARIS_CACHE_DIR}"
+  OPENPI_DATA_HOME="$(readlink -f -- "${OPENPI_DATA_HOME}")"
+  OUTPUT_ROOT="$(readlink -f -- "${OUTPUT_ROOT}")"
+  POLARIS_CACHE_DIR="$(readlink -f -- "${POLARIS_CACHE_DIR}")"
+fi
 
 verify_trusted_source_snapshot() {
   [[ -f "${TRUSTED_SOURCE_HASHER_PATH}" && ! -L "${TRUSTED_SOURCE_HASHER_PATH}" ]] \
@@ -94,11 +114,177 @@ verify_trusted_source_snapshot() {
     || die "Trusted batch source hasher changed"
   local observed
   observed="$(
-    /usr/bin/bash --noprofile --norc "${TRUSTED_SOURCE_HASHER_PATH}" \
+    /usr/bin/bash --noprofile --norc -p "${TRUSTED_SOURCE_HASHER_PATH}" \
       --source-digest "${POLARIS_DIR}"
   )" || die "Trusted terminal source hashing failed"
   [[ "${observed}" == "${EXPECTED_POLARIS_SOURCE_TREE_SHA256}" ]] \
     || die "PolaRiS source snapshot changed after trusted batch verification"
+}
+
+verify_runtime_closure_approval() {
+  local result observed_approval_sha256 observed_config_sha256
+  local observed_scontrol_sha256 observed_scontrol_size
+  local observed_slurm_library_sha256 observed_slurm_library_size
+  local observed_sacct_sha256 observed_sacct_size
+  local observed_scancel_sha256 observed_scancel_size
+  local observed_srun_sha256 observed_srun_size
+  result="$(
+    /usr/bin/bash --noprofile --norc -p "${TRUSTED_SOURCE_HASHER_PATH}" \
+      --validate-runtime-closure-approval \
+      "${POLARIS_RUNTIME_CLOSURE_APPROVAL}" \
+      "${POLARIS_RUNTIME_CLOSURE_APPROVAL_SHA256}"
+  )" || die "Trusted runtime-closure approval validation failed"
+  IFS=$'\t' read -r observed_approval_sha256 observed_config_sha256 \
+    observed_scontrol_sha256 observed_scontrol_size \
+    observed_slurm_library_sha256 observed_slurm_library_size \
+    observed_sacct_sha256 observed_sacct_size \
+    observed_scancel_sha256 observed_scancel_size \
+    observed_srun_sha256 observed_srun_size <<< "${result}"
+  [[ "${observed_approval_sha256}" == \
+      "${POLARIS_RUNTIME_CLOSURE_APPROVAL_SHA256}" \
+    && "${observed_approval_sha256}" == \
+      "${BATCH_VERIFIED_RUNTIME_CLOSURE_APPROVAL_SHA256}" \
+    && "${observed_config_sha256}" == \
+      "${POLARIS_EXPECTED_SLURM_CONFIG_SHA256}" \
+    && "${observed_scontrol_sha256}" == "${POLARIS_EXPECTED_SCONTROL_SHA256}" \
+    && "${observed_scontrol_size}" == "${POLARIS_EXPECTED_SCONTROL_SIZE}" \
+    && "${observed_slurm_library_sha256}" == \
+      "${POLARIS_EXPECTED_SLURM_LIBRARY_SHA256}" \
+    && "${observed_slurm_library_size}" == \
+      "${POLARIS_EXPECTED_SLURM_LIBRARY_SIZE}" \
+    && "${observed_sacct_sha256}" == "${POLARIS_EXPECTED_SACCT_SHA256}" \
+    && "${observed_sacct_size}" == "${POLARIS_EXPECTED_SACCT_SIZE}" \
+    && "${observed_scancel_sha256}" == "${POLARIS_EXPECTED_SCANCEL_SHA256}" \
+    && "${observed_scancel_size}" == "${POLARIS_EXPECTED_SCANCEL_SIZE}" \
+    && "${observed_srun_sha256}" == "${POLARIS_EXPECTED_SRUN_SHA256}" \
+    && "${observed_srun_size}" == "${POLARIS_EXPECTED_SRUN_SIZE}" ]] \
+    || die "Runtime-closure approval changed after trusted batch verification"
+}
+
+DIAGNOSTIC_HOST_PYTHON=/usr/bin/python3.12
+DIAGNOSTIC_MODULE="${POLARIS_DIR}/src/polaris/app_launcher_startup_diagnostic.py"
+EXPECTED_DIAGNOSTIC_MODULE_SHA256=e9b42dca89a67f45d4a1568641590f0a75c9ac9683a0ce4e5830a24499a5a292
+diagnostic_helper_command=()
+DIAGNOSTIC_MODULE_FD=""
+DIAGNOSTIC_MODULE_LOADER='import hashlib, os, sys; approved_path=sys.argv[1]; fd=int(sys.argv[2]); rest=sys.argv[3:]; os.lseek(fd, 0, os.SEEK_SET); payload=os.fdopen(os.dup(fd), "rb").read(); digest=hashlib.sha256(payload).hexdigest(); digest == os.environ["POLARIS_DIAGNOSTIC_MODULE_SHA256"] or sys.exit("diagnostic module descriptor digest mismatch"); sys.argv=[approved_path, *rest]; namespace={"__name__":"__main__", "__file__":approved_path, "__package__":None, "__cached__":None}; exec(compile(payload, approved_path, "exec"), namespace, namespace)'
+DIAGNOSTIC_CONTAINER_LOADER='import hashlib, os, stat, sys; approved_path=sys.argv[1]; expected=sys.argv[2]; rest=sys.argv[3:]; fd=os.open(approved_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)); metadata=os.fstat(fd); stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1 or sys.exit("diagnostic module descriptor metadata mismatch"); payload=os.fdopen(fd, "rb").read(); digest=hashlib.sha256(payload).hexdigest(); digest == expected == os.environ["POLARIS_DIAGNOSTIC_MODULE_SHA256"] or sys.exit("diagnostic module descriptor digest mismatch"); sys.argv=[approved_path, *rest]; namespace={"__name__":"__main__", "__file__":approved_path, "__package__":None, "__cached__":None}; exec(compile(payload, approved_path, "exec"), namespace, namespace)'
+
+close_diagnostic_module_fd() {
+  if [[ -n "${DIAGNOSTIC_MODULE_FD}" ]]; then
+    eval "exec ${DIAGNOSTIC_MODULE_FD}<&-" 2>/dev/null || true
+    DIAGNOSTIC_MODULE_FD=""
+  fi
+}
+
+build_diagnostic_helper_command() {
+  local module_path_metadata module_fd_metadata module_sha
+  close_diagnostic_module_fd
+  [[ -x "${DIAGNOSTIC_HOST_PYTHON}" && ! -L "${DIAGNOSTIC_HOST_PYTHON}" ]] \
+    || die "Pinned host Python is missing or symlinked"
+  [[ "$(/usr/bin/readlink -f -- "${DIAGNOSTIC_HOST_PYTHON}")" == \
+    "${DIAGNOSTIC_HOST_PYTHON}" ]] || die "Pinned host Python is not canonical"
+  [[ -f "${DIAGNOSTIC_MODULE}" && ! -L "${DIAGNOSTIC_MODULE}" \
+    && "$(/usr/bin/readlink -f -- "${DIAGNOSTIC_MODULE}")" == "${DIAGNOSTIC_MODULE}" ]] \
+    || die "Diagnostic helper module origin is not canonical"
+  exec {DIAGNOSTIC_MODULE_FD}<"${DIAGNOSTIC_MODULE}" \
+    || die "Cannot open diagnostic helper module"
+  module_path_metadata="$(/usr/bin/stat -Lc '%d:%i:%a:%u:%g:%h:%s' -- "${DIAGNOSTIC_MODULE}")" \
+    || die "Cannot inspect diagnostic helper module path"
+  module_fd_metadata="$(/usr/bin/stat -Lc '%d:%i:%a:%u:%g:%h:%s' -- "/proc/$$/fd/${DIAGNOSTIC_MODULE_FD}")" \
+    || die "Cannot inspect diagnostic helper module descriptor"
+  [[ "${module_path_metadata}" == "${module_fd_metadata}" \
+    && "${module_fd_metadata}" =~ ^[0-9]+:[0-9]+:[0-7]+:[0-9]+:[0-9]+:1:[1-9][0-9]*$ ]] \
+    || die "Diagnostic helper module descriptor binding is invalid"
+  module_sha="$(
+    /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+      /usr/bin/sha256sum -- "/proc/$$/fd/${DIAGNOSTIC_MODULE_FD}"
+  )" || die "Cannot hash diagnostic helper module"
+  [[ "${EXPECTED_DIAGNOSTIC_MODULE_SHA256}" =~ ^[0-9a-f]{64}$ \
+    && "${module_sha%% *}" == "${EXPECTED_DIAGNOSTIC_MODULE_SHA256}" ]] \
+    || die "Diagnostic helper module bytes changed"
+  diagnostic_helper_command=(
+    /usr/bin/env -i
+    PATH=/usr/bin:/bin LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    "SLURM_JOB_ID=${SLURM_JOB_ID:-}" \
+    "SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-}" \
+    "SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-}" \
+    "SLURM_JOB_ACCOUNT=${SLURM_JOB_ACCOUNT:-}" \
+    "SLURM_JOB_PARTITION=${SLURM_JOB_PARTITION:-}" \
+    "SLURM_JOB_QOS=${SLURM_JOB_QOS:-}" \
+    "SLURM_JOB_USER=${SLURM_JOB_USER:-}" \
+    "SUBMISSION_TRANSACTION_ID=${SUBMISSION_TRANSACTION_ID:-}" \
+    "NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-}" \
+    "BATCH_VERIFIED_POLARIS_SOURCE_TREE_SHA256=${BATCH_VERIFIED_POLARIS_SOURCE_TREE_SHA256:-}" \
+    "POLARIS_IMPLEMENTATION_COMMIT=${POLARIS_IMPLEMENTATION_COMMIT:-}" \
+    "SOURCE_APPROVAL_SHA256=${SOURCE_APPROVAL_SHA256:-}" \
+    "POLARIS_EXPECTED_SLURM_CONFIG_SHA256=${POLARIS_EXPECTED_SLURM_CONFIG_SHA256:-}" \
+    "POLARIS_EXPECTED_SCONTROL_SHA256=${POLARIS_EXPECTED_SCONTROL_SHA256:-}" \
+    "POLARIS_EXPECTED_SCONTROL_SIZE=${POLARIS_EXPECTED_SCONTROL_SIZE:-}" \
+    "POLARIS_EXPECTED_SLURM_LIBRARY_SHA256=${POLARIS_EXPECTED_SLURM_LIBRARY_SHA256:-}" \
+    "POLARIS_EXPECTED_SLURM_LIBRARY_SIZE=${POLARIS_EXPECTED_SLURM_LIBRARY_SIZE:-}" \
+    "POLARIS_EXPECTED_SACCT_SHA256=${POLARIS_EXPECTED_SACCT_SHA256:-}" \
+    "POLARIS_EXPECTED_SACCT_SIZE=${POLARIS_EXPECTED_SACCT_SIZE:-}" \
+    "POLARIS_EXPECTED_SCANCEL_SHA256=${POLARIS_EXPECTED_SCANCEL_SHA256:-}" \
+    "POLARIS_EXPECTED_SCANCEL_SIZE=${POLARIS_EXPECTED_SCANCEL_SIZE:-}" \
+    "POLARIS_EXPECTED_SRUN_SHA256=${POLARIS_EXPECTED_SRUN_SHA256:-}" \
+    "POLARIS_EXPECTED_SRUN_SIZE=${POLARIS_EXPECTED_SRUN_SIZE:-}" \
+    "POLARIS_RUNTIME_CLOSURE_APPROVAL_SHA256=${POLARIS_RUNTIME_CLOSURE_APPROVAL_SHA256:-}" \
+    "BATCH_VERIFIED_RUNTIME_CLOSURE_APPROVAL_SHA256=${BATCH_VERIFIED_RUNTIME_CLOSURE_APPROVAL_SHA256:-}" \
+    "POLARIS_PYXIS_IMAGE_PATH=${POLARIS_PYXIS_IMAGE_PATH:-}" \
+    "POLARIS_EXPECTED_PYXIS_IMAGE_SHA256=${POLARIS_EXPECTED_PYXIS_IMAGE_SHA256:-}" \
+    "POLARIS_OBSERVED_PYXIS_IMAGE_SHA256=${POLARIS_OBSERVED_PYXIS_IMAGE_SHA256:-}" \
+    "POLARIS_OBSERVED_PYXIS_IMAGE_MODE=${POLARIS_OBSERVED_PYXIS_IMAGE_MODE:-}" \
+    "POLARIS_OBSERVED_PYXIS_IMAGE_NLINK=${POLARIS_OBSERVED_PYXIS_IMAGE_NLINK:-}" \
+    "POLARIS_OBSERVED_PYXIS_IMAGE_SIZE=${POLARIS_OBSERVED_PYXIS_IMAGE_SIZE:-}" \
+    "POLARIS_DIAGNOSTIC_MODULE_SHA256=${EXPECTED_DIAGNOSTIC_MODULE_SHA256}" \
+    "${DIAGNOSTIC_HOST_PYTHON}" -I -S -c "${DIAGNOSTIC_MODULE_LOADER}" \
+    "${DIAGNOSTIC_MODULE}" "${DIAGNOSTIC_MODULE_FD}"
+  )
+}
+
+run_diagnostic_helper() {
+  local code=0
+  build_diagnostic_helper_command
+  "${diagnostic_helper_command[@]}" "$@" || code=$?
+  close_diagnostic_module_fd
+  return "${code}"
+}
+
+capture_and_export_pyxis_image_identity() {
+  local captured
+  captured="$(
+    run_diagnostic_helper capture-pyxis-image-identity \
+      --path "${POLARIS_PYXIS_IMAGE}" \
+      --expected-sha256 "${EXPECTED_PYXIS_SHA256}"
+  )" || die "Cannot capture the approved Pyxis image identity"
+  IFS=$'\t' read -r POLARIS_OBSERVED_PYXIS_IMAGE_MODE \
+    POLARIS_OBSERVED_PYXIS_IMAGE_NLINK POLARIS_OBSERVED_PYXIS_IMAGE_SIZE \
+    POLARIS_OBSERVED_PYXIS_IMAGE_SHA256 <<< "${captured}"
+  [[ "${POLARIS_OBSERVED_PYXIS_IMAGE_MODE}" =~ ^[0-7]{4}$ \
+    && "${POLARIS_OBSERVED_PYXIS_IMAGE_NLINK}" == 1 \
+    && "${POLARIS_OBSERVED_PYXIS_IMAGE_SIZE}" =~ ^[1-9][0-9]*$ \
+    && "${POLARIS_OBSERVED_PYXIS_IMAGE_SHA256}" == "${EXPECTED_PYXIS_SHA256}" ]] \
+    || die "Approved Pyxis image identity is malformed"
+  export POLARIS_PYXIS_IMAGE_PATH="${POLARIS_PYXIS_IMAGE}"
+  export POLARIS_EXPECTED_PYXIS_IMAGE_SHA256="${EXPECTED_PYXIS_SHA256}"
+  export POLARIS_OBSERVED_PYXIS_IMAGE_MODE \
+    POLARIS_OBSERVED_PYXIS_IMAGE_NLINK POLARIS_OBSERVED_PYXIS_IMAGE_SIZE \
+    POLARIS_OBSERVED_PYXIS_IMAGE_SHA256
+}
+
+verify_exported_pyxis_image_identity() {
+  local expected observed
+  expected="${POLARIS_OBSERVED_PYXIS_IMAGE_MODE}"$'\t'\
+"${POLARIS_OBSERVED_PYXIS_IMAGE_NLINK}"$'\t'\
+"${POLARIS_OBSERVED_PYXIS_IMAGE_SIZE}"$'\t'\
+"${POLARIS_OBSERVED_PYXIS_IMAGE_SHA256}"
+  observed="$(
+    run_diagnostic_helper capture-pyxis-image-identity \
+      --path "${POLARIS_PYXIS_IMAGE}" \
+      --expected-sha256 "${EXPECTED_PYXIS_SHA256}"
+  )" || die "Cannot revalidate the approved Pyxis image identity"
+  [[ "${observed}" == "${expected}" ]] \
+    || die "Approved Pyxis image identity changed during the diagnostic"
 }
 
 capture_gpu_runtime() {
@@ -206,109 +392,444 @@ build_public_eval_command() {
   fi
   [[ "${POLARIS_EVAL_MODE}" == app_launcher_only ]] \
     || die "Unsupported evaluator mode: ${POLARIS_EVAL_MODE}"
+  diagnostic_export_names=POLARIS_EVAL_MODE,SUBMISSION_TRANSACTION_ID,NVIDIA_VISIBLE_DEVICES,NVIDIA_DRIVER_CAPABILITIES,BATCH_VERIFIED_POLARIS_SOURCE_TREE_SHA256,POLARIS_IMPLEMENTATION_COMMIT,SOURCE_APPROVAL_SHA256,POLARIS_RUNTIME_CLOSURE_APPROVAL,BATCH_VERIFIED_RUNTIME_CLOSURE_APPROVAL_SHA256,POLARIS_EXPECTED_SLURM_CONFIG_SHA256,POLARIS_EXPECTED_SCONTROL_SHA256,POLARIS_EXPECTED_SCONTROL_SIZE,POLARIS_EXPECTED_SLURM_LIBRARY_SHA256,POLARIS_EXPECTED_SLURM_LIBRARY_SIZE,POLARIS_EXPECTED_SACCT_SHA256,POLARIS_EXPECTED_SACCT_SIZE,POLARIS_EXPECTED_SCANCEL_SHA256,POLARIS_EXPECTED_SCANCEL_SIZE,POLARIS_EXPECTED_SRUN_SHA256,POLARIS_EXPECTED_SRUN_SIZE,POLARIS_RUNTIME_CLOSURE_APPROVAL_SHA256,POLARIS_DIAGNOSTIC_MODULE_SHA256,POLARIS_PYXIS_IMAGE_PATH,POLARIS_EXPECTED_PYXIS_IMAGE_SHA256,POLARIS_OBSERVED_PYXIS_IMAGE_SHA256,POLARIS_OBSERVED_PYXIS_IMAGE_MODE,POLARIS_OBSERVED_PYXIS_IMAGE_NLINK,POLARIS_OBSERVED_PYXIS_IMAGE_SIZE,POLARIS_OUTPUT_NAMESPACE_PARENT_IDENTITY,POLARIS_STARTUP_DIAGNOSTIC_RUN_DIR,POLARIS_STARTUP_DIAGNOSTIC_TASK_DIR,POLARIS_STARTUP_DIAGNOSTIC_RUN_DIR_IDENTITY,POLARIS_STARTUP_DIAGNOSTIC_TASK_DIR_IDENTITY
   diagnostic_eval_command=(
-    srun --ntasks=1 "--cpus-per-task=${SLURM_CPUS_PER_TASK:-16}" --gpus-per-task=1
+    /cm/local/apps/slurm/24.11/bin/srun --ntasks=1 \
+    "--cpus-per-task=${SLURM_CPUS_PER_TASK:-16}" --gpus-per-task=1 \
+    --kill-on-bad-exit=1
     "--container-image=${POLARIS_PYXIS_IMAGE}"
     "--container-mounts=${pyxis_mounts}"
     "--container-workdir=${POLARIS_CONTAINER_SOURCE}"
     --no-container-entrypoint --no-container-mount-home --container-remap-root --container-writable
-    "--container-env=NVIDIA_VISIBLE_DEVICES,NVIDIA_DRIVER_CAPABILITIES,BATCH_VERIFIED_POLARIS_SOURCE_TREE_SHA256,POLARIS_IMPLEMENTATION_COMMIT,SOURCE_APPROVAL_SHA256"
-    --export=ALL
-    /usr/bin/env
-    PYTHONUNBUFFERED=1
-    "PYTHONPATH=${POLARIS_CONTAINER_SOURCE}/src:${POLARIS_CONTAINER_SOURCE}/third_party/openpi/packages/openpi-client/src"
-    /.venv/bin/python -m polaris.app_launcher_startup_diagnostic
+    "--container-env=${diagnostic_export_names}"
+    "--export=${diagnostic_export_names}"
+    /.venv/bin/python -I -S -c "${DIAGNOSTIC_CONTAINER_LOADER}"
+    /polaris-source/src/polaris/app_launcher_startup_diagnostic.py
+    "${EXPECTED_DIAGNOSTIC_MODULE_SHA256}"
     --preexec-output "${STARTUP_PREEXEC_FILE}"
     --preclose-output "${STARTUP_PRECLOSE_FILE}"
     --expected-batch-gpu-uuid "${actual_gpu_uuid}"
     --source-root "${POLARIS_CONTAINER_SOURCE}"
     --data-root "${POLARIS_DATA_DIR}"
     --cache-root /cache
+    --scheduler-request "${STARTUP_SCHEDULER_REQUEST_FILE}"
+    --scheduler-handoff "${STARTUP_SCHEDULER_HANDOFF_FILE}"
+    --run-dir "${RUN_DIR}"
+    --task-dir "${TASK_DIR}"
+    --namespace-parent-identity "${POLARIS_OUTPUT_NAMESPACE_PARENT_IDENTITY}"
+    --run-dir-identity "${RUN_DIR_IDENTITY}"
+    --task-dir-identity "${TASK_DIR_IDENTITY}"
     -- /.venv/bin/python "${eval_args[@]}"
   )
 }
 
+APP_HELPER_PID=""
+APP_HELPER_PGID=""
+APP_SRUN_PID=""
+APP_SRUN_PGID=""
+APP_LOG_PID=""
+APP_LOG_PGID=""
+APP_LOG_WRITE_FD=""
+APP_LOG_READ_FD=""
+APP_LOG_MIRROR_FD=""
+APP_CLEANUP_ACTIVE=0
+APP_TERMINALIZED=0
+APP_SRUN_CODE=255
+APP_LOG_CODE=255
+APP_HELPER_CODE=255
+
+app_process_is_live() {
+  local pid="$1"
+  local process_record process_state
+  kill -0 "${pid}" 2>/dev/null || return 1
+  if [[ -r "/proc/${pid}/stat" ]]; then
+    process_record="$(<"/proc/${pid}/stat")" || return 1
+    process_record="${process_record##*) }"
+    process_state="${process_record%% *}"
+    [[ "${process_state}" != Z && "${process_state}" != X ]] || return 1
+  fi
+  return 0
+}
+
+app_process_group_is_absent() {
+  local pgid="$1"
+  [[ -z "${pgid}" ]] && return 0
+  ! kill -0 -- "-${pgid}" 2>/dev/null
+}
+
+terminate_app_process_group() {
+  local pid="$1"
+  local pgid="$2"
+  local leader="${pid}"
+  [[ -n "${pgid}" && "${pgid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -TERM -- "-${pgid}" 2>/dev/null || true
+  for _ in {1..20}; do
+    if [[ -n "${leader}" ]] && ! app_process_is_live "${leader}"; then
+      wait "${leader}" 2>/dev/null || true
+      leader=""
+    fi
+    app_process_group_is_absent "${pgid}" && return 0
+    /usr/bin/sleep 0.05
+  done
+  kill -KILL -- "-${pgid}" 2>/dev/null || true
+  for _ in {1..20}; do
+    if [[ -n "${leader}" ]] && ! app_process_is_live "${leader}"; then
+      wait "${leader}" 2>/dev/null || true
+      leader=""
+    fi
+    app_process_group_is_absent "${pgid}" && return 0
+    /usr/bin/sleep 0.05
+  done
+  return 1
+}
+
+await_app_process_group() {
+  local pid="$1"
+  local observed_pgid
+  for _ in {1..100}; do
+    kill -0 "${pid}" 2>/dev/null || return 1
+    observed_pgid="$(/usr/bin/ps -o pgid= -p "${pid}" | /usr/bin/tr -d ' ')"
+    [[ "${observed_pgid}" == "${pid}" ]] && return 0
+    /usr/bin/sleep 0.01
+  done
+  return 1
+}
+
+APP_BOUNDED_WAIT_CODE=255
+wait_app_process_bounded() {
+  local pid="$1"
+  local attempts="$2"
+  APP_BOUNDED_WAIT_CODE=255
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    if ! app_process_is_live "${pid}"; then
+      wait "${pid}"
+      APP_BOUNDED_WAIT_CODE=$?
+      return 0
+    fi
+    /usr/bin/sleep 0.05
+  done
+  return 1
+}
+
+cleanup_app_processes_and_temps() {
+  local cleanup_failed=0
+  # SIGKILL cannot run this trap; any leftovers after KILL are forensic
+  # incomplete-failure evidence and are never presented as sealed completion.
+  if [[ -n "${APP_LOG_WRITE_FD}" ]]; then
+    eval "exec ${APP_LOG_WRITE_FD}>&-" 2>/dev/null || true
+    APP_LOG_WRITE_FD=""
+  fi
+  if [[ -n "${APP_LOG_READ_FD}" ]]; then
+    eval "exec ${APP_LOG_READ_FD}<&-" 2>/dev/null || true
+    APP_LOG_READ_FD=""
+  fi
+  if [[ -n "${APP_LOG_MIRROR_FD}" ]]; then
+    eval "exec ${APP_LOG_MIRROR_FD}>&-" 2>/dev/null || true
+    APP_LOG_MIRROR_FD=""
+  fi
+  close_diagnostic_module_fd
+  if [[ -n "${APP_SRUN_PGID}" ]]; then
+    terminate_app_process_group "${APP_SRUN_PID}" "${APP_SRUN_PGID}" \
+      || cleanup_failed=1
+  fi
+  if [[ -n "${APP_LOG_PGID}" ]]; then
+    terminate_app_process_group "${APP_LOG_PID}" "${APP_LOG_PGID}" \
+      || cleanup_failed=1
+  fi
+  if [[ -n "${APP_HELPER_PGID}" ]]; then
+    terminate_app_process_group "${APP_HELPER_PID}" "${APP_HELPER_PGID}" \
+      || cleanup_failed=1
+  fi
+  [[ -z "${APP_SRUN_PID}" ]] || wait "${APP_SRUN_PID}" 2>/dev/null || true
+  [[ -z "${APP_LOG_PID}" ]] || wait "${APP_LOG_PID}" 2>/dev/null || true
+  [[ -z "${APP_HELPER_PID}" ]] || wait "${APP_HELPER_PID}" 2>/dev/null || true
+  if app_process_group_is_absent "${APP_SRUN_PGID}"; then
+    APP_SRUN_PID=""
+    APP_SRUN_PGID=""
+  fi
+  if app_process_group_is_absent "${APP_LOG_PGID}"; then
+    APP_LOG_PID=""
+    APP_LOG_PGID=""
+  fi
+  if app_process_group_is_absent "${APP_HELPER_PGID}"; then
+    APP_HELPER_PID=""
+    APP_HELPER_PGID=""
+  fi
+  return "${cleanup_failed}"
+}
+
+finalize_app_failure() {
+  local primary_code="$1"
+  local signal_name="$2"
+  local failure_sealed=0
+  if ! cleanup_app_processes_and_temps; then
+    echo "POLARIS_APP_LAUNCHER_INCOMPLETE_FAILURE=process_group_survived" >&2
+    return 1
+  fi
+  if [[ -n "${TASK_DIR:-}" && -d "${TASK_DIR}" && ! -L "${TASK_DIR}" \
+    && "$(stat -c %a "${TASK_DIR}" 2>/dev/null)" == 755 ]]; then
+    if run_diagnostic_helper cleanup-transients \
+      --task-dir "${TASK_DIR}" --task-dir-identity "${TASK_DIR_IDENTITY}" \
+      >/dev/null 2>&1 \
+      && run_diagnostic_helper publish-failure-attestation \
+      --task-dir "${TASK_DIR}" --task-dir-identity "${TASK_DIR_IDENTITY}" \
+      --primary-exit-code "${primary_code}" \
+      --srun-exit-code "${APP_SRUN_CODE}" --log-exit-code "${APP_LOG_CODE}" \
+      --helper-exit-code "${APP_HELPER_CODE}" --signal "${signal_name}" \
+      >/dev/null 2>&1 \
+      && run_diagnostic_helper seal-evidence-tree \
+        --task-dir "${TASK_DIR}" --run-dir "${RUN_DIR}" \
+        --task-dir-identity "${TASK_DIR_IDENTITY}" \
+        --run-dir-identity "${RUN_DIR_IDENTITY}" \
+        --namespace-parent-identity "${POLARIS_OUTPUT_NAMESPACE_PARENT_IDENTITY}" \
+        --outcome failure \
+        >/dev/null 2>&1 \
+      && [[ "$(stat -c %a "${TASK_DIR}")" == 555 \
+        && "$(stat -c %a "${RUN_DIR}")" == 555 ]]; then
+      failure_sealed=1
+    fi
+  fi
+  if [[ "${failure_sealed}" == 1 ]]; then
+    APP_TERMINALIZED=1
+  else
+    echo "POLARIS_APP_LAUNCHER_INCOMPLETE_FAILURE=unsealed_process_survived" >&2
+  fi
+}
+
+app_signal_handler() {
+  local signal_name="$1"
+  local code=129
+  [[ "${signal_name}" == INT ]] && code=130
+  [[ "${signal_name}" == TERM ]] && code=143
+  trap - EXIT
+  trap '' HUP INT TERM
+  finalize_app_failure "${code}" "${signal_name}" || true
+  exit "${code}"
+}
+
+app_exit_handler() {
+  local code=$?
+  trap - EXIT
+  trap '' HUP INT TERM
+  if [[ "${APP_CLEANUP_ACTIVE}" == 1 && "${APP_TERMINALIZED}" == 0 \
+    && "${code}" != 0 ]]; then
+    finalize_app_failure "${code}" none || true
+  fi
+  exit "${code}"
+}
+
 run_app_launcher_only() {
+  local coproc_write_fd created_identities primary_code sealed_evidence
+  local terminal_request_code=0
+  local close_termination_mode log_sha256 returned_namespace_identity
   verify_trusted_source_snapshot
+  verify_runtime_closure_approval
   RUN_NAME="${RUN_NAME:-${RUN_NAMESPACE}_app-launcher-only_${POLARIS_ENVIRONMENT}_${SLURM_JOB_ID:-dryrun}}"
   RUN_DIR="${RUN_DIR:-${OUTPUT_ROOT}/${RUN_NAMESPACE}/${RUN_NAME}}"
   [[ ! -e "${RUN_DIR}" && ! -L "${RUN_DIR}" ]] \
     || die "AppLauncher-only run directory already exists"
-  mkdir -m 0755 "${RUN_DIR}"
-  [[ "$(readlink -f -- "${RUN_DIR}")" == "${RUN_DIR}" ]] \
-    || die "AppLauncher-only RUN_DIR must use its canonical physical path"
   TASK_DIR="${RUN_DIR}/app_launcher_only"
-  mkdir -m 0755 "${TASK_DIR}"
-  mkdir -p "${POLARIS_CACHE_DIR}/home"
   TRACE_PATH="${TASK_DIR}/policy_traces.forbidden"
   RUNTIME_CONTRACT_FILE="${TASK_DIR}/runtime_contract.forbidden"
   STARTUP_PREEXEC_FILE="${TASK_DIR}/startup_preexec.json"
   STARTUP_PRECLOSE_FILE="${TASK_DIR}/startup_preclose.json"
-  STARTUP_READY_FILE="${TASK_DIR}/startup_preclose.ready.json"
+  STARTUP_SCHEDULER_REQUEST_FILE="${TASK_DIR}/scheduler_request.json"
+  STARTUP_SCHEDULER_HANDOFF_FILE="${TASK_DIR}/scheduler_handoff.json"
+  STARTUP_SCHEDULER_TERMINAL_REQUEST_FILE="${TASK_DIR}/scheduler_terminal_request.json"
+  STARTUP_SCHEDULER_TERMINAL_FILE="${TASK_DIR}/scheduler_terminal.json"
   EVAL_LOG="${TASK_DIR}/app_launcher_only.log"
-  for output in \
-    "${STARTUP_PREEXEC_FILE}" "${STARTUP_PRECLOSE_FILE}" \
-    "${STARTUP_READY_FILE}" "${EVAL_LOG}"; do
-    [[ ! -e "${output}" && ! -L "${output}" ]] \
-      || die "AppLauncher-only output already exists: ${output}"
-  done
-  build_public_eval_command
+  EVAL_LOG_IDENTITY="${TASK_DIR}/app_launcher_only.log.identity.json"
   if [[ "${DRY_RUN}" == 1 ]]; then
+    RUN_DIR_IDENTITY=dry_run_no_directory
+    TASK_DIR_IDENTITY=dry_run_no_directory
+    export POLARIS_STARTUP_DIAGNOSTIC_RUN_DIR="${RUN_DIR}"
+    export POLARIS_STARTUP_DIAGNOSTIC_TASK_DIR="${TASK_DIR}"
+    export POLARIS_STARTUP_DIAGNOSTIC_RUN_DIR_IDENTITY="${RUN_DIR_IDENTITY}"
+    export POLARIS_STARTUP_DIAGNOSTIC_TASK_DIR_IDENTITY="${TASK_DIR_IDENTITY}"
+    export POLARIS_DIAGNOSTIC_MODULE_SHA256="${EXPECTED_DIAGNOSTIC_MODULE_SHA256}"
+    build_public_eval_command
     printf '%q ' "${diagnostic_eval_command[@]}"
     printf '\n'
+    [[ ! -e "${RUN_DIR}" && ! -L "${RUN_DIR}" ]] \
+      || die "Dry run mutated or raced with the output path"
     return
   fi
+
+  created_identities="$(
+    run_diagnostic_helper create-output-directories \
+      --run-dir "${RUN_DIR}" --task-dir "${TASK_DIR}" \
+      --namespace-parent-identity "${POLARIS_OUTPUT_NAMESPACE_PARENT_IDENTITY}"
+  )" || die "Cannot create identity-bound diagnostic output directories"
+  IFS=$'\t' read -r returned_namespace_identity RUN_DIR_IDENTITY TASK_DIR_IDENTITY \
+    <<< "${created_identities}"
+  [[ "${returned_namespace_identity}" == "${POLARIS_OUTPUT_NAMESPACE_PARENT_IDENTITY}" \
+    && "${RUN_DIR_IDENTITY}" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+:0755$ \
+    && "${TASK_DIR_IDENTITY}" =~ ^[0-9]+:[0-9]+:[0-9]+:[0-9]+:0755$ ]] \
+    || die "Diagnostic output-directory identities are malformed"
+  export POLARIS_STARTUP_DIAGNOSTIC_RUN_DIR="${RUN_DIR}"
+  export POLARIS_STARTUP_DIAGNOSTIC_TASK_DIR="${TASK_DIR}"
+  export POLARIS_STARTUP_DIAGNOSTIC_RUN_DIR_IDENTITY="${RUN_DIR_IDENTITY}"
+  export POLARIS_STARTUP_DIAGNOSTIC_TASK_DIR_IDENTITY="${TASK_DIR_IDENTITY}"
+  export POLARIS_DIAGNOSTIC_MODULE_SHA256="${EXPECTED_DIAGNOSTIC_MODULE_SHA256}"
+  mkdir -p "${POLARIS_CACHE_DIR}/home"
+  build_public_eval_command
+
+  APP_CLEANUP_ACTIVE=1
+  APP_TERMINALIZED=0
+  trap app_exit_handler EXIT
+  trap 'app_signal_handler HUP' HUP
+  trap 'app_signal_handler INT' INT
+  trap 'app_signal_handler TERM' TERM
+
+  set +m
+  build_diagnostic_helper_command
+  /usr/bin/setsid "${diagnostic_helper_command[@]}" \
+    broker-scheduler-handoff \
+    --request "${STARTUP_SCHEDULER_REQUEST_FILE}" \
+    --output "${STARTUP_SCHEDULER_HANDOFF_FILE}" \
+    --terminal-request "${STARTUP_SCHEDULER_TERMINAL_REQUEST_FILE}" \
+    --terminal-output "${STARTUP_SCHEDULER_TERMINAL_FILE}" \
+    --task-dir-identity "${TASK_DIR_IDENTITY}" --timeout-seconds 60 \
+    --terminal-timeout-seconds 120 &
+  APP_HELPER_PID=$!
+  APP_HELPER_PGID="${APP_HELPER_PID}"
+  close_diagnostic_module_fd
+  await_app_process_group "${APP_HELPER_PID}" \
+    || die "Scheduler broker did not enter its isolated process group"
+  exec {APP_LOG_MIRROR_FD}>&1
+  build_diagnostic_helper_command
+  coproc APP_LOGGER {
+    exec /usr/bin/setsid "${diagnostic_helper_command[@]}" immutable-log-tee \
+      --output "${EVAL_LOG}" --identity-output "${EVAL_LOG_IDENTITY}" \
+      --task-dir-identity "${TASK_DIR_IDENTITY}" \
+      >&"${APP_LOG_MIRROR_FD}"
+  }
+  APP_LOG_PID="${APP_LOGGER_PID}"
+  APP_LOG_PGID="${APP_LOG_PID}"
+  close_diagnostic_module_fd
+  APP_LOG_READ_FD="${APP_LOGGER[0]}"
+  coproc_write_fd="${APP_LOGGER[1]}"
+  # Bash marks the original coprocess descriptors close-on-exec.  Duplicate
+  # the input onto an ordinary descriptor before launching the srun group.
+  exec {APP_LOG_WRITE_FD}>&"${coproc_write_fd}"
+  eval "exec ${coproc_write_fd}>&-"
+  eval "exec ${APP_LOG_READ_FD}<&-"
+  APP_LOG_READ_FD=""
+  eval "exec ${APP_LOG_MIRROR_FD}>&-"
+  APP_LOG_MIRROR_FD=""
+  await_app_process_group "${APP_LOG_PID}" \
+    || die "Immutable logger did not enter its isolated process group"
+  /usr/bin/setsid "${diagnostic_eval_command[@]}" \
+    >&"${APP_LOG_WRITE_FD}" 2>&1 &
+  APP_SRUN_PID=$!
+  APP_SRUN_PGID="${APP_SRUN_PID}"
+  await_app_process_group "${APP_SRUN_PID}" \
+    || die "Diagnostic srun did not enter its isolated process group"
+
   set +e
-  (
-    cd "${POLARIS_DIR}"
-    "${diagnostic_eval_command[@]}"
-  ) 2>&1 | tee "${EVAL_LOG}"
-  pipeline_codes=("${PIPESTATUS[@]}")
-  set -e
-  chmod 0444 "${EVAL_LOG}"
-  (( pipeline_codes[0] == 0 )) || return "${pipeline_codes[0]}"
-  (( pipeline_codes[1] == 0 )) || return "${pipeline_codes[1]}"
-  close_error_count="$(grep -c '^POLARIS_STARTUP_DIAGNOSTIC_CLOSE_ERROR=' "${EVAL_LOG}" || true)"
-  [[ "${close_error_count}" == 0 ]] \
-    || die "AppLauncher-only evaluator reported a SimulationApp close error"
-  required_startup_phases=(
-    before_app_launcher
-    after_app_launcher
-    before_app_launcher_diagnostic_close
-  )
-  for phase in "${required_startup_phases[@]}"; do
-    phase_count="$(grep -Fxc "POLARIS_EVAL_PHASE=${phase}" "${EVAL_LOG}" || true)"
-    [[ "${phase_count}" == 1 ]] \
-      || die "AppLauncher-only phase ${phase} count is ${phase_count}, expected one"
-  done
-  forbidden_phase_count="$(grep -Fxc 'POLARIS_EVAL_PHASE=before_evaluation_imports' "${EVAL_LOG}" || true)"
-  [[ "${forbidden_phase_count}" == 0 ]] \
-    || die "AppLauncher-only evaluator crossed into evaluation imports"
-  postclose_phase_count="$(grep -Fxc 'POLARIS_EVAL_PHASE=after_app_launcher_diagnostic_close' "${EVAL_LOG}" || true)"
-  case "${postclose_phase_count}" in
-    0) close_termination_mode=process_exited_zero_before_postclose_marker ;;
-    1) close_termination_mode=simulation_app_close_returned ;;
-    *) die "AppLauncher-only post-close phase count is ${postclose_phase_count}, expected zero or one" ;;
-  esac
-  for output in \
-    "${STARTUP_PREEXEC_FILE}" "${STARTUP_PRECLOSE_FILE}" \
-    "${STARTUP_READY_FILE}" "${EVAL_LOG}"; do
-    [[ -f "${output}" && ! -L "${output}" \
-      && "$(stat -c '%a:%h' "${output}")" == 444:1 ]] \
-      || die "AppLauncher-only evidence is not one mode-0444 link: ${output}"
-  done
-  [[ "$(find "${TASK_DIR}" -mindepth 1 -maxdepth 1 -printf x | wc -c)" == 4 ]] \
-    || die "AppLauncher-only output directory contains unexpected artifacts"
-  if find "${RUN_DIR}" -type f \
-    \( -name '*.csv' -o -name '*.mp4' -o -name '*tokenizer*' \
-       -o -name '*checkpoint*' -o -name '*serving_contract*' \
-       -o -name '*policy_trace*' -o -name SUCCESS -o -name FAILED \) \
-    -print -quit | grep -q .; then
-    die "AppLauncher-only route created a forbidden scientific artifact"
+  wait "${APP_SRUN_PID}"
+  APP_SRUN_CODE=$?
+  eval "exec ${APP_LOG_WRITE_FD}>&-"
+  APP_LOG_WRITE_FD=""
+  if ! app_process_group_is_absent "${APP_SRUN_PGID}"; then
+    (( APP_SRUN_CODE == 0 )) && APP_SRUN_CODE=70
+    terminate_app_process_group "" "${APP_SRUN_PGID}" || true
   fi
+  if app_process_group_is_absent "${APP_SRUN_PGID}"; then
+    APP_SRUN_PID=""
+    APP_SRUN_PGID=""
+  fi
+  if app_process_group_is_absent "${APP_SRUN_PGID}"; then
+    run_diagnostic_helper publish-scheduler-terminal-request \
+      --request "${STARTUP_SCHEDULER_REQUEST_FILE}" \
+      --handoff "${STARTUP_SCHEDULER_HANDOFF_FILE}" \
+      --output "${STARTUP_SCHEDULER_TERMINAL_REQUEST_FILE}" \
+      --srun-exit-code "${APP_SRUN_CODE}" \
+      --task-dir-identity "${TASK_DIR_IDENTITY}" \
+      >/dev/null || terminal_request_code=$?
+  else
+    terminal_request_code=75
+  fi
+  if (( terminal_request_code != 0 )); then
+    if ! app_process_group_is_absent "${APP_HELPER_PGID}"; then
+      terminate_app_process_group "${APP_HELPER_PID}" "${APP_HELPER_PGID}" || true
+    fi
+    APP_HELPER_CODE="${terminal_request_code}"
+  elif wait_app_process_bounded "${APP_HELPER_PID}" 7000; then
+    APP_HELPER_CODE="${APP_BOUNDED_WAIT_CODE}"
+  else
+    APP_HELPER_CODE=74
+    terminate_app_process_group "${APP_HELPER_PID}" "${APP_HELPER_PGID}" || true
+  fi
+  if ! app_process_group_is_absent "${APP_HELPER_PGID}"; then
+    (( APP_HELPER_CODE == 0 )) && APP_HELPER_CODE=72
+    terminate_app_process_group "" "${APP_HELPER_PGID}" || true
+  fi
+  if app_process_group_is_absent "${APP_HELPER_PGID}"; then
+    APP_HELPER_PID=""
+    APP_HELPER_PGID=""
+  fi
+  if wait_app_process_bounded "${APP_LOG_PID}" 400; then
+    APP_LOG_CODE="${APP_BOUNDED_WAIT_CODE}"
+  else
+    APP_LOG_CODE=73
+    terminate_app_process_group "${APP_LOG_PID}" "${APP_LOG_PGID}" || true
+  fi
+  if ! app_process_group_is_absent "${APP_LOG_PGID}"; then
+    (( APP_LOG_CODE == 0 )) && APP_LOG_CODE=71
+    terminate_app_process_group "" "${APP_LOG_PGID}" || true
+  fi
+  if app_process_group_is_absent "${APP_LOG_PGID}"; then
+    APP_LOG_PID=""
+    APP_LOG_PGID=""
+  fi
+  set -e
+  primary_code="${APP_SRUN_CODE}"
+  (( primary_code == 0 )) && primary_code="${APP_LOG_CODE}"
+  (( primary_code == 0 )) && primary_code="${APP_HELPER_CODE}"
+  if (( primary_code != 0 )); then
+    trap '' HUP INT TERM
+    finalize_app_failure "${primary_code}" none || true
+    trap - EXIT
+    return "${primary_code}"
+  fi
+  trap '' HUP INT TERM
+  if ! app_process_group_is_absent "${APP_SRUN_PGID}" \
+    || ! app_process_group_is_absent "${APP_LOG_PGID}" \
+    || ! app_process_group_is_absent "${APP_HELPER_PGID}"; then
+    die "Cannot seal while an AppLauncher diagnostic process group survives"
+  fi
+  verify_exported_pyxis_image_identity
   verify_trusted_source_snapshot
-  echo "POLARIS_APP_LAUNCHER_CLOSE_TERMINATION_MODE=${close_termination_mode}"
-  echo "POLARIS_APP_LAUNCHER_ONLY_EVIDENCE_READY=${STARTUP_READY_FILE}"
+  verify_runtime_closure_approval
+  sealed_evidence="$(
+    run_diagnostic_helper seal-evidence-tree \
+      --task-dir "${TASK_DIR}" --run-dir "${RUN_DIR}" \
+      --task-dir-identity "${TASK_DIR_IDENTITY}" \
+      --run-dir-identity "${RUN_DIR_IDENTITY}" \
+      --namespace-parent-identity "${POLARIS_OUTPUT_NAMESPACE_PARENT_IDENTITY}" \
+      --srun-exit-code "${APP_SRUN_CODE}" \
+      --log-exit-code "${APP_LOG_CODE}" \
+      --helper-exit-code "${APP_HELPER_CODE}" \
+      --outcome success
+  )" || die "Cannot terminally seal AppLauncher-only evidence tree"
+  IFS=$'\t' read -r close_termination_mode log_sha256 <<< "${sealed_evidence}"
+  [[ "${close_termination_mode}" == process_exited_zero_before_postclose_marker \
+      || "${close_termination_mode}" == simulation_app_close_returned ]] \
+    || die "Sealed AppLauncher-only termination mode is malformed"
+  [[ "${log_sha256}" =~ ^[0-9a-f]{64}$ ]] \
+    || die "Sealed AppLauncher-only log SHA-256 is malformed"
+  APP_TERMINALIZED=1
+  APP_CLEANUP_ACTIVE=0
+  trap - EXIT
+  printf '%s\n' \
+    "POLARIS_APP_LAUNCHER_CLOSE_TERMINATION_MODE=${close_termination_mode}" \
+    "POLARIS_APP_LAUNCHER_ONLY_LOG_SHA256=${log_sha256}" \
+    "POLARIS_APP_LAUNCHER_ONLY_PRETERMINAL_ATTESTATION=${TASK_DIR}/preterminal_attestation.json" \
+    "POLARIS_APP_LAUNCHER_ONLY_AUTHORITATIVE_COMPLETION=0" \
+    "POLARIS_APP_LAUNCHER_ONLY_PROMOTION_REQUIRED=app_launcher_allocation_promotion.json" \
+    || true
+  return 0
 }
 
 [[ -n "${SLURM_JOB_ID:-}" || "${DRY_RUN}" == 1 ]] \
@@ -317,13 +838,60 @@ case "${POLARIS_EVAL_MODE}" in
   standard|app_launcher_only) ;;
   *) die "POLARIS_EVAL_MODE must be standard or app_launcher_only" ;;
 esac
+if [[ "${DRY_RUN}" != 1 ]]; then
+  [[ "${SUBMISSION_TRANSACTION_ID}" =~ ^pi05-[0-9a-f]{40}$ ]] \
+    || die "Invalid submission transaction ID"
+fi
+if [[ "${POLARIS_EVAL_MODE}" == app_launcher_only ]]; then
+  : "${BATCH_VERIFIED_RUNTIME_CLOSURE_APPROVAL_SHA256:?Missing trusted batch runtime-closure verification}"
+  : "${POLARIS_EXPECTED_SLURM_CONFIG_SHA256:?Missing approved Slurm config SHA-256}"
+  : "${POLARIS_EXPECTED_SCONTROL_SHA256:?Missing approved scontrol SHA-256}"
+  : "${POLARIS_EXPECTED_SCONTROL_SIZE:?Missing approved scontrol size}"
+  : "${POLARIS_EXPECTED_SLURM_LIBRARY_SHA256:?Missing approved Slurm library SHA-256}"
+  : "${POLARIS_EXPECTED_SLURM_LIBRARY_SIZE:?Missing approved Slurm library size}"
+  : "${POLARIS_EXPECTED_SACCT_SHA256:?Missing approved sacct SHA-256}"
+  : "${POLARIS_EXPECTED_SACCT_SIZE:?Missing approved sacct size}"
+  : "${POLARIS_EXPECTED_SCANCEL_SHA256:?Missing approved scancel SHA-256}"
+  : "${POLARIS_EXPECTED_SCANCEL_SIZE:?Missing approved scancel size}"
+  : "${POLARIS_EXPECTED_SRUN_SHA256:?Missing approved srun SHA-256}"
+  : "${POLARIS_EXPECTED_SRUN_SIZE:?Missing approved srun size}"
+  : "${POLARIS_RUNTIME_CLOSURE_APPROVAL_SHA256:?Missing runtime-closure approval SHA-256}"
+  : "${POLARIS_OUTPUT_NAMESPACE_PARENT_IDENTITY:?Missing output namespace identity}"
+  [[ "${POLARIS_EXPECTED_SLURM_CONFIG_SHA256}" =~ ^[0-9a-f]{64}$ \
+    && "${POLARIS_RUNTIME_CLOSURE_APPROVAL_SHA256}" =~ ^[0-9a-f]{64}$ \
+    && "${POLARIS_EXPECTED_SCONTROL_SHA256}" =~ ^[0-9a-f]{64}$ \
+    && "${POLARIS_EXPECTED_SCONTROL_SIZE}" =~ ^[1-9][0-9]*$ \
+    && "${POLARIS_EXPECTED_SLURM_LIBRARY_SHA256}" =~ ^[0-9a-f]{64}$ \
+    && "${POLARIS_EXPECTED_SLURM_LIBRARY_SIZE}" =~ ^[1-9][0-9]*$ \
+    && "${POLARIS_EXPECTED_SACCT_SHA256}" =~ ^[0-9a-f]{64}$ \
+    && "${POLARIS_EXPECTED_SACCT_SIZE}" =~ ^[1-9][0-9]*$ \
+    && "${POLARIS_EXPECTED_SCANCEL_SHA256}" =~ ^[0-9a-f]{64}$ \
+    && "${POLARIS_EXPECTED_SCANCEL_SIZE}" =~ ^[1-9][0-9]*$ \
+    && "${POLARIS_EXPECTED_SRUN_SHA256}" =~ ^[0-9a-f]{64}$ \
+    && "${POLARIS_EXPECTED_SRUN_SIZE}" =~ ^[1-9][0-9]*$ \
+    && "${BATCH_VERIFIED_RUNTIME_CLOSURE_APPROVAL_SHA256}" == \
+      "${POLARIS_RUNTIME_CLOSURE_APPROVAL_SHA256}" ]] \
+    || die "AppLauncher execution approval digests must be lowercase 64hex"
+  [[ "${POLARIS_OUTPUT_NAMESPACE_PARENT_IDENTITY}" =~ \
+    ^[0-9]+:[0-9]+:[0-9]+:[0-9]+:0755$ ]] \
+    || die "AppLauncher output namespace identity is malformed"
+  [[ "${POLARIS_ENVIRONMENT}" == DROID-FoodBussing ]] \
+    || die "AppLauncher-only diagnostic requires DROID-FoodBussing"
+  [[ "${ROLLOUTS}" == 1 && "${ENVIRONMENT_SEED}" == 0 ]] \
+    || die "AppLauncher-only diagnostic requires one rollout and seed zero"
+  [[ "${OPEN_LOOP_HORIZON}" == 8 && "${EXPECTED_ACTION_HORIZON}" == 15 \
+    && "${EXPECTED_ACTION_DIM}" == 8 ]] \
+    || die "AppLauncher-only diagnostic evaluator dimensions are not canonical"
+  [[ "${PORT}" == "$((20000 + ${SLURM_JOB_ID:-1} % 20000))" ]] \
+    || die "AppLauncher-only diagnostic port is not job-derived"
+fi
 : "${EXPECTED_POLARIS_COMMIT:?Set EXPECTED_POLARIS_COMMIT to the immutable launch commit}"
 [[ "${ROLLOUTS}" =~ ^[1-9][0-9]*$ ]] || die "ROLLOUTS must be positive"
 [[ "${ENVIRONMENT_SEED}" =~ ^(0|[1-9][0-9]*)$ ]] \
   || die "ENVIRONMENT_SEED must be a non-negative integer"
 (( ENVIRONMENT_SEED <= 4294967295 )) \
   || die "ENVIRONMENT_SEED must be at most 4294967295"
-if ! python3 - "${ENVIRONMENT_SEED}" "${ROLLOUTS}" <<'PY'
+if ! /usr/bin/python3.12 -I -S - "${ENVIRONMENT_SEED}" "${ROLLOUTS}" <<'PY'
 import sys
 
 base_seed = int(sys.argv[1])
@@ -363,6 +931,8 @@ preflight_gpu_uuid="${actual_gpu_uuid}"
 preflight_gpu_name="${actual_gpu_name}"
 preflight_nvidia_driver_version="${actual_nvidia_driver_version}"
 if [[ "${POLARIS_EVAL_MODE}" == app_launcher_only ]]; then
+  export POLARIS_DIAGNOSTIC_MODULE_SHA256="${EXPECTED_DIAGNOSTIC_MODULE_SHA256}"
+  capture_and_export_pyxis_image_identity
   run_app_launcher_only
   exit
 fi
@@ -513,6 +1083,7 @@ VIDEO_VALIDATION_FILE="${TASK_DIR}/pi05_droid_jointpos_video_validation.json"
 VIDEO_VALIDATION_LOG="${TASK_DIR}/video_validation.log"
 COMMANDS_FILE="${RUN_DIR}/commands.sh"
 METADATA_FILE="${RUN_DIR}/run_metadata.env"
+SCHEDULER_RUNNING_FILE="${RUN_DIR}/pi05_droid_jointpos_scheduler_running.json"
 SERVER_PID=""
 EVIDENCE_FINALIZED=0
 EVIDENCE_MANIFEST_SHA256=""
@@ -544,6 +1115,20 @@ done
   || die "Run-local tokenizer already exists"
 [[ ! -e "${RUN_SOURCE_APPROVAL_FILE}" && ! -L "${RUN_SOURCE_APPROVAL_FILE}" ]] \
   || die "Run-local source approval already exists"
+[[ ! -e "${SCHEDULER_RUNNING_FILE}" && ! -L "${SCHEDULER_RUNNING_FILE}" ]] \
+  || die "Running scheduler record already exists"
+if [[ "${DRY_RUN}" != 1 ]]; then
+  command -v scontrol >/dev/null || die "Missing required command: scontrol"
+  PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
+    PYTHONPATH="${POLARIS_DIR}/src" \
+    "${OPENPI_DIR}/.venv/bin/python" -B -m \
+    polaris.pi05_droid_jointpos_scheduler capture-job \
+    --output "${SCHEDULER_RUNNING_FILE}" \
+    --phase running \
+    --job-id "${SLURM_JOB_ID}" \
+    --transaction-id "${SUBMISSION_TRANSACTION_ID}" >/dev/null \
+    || die "Running scheduler no-requeue verification failed"
+fi
 cp -- "${POLARIS_SOURCE_APPROVAL}" "${RUN_SOURCE_APPROVAL_FILE}"
 chmod 0444 "${RUN_SOURCE_APPROVAL_FILE}"
 [[ "$(stat -c '%a:%h' "${RUN_SOURCE_APPROVAL_FILE}")" == 444:1 ]] \
@@ -803,6 +1388,7 @@ PYXIS_IMAGE_SHA256="$(sha256sum "${POLARIS_PYXIS_IMAGE}" | awk '{print $1}')"
   printf 'RUN_START=%q\n' "$(date -Iseconds)"
   printf 'HOST=%q\n' "$(hostname)"
   printf 'SLURM_JOB_ID=%q\n' "${SLURM_JOB_ID:-dryrun}"
+  printf 'SUBMISSION_TRANSACTION_ID=%q\n' "${SUBMISSION_TRANSACTION_ID}"
   printf 'RUN_NAMESPACE=%q\n' "${RUN_NAMESPACE}"
   printf 'RUN_DIR=%q\n' "${RUN_DIR}"
   printf 'POLARIS_DIR=%q\n' "${POLARIS_DIR}"

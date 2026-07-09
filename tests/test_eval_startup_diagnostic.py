@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from contextlib import contextmanager
 import importlib.util
+import os
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -32,7 +33,7 @@ class FakeAppLauncher:
 
 
 @contextmanager
-def evaluator_module() -> Iterator[ModuleType]:
+def evaluator_module(*, eval_mode: str | None = None) -> Iterator[ModuleType]:
     replacements = {
         name: ModuleType(name) for name in ("mediapy", "pandas", "torch", "tqdm")
     }
@@ -46,7 +47,12 @@ def evaluator_module() -> Iterator[ModuleType]:
     sys.modules.update(replacements)
     module_name = "_polaris_eval_startup_diagnostic_test"
     previous_eval = sys.modules.get(module_name)
+    previous_eval_mode = os.environ.get("POLARIS_EVAL_MODE")
     try:
+        if eval_mode is None:
+            os.environ.pop("POLARIS_EVAL_MODE", None)
+        else:
+            os.environ["POLARIS_EVAL_MODE"] = eval_mode
         specification = importlib.util.spec_from_file_location(module_name, EVAL_SCRIPT)
         assert specification is not None and specification.loader is not None
         module = importlib.util.module_from_spec(specification)
@@ -54,6 +60,10 @@ def evaluator_module() -> Iterator[ModuleType]:
         specification.loader.exec_module(module)
         yield module
     finally:
+        if previous_eval_mode is None:
+            os.environ.pop("POLARIS_EVAL_MODE", None)
+        else:
+            os.environ["POLARIS_EVAL_MODE"] = previous_eval_mode
         if previous_eval is None:
             sys.modules.pop(module_name, None)
         else:
@@ -107,7 +117,7 @@ def test_diagnostic_branch_calls_public_app_launcher_then_returns_before_evaluat
             for prefix in forbidden_prefixes
         )
     }
-    with evaluator_module() as evaluator:
+    with evaluator_module(eval_mode="app_launcher_only") as evaluator:
         calls = []
 
         def run_diagnostic(**kwargs):
@@ -148,23 +158,35 @@ def test_diagnostic_branch_calls_public_app_launcher_then_returns_before_evaluat
 
 
 @pytest.mark.parametrize(
-    "field,value",
+    "field,value,message",
     [
-        ("startup_diagnostic", "unknown"),
-        ("startup_diagnostic_preexec_path", None),
-        ("startup_diagnostic_preclose_path", "relative.json"),
-        ("startup_diagnostic_expected_gpu_uuid", "GPU-not-a-uuid"),
+        ("startup_diagnostic", "unknown", "unsupported startup diagnostic"),
+        ("startup_diagnostic_preexec_path", None, "requires every"),
+        (
+            "startup_diagnostic_preclose_path",
+            "relative.json",
+            "paths must be absolute",
+        ),
+        (
+            "startup_diagnostic_expected_gpu_uuid",
+            "GPU-not-a-uuid",
+            "expected GPU UUID is malformed",
+        ),
     ],
 )
 def test_invalid_diagnostic_arguments_fail_before_app_launcher(
     tmp_path: Path,
     field: str,
     value: object,
+    message: str,
 ) -> None:
     FakeAppLauncher.instances.clear()
     args = diagnostic_args(tmp_path)
     setattr(args, field, value)
-    with evaluator_module() as evaluator, pytest.raises(ValueError):
+    with (
+        evaluator_module(eval_mode="app_launcher_only") as evaluator,
+        pytest.raises(ValueError, match=message),
+    ):
         evaluator.main(args)
     assert FakeAppLauncher.instances == []
 
@@ -178,6 +200,32 @@ def test_diagnostic_arguments_are_rejected_when_mode_is_off(tmp_path: Path) -> N
         startup_diagnostic_preexec_path=str(tmp_path / "unexpected.json"),
     )
     with evaluator_module() as evaluator, pytest.raises(ValueError):
+        evaluator.main(args)
+    assert FakeAppLauncher.instances == []
+
+
+@pytest.mark.parametrize(
+    "process_mode,argument_mode",
+    [
+        ("app_launcher_only", None),
+        ("standard", "app_launcher_only"),
+    ],
+)
+def test_process_and_argument_diagnostic_modes_must_match(
+    tmp_path: Path,
+    process_mode: str,
+    argument_mode: str | None,
+) -> None:
+    FakeAppLauncher.instances.clear()
+    args = diagnostic_args(tmp_path)
+    args.startup_diagnostic = argument_mode
+    with (
+        evaluator_module(eval_mode=process_mode) as evaluator,
+        pytest.raises(
+            ValueError,
+            match="must be selected together",
+        ),
+    ):
         evaluator.main(args)
     assert FakeAppLauncher.instances == []
 
@@ -200,7 +248,7 @@ def test_default_path_still_constructs_lifecycle_runs_evaluation_and_closes(
     previous = sys.modules.get("polaris.pi05_droid_native_lifecycle")
     sys.modules["polaris.pi05_droid_native_lifecycle"] = lifecycle_module
     try:
-        with evaluator_module() as evaluator:
+        with evaluator_module(eval_mode="standard") as evaluator:
             evaluator._run_evaluation = lambda args, lifecycle: events.append(
                 ("run", lifecycle)
             )
@@ -221,30 +269,63 @@ def test_default_path_still_constructs_lifecycle_runs_evaluation_and_closes(
     assert len(FakeAppLauncher.instances) == 1
 
 
-def test_eval_ast_places_closed_branch_at_exact_import_boundary() -> None:
+def test_eval_ast_preserves_standard_gym_import_boundary() -> None:
     source = EVAL_SCRIPT.read_text(encoding="utf-8")
     tree = ast.parse(source)
     top_level_gym_imports = [
         node
-        for node in tree.body
+        for node in ast.walk(tree)
         if isinstance(node, (ast.Import, ast.ImportFrom))
         and any(alias.name in {"gym", "gymnasium"} for alias in node.names)
     ]
-    assert top_level_gym_imports == []
+    assert len(top_level_gym_imports) == 1
+    gym_import = top_level_gym_imports[0]
+    mode_guard = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.If) and node.body == [gym_import]
+    )
+    assert mode_guard.body == [gym_import]
+    process_mode_binding = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "_PROCESS_EVAL_MODE"
+            for target in node.targets
+        )
+    )
+    assert "POLARIS_EVAL_MODE" in ast.unparse(process_mode_binding.value)
+    assert "_PROCESS_EVAL_MODE" in ast.unparse(mode_guard.test)
+    imports = {
+        alias.name: node.lineno
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    # These are the original evaluator's adjacent scientific import slots.
+    assert imports["tqdm"] < gym_import.lineno < imports["torch"]
+
+
+def test_default_startup_validation_is_a_pure_noop(tmp_path: Path) -> None:
+    args = EvalArgs(
+        policy=PolicyArgs(client="Fake"),
+        environment="DROID-FoodBussing",
+        run_folder=str(tmp_path),
+    )
+    before = vars(args).copy()
+    with evaluator_module(eval_mode="standard") as evaluator:
+        assert evaluator._validate_startup_diagnostic_args(args) is None
+    assert vars(args) == before
+
+
+def test_eval_ast_places_closed_branch_at_exact_import_boundary() -> None:
+    source = EVAL_SCRIPT.read_text(encoding="utf-8")
+    tree = ast.parse(source)
     main = next(
         node
         for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "main"
-    )
-    run_evaluation = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_run_evaluation"
-    )
-    assert any(
-        isinstance(node, ast.Import)
-        and any(alias.name == "gymnasium" for alias in node.names)
-        for node in run_evaluation.body
     )
     app_launcher_line = next(
         node.lineno
@@ -293,9 +374,11 @@ def test_diagnostic_module_has_only_stdlib_imports() -> None:
         "os",
         "pathlib",
         "re",
+        "signal",
         "stat",
         "subprocess",
         "sys",
+        "time",
         "typing",
     }
 
