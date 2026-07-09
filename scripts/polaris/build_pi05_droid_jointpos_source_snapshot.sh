@@ -104,7 +104,7 @@ while IFS= read -r -d '' directory; do
 done < <(find "${temporary}" -depth -type d -print0)
 
 source_tree_sha256="$(
-  /usr/bin/bash --noprofile --norc "${TRUSTED_HASHER}" \
+  /usr/bin/bash --noprofile --norc -p "${TRUSTED_HASHER}" \
     --source-digest "${temporary}"
 )" || die "Trusted source snapshot hashing failed"
 [[ "${source_tree_sha256}" =~ ^[0-9a-f]{64}$ ]] \

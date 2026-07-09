@@ -10,6 +10,9 @@ ROOT = Path(__file__).parents[1]
 WORKER = ROOT / "scripts/polaris/eval_pi05_droid_jointpos_polaris.sh"
 BATCH = ROOT / "scripts/polaris/l40s_pi05_eval_job.sbatch"
 SUBMITTER = ROOT / "scripts/polaris/submit_pi05_droid_jointpos_polaris.sh"
+SOURCE_SNAPSHOT_BUILDER = (
+    ROOT / "scripts/polaris/build_pi05_droid_jointpos_source_snapshot.sh"
+)
 DIAGNOSTIC_MODULE = ROOT / "src/polaris/app_launcher_startup_diagnostic.py"
 PUBLIC_BASE_COMMIT = "a00ac41d822f7e6a02c7a787c6b5aae66c6aa08b"
 
@@ -18,6 +21,15 @@ def _function(source: str, name: str, next_name: str) -> str:
     start = source.index(f"{name}() {{")
     end = source.index(f"{next_name}() {{", start)
     return source[start:end]
+
+
+def test_source_snapshot_builder_invokes_privileged_trusted_hasher() -> None:
+    source = SOURCE_SNAPSHOT_BUILDER.read_text(encoding="utf-8")
+    invocation = (
+        '/usr/bin/bash --noprofile --norc -p "${TRUSTED_HASHER}" '
+        "\\\n    --source-digest"
+    )
+    assert source.count(invocation) == 1
 
 
 def test_worker_routes_diagnostic_before_checkpoint_and_model_work() -> None:
