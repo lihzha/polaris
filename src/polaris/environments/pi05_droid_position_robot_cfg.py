@@ -48,10 +48,6 @@ def make_nvidia_droid_position_adapter_cfg() -> ArticulationCfg:
     return config
 
 
-NVIDIA_DROID_POSITION_ADAPTER = make_nvidia_droid_position_adapter_cfg()
-
-
 __all__ = [
-    "NVIDIA_DROID_POSITION_ADAPTER",
     "make_nvidia_droid_position_adapter_cfg",
 ]

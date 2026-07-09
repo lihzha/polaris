@@ -73,7 +73,7 @@ PI05_DROID_GRIPPER_OBSERVATION_CONTRACT = {
 }
 PI05_DROID_POLARIS_RUNTIME_SOURCE_SHA256 = {
     "droid_cfg.py": "2947a19d75d75229462debd0b7faddd4cce75e73ea67e2dbf41eefb3ae90467f",
-    "robot_cfg.py": "d514b32e07b54f98deb6d9dbc7a5201fff5337cdc4600d9351ee2a95e5c4c4c5",
+    "robot_cfg.py": "26874c2a7807cc69028e538d6428853b75969edc20c05637385303e838144aa7",
     "native_gripper_runtime.py": (
         "2c0d79d63ee7f0a3809b6249565f29f80218511a6baf7aa4942913b03a71e6d5"
     ),

@@ -8,6 +8,10 @@ from polaris.pi05_droid_jointvelocity_contract import (
     NATIVE_GRIPPER_EFFORT_LIMIT,
     NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
 )
+from polaris.pi05_droid_position_contract import (
+    PI05_DROID_POSITION_DRIVE_DAMPING,
+    PI05_DROID_POSITION_DRIVE_STIFFNESS,
+)
 
 
 ROOT = Path(__file__).parents[1]
@@ -19,14 +23,18 @@ class _Cfg:
 
 
 class _ArticulationCfg(_Cfg):
+    copy_calls = 0
+
     class InitialStateCfg(_Cfg):
         pass
 
     def copy(self):
+        type(self).copy_calls += 1
         return copy.deepcopy(self)
 
 
 def _load_robot_cfg_with_isaac_stubs(monkeypatch):
+    _ArticulationCfg.copy_calls = 0
     isaaclab = ModuleType("isaaclab")
     sim = ModuleType("isaaclab.sim")
     sim.UsdFileCfg = _Cfg
@@ -55,12 +63,26 @@ def _load_robot_cfg_with_isaac_stubs(monkeypatch):
     return module
 
 
+def _load_position_robot_cfg_with_isaac_stubs(monkeypatch, robot_cfg):
+    monkeypatch.setitem(sys.modules, "polaris.environments.robot_cfg", robot_cfg)
+    path = ROOT / "src/polaris/environments/pi05_droid_position_robot_cfg.py"
+    spec = importlib.util.spec_from_file_location("_position_robot_cfg_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_native_gripper_sim_limits_do_not_mutate_joint_position_or_eef_base(
     monkeypatch,
 ):
     robot_cfg = _load_robot_cfg_with_isaac_stubs(monkeypatch)
+    assert _ArticulationCfg.copy_calls == 0
+    assert not hasattr(robot_cfg, "NVIDIA_DROID_JOINT_VELOCITY")
     shared = robot_cfg.NVIDIA_DROID.actuators["gripper"]
-    native = robot_cfg.NVIDIA_DROID_JOINT_VELOCITY.actuators["gripper"]
+    native_cfg = robot_cfg.make_nvidia_droid_joint_velocity_cfg()
+    assert _ArticulationCfg.copy_calls == 1
+    native = native_cfg.actuators["gripper"]
 
     assert shared is not native
     assert shared.joint_names_expr == ["finger_joint"]
@@ -78,6 +100,7 @@ def test_native_gripper_sim_limits_do_not_mutate_joint_position_or_eef_base(
 
     shared_before = copy.deepcopy(shared.__dict__)
     rebuilt = robot_cfg.make_nvidia_droid_joint_velocity_cfg()
+    assert _ArticulationCfg.copy_calls == 2
     assert shared.__dict__ == shared_before
     assert rebuilt.actuators["gripper"] is not shared
 
@@ -86,3 +109,20 @@ def test_native_gripper_sim_limits_do_not_mutate_joint_position_or_eef_base(
     )
     assert "from polaris.environments.robot_cfg import NVIDIA_DROID" in droid_source
     assert "NVIDIA_DROID_JOINT_VELOCITY" not in droid_source
+
+
+def test_position_robot_cfg_is_constructed_only_on_factory_call(monkeypatch):
+    robot_cfg = _load_robot_cfg_with_isaac_stubs(monkeypatch)
+    position_cfg = _load_position_robot_cfg_with_isaac_stubs(monkeypatch, robot_cfg)
+
+    assert _ArticulationCfg.copy_calls == 0
+    assert not hasattr(position_cfg, "NVIDIA_DROID_POSITION_ADAPTER")
+    configured = position_cfg.make_nvidia_droid_position_adapter_cfg()
+    assert _ArticulationCfg.copy_calls == 1
+    assert configured is not robot_cfg.NVIDIA_DROID
+    assert configured.actuators["panda_shoulder"].stiffness == (
+        PI05_DROID_POSITION_DRIVE_STIFFNESS
+    )
+    assert configured.actuators["panda_shoulder"].damping == (
+        PI05_DROID_POSITION_DRIVE_DAMPING
+    )

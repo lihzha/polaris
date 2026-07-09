@@ -38,9 +38,7 @@ def _run_capture(args, env, runtime_contract):
     arm_ids, arm_names = robot.find_joints(
         list(PANDA_ARM_JOINT_NAMES), preserve_order=True
     )
-    finger_ids, finger_names = robot.find_joints(
-        ["finger_joint"], preserve_order=True
-    )
+    finger_ids, finger_names = robot.find_joints(["finger_joint"], preserve_order=True)
     if tuple(arm_names) != PANDA_ARM_JOINT_NAMES or finger_names != ["finger_joint"]:
         raise ValueError("position smoke articulation order mismatch")
     cases = []
@@ -50,7 +48,9 @@ def _run_capture(args, env, runtime_contract):
         finger_term = root.action_manager._terms["finger_joint"]
         q_observation = _numpy(observation["policy"]["arm_joint_pos"])[0]
         q_live = _numpy(robot.data.joint_pos[:, arm_ids])[0]
-        if q_observation.dtype != np.float32 or not np.array_equal(q_observation, q_live):
+        if q_observation.dtype != np.float32 or not np.array_equal(
+            q_observation, q_live
+        ):
             raise ValueError("position smoke observation/live q mismatch")
         adapter = adapt_official_droid_action(definition["raw_action"], q_live)
         action = torch.as_tensor(
@@ -65,9 +65,9 @@ def _run_capture(args, env, runtime_contract):
             {
                 **definition,
                 "adapter": adapter,
-                "processed_joint_position_target": _numpy(
-                    arm_term.processed_actions
-                )[0].tolist(),
+                "processed_joint_position_target": _numpy(arm_term.processed_actions)[
+                    0
+                ].tolist(),
                 "articulation_joint_position_target": _numpy(
                     robot.data.joint_pos_target[:, arm_ids]
                 )[0].tolist(),
@@ -101,9 +101,7 @@ def _run_capture(args, env, runtime_contract):
     first_action = torch.as_tensor(
         first["emitted_absolute_action"], device=env.device
     ).reshape(1, 8)
-    observation, _, terminated, truncated, _ = env.step(
-        first_action, expensive=False
-    )
+    observation, _, terminated, truncated, _ = env.step(first_action, expensive=False)
     if bool(terminated[0]) or bool(truncated[0]):
         raise RuntimeError("fresh-reanchor step one terminated")
     arm_term.record_native_all_joint_post_policy_step()
@@ -119,9 +117,7 @@ def _run_capture(args, env, runtime_contract):
     second_action = torch.as_tensor(
         second["emitted_absolute_action"], device=env.device
     ).reshape(1, 8)
-    observation, _, terminated, truncated, _ = env.step(
-        second_action, expensive=False
-    )
+    observation, _, terminated, truncated, _ = env.step(second_action, expensive=False)
     if bool(terminated[0]) or bool(truncated[0]):
         raise RuntimeError("fresh-reanchor step two terminated")
     arm_term.record_native_all_joint_post_policy_step()
@@ -132,7 +128,9 @@ def _run_capture(args, env, runtime_contract):
     )
     target2 = np.asarray(second["absolute_joint_position_target_rad"])
     if np.array_equal(target2.astype(np.float32), stale_second.astype(np.float32)):
-        raise ValueError("fresh-reanchor probe did not separate measured and stale anchors")
+        raise ValueError(
+            "fresh-reanchor probe did not separate measured and stale anchors"
+        )
     fresh_reanchor_probe = {
         "raw_action": raw_reanchor.tolist(),
         "step1_measured_joint_position": q_step1.tolist(),
@@ -183,12 +181,8 @@ def _run_capture(args, env, runtime_contract):
         "position_limit_contract": expected_position_limit_contract(),
         "joint_index": joint_index,
         "controlling_bound_source": "live_joint_pos_limits",
-        "hard_upper_limit_rad": float(
-            live_hard_limits[0, joint_index, 1]
-        ),
-        "soft_upper_limit_rad": float(
-            live_soft_limits[0, joint_index, 1]
-        ),
+        "hard_upper_limit_rad": float(live_hard_limits[0, joint_index, 1]),
+        "soft_upper_limit_rad": float(live_soft_limits[0, joint_index, 1]),
         "intersection_guard_upper_limit_rad": float(
             target_guard_limits[0, joint_index, 1]
         ),
@@ -205,9 +199,7 @@ def _run_capture(args, env, runtime_contract):
     return {
         "schema_version": 1,
         "smoke_profile": POSITION_SMOKE_PROFILE,
-        "controller_profile": (
-            "openpi_pi05_droid_fresh_jointdelta_position_v1"
-        ),
+        "controller_profile": ("openpi_pi05_droid_fresh_jointdelta_position_v1"),
         "environment": args.environment,
         "command_magnitude": args.command_magnitude,
         "runtime_contract": runtime_contract,
@@ -247,7 +239,7 @@ def _kit_child(argv: list[str]) -> int:
             DroidPositionAdapterObservationCfg,
         )
         from polaris.environments.pi05_droid_position_robot_cfg import (
-            NVIDIA_DROID_POSITION_ADAPTER,
+            make_nvidia_droid_position_adapter_cfg,
         )
         from polaris.pi05_droid_position_runtime import (
             capture_position_adapter_runtime,
@@ -257,7 +249,7 @@ def _kit_child(argv: list[str]) -> int:
         cfg = parse_env_cfg(
             args.environment, device=args.device, num_envs=1, use_fabric=True
         )
-        cfg.scene.robot = NVIDIA_DROID_POSITION_ADAPTER.copy()
+        cfg.scene.robot = make_nvidia_droid_position_adapter_cfg()
         cfg.actions = DroidPositionAdapterActionCfg()
         cfg.events = DroidPositionAdapterEventCfg()
         cfg.observations = DroidPositionAdapterObservationCfg()
@@ -273,9 +265,7 @@ def _kit_child(argv: list[str]) -> int:
             "simulation_app_close": "pending_child_exit",
             "capture_stage": "kit_child_after_env_close_before_simulation_app_close",
         }
-        validated = validate_position_smoke(
-            payload, require_parent_completion=False
-        )
+        validated = validate_position_smoke(payload, require_parent_completion=False)
         raw = lifecycle._write_immutable_json(args.raw_json, validated)
         lifecycle._write_immutable_json(
             args.ready_json, lifecycle._child_ready_payload(args.raw_json, raw)

@@ -1,8 +1,20 @@
 from abc import ABC, abstractmethod
+import importlib
+from types import MappingProxyType
 from typing import Callable
 import numpy as np
 
 from polaris.config import PolicyArgs
+
+
+_CLIENT_MODULE_BY_NAME = MappingProxyType(
+    {
+        "DroidDeltaJointPosition": "polaris.policy.droid_delta_position_client",
+        "DroidJointPos": "polaris.policy.droid_jointpos_client",
+        "DroidJointVelocity": "polaris.policy.droid_jointvelocity_client",
+        "EgoLAPEefPose": "polaris.policy.lap_eef_pose_client",
+    }
+)
 
 
 class InferenceClient(ABC):
@@ -21,12 +33,33 @@ class InferenceClient(ABC):
         return decorator
 
     @staticmethod
-    def get_client(policy_args: PolicyArgs) -> "InferenceClient":
-        if policy_args.client not in InferenceClient.REGISTERED_CLIENTS:
+    def load_client_class(client_name: str) -> type["InferenceClient"]:
+        """Import exactly the module bound to ``client_name`` and verify it."""
+
+        if type(client_name) is not str:
+            raise ValueError("Client name must be one exact string")
+        module_name = _CLIENT_MODULE_BY_NAME.get(client_name)
+        if module_name is None:
             raise ValueError(
-                f"Client {policy_args.client} not found. Available clients: {list(InferenceClient.REGISTERED_CLIENTS.keys())}"
+                f"Client {client_name} not found. Available clients: "
+                f"{sorted(_CLIENT_MODULE_BY_NAME)}"
             )
-        return InferenceClient.REGISTERED_CLIENTS[policy_args.client](policy_args)
+        importlib.import_module(module_name)
+        client_class = InferenceClient.REGISTERED_CLIENTS.get(client_name)
+        if (
+            not isinstance(client_class, type)
+            or not issubclass(client_class, InferenceClient)
+            or client_class.__module__ != module_name
+        ):
+            raise RuntimeError(
+                f"Client {client_name} did not register from exact module {module_name}"
+            )
+        return client_class
+
+    @staticmethod
+    def get_client(policy_args: PolicyArgs) -> "InferenceClient":
+        client_class = InferenceClient.load_client_class(policy_args.client)
+        return client_class(policy_args)
 
     @abstractmethod
     def __init__(self, args) -> None:

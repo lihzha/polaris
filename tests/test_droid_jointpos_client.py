@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +12,7 @@ import torch
 
 from polaris.config import PolicyArgs
 from polaris.evaluation_seed import make_live_environment_seed_contract
+from polaris.policy import FakeClient, InferenceClient
 from polaris.policy.droid_jointpos_client import (
     DroidJointPosClient,
     JointPositionObservationNumericalError,
@@ -18,6 +22,9 @@ from polaris.policy.droid_jointpos_client import (
 from polaris.pi05_droid_jointpos_serving_contract import (
     PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE,
 )
+
+
+ROOT = Path(__file__).parents[1]
 
 
 class _FakePolicyServer:
@@ -145,6 +152,91 @@ class JointActionValidationTest(unittest.TestCase):
                 {"actions": np.full((15, 8), np.nan)},
                 open_loop_horizon=8,
             )
+
+
+class LazyPolicyRegistrationTest(unittest.TestCase):
+    def _run_isolated(self, source):
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = os.pathsep.join(
+            [
+                str(ROOT / "src"),
+                str(ROOT / "third_party/openpi/src"),
+                str(ROOT / "third_party/openpi/packages/openpi-client/src"),
+            ]
+        )
+        return subprocess.run(
+            [sys.executable, "-c", source],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        ).stdout.strip()
+
+    def test_policy_package_imports_no_concrete_client(self):
+        output = self._run_isolated(
+            """
+import json
+import sys
+import polaris.policy
+
+client_modules = {
+    "polaris.policy.droid_jointpos_client",
+    "polaris.policy.droid_jointvelocity_client",
+    "polaris.policy.droid_delta_position_client",
+    "polaris.policy.lap_eef_pose_client",
+}
+print(json.dumps(sorted(client_modules.intersection(sys.modules))))
+"""
+        )
+        self.assertEqual(json.loads(output), [])
+
+    def test_jointpos_loader_imports_only_the_selected_client(self):
+        output = self._run_isolated(
+            """
+import json
+import sys
+from polaris.policy import InferenceClient
+
+client_class = InferenceClient.load_client_class("DroidJointPos")
+client_modules = {
+    "polaris.policy.droid_jointpos_client",
+    "polaris.policy.droid_jointvelocity_client",
+    "polaris.policy.droid_delta_position_client",
+    "polaris.policy.lap_eef_pose_client",
+}
+print(json.dumps({
+    "class_module": client_class.__module__,
+    "loaded": sorted(client_modules.intersection(sys.modules)),
+}, sort_keys=True))
+"""
+        )
+        result = json.loads(output)
+        self.assertEqual(result["class_module"], "polaris.policy.droid_jointpos_client")
+        self.assertEqual(result["loaded"], ["polaris.policy.droid_jointpos_client"])
+
+        eval_source = (ROOT / "scripts/eval.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "InferenceClient.load_client_class(eval_args.policy.client)", eval_source
+        )
+        self.assertNotIn(
+            "from polaris.policy.droid_jointvelocity_client import", eval_source
+        )
+        self.assertNotIn(
+            "from polaris.policy.droid_delta_position_client import", eval_source
+        )
+
+    def test_loader_rejects_unknown_non_string_and_spoofed_clients(self):
+        with self.assertRaisesRegex(ValueError, "Available clients"):
+            InferenceClient.load_client_class("UnknownClient")
+        with self.assertRaisesRegex(ValueError, "exact string"):
+            InferenceClient.load_client_class(None)
+        with mock.patch.dict(
+            InferenceClient.REGISTERED_CLIENTS,
+            {"DroidJointPos": FakeClient},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "exact module"):
+                InferenceClient.load_client_class("DroidJointPos")
 
 
 class DroidJointPosClientContractTest(unittest.TestCase):

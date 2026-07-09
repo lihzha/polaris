@@ -447,7 +447,9 @@ def _kit_child_main(argv: list[str]) -> int:
             DroidJointVelocityEventCfg,
             DroidJointVelocityObservationCfg,
         )
-        from polaris.environments.robot_cfg import NVIDIA_DROID_JOINT_VELOCITY
+        from polaris.environments.robot_cfg import (
+            make_nvidia_droid_joint_velocity_cfg,
+        )
         from polaris.joint_velocity_runtime import validate_joint_velocity_runtime
 
         env_cfg = parse_env_cfg(
@@ -456,7 +458,7 @@ def _kit_child_main(argv: list[str]) -> int:
             num_envs=1,
             use_fabric=True,
         )
-        env_cfg.scene.robot = NVIDIA_DROID_JOINT_VELOCITY.copy()
+        env_cfg.scene.robot = make_nvidia_droid_joint_velocity_cfg()
         env_cfg.actions = DroidJointVelocityActionCfg()
         env_cfg.events = DroidJointVelocityEventCfg()
         env_cfg.observations = DroidJointVelocityObservationCfg()

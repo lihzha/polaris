@@ -22,6 +22,12 @@ from polaris.evaluation_seed import (
 )
 
 
+def _print_eval_phase(phase: str) -> None:
+    """Publish one flushed evaluator phase boundary for startup diagnosis."""
+
+    print(f"POLARIS_EVAL_PHASE={phase}", flush=True)
+
+
 def main(eval_args: EvalArgs):
     position_adapter = eval_args.policy.client == "DroidDeltaJointPosition"
     native_drive_contract = (
@@ -101,10 +107,13 @@ def main(eval_args: EvalArgs):
     args_cli, _ = parser.parse_known_args()
     args_cli.enable_cameras = True
     args_cli.headless = eval_args.headless
+    _print_eval_phase("before_app_launcher")
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
+    _print_eval_phase("after_app_launcher")
     # >>>> Isaac Sim App Launcher <<<<
 
+    _print_eval_phase("before_evaluation_imports")
     from polaris.pi05_droid_native_lifecycle import NativeEvaluatorLifecycle
 
     lifecycle = NativeEvaluatorLifecycle(simulation_app)
@@ -124,6 +133,9 @@ def main(eval_args: EvalArgs):
 
 
 def _run_evaluation(eval_args: EvalArgs, lifecycle):
+    position_adapter = eval_args.policy.client == "DroidDeltaJointPosition"
+    audited_jointpos = eval_args.policy.client == "DroidJointPos"
+    audited_droid = eval_args.control_mode == "joint-velocity" or position_adapter
     from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
     from polaris.environments.manager_based_rl_splat_environment import (
         ManagerBasedRLSplatEnv,
@@ -138,14 +150,10 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         DroidJointPositionActionCfg,
         DroidJointPositionObservationCfg,
     )
-    from polaris.environments.robot_cfg import NVIDIA_DROID_JOINT_VELOCITY
     from polaris.environments.pi05_droid_position_cfg import (
         DroidPositionAdapterActionCfg,
         DroidPositionAdapterEventCfg,
         DroidPositionAdapterObservationCfg,
-    )
-    from polaris.environments.pi05_droid_position_robot_cfg import (
-        NVIDIA_DROID_POSITION_ADAPTER,
     )
     from polaris.joint_velocity_runtime import (
         print_joint_velocity_runtime,
@@ -187,26 +195,57 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
     )
     from polaris.utils import load_eval_initial_conditions
     from polaris.policy import InferenceClient
-    from polaris.policy.droid_jointpos_client import (
-        JointPositionObservationNumericalError,
-    )
-    from polaris.policy.droid_jointvelocity_client import (
-        JointVelocityObservationNumericalError,
-    )
-    from polaris.policy.droid_delta_position_client import PositionTargetLimitError
     from polaris.robust_differential_ik import DifferentialIKNumericalError
-    from polaris.native_gripper_runtime import NativeAllJointVelocityLimitError
     # from real2simeval.autoscoring import TASK_TO_SUCCESS_CHECKER
 
-    position_adapter = eval_args.policy.client == "DroidDeltaJointPosition"
-    audited_jointpos = eval_args.policy.client == "DroidJointPos"
-    audited_droid = eval_args.control_mode == "joint-velocity" or position_adapter
+    selected_client_class = InferenceClient.load_client_class(eval_args.policy.client)
+    selected_client_module = sys.modules[selected_client_class.__module__]
+
+    def selected_exception_type(name: str) -> type[BaseException]:
+        exception_type = getattr(selected_client_module, name, None)
+        if not isinstance(exception_type, type) or not issubclass(
+            exception_type, BaseException
+        ):
+            raise RuntimeError(
+                f"Selected client module {selected_client_class.__module__} lacks "
+                f"exception type {name}"
+            )
+        return exception_type
+
+    observation_numerical_errors = ()
+    position_target_limit_errors = ()
+    native_velocity_limit_errors = ()
+    if audited_jointpos:
+        observation_numerical_errors = (
+            selected_exception_type("JointPositionObservationNumericalError"),
+        )
+    elif eval_args.control_mode == "joint-velocity":
+        from polaris.native_gripper_runtime import NativeAllJointVelocityLimitError
+
+        observation_numerical_errors = (
+            selected_exception_type("JointVelocityObservationNumericalError"),
+        )
+        native_velocity_limit_errors = (NativeAllJointVelocityLimitError,)
+    elif position_adapter:
+        from polaris.native_gripper_runtime import NativeAllJointVelocityLimitError
+
+        observation_numerical_errors = (
+            selected_exception_type("JointPositionObservationNumericalError"),
+        )
+        position_target_limit_errors = (
+            selected_exception_type("PositionTargetLimitError"),
+        )
+        native_velocity_limit_errors = (NativeAllJointVelocityLimitError,)
+
+    _print_eval_phase("after_evaluation_imports")
+    _print_eval_phase("before_parse_env_cfg")
     env_cfg = parse_env_cfg(
         eval_args.environment,
         device="cuda",
         num_envs=1,
         use_fabric=True,
     )
+    _print_eval_phase("after_parse_env_cfg")
     if eval_args.environment_seed is not None:
         bind_environment_seed(env_cfg, eval_args.environment_seed)
     configured_episode_length_seconds = None
@@ -215,7 +254,11 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         # on the config before creating the environment.
         env_cfg.actions = EefPoseActionCfg()
     elif eval_args.control_mode == "joint-velocity":
-        env_cfg.scene.robot = NVIDIA_DROID_JOINT_VELOCITY.copy()
+        from polaris.environments.robot_cfg import (
+            make_nvidia_droid_joint_velocity_cfg,
+        )
+
+        env_cfg.scene.robot = make_nvidia_droid_joint_velocity_cfg()
         env_cfg.actions = DroidJointVelocityActionCfg()
         env_cfg.events = DroidJointVelocityEventCfg()
         env_cfg.observations = DroidJointVelocityObservationCfg()
@@ -223,7 +266,11 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
             env_cfg
         )
     elif position_adapter:
-        env_cfg.scene.robot = NVIDIA_DROID_POSITION_ADAPTER.copy()
+        from polaris.environments.pi05_droid_position_robot_cfg import (
+            make_nvidia_droid_position_adapter_cfg,
+        )
+
+        env_cfg.scene.robot = make_nvidia_droid_position_adapter_cfg()
         env_cfg.actions = DroidPositionAdapterActionCfg()
         env_cfg.events = DroidPositionAdapterEventCfg()
         env_cfg.observations = DroidPositionAdapterObservationCfg()
@@ -236,9 +283,11 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         configured_episode_length_seconds = configure_jointpos_timeout(env_cfg)
     elif eval_args.control_mode != "joint-position":
         raise ValueError(f"Unsupported control mode: {eval_args.control_mode}")
+    _print_eval_phase("before_gym_make")
     env: ManagerBasedRLSplatEnv = gym.make(  # type: ignore[assignment]
         eval_args.environment, cfg=env_cfg
     )
+    _print_eval_phase("after_gym_make")
     lifecycle.bind_environment(env)
     environment_seed_contract = None
     if eval_args.environment_seed is not None:
@@ -255,7 +304,9 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         # Gym construction initializes physics but does not execute reset-mode
         # events.  Perform one native reset before accepting any live drive
         # contract; the rollout reset below reapplies and recounts the cap.
+        _print_eval_phase("before_native_preflight_reset")
         env.reset(expensive=False)
+        _print_eval_phase("after_native_preflight_reset")
         environment_runtime_contract = make_environment_runtime_contract(
             configured_episode_length_seconds=configured_episode_length_seconds,
             live_max_episode_length=env.max_episode_length,
@@ -272,7 +323,9 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
     elif position_adapter:
         # Reset-mode events establish the all-six gripper limits before the
         # live controller report is accepted. The rollout reset repeats them.
+        _print_eval_phase("before_position_preflight_reset")
         env.reset(expensive=False)
+        _print_eval_phase("after_position_preflight_reset")
         environment_runtime_contract = make_environment_runtime_contract(
             configured_episode_length_seconds=configured_episode_length_seconds,
             live_max_episode_length=env.max_episode_length,
@@ -324,7 +377,9 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         print("All rollouts have been evaluated. Exiting.")
         return
 
+    _print_eval_phase(f"before_policy_client_load:{eval_args.policy.client}")
     policy_client: InferenceClient = InferenceClient.get_client(eval_args.policy)
+    _print_eval_phase(f"after_policy_client_load:{eval_args.policy.client}")
     if eval_args.policy.client == "DroidJointPos":
         if environment_seed_contract is None:
             raise RuntimeError("DroidJointPos environment seed contract is missing")
@@ -355,12 +410,16 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         episode_seed = None
         if eval_args.environment_seed is not None:
             episode_seed = episode_environment_seed(eval_args.environment_seed, episode)
+        _print_eval_phase(f"before_rollout_reset:{episode}")
         obs, info = env.reset(
             seed=episode_seed,
             object_positions=initial_conditions[episode],
         )
+        _print_eval_phase(f"after_rollout_reset:{episode}")
         if audited_jointpos:
+            _print_eval_phase(f"before_jointpos_runtime_capture:{episode}")
             live_jointpos_runtime = capture_jointpos_runtime(env, obs)
+            _print_eval_phase(f"after_jointpos_runtime_capture:{episode}")
             if jointpos_runtime_sha256 is None:
                 print(format_jointpos_runtime(live_jointpos_runtime), flush=True)
                 runtime_artifact = publish_jointpos_runtime(
@@ -415,7 +474,7 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                 action, viz = policy_client.infer(
                     obs, language_instruction, return_viz=True
                 )
-            except PositionTargetLimitError as error:
+            except position_target_limit_errors as error:
                 if not position_adapter:
                     raise
                 video.append(policy_client.visualize(obs))
@@ -429,16 +488,13 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                 incident_artifact = error.incident_artifact
                 bar.update(1)
                 break
-            except (
-                JointPositionObservationNumericalError,
-                JointVelocityObservationNumericalError,
-            ) as error:
+            except observation_numerical_errors as error:
                 if position_adapter:
                     # State/image/schema corruption is a contract-fatal error,
                     # not a controller numerical outcome.
                     raise
                 if eval_args.control_mode == "joint-velocity" and isinstance(
-                    error, JointVelocityObservationNumericalError
+                    error, observation_numerical_errors
                 ):
                     # The native canary has one typed monitor terminal form.
                     # Observation/schema failures remain fatal contract errors.
@@ -462,7 +518,7 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
                         needs_next_policy_render=policy_client.rerender,
                     ),
                 )
-            except NativeAllJointVelocityLimitError as error:
+            except native_velocity_limit_errors as error:
                 if position_adapter:
                     dynamic_report = native_arm_term.native_all_joint_dynamic_report(
                         include_samples=False
@@ -513,7 +569,7 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
             if audited_droid:
                 try:
                     native_arm_term.record_native_all_joint_post_policy_step()
-                except NativeAllJointVelocityLimitError as error:
+                except native_velocity_limit_errors as error:
                     if position_adapter:
                         policy_client.record_execution(
                             obs,

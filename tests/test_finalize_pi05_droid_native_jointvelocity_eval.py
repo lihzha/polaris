@@ -1711,15 +1711,16 @@ def test_launchers_block_before_download_or_sbatch_and_forbid_resume():
     assert evaluator_source.index("bind_native_all_joint_failure_path") < (
         evaluator_source.index("env.step(")
     )
-    assert (
-        evaluator_source.count("except NativeAllJointVelocityLimitError as error:") == 2
+    assert evaluator_source.count("except native_velocity_limit_errors as error:") == 2
+    assert "native_velocity_limit_errors = (NativeAllJointVelocityLimitError,)" in (
+        evaluator_source
     )
     assert evaluator_source.count("finalize_native_velocity_failure(error)") == 3
     post_sample = evaluator_source.index(
         "native_arm_term.record_native_all_joint_post_policy_step()"
     )
     post_failure = evaluator_source.index(
-        "except NativeAllJointVelocityLimitError as error:", post_sample
+        "except native_velocity_limit_errors as error:", post_sample
     )
     post_execution = evaluator_source.index(
         "policy_client.record_execution(", post_failure

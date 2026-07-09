@@ -108,6 +108,3 @@ def make_nvidia_droid_joint_velocity_cfg() -> ArticulationCfg:
         velocity_limit_sim=NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
     )
     return config
-
-
-NVIDIA_DROID_JOINT_VELOCITY = make_nvidia_droid_joint_velocity_cfg()

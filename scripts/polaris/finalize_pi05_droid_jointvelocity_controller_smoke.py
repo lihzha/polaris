@@ -43,7 +43,7 @@ ISAACLAB_SOURCES = {
 }
 POLARIS_RUNTIME_SOURCES = {
     "droid_cfg.py": "19ceaceeb06c06e1f708af2380d47dded2a5f7030c436e266c4efca255509287",
-    "robot_cfg.py": "d514b32e07b54f98deb6d9dbc7a5201fff5337cdc4600d9351ee2a95e5c4c4c5",
+    "robot_cfg.py": "26874c2a7807cc69028e538d6428853b75969edc20c05637385303e838144aa7",
     "native_gripper_runtime.py": (
         "8b5cd2e7c0f912418a878544fce621c00a4126551a21ab72d486686b67d70ff1"
     ),
