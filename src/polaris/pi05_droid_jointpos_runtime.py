@@ -45,7 +45,7 @@ PI05_DROID_JOINTPOS_SENSOR_NAMES = ("external_cam", "wrist_cam")
 PI05_DROID_JOINTPOS_NATIVE_IMAGE_SHAPE = (720, 1280, 3)
 PI05_DROID_JOINTPOS_BOUNDARY_PROFILE = "outer450_internal451_no_autoreset"
 PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE = (
-    "l401_pyxis_nvidia_580_105_08_mapped_graphics_v4"
+    "l401_pyxis_nvidia_580_105_08_mapped_graphics_v5"
 )
 PI05_DROID_JOINTPOS_GRAPHICS_PROC_MAPS_PATH = "/proc/self/maps"
 PI05_DROID_JOINTPOS_GRAPHICS_PROC_ENVIRON_PATH = "/proc/self/environ"
@@ -279,7 +279,7 @@ PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES: tuple[
     ),
 )
 PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_SHA256 = (
-    "d251727e38315050a25b79954ed77984fa5cc4649b954e7789bfcbb0a77e3629"
+    "f08522c21472c7a42a726952f0bdce5119a31744cd35cb4cb81e37a24faa2eb7"
 )
 
 _ACTION_TERM_CLASS = (
@@ -1106,7 +1106,7 @@ def _validate_graphics_runtime(value: Any, *, expected_gpu_uuid: str) -> dict[st
         "NVIDIA_VISIBLE_DEVICES": expected_gpu_uuid,
         "NVIDIA_DRIVER_CAPABILITIES": "all",
         **{name: None for name in PI05_DROID_JOINTPOS_GRAPHICS_FORBIDDEN_ENVIRONMENT},
-        **{name: "" for name in PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT},
+        **{name: None for name in PI05_DROID_JOINTPOS_GRAPHICS_KIT_CLEARED_ENVIRONMENT},
     }
     expected_initial_environment = {
         "LD_LIBRARY_PATH": None,
