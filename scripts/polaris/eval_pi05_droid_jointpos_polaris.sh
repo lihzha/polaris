@@ -163,7 +163,7 @@ verify_runtime_closure_approval() {
 
 DIAGNOSTIC_HOST_PYTHON=/usr/bin/python3.12
 DIAGNOSTIC_MODULE="${POLARIS_DIR}/src/polaris/app_launcher_startup_diagnostic.py"
-EXPECTED_DIAGNOSTIC_MODULE_SHA256=e9b42dca89a67f45d4a1568641590f0a75c9ac9683a0ce4e5830a24499a5a292
+EXPECTED_DIAGNOSTIC_MODULE_SHA256=eadfc3bc3421eba1379ff4c24e2b084639e2a9949cdb32f9d6279d4eaa1032f2
 diagnostic_helper_command=()
 DIAGNOSTIC_MODULE_FD=""
 DIAGNOSTIC_MODULE_LOADER='import hashlib, os, sys; approved_path=sys.argv[1]; fd=int(sys.argv[2]); rest=sys.argv[3:]; os.lseek(fd, 0, os.SEEK_SET); payload=os.fdopen(os.dup(fd), "rb").read(); digest=hashlib.sha256(payload).hexdigest(); digest == os.environ["POLARIS_DIAGNOSTIC_MODULE_SHA256"] or sys.exit("diagnostic module descriptor digest mismatch"); sys.argv=[approved_path, *rest]; namespace={"__name__":"__main__", "__file__":approved_path, "__package__":None, "__cached__":None}; exec(compile(payload, approved_path, "exec"), namespace, namespace)'

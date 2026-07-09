@@ -812,7 +812,7 @@ fi
 
 SCRIPT_DIR="$(readlink -f -- "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")"
 APPROVED_SBATCH_SCRIPT="${SCRIPT_DIR}/l40s_pi05_eval_job.sbatch"
-APPROVED_SBATCH_SCRIPT_SHA256="35515abaf15d7060f86ad959aaa73a53c5ed5fa9dec1e5a124fc109e91812d7e"
+APPROVED_SBATCH_SCRIPT_SHA256="19a403c89e934257bf33db428ba1a9346b7605b135d86c6a6515df4c4ff57787"
 SBATCH_SCRIPT="${SBATCH_SCRIPT:-${APPROVED_SBATCH_SCRIPT}}"
 : "${POLARIS_SOURCE_SNAPSHOT:?Set the approved content-addressed source snapshot}"
 : "${EXPECTED_POLARIS_SOURCE_TREE_SHA256:?Set the approved source-snapshot tree SHA-256}"
