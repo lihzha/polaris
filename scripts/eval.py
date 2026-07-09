@@ -84,6 +84,9 @@ def main(eval_args: EvalArgs):
         format_jointpos_runtime,
         publish_jointpos_runtime,
     )
+    from polaris.pi05_droid_jointpos_image_contract import (
+        install_jointpos_image_instrumentation,
+    )
     from polaris.utils import load_eval_initial_conditions
     from polaris.policy import InferenceClient
     from polaris.policy.droid_jointpos_client import (
@@ -119,6 +122,10 @@ def main(eval_args: EvalArgs):
         eval_args.environment, cfg=env_cfg
     )
     _print_eval_phase("after_gym_make")
+    if audited_jointpos:
+        _print_eval_phase("before_jointpos_image_instrumentation")
+        install_jointpos_image_instrumentation(env)
+        _print_eval_phase("after_jointpos_image_instrumentation")
     environment_seed_contract = None
     if eval_args.environment_seed is not None:
         environment_seed_contract = make_live_environment_seed_contract(

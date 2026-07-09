@@ -13,8 +13,6 @@ from isaaclab.utils import configclass, noise
 
 from polaris.environments.droid_cfg import (
     BinaryJointPositionZeroToOneActionCfg,
-    eef_pos,
-    eef_quat,
 )
 from polaris.pi05_droid_jointpos_runtime import (
     JointPositionExecutionRecorder,
@@ -121,8 +119,6 @@ class DroidJointPositionObservationCfg:
             noise=noise.GaussianNoiseCfg(std=0.05),
             clip=(0.0, 1.0),
         )
-        eef_pos = ObsTerm(func=eef_pos)
-        eef_quat = ObsTerm(func=eef_quat)
 
         def __post_init__(self) -> None:
             self.enable_corruption = False

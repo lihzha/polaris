@@ -442,3 +442,29 @@
 - Residual renderer/JPEG, simulated-dynamics, and fixed-view domain shifts are
   explicit. Because the PolaRiS rubric can latch transient positives, final
   reporting must visually adjudicate every raw-positive video separately.
+
+## 2026-07-08 — v16 mirrored official contract
+
+- V15 job `1101941` was rejected before request zero by an audit error: Isaac
+  Lab 2.3 correctly ignored the legacy `velocity_limit=2.175/2.61` fields and
+  preserved the USD/PhysX arm limit `10.0 rad/s`. It produced no rollout,
+  trace, metric, image, video, or terminal runtime evidence and remains
+  non-authoritative.
+- The v16 scientific patch is mirrored from current while preserving this
+  branch's historical evaluator lifecycle as the sole intended factor. Common
+  production modules bind schema-5 runtime/trace, evidence-v9, the exact
+  official OpenPI client 720x1280-to-224 Pillow resize before WebSocket,
+  external/wrist/masked-blank order, no wrist rotation, reset plus post-action
+  7/15/.../447 expensive cadence, and all-step execution/image evidence.
+- The shared robot config, manager, and splat renderer remain unmodified. Live
+  limits are observed without writes: arm velocity `10.0`, finger velocity
+  `8.726646423339844`, and PhysX-converted finger drive gains
+  `5729.578125`/`0.011459155939519405`. The latter replace the incorrect raw
+  USD per-degree values `100`/`0.0002`; a regression binds the `180/pi`
+  conversion independently captured by L40S job `1098162`.
+- After conflict resolution, all 18 shared production/validation files compare
+  byte-for-byte with current. The historical host-safe suite passes 331 tests
+  plus eight subtests; Ruff format/lint, Bash syntax, ShellCheck, Python
+  compilation, and staged/unstaged whitespace checks pass. A fresh serialized
+  L40S lifecycle probe and isolated canary remain mandatory before this
+  revision can be used as the historical control.

@@ -1,3 +1,4 @@
+import importlib.metadata
 import json
 import tempfile
 import unittest
@@ -18,6 +19,9 @@ from polaris.policy.droid_jointpos_client import (
 from polaris.pi05_droid_jointpos_serving_contract import (
     PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE,
 )
+
+
+_ORIGINAL_METADATA_VERSION = importlib.metadata.version
 
 
 class _FakePolicyServer:
@@ -70,6 +74,7 @@ def _policy_args(trace_path, **overrides):
         "expected_action_dim": 8,
         "state_type": "joint_position",
         "rotate_wrist_180": False,
+        "render_every_step": False,
     }
     values.update(overrides)
     return PolicyArgs(**values)
@@ -148,6 +153,94 @@ class JointActionValidationTest(unittest.TestCase):
 
 
 class DroidJointPosClientContractTest(unittest.TestCase):
+    def setUp(self):
+        self._pillow_version_patch = mock.patch(
+            "polaris.pi05_droid_jointpos_image_contract.importlib_metadata.version",
+            side_effect=lambda name: (
+                "11.3.0" if name == "Pillow" else _ORIGINAL_METADATA_VERSION(name)
+            ),
+        )
+        self._pillow_version_patch.start()
+
+    def tearDown(self):
+        self._pillow_version_patch.stop()
+
+    def test_visualize_calls_diagnostic_resize_once(self):
+        client = object.__new__(DroidJointPosClient)
+        current = {"sentinel": object()}
+        external = np.zeros((224, 224, 3), dtype=np.uint8)
+        wrist = np.ones((224, 224, 3), dtype=np.uint8)
+        with (
+            mock.patch.object(client, "_extract_observation", return_value=current),
+            mock.patch.object(
+                client,
+                "_diagnostic_images",
+                return_value=(external, wrist),
+            ) as diagnostic_images,
+        ):
+            visualization = client.visualize({})
+
+        diagnostic_images.assert_called_once_with(current)
+        np.testing.assert_array_equal(visualization[:, :224], external)
+        np.testing.assert_array_equal(visualization[:, 224:], wrist)
+
+    def test_exact_450_step_query_render_and_video_cadence(self):
+        client = object.__new__(DroidJointPosClient)
+        client.open_loop_horizon = 8
+        client.actions_from_chunk_completed = 0
+        query_action_indices = []
+        expensive_post_action_indices = []
+        video_frame_sources = []
+        step_was_expensive = []
+
+        # One expensive reset supplies the first query observation. Thereafter
+        # infer() increments the chunk counter before eval.py asks whether the
+        # just-executed action must render the next query observation.
+        expensive_observation_sources = ["reset_expensive_hybrid"]
+        for action_index in range(450):
+            query_now = client.rerender
+            if query_now:
+                query_action_indices.append(action_index)
+                client.actions_from_chunk_completed = 0
+                video_frame_sources.append("query_client224_wire_model_input")
+            else:
+                video_frame_sources.append("interquery_sim_only_non_model")
+
+            client.actions_from_chunk_completed += 1
+            # Historical eval.py directly uses ``render_every_step or
+            # client.rerender`` for DroidJointPos. The v16 CLI pins the first
+            # operand false, so this is the exact historical decision path.
+            expensive = client.rerender
+            step_was_expensive.append(expensive)
+            if expensive:
+                expensive_post_action_indices.append(action_index)
+                expensive_observation_sources.append("post_action_expensive_hybrid")
+
+        self.assertEqual(query_action_indices, list(range(0, 450, 8)))
+        self.assertEqual(len(query_action_indices), 57)
+        self.assertEqual(expensive_post_action_indices, list(range(7, 448, 8)))
+        self.assertEqual(len(expensive_post_action_indices), 56)
+        self.assertEqual(len(expensive_observation_sources), 57)
+        self.assertFalse(step_was_expensive[448])
+        self.assertFalse(step_was_expensive[449])
+        self.assertEqual(len(video_frame_sources), 450)
+        self.assertEqual(
+            video_frame_sources.count("query_client224_wire_model_input"), 57
+        )
+        self.assertEqual(
+            video_frame_sources.count("interquery_sim_only_non_model"), 393
+        )
+        self.assertEqual(video_frame_sources[-1], "interquery_sim_only_non_model")
+        terminal_source = (
+            "post_action450_returned_nonexpensive_sim_camera_observation"
+            if not step_was_expensive[-1]
+            else "unexpected_expensive_hybrid_observation"
+        )
+        self.assertEqual(
+            terminal_source,
+            "post_action450_returned_nonexpensive_sim_camera_observation",
+        )
+
     def test_nonfinite_joint_observation_is_a_numerical_failure(self):
         observation = {
             "splat": {
@@ -256,33 +349,37 @@ class DroidJointPosClientContractTest(unittest.TestCase):
                 _bind_test_runtime(client)
                 client.reset(episode_index=0, episode_seed=0)
                 client._last_environment_after = _environment_boundary()
+                client._image_evidence_env = object()
                 returned = []
-                for _ in range(8):
-                    returned.append(
-                        client.infer(
-                            observation,
-                            "put all foods in the bowl",
-                            return_viz=True,
+                with mock.patch(
+                    "polaris.policy.droid_jointpos_client.get_jointpos_image_evidence",
+                    return_value={"external_cam": {}, "wrist_cam": {}},
+                ):
+                    for _ in range(8):
+                        returned.append(
+                            client.infer(
+                                observation,
+                                "put all foods in the bowl",
+                                return_viz=True,
+                            )
                         )
-                    )
-                    # This focused test covers query/emission serialization;
-                    # live execution evidence has a separate fake-runtime test.
-                    client._pending_execution = None
+                        # This focused test covers query/emission serialization;
+                        # live execution evidence has a separate fake-runtime test.
+                        client._pending_execution = None
 
             records = [json.loads(line) for line in trace_path.read_text().splitlines()]
 
         self.assertEqual(len(fake_server.requests), 1)
         request = fake_server.requests[0]
         self.assertEqual(
-            request["observation/exterior_image_1_left"].shape, (720, 1280, 3)
+            request["observation/exterior_image_1_left"].shape, (224, 224, 3)
         )
-        self.assertEqual(request["observation/wrist_image_left"].shape, (720, 1280, 3))
+        self.assertEqual(request["observation/wrist_image_left"].shape, (224, 224, 3))
         self.assertEqual(request["observation/exterior_image_1_left"].dtype, np.uint8)
         self.assertEqual(request["observation/wrist_image_left"].dtype, np.uint8)
-        np.testing.assert_array_equal(
-            request["observation/exterior_image_1_left"], external
+        self.assertFalse(
+            np.array_equal(request["observation/exterior_image_1_left"], external)
         )
-        np.testing.assert_array_equal(request["observation/wrist_image_left"], wrist)
         np.testing.assert_array_equal(
             request["observation/joint_position"], np.arange(7, dtype=np.float32)
         )
@@ -298,7 +395,7 @@ class DroidJointPosClientContractTest(unittest.TestCase):
 
         self.assertEqual(len(records), 9)
         trace = records[0]
-        self.assertEqual(trace["schema_version"], 4)
+        self.assertEqual(trace["schema_version"], 5)
         self.assertEqual(trace["environment_rng"]["base_seed"], 0)
         self.assertEqual(trace["environment_rng"]["episode_index"], 0)
         self.assertEqual(trace["environment_rng"]["episode_seed"], 0)
@@ -309,26 +406,28 @@ class DroidJointPosClientContractTest(unittest.TestCase):
         self.assertEqual(trace["response_action_shape"], [15, 8])
         self.assertEqual(trace["execution_horizon"], 8)
         self.assertEqual(len(trace["planned_action_chunk"]), 8)
-        self.assertEqual(trace["images"]["request_external"]["shape"], [720, 1280, 3])
-        self.assertEqual(trace["images"]["request_wrist"]["shape"], [720, 1280, 3])
+        self.assertEqual(trace["images"]["request_external"]["shape"], [224, 224, 3])
+        self.assertEqual(trace["images"]["request_wrist"]["shape"], [224, 224, 3])
         self.assertEqual(
             trace["images"]["request_external"]["sha256"],
-            trace["images"]["native_external"]["sha256"],
+            trace["images"]["client_resize_external"]["wire_request"]["sha256"],
         )
         self.assertEqual(
             trace["images"]["request_wrist"]["sha256"],
-            trace["images"]["native_wrist"]["sha256"],
+            trace["images"]["client_resize_wrist"]["wire_request"]["sha256"],
         )
         self.assertEqual(
-            trace["images"]["visualization_external"]["shape"], [224, 224, 3]
+            trace["images"]["query_visualization_external"]["shape"], [224, 224, 3]
         )
-        self.assertEqual(trace["images"]["visualization_wrist"]["shape"], [224, 224, 3])
-        self.assertIsNone(trace["images"]["client_model_spatial_transform"])
+        self.assertEqual(
+            trace["images"]["query_visualization_wrist"]["shape"], [224, 224, 3]
+        )
+        self.assertIsNotNone(trace["images"]["client_model_spatial_transform"])
         self.assertEqual(
             trace["images"]["server_model_resize"],
             PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE,
         )
-        self.assertIn("non_model", trace["images"]["visualization_spatial_transform"])
+        self.assertIn("model_input", trace["images"]["query_visualization_source"])
         self.assertEqual(trace["images"]["wrist_rotation_degrees"], 0)
         self.assertTrue(
             print_mock.call_args_list[0].args[0].startswith(PI05_DROID_CONTRACT_MARKER)
@@ -374,6 +473,7 @@ class DroidJointPosClientContractTest(unittest.TestCase):
             before = _environment_boundary()
             client._rollout_environment_before = before
             client._last_environment_after = _environment_boundary(449)
+            client._image_evidence_env = object()
             client.outer_step_index = 449
             observation = {
                 "splat": {
@@ -385,7 +485,13 @@ class DroidJointPosClientContractTest(unittest.TestCase):
                     "gripper_pos": torch.zeros((1, 1), dtype=torch.float32),
                 },
             }
-            emitted, _ = client.infer(observation, "test execution", return_viz=True)
+            with mock.patch(
+                "polaris.policy.droid_jointpos_client.get_jointpos_image_evidence",
+                return_value={"external_cam": {}, "wrist_cam": {}},
+            ):
+                emitted, _ = client.infer(
+                    observation, "test execution", return_viz=True
+                )
             target = np.asarray(emitted[:7], dtype=np.float32)
 
             class Arm:
@@ -472,7 +578,7 @@ class DroidJointPosClientContractTest(unittest.TestCase):
             self.assertEqual(record["measured_joint_position_after"], [0.0] * 7)
             self.assertEqual(
                 record["terminal_visualization"]["source"],
-                "post_action450_returned_expensive_splat_observation",
+                "post_action450_returned_nonexpensive_sim_camera_observation",
             )
             terminal = client.final_terminal_visualization()
             self.assertEqual(terminal.shape, (224, 448, 3))

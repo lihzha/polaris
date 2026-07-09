@@ -9,6 +9,12 @@ from unittest import mock
 import numpy as np
 
 from polaris.evaluation_seed import environment_seed_contract_sha256
+from polaris.pi05_droid_jointpos_image_contract import (
+    CLIENT_RESIZE_PROFILE,
+    FILTER_PROBE,
+    IMAGE_PROFILE,
+    static_image_contract,
+)
 
 
 SCRIPT_PATH = Path(__file__).parents[1] / "scripts/polaris/validate_pi05_trace.py"
@@ -84,6 +90,74 @@ def _write_jsonl(path: Path, records: list[dict]) -> None:
     path.write_text("".join(json.dumps(record) + "\n" for record in records))
 
 
+def _image_id(shape, dtype, digest):
+    return {"shape": list(shape), "dtype": dtype, "sha256": digest}
+
+
+def _camera_evidence(name, final_digest):
+    post = _image_id((720, 1280, 3), "uint8", "4" * 64)
+    return {
+        "schema_version": 1,
+        "profile": IMAGE_PROFILE,
+        "contract_sha256": static_image_contract()["contract_sha256"],
+        "camera_name": name,
+        "background_source": "filtered_splat",
+        "renderer_stages": {
+            "source": "splat_renderer_output",
+            "cv2_runtime": {
+                "provider": "opencv-python-headless",
+                "package_version": "4.11.0.86",
+                "opencv_version": "4.11.0",
+                "module_path": "/.venv/lib/python3.11/site-packages/cv2/__init__.py",
+                "interpolation": "cv2.INTER_LINEAR",
+                "interpolation_value": 1,
+                "probe": dict(FILTER_PROBE),
+            },
+            "renderer_float": _image_id((720, 1280, 3), "float32", "1" * 64),
+            "pre_filter_uint8": _image_id((720, 1280, 3), "uint8", "2" * 64),
+            "half_resolution_uint8": _image_id((360, 640, 3), "uint8", "3" * 64),
+            "post_filter_splat_uint8": post,
+        },
+        "composite_background_uint8": post,
+        "composite_mask_int64": _image_id((720, 1280, 1), "int64", "5" * 64),
+        "composite_mask_coverage": {
+            "true_pixel_count": 100,
+            "total_pixel_count": 720 * 1280,
+            "true_fraction": 100 / (720 * 1280),
+        },
+        "sim_rgb_layer_uint8": _image_id((720, 1280, 3), "uint8", "6" * 64),
+        "final_composite_uint8": _image_id((720, 1280, 3), "uint8", final_digest),
+    }
+
+
+def _resize_evidence(final_digest, wire_digest):
+    return {
+        "profile": CLIENT_RESIZE_PROFILE,
+        "runtime": {
+            "profile": CLIENT_RESIZE_PROFILE,
+            "implementation": "openpi_client.image_tools.resize_with_pad",
+            "backend": "PIL.Image.resize",
+            "method": "PIL.Image.Resampling.BILINEAR",
+            "padding": "symmetric_zero",
+            "source": {
+                "path": "/openpi/image_tools.py",
+                "size": 1,
+                "sha256": (
+                    "d48b4bd7f44e79fe6db8a8e07c9161144fa250be686e1245014a8b47e6171977"
+                ),
+            },
+            "probe_output_sha256": (
+                "4485703601c6d6fa2d256374d7b7e2fb9c60d585e8278aa4251983a96ec74cc5"
+            ),
+            "server_224_to_224": "early_return_same_array_no_pixel_change",
+            "pillow_version": "11.3.0",
+            "pillow_module": "PIL.Image",
+        },
+        "input_final_composite": _image_id((720, 1280, 3), "uint8", final_digest),
+        "wire_request": _image_id((224, 224, 3), "uint8", wire_digest),
+    }
+
+
 def _attested_records(base_seed: int = 7) -> list[dict]:
     seed_contract = {
         "schema_version": 1,
@@ -97,8 +171,8 @@ def _attested_records(base_seed: int = 7) -> list[dict]:
     }
     seed_hash = environment_seed_contract_sha256(seed_contract)
     identity = {
-        "schema_version": 4,
-        "profile": "openpi_pi05_droid_native_joint_position_v1",
+        "schema_version": 5,
+        "profile": "openpi_pi05_droid_native_joint_position_v2",
         "reset_index": 0,
         "server_contract_sha256": "c" * 64,
         "environment_seed_contract_sha256": seed_hash,
@@ -144,51 +218,49 @@ def _attested_records(base_seed: int = 7) -> list[dict]:
                         "gripper_position": [0.0],
                     },
                     "images": {
-                        "native_external": {
-                            "shape": [720, 1280, 3],
-                            "dtype": "uint8",
-                            "sha256": "a" * 64,
-                        },
-                        "native_wrist": {
-                            "shape": [720, 1280, 3],
-                            "dtype": "uint8",
-                            "sha256": "b" * 64,
-                        },
-                        "request_external": {
-                            "shape": [720, 1280, 3],
-                            "dtype": "uint8",
-                            "sha256": "a" * 64,
-                        },
-                        "request_wrist": {
-                            "shape": [720, 1280, 3],
-                            "dtype": "uint8",
-                            "sha256": "b" * 64,
-                        },
-                        "visualization_external": {
-                            "shape": [224, 224, 3],
-                            "dtype": "uint8",
-                            "sha256": "e" * 64,
-                        },
-                        "visualization_wrist": {
-                            "shape": [224, 224, 3],
-                            "dtype": "uint8",
-                            "sha256": "f" * 64,
-                        },
+                        "environment_image_contract": static_image_contract(),
+                        "external_camera_pipeline": _camera_evidence(
+                            "external_cam", "a" * 64
+                        ),
+                        "wrist_camera_pipeline": _camera_evidence(
+                            "wrist_cam", "b" * 64
+                        ),
+                        "final_composite_external": _image_id(
+                            (720, 1280, 3), "uint8", "a" * 64
+                        ),
+                        "final_composite_wrist": _image_id(
+                            (720, 1280, 3), "uint8", "b" * 64
+                        ),
+                        "client_resize_external": _resize_evidence("a" * 64, "e" * 64),
+                        "client_resize_wrist": _resize_evidence("b" * 64, "f" * 64),
+                        "request_external": _image_id((224, 224, 3), "uint8", "e" * 64),
+                        "request_wrist": _image_id((224, 224, 3), "uint8", "f" * 64),
+                        "server224_external_idempotent": _image_id(
+                            (224, 224, 3), "uint8", "e" * 64
+                        ),
+                        "server224_wrist_idempotent": _image_id(
+                            (224, 224, 3), "uint8", "f" * 64
+                        ),
+                        "query_visualization_external": _image_id(
+                            (224, 224, 3), "uint8", "e" * 64
+                        ),
+                        "query_visualization_wrist": _image_id(
+                            (224, 224, 3), "uint8", "f" * 64
+                        ),
                         "model_order": [
                             "base_0_rgb",
                             "left_wrist_0_rgb",
                             "right_wrist_0_rgb_masked",
                         ],
-                        "client_model_spatial_transform": None,
+                        "client_model_spatial_transform": CLIENT_RESIZE_PROFILE,
                         "server_model_resize": (
                             MODULE.PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE
                         ),
                         "masked_third_slot": (
                             "server_DroidInputs_zeros_like_base_mask_false"
                         ),
-                        "visualization_spatial_transform": (
-                            "openpi_client.image_tools.resize_with_pad_"
-                            "PIL_bilinear_non_model"
+                        "query_visualization_source": (
+                            "byte_identical_client224_wire_model_input"
                         ),
                         "wrist_rotation_degrees": 0,
                     },
@@ -271,7 +343,7 @@ def _attested_records(base_seed: int = 7) -> list[dict]:
                         "dtype": "uint8",
                         "sha256": "7" * 64,
                         "source": (
-                            "post_action450_returned_expensive_splat_observation"
+                            "post_action450_returned_nonexpensive_sim_camera_observation"
                         ),
                     }
                     if outer_step == 449
@@ -316,14 +388,17 @@ class TraceAuditTest(unittest.TestCase):
         self.assertEqual(summary["environment_episode_seeds"], [7])
         self.assertEqual(summary["episode_query_counts"], [57])
         self.assertEqual(summary["cumulative_query_counts"], [57])
-        self.assertEqual(summary["request_image_shape"], [720, 1280, 3])
+        self.assertEqual(summary["request_image_shape"], [224, 224, 3])
         self.assertEqual(summary["request_image_dtype"], "uint8")
-        self.assertIsNone(summary["client_model_spatial_transform"])
+        self.assertEqual(
+            summary["client_model_spatial_transform"], CLIENT_RESIZE_PROFILE
+        )
         self.assertEqual(
             summary["server_model_resize"],
             MODULE.PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE,
         )
-        self.assertFalse(summary["visualization_is_model_input"])
+        self.assertTrue(summary["query_visualization_is_model_input"])
+        self.assertFalse(summary["interquery_visualization_is_model_input"])
         self.assertEqual(summary["terminal_visualization_shape"], [224, 448, 3])
         self.assertEqual(summary["terminal_visualization_sha256"], ["7" * 64])
         self.assertFalse(summary["environment_physx_enhanced_determinism"])
@@ -439,9 +514,9 @@ class TraceAuditTest(unittest.TestCase):
                     runtime_contract_path=Path(temporary_directory) / "runtime.json",
                 )
 
-    def test_attested_trace_rejects_client_resized_model_request(self):
+    def test_attested_trace_rejects_non_wire_shape_model_request(self):
         records = _attested_records()
-        records[0]["images"]["request_external"]["shape"] = [224, 224, 3]
+        records[0]["images"]["request_external"]["shape"] = [720, 1280, 3]
         with tempfile.TemporaryDirectory() as temporary_directory:
             trace_path = Path(temporary_directory) / "trace.jsonl"
             _write_jsonl(trace_path, records)
@@ -453,13 +528,15 @@ class TraceAuditTest(unittest.TestCase):
                     runtime_contract_path=Path(temporary_directory) / "runtime.json",
                 )
 
-    def test_attested_trace_requires_byte_identical_native_model_request(self):
+    def test_attested_trace_requires_byte_identical_wire_model_request(self):
         records = _attested_records()
         records[0]["images"]["request_wrist"]["sha256"] = "9" * 64
         with tempfile.TemporaryDirectory() as temporary_directory:
             trace_path = Path(temporary_directory) / "trace.jsonl"
             _write_jsonl(trace_path, records)
-            with self.assertRaisesRegex(ValueError, "byte-identical native imagery"):
+            with self.assertRaisesRegex(
+                ValueError, "final720/client224/wire/model/viz identity mismatch"
+            ):
                 MODULE.audit_trace(
                     trace_path,
                     expected_environment_seed=7,
