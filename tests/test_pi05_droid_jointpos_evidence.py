@@ -328,7 +328,7 @@ def test_worker_finalizes_server_rng_then_evidence_before_success_marker():
 
 def test_gpu_vulkan_contract_requires_model_simulator_agreement():
     assert evidence.PI05_DROID_JOINTPOS_EVIDENCE_PROFILE == (
-        "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v7"
+        "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v8"
     )
     model, simulator = _gpu_vulkan_contracts()
     assert evidence._validate_gpu_vulkan_runtime_agreement(model, simulator) == {
