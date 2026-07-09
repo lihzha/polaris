@@ -823,3 +823,88 @@
   `pi05-confidence-final-v12-20260708T225010Z` using immutable script SHA-256
   `a31ebd3c0ffc687bcbe51fcc0d5e77d4aca2cdf4259dd826f8454de83dd0cd9b`.
   No v12 GPU evaluation is launched until both setup records pass.
+
+## 2026-07-08 — v12/v13 zero-rollout closure
+
+- Fresh v12 setup jobs `1101841` (current) and `1101842` (historical)
+  completed `0:0` in 11:22 and 12:39. They again verified 242 packages, 240
+  RECORD inventories, the full 12,434,530,837-byte checkpoint, tokenizer,
+  official config, and checkpoint-global DROID normalization. Paired L40S
+  canaries `1101847` and `1101848` constructed and reset FoodBussing, then
+  rejected the live graphics environment before request zero. They were
+  canceled during Isaac teardown and produced no policy request, episode,
+  trace, metric, image, video, runtime artifact, or evidence manifest.
+- V13 source attempted to close the five Kit variables observed at the full
+  environment boundary. Fresh setup `1101851` completed `0:0` in 11:44 for
+  current and `1101852` completed `0:0` in 9:23 for historical. Current's
+  sealed/final package digest is
+  `a1c9799f2d8265ff0e51f01861f60d1f4a16e87c108c5215ca08844a3f692437`;
+  the historical digest is
+  `66d499de6595806f9560a6644d2857e78e5205d57fe6a191dad2773e5889ef10`.
+  An independent review found that v13 still left the deterministic cv2 loader
+  mutation and loaded-module identity unbound. Both v13 evaluation objects
+  were canceled before any GPU job or scientific rollout. Shared registry
+  revision 42 also cancels all three legacy zero-rollout planned objects as
+  non-authoritative.
+
+## 2026-07-08 — live import-order probe and headless OpenCV correction
+
+- Clean L40S probe `1101856` completed `0:0` in 3:28 on `pool0-00023` from
+  immutable source `519a2b2fbd88f4f363327def6ff9ef0acd35fb1b` and the exact evaluation
+  image SHA-256
+  `ad566a3a0bbb300cafb4a63e0f4c0056f501e4490a136881b0b1ae2d556b324a`.
+  Its mode-0444, 20,507-byte report is
+  `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris-pi05/pi05-graphics-env-probe-v5-20260709T001500Z/graphics_environment_probe.json`,
+  SHA-256
+  `4b66297d8747f93176c836fb76faeffaaa6836bfc585d4efa8c715e7c6684679`.
+  The terminal log SHA-256 is
+  `61cb41cd8e765f9e2b6764d4480ef691c9b4f4ef0b85126dd0f7c6b8aa472043`.
+- The probe proves process-start `LD_LIBRARY_PATH`, all five Kit variables,
+  both Qt variables, and every enumerated loader/layer override are absent.
+  The exact eval import order changes only `LD_LIBRARY_PATH` to
+  `/.venv/lib/python3.11/site-packages/cv2/../../lib64:` when the renderer
+  imports cv2. The source mount equals the working directory, is read-only,
+  the normalized first loader path `/.venv/lib/python3.11/lib64` is absent,
+  and the root contains no ELF candidate.
+- The probe rejected a prior inference before launch: the immutable evaluator
+  image's active co-installed provider is `opencv-python-headless==4.11.0.86`,
+  not the GUI wheel. The final contract now requires `headless=true`, keeps Qt
+  variables absent, and pins the active native module at 66,106,617 bytes,
+  SHA-256
+  `68fee49d266a95e730c1cb17d913a39a93ab5c50bee1581600f453026f9c7b8d`,
+  plus the 92-byte `version.py` SHA-256
+  `3b07492169e6079940f716162368c51b6dbee45be36c9c46fb6f9e56b0449739`.
+  The other four responsible loader files match the sealed table. Runtime
+  schema 4, graphics profile
+  `l401_pyxis_nvidia_580_105_08_mapped_graphics_v4`, and evidence transaction
+  v7 bind the initial/live environment, module/spec/ABI/maps identity, exact
+  files, absent higher-priority config, read-only loader search, 15 graphics
+  ELFs, and before/after drift checks. The new stable graphics digest is
+  `d251727e38315050a25b79954ed77984fa5cc4649b954e7789bfcbb0a77e3629`.
+
+## 2026-07-08 — final semantic and host-validation gate
+
+- A fresh adversarial audit found no double normalization, double delta
+  integration, gripper inversion, image slot/order/rotation error, cadence
+  error, or FLOW/AR mismatch. Serving uses unmodified official OpenPI
+  `bd70b8f4011e85b3f3b0f039f12113f78718e7bf`: FLOW Euler-10, 15x32 model
+  output, checkpoint-global `assets/droid/norm_stats.json`, inverse absolute
+  reconstruction on the first seven joints exactly once, and leading 15x8
+  response. There is no `single_arm` normalization category; applying one
+  would be a mismatch. The client executes the first eight absolute targets,
+  with closed-positive gripper, native external/wrist RGB, masked third slot,
+  server-side 224 padding, and no wrist rotation.
+- Fully import-isolated validation resolves OpenPI and OpenPI-client from this
+  worktree. Ruff format/lint, Python compilation, and `git diff --check` pass;
+  focused runtime/evidence/serving tests pass 135/135; the host-safe current
+  suite passes 533 tests plus eight subtests. Historical passes 229 plus eight.
+  The four governed runtime/evidence/test files are byte-identical across
+  roles with SHA-256 values `44055d1e...064cb`, `788f925b...48d0be`,
+  `be77e0ea...085c`, and `7b635ed3...12f36`.
+- Remaining differences are benchmark domain shifts, not adapter transforms:
+  training JPEG 180x320 versus rendered 720x1280 before the same 224 resize,
+  real versus simulated sensing/dynamics, and one fixed external evaluation
+  view versus training-time sampling of either external camera. PolaRiS raw
+  rubric positives can latch transient criteria, so authoritative reporting
+  must keep raw success separate from visually task-valid success and inspect
+  every raw-positive video.
