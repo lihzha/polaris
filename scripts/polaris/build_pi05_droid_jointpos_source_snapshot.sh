@@ -80,6 +80,7 @@ for required_path in \
   scripts/polaris/eval_pi05_droid_jointpos_polaris.sh \
   scripts/polaris/serve_pi05_droid_jointpos_attested.py \
   src/polaris/pi05_droid_jointpos_consumer_binding.py \
+  src/polaris/pi05_droid_jointpos_scheduler.py \
   src/polaris/policy/droid_jointpos_client.py \
   third_party/openpi/packages/openpi-client/src/openpi_client/image_tools.py \
   third_party/openpi/packages/openpi-client/src/openpi_client/websocket_client_policy.py; do

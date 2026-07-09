@@ -121,6 +121,29 @@ binding detects persistent mutation and path replacement; malicious transient
 mutation or process tampering by the same Unix uid remains outside its threat
 model.
 
+The governed submitter and spooled batch script both disable Slurm requeue.
+Before release, the submitter seals the controller's held record and requires
+`Requeue=0`, `Restarts=0`, the expected transaction comment, and a user-held
+pending state. The worker independently seals the corresponding running record
+into the evaluation evidence manifest. After the allocation is terminal, join
+those records to the allocation-level accounting row before accepting the run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$POLARIS_SOURCE_SNAPSHOT/src" \
+  "$POLARIS_OPENPI_RUNTIME_DIR/.venv/bin/python" -B -m \
+  polaris.pi05_droid_jointpos_scheduler attest-terminal \
+  --job-id "$JOB_ID" --transaction-id "$SUBMISSION_TRANSACTION_ID" \
+  --held-record "$PROVENANCE_DIR/scheduler_held.json" \
+  --running-record "$RUN_DIR/pi05_droid_jointpos_scheduler_running.json" \
+  --evidence-manifest "$RUN_DIR/pi05_droid_jointpos_evidence_manifest.json" \
+  --task-success "$RUN_DIR/$POLARIS_ENVIRONMENT/SUCCESS" \
+  --output "$RUN_DIR/pi05_droid_jointpos_scheduler_terminal.json"
+```
+
+The terminal attestation requires `COMPLETED`, exit code `0:0`, and Slurm's
+allocation-level `Restarts=0`; it immutably binds the held record, running
+record, evaluator evidence manifest, and task success marker.
+
 ### Run Ego-LAP with end-effector pose control
 
 PolaRiS also includes an `EgoLAPEefPose` client and selectable absolute

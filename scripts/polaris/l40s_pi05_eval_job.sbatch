@@ -7,6 +7,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
 #SBATCH --time=03:50:00
+#SBATCH --no-requeue
 #SBATCH --job-name=pi05_polaris_eval
 #SBATCH --output=/lustre/fs11/portfolios/nvr/projects/nvr_lpr_rvp/users/lzha/slurm_logs/polaris-pi05/%x-%j.out
 
@@ -243,6 +244,7 @@ NFS_ROOT="${NFS_ROOT:-/lustre/fsw/portfolios/nvr/users/lzha}"
 : "${EXPECTED_POLARIS_COMMIT:?Set EXPECTED_POLARIS_COMMIT to the frozen launch commit}"
 : "${POLARIS_ENVIRONMENT:?Set POLARIS_ENVIRONMENT to one DROID task}"
 : "${RUN_NAMESPACE:?Set RUN_NAMESPACE to the immutable sweep namespace}"
+: "${SUBMISSION_TRANSACTION_ID:?Set the immutable submission transaction ID}"
 
 [[ -d "${NFS_ROOT}" && ! -L "${NFS_ROOT}" ]] \
   || { echo "NFS_ROOT must name a real directory" >&2; exit 2; }

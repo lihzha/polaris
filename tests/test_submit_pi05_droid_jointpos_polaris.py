@@ -7,7 +7,12 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
 from polaris.pi05_droid_jointpos_consumer_binding import source_tree_sha256
+from polaris.pi05_droid_jointpos_scheduler import (
+    validate_persisted_scheduler_job,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,14 +29,18 @@ case "${command_name}" in
     : > "${FAKE_STATE}/sbatch.args"
     comment=""
     held=0
+    no_requeue=0
+    requeue=0
     for argument in "$@"; do
       printf '%s\n' "${argument}" >> "${FAKE_STATE}/sbatch.args"
       case "${argument}" in
         --comment=*) comment="${argument#--comment=}" ;;
         --hold) held=1 ;;
+        --no-requeue) no_requeue=$((no_requeue + 1)) ;;
+        --requeue) requeue=$((requeue + 1)) ;;
       esac
     done
-    [[ "${held}" == 1 && "${comment}" == pi05-* ]]
+    [[ "${held}" == 1 && "${no_requeue}" == 1 && "${requeue}" == 0 ]]
     printf '4242|%s\n' "${comment}" > "${FAKE_STATE}/active"
     if [[ "${FAKE_SBATCH_SIGNAL:-0}" == 1 ]]; then
       kill -TERM "${PPID}"
@@ -58,6 +67,21 @@ case "${command_name}" in
         fi
         cp "${APPROVED_SBATCH_SCRIPT_FOR_TEST}" "${4}"
         ;;
+      show)
+        [[ "${2:-}" == job && "${3:-}" == 4242 && "${4:-}" == --oneliner ]]
+        printf 'show %s\n' "${3}" >> "${FAKE_STATE}/scontrol.log"
+        transaction="$(cut -d '|' -f 2 "${FAKE_STATE}/active")"
+        if [[ "${FAKE_COMMENT_MISMATCH:-0}" == 1 ]]; then
+          transaction=pi05-0000000000000000000000000000000000000000
+        fi
+        printf 'JobId=4242 JobState=%s Reason=%s Requeue=%s Restarts=%s Comment=%s' \
+          "${FAKE_JOB_STATE:-PENDING}" "${FAKE_JOB_REASON:-JobHeldUser}" \
+          "${FAKE_REQUEUE:-0}" "${FAKE_RESTARTS:-0}" "${transaction}"
+        if [[ "${FAKE_DUPLICATE_REQUEUE:-0}" == 1 ]]; then
+          printf ' Requeue=0'
+        fi
+        printf '\n'
+        ;;
       release)
         [[ "${2:-}" == 4242 ]]
         manifest_row="$(
@@ -67,7 +91,8 @@ case "${command_name}" in
         )"
         IFS=$'\t' read -r row_id row_mode row_task row_rollouts row_seed \
           row_namespace row_source_sha row_approval_sha row_implementation \
-          row_openpi_commit row_time batch_sha argv_sha provenance <<< "${manifest_row}"
+          row_openpi_commit row_time batch_sha argv_sha scheduler_sha \
+          provenance <<< "${manifest_row}"
         [[ "${row_id}" == 4242 && "${row_mode}" == canary ]]
         [[ "${row_task}" == DROID-FoodBussing && "${row_rollouts}" == 1 ]]
         [[ "${row_seed}" == 0 && -n "${row_namespace}" && -n "${row_time}" ]]
@@ -77,8 +102,10 @@ case "${command_name}" in
         [[ "${row_openpi_commit}" == bd70b8f4011e85b3f3b0f039f12113f78718e7bf ]]
         [[ "$(stat -c '%a' "${provenance}/batch_script.sbatch")" == 444 ]]
         [[ "$(stat -c '%a' "${provenance}/submission_argv.sh")" == 444 ]]
+        [[ "$(stat -c '%a' "${provenance}/scheduler_held.json")" == 444 ]]
         [[ "$(sha256sum "${provenance}/batch_script.sbatch" | awk '{print $1}')" == "${batch_sha}" ]]
         [[ "$(sha256sum "${provenance}/submission_argv.sh" | awk '{print $1}')" == "${argv_sha}" ]]
+        [[ "$(sha256sum "${provenance}/scheduler_held.json" | awk '{print $1}')" == "${scheduler_sha}" ]]
         printf 'release %s\n' "${2}" >> "${FAKE_STATE}/scontrol.log"
         if [[ "${FAKE_RELEASE_FAIL:-0}" == 1 ]]; then
           exit 23
@@ -129,6 +156,12 @@ def _make_clean_repository(path: Path) -> Path:
     module.write_text(
         (ROOT / "src/polaris/pi05_droid_jointpos_consumer_binding.py").read_text()
     )
+    (module.parent / "pi05_droid_jointpos_immutable.py").write_text(
+        (ROOT / "src/polaris/pi05_droid_jointpos_immutable.py").read_text()
+    )
+    (module.parent / "pi05_droid_jointpos_scheduler.py").write_text(
+        (ROOT / "src/polaris/pi05_droid_jointpos_scheduler.py").read_text()
+    )
     policy = path / "src/polaris/policy"
     policy.mkdir()
     (policy / "__init__.py").write_text("")
@@ -146,13 +179,9 @@ def _make_clean_repository(path: Path) -> Path:
         cwd=path,
         check=True,
     )
-    subprocess.run(
-        ["git", "config", "user.name", "Submit Test"], cwd=path, check=True
-    )
+    subprocess.run(["git", "config", "user.name", "Submit Test"], cwd=path, check=True)
     subprocess.run(["git", "add", "."], cwd=path, check=True)
-    subprocess.run(
-        ["git", "commit", "-q", "-m", "test fixture"], cwd=path, check=True
-    )
+    subprocess.run(["git", "commit", "-q", "-m", "test fixture"], cwd=path, check=True)
     return batch_script
 
 
@@ -213,9 +242,7 @@ def _environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
             "SBATCH_LOG_ROOT": str(tmp_path / "logs"),
             "SUBMISSION_MANIFEST": str(manifest),
             "RUN_NAMESPACE": "pi05-submit-host-test",
-            "APPROVED_SBATCH_SCRIPT_FOR_TEST": str(
-                batch_path
-            ),
+            "APPROVED_SBATCH_SCRIPT_FOR_TEST": str(batch_path),
             "FAKE_STATE": str(fake_state),
             "USER": "submit-test",
         }
@@ -252,11 +279,14 @@ def test_held_job_is_released_only_after_durable_provenance_and_manifest(
     assert "submitted_job_ids=4242" in result.stdout
     arguments = (fake_state / "sbatch.args").read_text().splitlines()
     assert "--hold" in arguments
+    assert arguments.count("--no-requeue") == 1
+    assert "--requeue" not in arguments
     comments = [value for value in arguments if value.startswith("--comment=pi05-")]
     assert len(comments) == 1
     assert len(comments[0].removeprefix("--comment=")) == 45
     assert (fake_state / "scontrol.log").read_text().splitlines() == [
         "write 4242",
+        "show 4242",
         "release 4242",
     ]
     assert not (fake_state / "scancel.log").exists()
@@ -265,10 +295,18 @@ def test_held_job_is_released_only_after_durable_provenance_and_manifest(
     assert len(rows) == 2
     assert rows[1].startswith("4242\tcanary\tDROID-FoodBussing\t")
     provenance = manifest.parent / "submission_provenance/job_4242"
-    for name in ("batch_script.sbatch", "submission_argv.sh"):
+    for name in ("batch_script.sbatch", "submission_argv.sh", "scheduler_held.json"):
         artifact = provenance / name
         assert artifact.is_file()
         assert stat.S_IMODE(artifact.stat().st_mode) == 0o444
+    scheduler = validate_persisted_scheduler_job(
+        provenance / "scheduler_held.json",
+        phase="held",
+        expected_job_id=4242,
+        expected_transaction_id=comments[0].removeprefix("--comment="),
+    )
+    assert scheduler["value"]["job"]["requeue"] == 0
+    assert scheduler["value"]["job"]["restarts"] == 0
 
 
 def test_provenance_capture_failure_cancels_held_job(tmp_path: Path) -> None:
@@ -296,6 +334,7 @@ def test_release_failure_preserves_manifest_and_cancels_job(tmp_path: Path) -> N
     assert (fake_state / "scancel.log").read_text().splitlines() == ["4242"]
     assert (fake_state / "scontrol.log").read_text().splitlines() == [
         "write 4242",
+        "show 4242",
         "release 4242",
     ]
     assert _transaction_states(manifest) == ["canceled"]
@@ -311,6 +350,34 @@ def test_comment_recovers_job_when_sbatch_id_was_never_captured(tmp_path: Path) 
     assert result.returncode == 3
     assert "did not return exactly one numeric held job ID" in result.stderr
     assert (fake_state / "scancel.log").read_text().splitlines() == ["4242"]
+    assert _transaction_states(manifest) == ["canceled"]
+    assert len(manifest.read_text().splitlines()) == 1
+
+
+@pytest.mark.parametrize(
+    ("override", "detail"),
+    [
+        ({"FAKE_REQUEUE": "1"}, "permits requeue"),
+        ({"FAKE_RESTARTS": "1"}, "already restarted"),
+        ({"FAKE_JOB_STATE": "RUNNING"}, "held state mismatch"),
+        ({"FAKE_JOB_REASON": "None"}, "not user-held"),
+        ({"FAKE_COMMENT_MISMATCH": "1"}, "comment mismatch"),
+        ({"FAKE_DUPLICATE_REQUEUE": "1"}, "duplicate scontrol field"),
+    ],
+)
+def test_held_scheduler_contract_failure_cancels_before_release(
+    tmp_path: Path, override: dict[str, str], detail: str
+) -> None:
+    env, manifest, fake_state = _environment(tmp_path)
+    env.update(override)
+
+    result = _run(env)
+
+    assert result.returncode == 5
+    assert detail in result.stderr
+    assert "Failed to preserve submission provenance" in result.stderr
+    assert (fake_state / "scancel.log").read_text().splitlines() == ["4242"]
+    assert "release" not in (fake_state / "scontrol.log").read_text()
     assert _transaction_states(manifest) == ["canceled"]
     assert len(manifest.read_text().splitlines()) == 1
 

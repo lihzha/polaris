@@ -161,27 +161,41 @@ capture_submission_provenance() {
   local provenance_dir="$1"
   local job_id="$2"
   local submission_argv="$3"
-  local batch_script_path submission_argv_path
-  local batch_temporary argv_temporary
+  local batch_script_path submission_argv_path held_scheduler_record_path
+  local batch_temporary argv_temporary scheduler_temporary
 
   batch_script_path="${provenance_dir}/batch_script.sbatch"
   submission_argv_path="${provenance_dir}/submission_argv.sh"
+  held_scheduler_record_path="${provenance_dir}/scheduler_held.json"
   batch_temporary="${provenance_dir}/.batch_script.sbatch.tmp.${BASHPID}.${RANDOM}"
   argv_temporary="${provenance_dir}/.submission_argv.sh.tmp.${BASHPID}.${RANDOM}"
+  scheduler_temporary="${provenance_dir}/.scheduler_held.json.tmp.${BASHPID}.${RANDOM}"
   mkdir -p "$(dirname "${provenance_dir}")" || return
   mkdir -m 0755 "${provenance_dir}" || return
   scontrol write batch_script "${job_id}" "${batch_temporary}" || return
   [[ -f "${batch_temporary}" && ! -L "${batch_temporary}" && -s "${batch_temporary}" ]] || return
   printf '%s\n' "${submission_argv}" > "${argv_temporary}" || return
-  chmod 0444 "${batch_temporary}" "${argv_temporary}" || return
+  PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
+    PYTHONPATH="${POLARIS_SOURCE_SNAPSHOT}/src" \
+    "${POLARIS_OPENPI_RUNTIME_DIR}/.venv/bin/python" -B -m \
+    polaris.pi05_droid_jointpos_scheduler capture-job \
+    --output "${scheduler_temporary}" \
+    --phase held \
+    --job-id "${job_id}" \
+    --transaction-id "${ACTIVE_TRANSACTION_ID}" >/dev/null || return
+  chmod 0444 "${batch_temporary}" "${argv_temporary}" "${scheduler_temporary}" || return
   sync -- "${batch_temporary}" || return
   sync -- "${argv_temporary}" || return
-  [[ ! -e "${batch_script_path}" && ! -e "${submission_argv_path}" ]] || return
+  sync -- "${scheduler_temporary}" || return
+  [[ ! -e "${batch_script_path}" && ! -e "${submission_argv_path}" \
+    && ! -e "${held_scheduler_record_path}" ]] || return
   mv -- "${batch_temporary}" "${batch_script_path}" || return
   mv -- "${argv_temporary}" "${submission_argv_path}" || return
+  mv -- "${scheduler_temporary}" "${held_scheduler_record_path}" || return
   sync -- "${provenance_dir}" || return
   batch_script_sha256="$(sha256sum "${batch_script_path}" | awk '{print $1}')" || return
   submission_argv_sha256="$(sha256sum "${submission_argv_path}" | awk '{print $1}')" || return
+  held_scheduler_record_sha256="$(sha256sum "${held_scheduler_record_path}" | awk '{print $1}')" || return
 }
 
 MODE="${1:-}"
@@ -192,7 +206,7 @@ esac
 
 SCRIPT_DIR="$(readlink -f -- "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")"
 APPROVED_SBATCH_SCRIPT="${SCRIPT_DIR}/l40s_pi05_eval_job.sbatch"
-APPROVED_SBATCH_SCRIPT_SHA256="7117f1455eb2cd9dc1a96d6e5e91adad59c411152e95b970771cda4f562c90f2"
+APPROVED_SBATCH_SCRIPT_SHA256="a2e0bade620d92b5fdf21b4a87f6c2277f2fbc2fec76c7f7a4f159970b3dc8f0"
 SBATCH_SCRIPT="${SBATCH_SCRIPT:-${APPROVED_SBATCH_SCRIPT}}"
 : "${POLARIS_SOURCE_SNAPSHOT:?Set the approved content-addressed source snapshot}"
 : "${EXPECTED_POLARIS_SOURCE_TREE_SHA256:?Set the approved source-snapshot tree SHA-256}"
@@ -349,7 +363,7 @@ flock -n 9 || { echo "Another submitter holds ${SUBMISSION_MANIFEST}.lock" >&2; 
 recover_incomplete_transactions \
   || { echo "Unresolved prior submission transaction; refusing new work" >&2; exit 5; }
 
-expected_header=$'job_id\tmode\ttask\trollouts\tenvironment_seed\trun_namespace\tsource_tree_sha256\tsource_approval_sha256\timplementation_commit\topenpi_commit\tsubmitted_at\tbatch_script_sha256\tsubmission_argv_sha256\tprovenance_dir'
+expected_header=$'job_id\tmode\ttask\trollouts\tenvironment_seed\trun_namespace\tsource_tree_sha256\tsource_approval_sha256\timplementation_commit\topenpi_commit\tsubmitted_at\tbatch_script_sha256\tsubmission_argv_sha256\theld_scheduler_record_sha256\tprovenance_dir'
 if [[ ! -e "${SUBMISSION_MANIFEST}" ]]; then
   write_atomic_text "${SUBMISSION_MANIFEST}" 0644 "${expected_header}"
 else
@@ -371,7 +385,8 @@ for task in "${tasks[@]}"; do
       existing_rollouts existing_seed existing_namespace existing_source_sha256 \
       existing_source_approval_sha256 existing_implementation_commit \
       existing_openpi_commit _existing_time _existing_batch_sha256 \
-      _existing_argv_sha256 _existing_provenance <<< "${existing_row}"
+      _existing_argv_sha256 _existing_scheduler_sha256 \
+      _existing_provenance <<< "${existing_row}"
     if [[ "${existing_mode}" != "${MODE}" \
       || "${existing_task}" != "${task}" \
       || "${existing_rollouts}" != "${rollouts}" \
@@ -411,8 +426,8 @@ for task in "${tasks[@]}"; do
   write_atomic_text "${ACTIVE_TRANSACTION_DIR}/metadata" 0444 "${transaction_metadata%$'\n'}"
   write_transaction_state "${ACTIVE_TRANSACTION_DIR}" prepared
 
-  export_vars="PATH=${PATH},HOME=${HOME},POLARIS_SOURCE_SNAPSHOT=${POLARIS_SOURCE_SNAPSHOT},EXPECTED_POLARIS_SOURCE_TREE_SHA256=${EXPECTED_POLARIS_SOURCE_TREE_SHA256},POLARIS_SOURCE_APPROVAL=${POLARIS_SOURCE_APPROVAL},POLARIS_OPENPI_RUNTIME_DIR=${POLARIS_OPENPI_RUNTIME_DIR},EXPECTED_POLARIS_COMMIT=${POLARIS_COMMIT},POLARIS_ENVIRONMENT=${task},ROLLOUTS=${rollouts},ENVIRONMENT_SEED=${ENVIRONMENT_SEED},RUN_NAMESPACE=${RUN_NAMESPACE}"
-  sbatch_argv=(sbatch --parsable --hold \
+  export_vars="PATH=${PATH},HOME=${HOME},POLARIS_SOURCE_SNAPSHOT=${POLARIS_SOURCE_SNAPSHOT},EXPECTED_POLARIS_SOURCE_TREE_SHA256=${EXPECTED_POLARIS_SOURCE_TREE_SHA256},POLARIS_SOURCE_APPROVAL=${POLARIS_SOURCE_APPROVAL},POLARIS_OPENPI_RUNTIME_DIR=${POLARIS_OPENPI_RUNTIME_DIR},EXPECTED_POLARIS_COMMIT=${POLARIS_COMMIT},POLARIS_ENVIRONMENT=${task},ROLLOUTS=${rollouts},ENVIRONMENT_SEED=${ENVIRONMENT_SEED},RUN_NAMESPACE=${RUN_NAMESPACE},SUBMISSION_TRANSACTION_ID=${ACTIVE_TRANSACTION_ID}"
+  sbatch_argv=(sbatch --parsable --hold --no-requeue \
     --comment="${ACTIVE_TRANSACTION_ID}" \
     --job-name="${job_name}" \
     --time="${time_limit}" \
@@ -440,6 +455,7 @@ for task in "${tasks[@]}"; do
   provenance_dir="$(dirname "${SUBMISSION_MANIFEST}")/submission_provenance/job_${ACTIVE_JOB_ID}"
   batch_script_sha256=""
   submission_argv_sha256=""
+  held_scheduler_record_sha256=""
   if ! capture_submission_provenance \
     "${provenance_dir}" "${ACTIVE_JOB_ID}" "${submission_argv}"; then
     write_transaction_state "${ACTIVE_TRANSACTION_DIR}" provenance_failed || true
@@ -453,13 +469,14 @@ for task in "${tasks[@]}"; do
   fi
   write_transaction_state "${ACTIVE_TRANSACTION_DIR}" provenance_durable
 
-  printf -v manifest_row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+  printf -v manifest_row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
     "${ACTIVE_JOB_ID}" "${MODE}" "${task}" "${rollouts}" "${ENVIRONMENT_SEED}" \
     "${RUN_NAMESPACE}" "${EXPECTED_POLARIS_SOURCE_TREE_SHA256}" \
     "${SOURCE_APPROVAL_SHA256}" "${POLARIS_IMPLEMENTATION_COMMIT}" \
     bd70b8f4011e85b3f3b0f039f12113f78718e7bf \
     "$(date -Iseconds)" "${batch_script_sha256}" \
-    "${submission_argv_sha256}" "${provenance_dir}"
+    "${submission_argv_sha256}" "${held_scheduler_record_sha256}" \
+    "${provenance_dir}"
   append_manifest_row "${manifest_row}"
   write_transaction_state "${ACTIVE_TRANSACTION_DIR}" manifest_durable
 

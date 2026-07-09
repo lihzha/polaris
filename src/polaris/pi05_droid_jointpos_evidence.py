@@ -38,6 +38,9 @@ from polaris.pi05_droid_jointpos_runtime import (
     expected_graphics_cv2_loader_identity,
     validate_jointpos_runtime_artifact,
 )
+from polaris.pi05_droid_jointpos_scheduler import (
+    validate_persisted_scheduler_job,
+)
 from polaris.pi05_droid_jointpos_serving_contract import (
     PI05_DROID_JOINTPOS_CHECKPOINT_URI,
     PI05_DROID_JOINTPOS_NVIDIA_DRIVER_VERSION,
@@ -63,7 +66,7 @@ from polaris.pi05_droid_jointpos_immutable import (
 
 
 PI05_DROID_JOINTPOS_EVIDENCE_PROFILE = (
-    "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v10"
+    "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v11"
 )
 PI05_DROID_JOINTPOS_EVIDENCE_MANIFEST = "pi05_droid_jointpos_evidence_manifest.json"
 
@@ -84,6 +87,7 @@ _RUN_ARTIFACTS = {
     "rng_stream": "pi05_droid_jointpos_rng_stream.json",
     "run_tokenizer": "consumer_inputs/paligemma_tokenizer.model",
     "run_metadata": "run_metadata.env",
+    "scheduler_running": "pi05_droid_jointpos_scheduler_running.json",
     "serving_contract": "pi05_droid_jointpos_serving_contract.json",
 }
 _TASK_ARTIFACTS = {
@@ -199,6 +203,8 @@ def _validate_package_run_metadata(
             "FINAL_CONSUMER_BINDING_SHA256",
             "POLARIS_COMMIT",
             "OPENPI_COMMIT",
+            "SLURM_JOB_ID",
+            "SUBMISSION_TRANSACTION_ID",
         ),
     )
 
@@ -235,17 +241,13 @@ def _validate_package_run_metadata(
         "POLARIS_IMPLEMENTATION_COMMIT": source_contracts[
             "source_implementation_commit"
         ],
-        "SOURCE_APPROVAL_SHA256": source_contracts[
-            "source_approval_artifact_sha256"
-        ],
+        "SOURCE_APPROVAL_SHA256": source_contracts["source_approval_artifact_sha256"],
         "RUN_SOURCE_APPROVAL_FILE": source_contracts["source_approval_path"],
         "TRUSTED_SOURCE_HASHER_SHA256": source_contracts[
             "trusted_source_hasher_sha256"
         ],
         "CONSUMER_BINDING_SHA256": source_contracts["consumer_binding_sha256"],
-        "FINAL_CONSUMER_BINDING_SHA256": source_contracts[
-            "consumer_binding_sha256"
-        ],
+        "FINAL_CONSUMER_BINDING_SHA256": source_contracts["consumer_binding_sha256"],
         "POLARIS_COMMIT": source_contracts["polaris_base_commit"],
         "OPENPI_COMMIT": source_contracts["source_openpi_commit"],
     }
@@ -253,10 +255,25 @@ def _validate_package_run_metadata(
         all(decoded[key] == value for key, value in expected_source_metadata.items()),
         "run metadata source approval/binding identity mismatch",
     )
+    _require(
+        decoded["SLURM_JOB_ID"].isdecimal() and int(decoded["SLURM_JOB_ID"]) > 0,
+        "run metadata Slurm job ID is invalid",
+    )
+    _require(
+        len(decoded["SUBMISSION_TRANSACTION_ID"]) == 45
+        and decoded["SUBMISSION_TRANSACTION_ID"].startswith("pi05-")
+        and all(
+            character in "0123456789abcdef"
+            for character in decoded["SUBMISSION_TRANSACTION_ID"][5:]
+        ),
+        "run metadata submission transaction ID is invalid",
+    )
     return {
         "openpi_package_environment_sha256": package_sha256,
         "openpi_package_preflight_postrun_unchanged": True,
         "numpydantic_warning_filter": decoded["PYTHONWARNINGS"],
+        "scheduler_job_id": int(decoded["SLURM_JOB_ID"]),
+        "scheduler_transaction_id": decoded["SUBMISSION_TRANSACTION_ID"],
     }
 
 
@@ -566,6 +583,12 @@ def _validate_specialized_contracts(
     package_runtime = _validate_package_run_metadata(
         paths["run_metadata"], model["value"]["host_runtime"], consumer_contracts
     )
+    scheduler = validate_persisted_scheduler_job(
+        paths["scheduler_running"],
+        phase="running",
+        expected_job_id=package_runtime["scheduler_job_id"],
+        expected_transaction_id=package_runtime["scheduler_transaction_id"],
+    )
     return {
         "asset_manifest_sha256": asset["manifest_sha256"],
         "asset_tree_sha256": asset["tree_sha256"],
@@ -580,6 +603,9 @@ def _validate_specialized_contracts(
         "video_ffmpeg_sha256": media_tools["ffmpeg"]["sha256"],
         **gpu_vulkan,
         **package_runtime,
+        "scheduler_running_artifact_sha256": scheduler["sha256"],
+        "scheduler_requeue": 0,
+        "scheduler_restarts": 0,
     }
 
 
@@ -635,8 +661,7 @@ def _validate_consumer_binding_contracts(
         and model_consumer["tokenizer_sha256"] == consumer["tokenizer_sha256"]
         and model_consumer["preload_artifact_sha256"] == consumer_preload["sha256"]
         and model_consumer["postload_artifact_sha256"] == consumer_postload["sha256"]
-        and model_consumer["preload_filename"]
-        == paths["consumer_binding_preload"].name
+        and model_consumer["preload_filename"] == paths["consumer_binding_preload"].name
         and model_consumer["postload_filename"]
         == paths["consumer_binding_postload"].name
         and model_consumer["postrun_filename"]
@@ -646,12 +671,10 @@ def _validate_consumer_binding_contracts(
     _require(
         approval_value["snapshot_path"] == bound_source["root"]
         and approval_value["source_tree_sha256"] == consumer["source_tree_sha256"]
-        and approval_value["polaris_base_commit"]
-        == bound_source["polaris_base_commit"]
+        and approval_value["polaris_base_commit"] == bound_source["polaris_base_commit"]
         and approval_value["polaris_base_tree"] == bound_source["polaris_base_tree"]
         and approval_value["openpi_commit"] == bound_source["openpi_commit"]
-        and model_consumer["source_approval_filename"]
-        == paths["source_approval"].name
+        and model_consumer["source_approval_filename"] == paths["source_approval"].name
         and model_consumer["source_approval_artifact_sha256"]
         == source_approval["sha256"]
         and model_consumer["implementation_commit"]
@@ -670,9 +693,7 @@ def _validate_consumer_binding_contracts(
         "source_snapshot_path": approval_value["snapshot_path"],
         "source_tree_sha256": approval_value["source_tree_sha256"],
         "source_implementation_commit": approval_value["implementation_commit"],
-        "trusted_source_hasher_sha256": approval_value[
-            "trusted_hasher_sha256"
-        ],
+        "trusted_source_hasher_sha256": approval_value["trusted_hasher_sha256"],
         "polaris_base_commit": approval_value["polaris_base_commit"],
         "polaris_base_tree": approval_value["polaris_base_tree"],
         "source_openpi_commit": approval_value["openpi_commit"],

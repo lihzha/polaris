@@ -51,6 +51,7 @@ PORT="${PORT:-$((20000 + ${SLURM_JOB_ID:-1} % 20000))}"
 SERVER_START_TIMEOUT_SECS="${SERVER_START_TIMEOUT_SECS:-2400}"
 DRY_RUN="${DRY_RUN:-0}"
 RESUME_FROM_TASK_DIR="${RESUME_FROM_TASK_DIR:-}"
+SUBMISSION_TRANSACTION_ID="${SUBMISSION_TRANSACTION_ID:-dryrun}"
 ENVIRONMENT_SEED_SCHEME=base_plus_episode_index_v1
 ENVIRONMENT_DETERMINISM_CLAIM=rng_bound_not_bitwise
 POLARIS_DATA_REVISION=8c7e4103e266ef83d8b1ad2e9a63116edd5f155b
@@ -143,6 +144,10 @@ PY
 
 [[ -n "${SLURM_JOB_ID:-}" || "${DRY_RUN}" == 1 ]] \
   || die "A Slurm allocation is required unless DRY_RUN=1"
+if [[ "${DRY_RUN}" != 1 ]]; then
+  [[ "${SUBMISSION_TRANSACTION_ID}" =~ ^pi05-[0-9a-f]{40}$ ]] \
+    || die "Invalid submission transaction ID"
+fi
 : "${EXPECTED_POLARIS_COMMIT:?Set EXPECTED_POLARIS_COMMIT to the immutable launch commit}"
 [[ "${ROLLOUTS}" =~ ^[1-9][0-9]*$ ]] || die "ROLLOUTS must be positive"
 [[ "${ENVIRONMENT_SEED}" =~ ^(0|[1-9][0-9]*)$ ]] \
@@ -335,6 +340,7 @@ VIDEO_VALIDATION_FILE="${TASK_DIR}/pi05_droid_jointpos_video_validation.json"
 VIDEO_VALIDATION_LOG="${TASK_DIR}/video_validation.log"
 COMMANDS_FILE="${RUN_DIR}/commands.sh"
 METADATA_FILE="${RUN_DIR}/run_metadata.env"
+SCHEDULER_RUNNING_FILE="${RUN_DIR}/pi05_droid_jointpos_scheduler_running.json"
 SERVER_PID=""
 EVIDENCE_FINALIZED=0
 EVIDENCE_MANIFEST_SHA256=""
@@ -366,6 +372,20 @@ done
   || die "Run-local tokenizer already exists"
 [[ ! -e "${RUN_SOURCE_APPROVAL_FILE}" && ! -L "${RUN_SOURCE_APPROVAL_FILE}" ]] \
   || die "Run-local source approval already exists"
+[[ ! -e "${SCHEDULER_RUNNING_FILE}" && ! -L "${SCHEDULER_RUNNING_FILE}" ]] \
+  || die "Running scheduler record already exists"
+if [[ "${DRY_RUN}" != 1 ]]; then
+  command -v scontrol >/dev/null || die "Missing required command: scontrol"
+  PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
+    PYTHONPATH="${POLARIS_DIR}/src" \
+    "${OPENPI_DIR}/.venv/bin/python" -B -m \
+    polaris.pi05_droid_jointpos_scheduler capture-job \
+    --output "${SCHEDULER_RUNNING_FILE}" \
+    --phase running \
+    --job-id "${SLURM_JOB_ID}" \
+    --transaction-id "${SUBMISSION_TRANSACTION_ID}" >/dev/null \
+    || die "Running scheduler no-requeue verification failed"
+fi
 cp -- "${POLARIS_SOURCE_APPROVAL}" "${RUN_SOURCE_APPROVAL_FILE}"
 chmod 0444 "${RUN_SOURCE_APPROVAL_FILE}"
 [[ "$(stat -c '%a:%h' "${RUN_SOURCE_APPROVAL_FILE}")" == 444:1 ]] \
@@ -625,6 +645,7 @@ PYXIS_IMAGE_SHA256="$(sha256sum "${POLARIS_PYXIS_IMAGE}" | awk '{print $1}')"
   printf 'RUN_START=%q\n' "$(date -Iseconds)"
   printf 'HOST=%q\n' "$(hostname)"
   printf 'SLURM_JOB_ID=%q\n' "${SLURM_JOB_ID:-dryrun}"
+  printf 'SUBMISSION_TRANSACTION_ID=%q\n' "${SUBMISSION_TRANSACTION_ID}"
   printf 'RUN_NAMESPACE=%q\n' "${RUN_NAMESPACE}"
   printf 'RUN_DIR=%q\n' "${RUN_DIR}"
   printf 'POLARIS_DIR=%q\n' "${POLARIS_DIR}"
