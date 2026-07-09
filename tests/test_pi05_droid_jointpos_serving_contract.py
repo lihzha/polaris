@@ -427,9 +427,9 @@ def test_exact_handshake_binds_joint_position_flow_and_is_path_independent():
     ]
     assert validated["policy_output"]["response_shape"] == [15, 8]
     assert validated["policy_output"]["execute_first"] == 8
-    assert validated["policy_input"]["request_image_shape"] == [720, 1280, 3]
+    assert validated["policy_input"]["request_image_shape"] == [224, 224, 3]
     assert validated["policy_input"]["request_image_dtype"] == "uint8"
-    assert validated["policy_input"]["client_model_spatial_transform"] is None
+    assert validated["policy_input"]["client_model_spatial_transform"] is not None
     assert validated["policy_input"]["server_resize"] == {
         "transform": "openpi.transforms.ResizeImages",
         "implementation": "openpi_client.image_tools.resize_with_pad",
@@ -438,13 +438,16 @@ def test_exact_handshake_binds_joint_position_flow_and_is_path_independent():
         "padding": "symmetric_zero",
         "target_shape": [224, 224, 3],
         "output_dtype": "uint8",
-        "application_count": 1,
+        "transform_invocation_count": 1,
+        "pixel_changing_resize_count": 0,
+        "input_already_target_shape": True,
+        "runtime_behavior": "early_return_same_array_no_pixel_change",
         "runtime_probe": _expected_resize_probe(),
         "observation_conversion": _expected_observation_conversion(),
         "model_preprocess_resize": _expected_inactive_model_resize(),
     }
     assert validated["policy_input"]["model_image_shape"] == [224, 224, 3]
-    assert "non_model_only" in validated["policy_input"]["client_visualization_resize"]
+    assert validated["policy_input"]["query_visualization"].startswith("byte_identical")
     assert validated["serving"]["bind_host"] == "127.0.0.1"
     assert validated["serving"]["network_scope"] == "ipv4_loopback_only"
     assert validated["serving"]["rng_stream"]["policy_infer_wrapper"] is None
@@ -653,32 +656,18 @@ def test_contracts_publish_atomically_and_runtime_validation_is_not_opaque(tmp_p
         runtime_path, metadata
     )
     assert validated["sha256"] == runtime["sha256"]
-    assert validated["value"]["data_config"]["image_preprocessing"] == {
-        "request_shape": [720, 1280, 3],
-        "request_dtype": "uint8",
-        "client_model_spatial_transform": None,
-        "resize_transform": "openpi.transforms.ResizeImages",
-        "resize_implementation": "openpi_client.image_tools.resize_with_pad",
-        "resize_backend": "PIL.Image.resize",
-        "resize_method": "PIL.Image.Resampling.BILINEAR",
-        "padding": "symmetric_zero",
-        "model_shape": [224, 224, 3],
-        "resize_output_dtype": "uint8",
-        "resize_application_count": 1,
-        "resize_runtime_probe": _expected_resize_probe(),
-        "observation_conversion": _expected_observation_conversion(),
-        "model_preprocess_resize": _expected_inactive_model_resize(),
-    }
-    assert validated["value"]["server"]["request_image_contract"]["shape"] == [
-        720,
-        1280,
-        3,
-    ]
+    assert (
+        validated["value"]["data_config"]["image_preprocessing"]
+        == (contract._expected_data_config_report()["image_preprocessing"])
+    )
+    assert validated["value"]["server"]["request_image_contract"][
+        "evaluation_wire_shape"
+    ] == [224, 224, 3]
     assert (
         validated["value"]["server"]["request_image_contract"][
             "client_model_spatial_transform"
         ]
-        is None
+        is not None
     )
 
     for field in ("train_config", "data_config", "policy_runtime"):
@@ -748,7 +737,7 @@ def test_worker_joins_trace_to_complete_official_rng_stream(tmp_path, monkeypatc
         ),
     )
     trace = {
-        "schema_version": 4,
+        "schema_version": 5,
         "status": "pass",
         "reset_count": 1,
         "episode_lengths": [450],
@@ -907,10 +896,10 @@ def test_nvidia_smi_capture_rejects_count_schema_and_identity_drift(
         contract._capture_nvidia_smi_gpu_identity()
 
 
-def test_model_runtime_v3_rejects_legacy_host_or_model_schema(tmp_path):
+def test_model_runtime_v4_rejects_legacy_host_or_model_schema(tmp_path):
     metadata = _metadata()
     runtime = _model_runtime(tmp_path, metadata)
-    assert runtime["schema_version"] == 3
+    assert runtime["schema_version"] == 4
     assert runtime["profile"] == contract.PI05_DROID_JOINTPOS_MODEL_RUNTIME_PROFILE
 
     legacy_model = copy.deepcopy(runtime)
@@ -1047,6 +1036,12 @@ def test_worker_fail_closes_live_contract_hub_metadata_and_seed_range():
     assert "pi05_droid_jointpos_runtime.json" in source
     assert "--runtime-contract-path" in source
     assert "--policy.no-rotate-wrist-180" in source
+    assert "--policy.no-render-every-step" in source
+    assert (
+        'PYTHONPATH="${POLARIS_DIR}/src:${OPENPI_DIR}/packages/openpi-client/src" '
+        '\\\n  "${OPENPI_DIR}/.venv/bin/python" - \\\n'
+        '  "${EVAL_LOG}" "${ENVIRONMENT_SEED}" "${SERVER_CONTRACT_SHA256}"' in source
+    )
     assert "validate_jointpos_runtime_artifact" in source
     assert "--expected-server-contract-sha256" in source
     assert "--runtime-contract" in source

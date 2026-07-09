@@ -48,9 +48,10 @@ def _execution(
     outer_step_index,
     action,
     state_after,
+    schema_version=4,
 ):
     return {
-        "schema_version": 4,
+        "schema_version": schema_version,
         "record_type": "openpi_joint_position_execution",
         "reset_index": reset_index,
         "query_index": query_index,
@@ -203,6 +204,26 @@ class JointBoundAuditTest(unittest.TestCase):
         self.assertEqual(violation["record_type"], "openpi_joint_position_execution")
         self.assertEqual(violation["outer_step_index"], 0)
         self.assertTrue(violation["preceding_emitted_targets_in_bounds"])
+
+    def test_schema5_execution_states_enforce_full_cadence_and_coverage(self):
+        records = copy.deepcopy(_schema4_records(9))
+        for record in records:
+            record["schema_version"] = MODULE.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION
+
+        summary = _run_audit(records, episode_length=9, success=True)
+
+        self.assertEqual(
+            summary["trace_schema_version"],
+            MODULE.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
+        )
+        self.assertEqual(summary["query_record_count"], 2)
+        self.assertEqual(summary["action_record_count"], 9)
+        self.assertEqual(summary["execution_record_count"], 9)
+        self.assertFalse(summary["state_audit_is_lower_bound"])
+        self.assertEqual(
+            summary["state_observation_coverage"],
+            "initial_query_plus_post_action_every_step",
+        )
 
     def test_schema4_action_execution_target_mismatch_is_rejected(self):
         valid = [0.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0]

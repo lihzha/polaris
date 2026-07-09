@@ -552,10 +552,16 @@ PYXIS_IMAGE_SHA256="$(sha256sum "${POLARIS_PYXIS_IMAGE}" | awk '{print $1}')"
   printf 'CONTROL_FREQUENCY_HZ=15\n'
   printf 'WRIST_ROTATION_DEGREES=0\n'
   printf 'MODEL_IMAGE_SLOTS=base_0_rgb,left_wrist_0_rgb,right_wrist_0_rgb_masked\n'
-  printf 'MODEL_REQUEST_IMAGE_SHAPE=720x1280x3_uint8\n'
-  printf 'CLIENT_MODEL_SPATIAL_TRANSFORM=none\n'
+  printf 'PROTOCOL_GENERATION=v16\n'
+  printf 'ENVIRONMENT_FINAL_COMPOSITE_SHAPE=720x1280x3_uint8\n'
+  printf 'MODEL_REQUEST_IMAGE_SHAPE=224x224x3_uint8\n'
+  printf 'CLIENT_MODEL_SPATIAL_TRANSFORM=openpi_client_resize_with_pad_PIL_bilinear_224\n'
   printf 'SERVER_MODEL_RESIZE=openpi_transforms_ResizeImages_openpi_client_PIL_bilinear_symmetric_zero_pad_224x224\n'
-  printf 'VISUALIZATION_RESIZE=PIL_bilinear_pad_224x224_non_model_only\n'
+  printf 'SERVER_RESIZE_BEHAVIOR=invoked_once_pixel_changes_zero_identity_at_224\n'
+  printf 'EXPENSIVE_RENDER_CADENCE=reset_then_post_actions_7_15_through_447\n'
+  printf 'QUERY_VISUALIZATION=client224_wire_model_input\n'
+  printf 'INTERQUERY_VISUALIZATION=sim_only_client224_non_model_diagnostic\n'
+  printf 'TERMINAL_VISUALIZATION=post_action450_nonexpensive_sim_camera\n'
   printf 'JOINTPOS_RUNTIME_CONTRACT_FILE=%q\n' "${RUNTIME_CONTRACT_FILE}"
 } | tee "${METADATA_FILE}"
 
@@ -597,6 +603,7 @@ eval_args=(
   --policy.action-frame robot_base
   --policy.dataset-name droid
   --policy.no-rotate-wrist-180
+  --policy.no-render-every-step
   --policy.state-type joint_position
   --policy.expected-action-horizon "${EXPECTED_ACTION_HORIZON}"
   --policy.expected-action-dim "${EXPECTED_ACTION_DIM}"
@@ -808,9 +815,17 @@ tee_code="${pipeline_codes[1]}"
 (( eval_code == 0 )) || exit "${eval_code}"
 (( tee_code == 0 )) || exit "${tee_code}"
 
-python3 - "${EVAL_LOG}" "${ENVIRONMENT_SEED}" "${SERVER_CONTRACT_SHA256}" <<'PY'
+PYTHONPATH="${POLARIS_DIR}/src:${OPENPI_DIR}/packages/openpi-client/src" \
+  "${OPENPI_DIR}/.venv/bin/python" - \
+  "${EVAL_LOG}" "${ENVIRONMENT_SEED}" "${SERVER_CONTRACT_SHA256}" <<'PY'
 import json
 import sys
+
+from polaris.pi05_droid_jointpos_image_contract import (
+    CLIENT_RESIZE_PROFILE,
+    IMAGE_PROFILE,
+    static_image_contract,
+)
 
 log_lines = list(open(sys.argv[1], encoding="utf-8"))
 
@@ -821,8 +836,8 @@ if len(client_lines) != 1:
 client_payload = json.loads(client_lines[0].split(client_marker, 1)[1])
 expected_client = {
     "client": "DroidJointPos",
-    "profile": "openpi_pi05_droid_native_joint_position_v1",
-    "serving_profile": "openpi_pi05_droid_jointpos_polaris_flow_v1",
+    "profile": "openpi_pi05_droid_native_joint_position_v2",
+    "serving_profile": "openpi_pi05_droid_jointpos_polaris_flow_v2",
     "server_contract_sha256": sys.argv[3],
     "state": "ordered_7_panda_joint_radians_plus_closed_positive_gripper",
     "action": "7_absolute_panda_joint_targets_plus_closed_positive_gripper",
@@ -831,17 +846,25 @@ expected_client = {
         "left_wrist_0_rgb",
         "right_wrist_0_rgb_masked",
     ],
-    "request_image_shape": [720, 1280, 3],
+    "final_composite_image_shape": [720, 1280, 3],
+    "final_composite_image_source": (
+        "post_manager_filtered_splat_then_sim_mask_composite"
+    ),
+    "environment_image_profile": IMAGE_PROFILE,
+    "environment_image_contract": static_image_contract(),
+    "request_image_shape": [224, 224, 3],
     "request_image_dtype": "uint8",
-    "client_model_spatial_transform": None,
+    "request_image_source": "client_resize_with_pad_224_of_final_composite",
+    "client_model_spatial_transform": CLIENT_RESIZE_PROFILE,
     "server_model_resize": (
         "openpi.transforms.ResizeImages_openpi_client_PIL_bilinear_"
         "symmetric_zero_pad_224x224"
     ),
     "model_image_resolution": [224, 224],
     "visualization_image_resolution": [224, 224],
-    "visualization_spatial_transform": (
-        "openpi_client.image_tools.resize_with_pad_PIL_bilinear_non_model"
+    "query_visualization_source": "byte_identical_client224_wire_model_input",
+    "interquery_visualization_source": (
+        "client224_resize_of_nonexpensive_sim_camera_non_model_input"
     ),
     "wrist_rotation_degrees": 0,
     "open_loop_horizon": 8,

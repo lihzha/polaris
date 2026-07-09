@@ -19,7 +19,13 @@ import shlex
 import stat
 from typing import Any
 
+from polaris.pi05_droid_jointpos_image_contract import (
+    CLIENT_RESIZE_PROFILE,
+    IMAGE_PROFILE,
+    static_image_contract,
+)
 from polaris.pi05_droid_jointpos_runtime import (
+    PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
     PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_SEARCH_SAFETY_PROFILE,
     PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES,
     PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE,
@@ -52,7 +58,7 @@ from polaris.pi05_droid_jointpos_immutable import (
 
 
 PI05_DROID_JOINTPOS_EVIDENCE_PROFILE = (
-    "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v8"
+    "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v9"
 )
 PI05_DROID_JOINTPOS_EVIDENCE_MANIFEST = "pi05_droid_jointpos_evidence_manifest.json"
 
@@ -310,7 +316,10 @@ def _validate_trace_summary(
 ) -> dict[str, Any]:
     summary = _strict_json(summary_path, "trace summary")
     _require(isinstance(summary, dict), "trace summary must be one object")
-    _require(summary.get("schema_version") == 4, "trace summary schema mismatch")
+    _require(
+        summary.get("schema_version") == PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
+        "trace summary schema mismatch",
+    )
     _require(summary.get("status") == "pass", "trace summary did not pass")
     _require(
         summary.get("trace_sha256") == trace_identity["sha256"],
@@ -337,15 +346,28 @@ def _validate_trace_summary(
         "trace summary request stream mismatch",
     )
     _require(
-        summary.get("native_image_shape") == [720, 1280, 3]
-        and summary.get("request_image_shape") == [720, 1280, 3]
+        summary.get("environment_image_profile") == IMAGE_PROFILE
+        and summary.get("environment_image_contract") == static_image_contract()
+        and summary.get("final_composite_image_shape") == [720, 1280, 3]
+        and summary.get("request_image_shape") == [224, 224, 3]
         and summary.get("request_image_dtype") == "uint8"
-        and summary.get("client_model_spatial_transform") is None
+        and summary.get("client_model_spatial_transform") == CLIENT_RESIZE_PROFILE
         and summary.get("server_model_resize")
         == PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE
+        and summary.get("server_resize_behavior")
+        == "early_return_same_array_no_pixel_change"
         and summary.get("model_image_shape") == [224, 224, 3]
         and summary.get("visualization_image_shape") == [224, 224, 3]
-        and summary.get("visualization_is_model_input") is False,
+        and summary.get("query_visualization_is_model_input") is True
+        and summary.get("query_visualization_source")
+        == "byte_identical_client224_wire_model_input"
+        and summary.get("interquery_visualization_is_model_input") is False
+        and summary.get("interquery_visualization_source")
+        == "client224_resize_of_nonexpensive_sim_camera_non_model_input"
+        and summary.get("expensive_render_cadence")
+        == "reset_then_post_actions_7_15_through_447_for_next_query"
+        and summary.get("query_frames_per_episode") == 57
+        and summary.get("diagnostic_video_frames_per_episode") == 450,
         "trace summary image-preprocessing boundary mismatch",
     )
     terminal_hashes = summary.get("terminal_visualization_sha256")
@@ -353,7 +375,7 @@ def _validate_trace_summary(
         summary.get("terminal_visualization_shape") == [224, 448, 3]
         and summary.get("terminal_visualization_dtype") == "uint8"
         and summary.get("terminal_visualization_source")
-        == "post_action450_returned_expensive_splat_observation"
+        == "post_action450_returned_nonexpensive_sim_camera_observation"
         and isinstance(terminal_hashes, list)
         and len(terminal_hashes) == expected_rollouts,
         "trace summary terminal-visualization boundary mismatch",
@@ -691,7 +713,7 @@ def _manifest_value(
         "PolaRiS commit must be one full lowercase Git SHA",
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": PI05_DROID_JOINTPOS_EVIDENCE_PROFILE,
         "status": "pass",
         "checkpoint_uri": PI05_DROID_JOINTPOS_CHECKPOINT_URI,
@@ -758,7 +780,7 @@ def validate_evidence_manifest(
         "evidence manifest schema mismatch",
     )
     _require(
-        value["schema_version"] == 1
+        value["schema_version"] == 2
         and value["profile"] == PI05_DROID_JOINTPOS_EVIDENCE_PROFILE
         and value["status"] == "pass"
         and value["checkpoint_uri"] == PI05_DROID_JOINTPOS_CHECKPOINT_URI
