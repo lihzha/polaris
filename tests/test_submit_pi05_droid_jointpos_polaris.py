@@ -15,6 +15,9 @@ from polaris.pi05_droid_jointpos_scheduler import validate_persisted_scheduler_j
 
 ROOT = Path(__file__).resolve().parents[1]
 SUBMITTER = ROOT / "scripts/polaris/submit_pi05_droid_jointpos_polaris.sh"
+STALE_AUDIT_SBATCH_SHA256 = (
+    "35515abaf15d7060f86ad959aaa73a53c5ed5fa9dec1e5a124fc109e91812d7e"
+)
 STANDARD_MANIFEST_COLUMNS = (
     "job_id",
     "mode",
@@ -533,15 +536,21 @@ def _make_submitter_harness(tmp_path: Path, fake_bin: Path) -> tuple[Path, Path]
     current_batch_sha256 = hashlib.sha256(batch_payload).hexdigest()
 
     source = SUBMITTER.read_text()
-    source = _replace_exact(
-        source,
-        (
-            "APPROVED_SBATCH_SCRIPT_SHA256="
-            '"35515abaf15d7060f86ad959aaa73a53c5ed5fa9dec1e5a124fc109e91812d7e"'
-        ),
-        f'APPROVED_SBATCH_SCRIPT_SHA256="{current_batch_sha256}"',
-        count=1,
-    )
+    pin_prefix = 'APPROVED_SBATCH_SCRIPT_SHA256="'
+    pin_lines = [line for line in source.splitlines() if line.startswith(pin_prefix)]
+    assert len(pin_lines) == 1
+    pinned_batch_sha256 = pin_lines[0].removeprefix(pin_prefix).removesuffix('"')
+    assert pinned_batch_sha256 in {
+        STALE_AUDIT_SBATCH_SHA256,
+        current_batch_sha256,
+    }
+    if pinned_batch_sha256 != current_batch_sha256:
+        source = _replace_exact(
+            source,
+            pin_lines[0],
+            f'APPROVED_SBATCH_SCRIPT_SHA256="{current_batch_sha256}"',
+            count=1,
+        )
     source = _replace_exact(
         source,
         "/cm/local/apps/slurm/24.11/bin/",
