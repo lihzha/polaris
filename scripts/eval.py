@@ -20,6 +20,12 @@ from polaris.evaluation_seed import (
 )
 
 
+def _print_eval_phase(phase: str) -> None:
+    """Publish one flushed evaluator phase boundary for startup diagnosis."""
+
+    print(f"POLARIS_EVAL_PHASE={phase}", flush=True)
+
+
 def main(eval_args: EvalArgs):
     if eval_args.policy.client == "DroidJointPos":
         if eval_args.environment_seed is None:
@@ -50,10 +56,13 @@ def main(eval_args: EvalArgs):
     args_cli, _ = parser.parse_known_args()
     args_cli.enable_cameras = True
     args_cli.headless = eval_args.headless
+    _print_eval_phase("before_app_launcher")
     app_launcher = AppLauncher(args_cli)
     simulation_app = app_launcher.app
+    _print_eval_phase("after_app_launcher")
     # >>>> Isaac Sim App Launcher <<<<
 
+    _print_eval_phase("before_evaluation_imports")
     from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
     from polaris.environments.manager_based_rl_splat_environment import (
         ManagerBasedRLSplatEnv,
@@ -83,13 +92,16 @@ def main(eval_args: EvalArgs):
     from polaris.robust_differential_ik import DifferentialIKNumericalError
     # from real2simeval.autoscoring import TASK_TO_SUCCESS_CHECKER
 
+    _print_eval_phase("after_evaluation_imports")
     audited_jointpos = eval_args.policy.client == "DroidJointPos"
+    _print_eval_phase("before_parse_env_cfg")
     env_cfg = parse_env_cfg(
         eval_args.environment,
         device="cuda",
         num_envs=1,
         use_fabric=True,
     )
+    _print_eval_phase("after_parse_env_cfg")
     if eval_args.environment_seed is not None:
         bind_environment_seed(env_cfg, eval_args.environment_seed)
     if eval_args.control_mode == "eef-pose":
@@ -102,9 +114,11 @@ def main(eval_args: EvalArgs):
         configure_jointpos_timeout(env_cfg)
     elif eval_args.control_mode != "joint-position":
         raise ValueError(f"Unsupported control mode: {eval_args.control_mode}")
+    _print_eval_phase("before_gym_make")
     env: ManagerBasedRLSplatEnv = gym.make(  # type: ignore[assignment]
         eval_args.environment, cfg=env_cfg
     )
+    _print_eval_phase("after_gym_make")
     environment_seed_contract = None
     if eval_args.environment_seed is not None:
         environment_seed_contract = make_live_environment_seed_contract(
@@ -156,7 +170,9 @@ def main(eval_args: EvalArgs):
         simulation_app.close()
         return
 
+    _print_eval_phase(f"before_policy_client_load:{eval_args.policy.client}")
     policy_client: InferenceClient = InferenceClient.get_client(eval_args.policy)
+    _print_eval_phase(f"after_policy_client_load:{eval_args.policy.client}")
     if audited_jointpos:
         if environment_seed_contract is None:
             raise RuntimeError("DroidJointPos environment seed contract is missing")
@@ -172,12 +188,16 @@ def main(eval_args: EvalArgs):
         episode_seed = None
         if eval_args.environment_seed is not None:
             episode_seed = episode_environment_seed(eval_args.environment_seed, episode)
+        _print_eval_phase(f"before_rollout_reset:{episode}")
         obs, info = env.reset(
             seed=episode_seed,
             object_positions=initial_conditions[episode],
         )
+        _print_eval_phase(f"after_rollout_reset:{episode}")
         if audited_jointpos:
+            _print_eval_phase(f"before_jointpos_runtime_capture:{episode}")
             live_jointpos_runtime = capture_jointpos_runtime(env, obs)
+            _print_eval_phase(f"after_jointpos_runtime_capture:{episode}")
             if jointpos_runtime_sha256 is None:
                 print(format_jointpos_runtime(live_jointpos_runtime), flush=True)
                 publish_jointpos_runtime(
