@@ -843,9 +843,9 @@
   `66d499de6595806f9560a6644d2857e78e5205d57fe6a191dad2773e5889ef10`.
   An independent review found that v13 still left the deterministic cv2 loader
   mutation and loaded-module identity unbound. Both v13 evaluation objects
-  were canceled before any GPU job or scientific rollout. Shared registry
-  revision 42 also cancels all three legacy zero-rollout planned objects as
-  non-authoritative.
+  were submitted but canceled while still pending, before allocation, process
+  start, or scientific rollout. Shared registry revision 44 records both v13
+  attempts as canceled, zero-query, zero-episode, and non-authoritative.
 
 ## 2026-07-08 — live import-order probe and headless OpenCV correction
 
@@ -859,13 +859,18 @@
   `4b66297d8747f93176c836fb76faeffaaa6836bfc585d4efa8c715e7c6684679`.
   The terminal log SHA-256 is
   `61cb41cd8e765f9e2b6764d4480ef691c9b4f4ef0b85126dd0f7c6b8aa472043`.
-- The probe proves process-start `LD_LIBRARY_PATH`, all five Kit variables,
+- The reduced pre-task probe proves process-start `LD_LIBRARY_PATH`, all five Kit variables,
   both Qt variables, and every enumerated loader/layer override are absent.
-  The exact eval import order changes only `LD_LIBRARY_PATH` to
+  Its AppLauncher-plus-renderer import path changes only `LD_LIBRARY_PATH` to
   `/.venv/lib/python3.11/site-packages/cv2/../../lib64:` when the renderer
   imports cv2. The source mount equals the working directory, is read-only,
   the normalized first loader path `/.venv/lib/python3.11/lib64` is absent,
   and the root contains no ELF candidate.
+- That reduced probe intentionally stops before `parse_env_cfg`, `gym.make`,
+  scene construction, and the first object reset, so it does not authorize the
+  final five Kit values. Paired v12 post-reset captures directly establish
+  empty `VK_LAYER_PATH` and `VK_INSTANCE_LAYERS`; the fresh v4 canary remains
+  the fail-closed authority for all five final values before any scale-up.
 - The probe rejected a prior inference before launch: the immutable evaluator
   image's active co-installed provider is `opencv-python-headless==4.11.0.86`,
   not the GUI wheel. The final contract now requires `headless=true`, keeps Qt
