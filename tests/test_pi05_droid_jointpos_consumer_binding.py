@@ -11,6 +11,18 @@ import pytest
 from polaris import pi05_droid_jointpos_consumer_binding as binding
 
 
+ROOT = Path(__file__).parents[1]
+TRUSTED_SOURCE_HASHER = ROOT / "scripts/polaris/l40s_pi05_eval_job.sbatch"
+
+
+def test_source_approval_pin_matches_committed_trusted_hasher() -> None:
+    assert TRUSTED_SOURCE_HASHER.is_file()
+    assert not TRUSTED_SOURCE_HASHER.is_symlink()
+    assert binding.SOURCE_APPROVAL_TRUSTED_HASHER_SHA256 == hashlib.sha256(
+        TRUSTED_SOURCE_HASHER.read_bytes()
+    ).hexdigest()
+
+
 def _md5(payload: bytes) -> str:
     return base64.b64encode(
         hashlib.md5(payload, usedforsecurity=False).digest()
