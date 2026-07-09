@@ -404,9 +404,10 @@
   `66d499de6595806f9560a6644d2857e78e5205d57fe6a191dad2773e5889ef10`;
   current is
   `a1c9799f2d8265ff0e51f01861f60d1f4a16e87c108c5215ca08844a3f692437`.
-  V13 was then found to leave deterministic cv2 loader provenance unbound and
-  was canceled before any GPU launch. Registry revision 42 marks all legacy
-  zero-rollout planned objects non-authoritative.
+  V13 was then found to leave deterministic cv2 loader provenance unbound.
+  Jobs `1101857` and `1101858` were submitted but canceled while pending,
+  before allocation or process start. Registry revision 44 records both as
+  canceled, zero-query, zero-episode, and non-authoritative.
 
 ## 2026-07-08 — live import-order probe and byte-exact final port
 
@@ -417,6 +418,11 @@
   `4b66297d8747f93176c836fb76faeffaaa6836bfc585d4efa8c715e7c6684679`.
   It proves the exact initial environment, cv2-only LD mutation, loaded module
   paths/specs/ABI/maps, read-only search surface, and active provider.
+- This reduced probe stops before `parse_env_cfg`, `gym.make`, scene
+  construction, and object reset. It therefore does not authorize the final
+  five Kit values. Paired v12 post-reset captures directly establish empty
+  `VK_LAYER_PATH` and `VK_INSTANCE_LAYERS`; the fresh v4 canary is the
+  fail-closed authority for all five final values before any scale-up.
 - The active evaluator provider is
   `opencv-python-headless==4.11.0.86`. The final historical port requires
   `headless=true`, absent Qt variables, native `cv2.abi3.so` size 66,106,617

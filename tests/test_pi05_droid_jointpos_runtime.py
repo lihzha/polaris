@@ -791,6 +791,21 @@ def test_mapped_graphics_capture_binds_maps_file_hash_and_build_id(
     )
 
 
+def test_cv2_native_maps_identity_normalizes_device_numbers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    native = tmp_path / "cv2.abi3.so"
+    maps = tmp_path / "maps"
+    maps.write_text(
+        f"7f000000-7f001000 r-xp 00000000 09:00 123 {native}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        runtime, "PI05_DROID_JOINTPOS_GRAPHICS_PROC_MAPS_PATH", str(maps)
+    )
+    assert runtime._parse_proc_maps_identity_for_path(str(native)) == ("9:0", 123)
+
+
 @pytest.mark.parametrize("mode", ["missing", "extra", "deleted"])
 def test_mapped_graphics_capture_rejects_missing_extra_or_deleted_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
