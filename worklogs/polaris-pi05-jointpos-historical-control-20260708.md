@@ -390,3 +390,49 @@
   `pi05-confidence-final-v12-20260708T225010Z` using immutable script SHA-256
   `a31ebd3c0ffc687bcbe51fcc0d5e77d4aca2cdf4259dd826f8454de83dd0cd9b`.
   No v12 GPU evaluation is launched until both setup records pass.
+
+## 2026-07-08 — v12/v13 zero-rollout closure
+
+- Fresh historical v12 setup `1101842` and current setup `1101841` completed
+  `0:0`. Paired L40S canaries `1101848` and `1101847` constructed and reset
+  FoodBussing, then failed the old graphics-environment contract before policy
+  request zero. Cancellation during Isaac teardown left no valid episode,
+  trace, metric, video, runtime artifact, or evidence manifest.
+- V13 historical setup `1101852` completed `0:0` in 9:23; paired current setup
+  `1101851` completed `0:0` in 11:44. The historical sealed/final package
+  digest is
+  `66d499de6595806f9560a6644d2857e78e5205d57fe6a191dad2773e5889ef10`;
+  current is
+  `a1c9799f2d8265ff0e51f01861f60d1f4a16e87c108c5215ca08844a3f692437`.
+  V13 was then found to leave deterministic cv2 loader provenance unbound and
+  was canceled before any GPU launch. Registry revision 42 marks all legacy
+  zero-rollout planned objects non-authoritative.
+
+## 2026-07-08 — live import-order probe and byte-exact final port
+
+- L40S probe `1101856` completed `0:0` in 3:28 from immutable source
+  `519a2b2fbd88f4f363327def6ff9ef0acd35fb1b`. Its mode-0444 report at
+  `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris-pi05/pi05-graphics-env-probe-v5-20260709T001500Z/graphics_environment_probe.json`
+  is 20,507 bytes with SHA-256
+  `4b66297d8747f93176c836fb76faeffaaa6836bfc585d4efa8c715e7c6684679`.
+  It proves the exact initial environment, cv2-only LD mutation, loaded module
+  paths/specs/ABI/maps, read-only search surface, and active provider.
+- The active evaluator provider is
+  `opencv-python-headless==4.11.0.86`. The final historical port requires
+  `headless=true`, absent Qt variables, native `cv2.abi3.so` size 66,106,617
+  and SHA-256
+  `68fee49d266a95e730c1cb17d913a39a93ab5c50bee1581600f453026f9c7b8d`,
+  plus the exact five remaining responsible files. Runtime schema 4, graphics
+  profile v4, and evidence v7 bind this closure with stable digest
+  `d251727e38315050a25b79954ed77984fa5cc4649b954e7789bfcbb0a77e3629`.
+- The four runtime/evidence/test files are byte-identical to current. Ruff,
+  compilation, and whitespace checks pass; focused tests pass 135/135 and the
+  import-isolated historical suite passes 229 tests plus eight subtests
+  (current: 533 plus eight). A fresh semantic audit is GO: official FLOW-10,
+  global DROID normalization with no category, state/action/gripper/image
+  ordering, native resolution plus one server resize, 15x8 response, and
+  execute-first-eight semantics all match training and current. The historical
+  evaluator lifecycle remains the only intended paired factor.
+- Residual renderer/JPEG, simulated-dynamics, and fixed-view domain shifts are
+  explicit. Because the PolaRiS rubric can latch transient positives, final
+  reporting must visually adjudicate every raw-positive video separately.
