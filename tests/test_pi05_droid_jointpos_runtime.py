@@ -309,6 +309,19 @@ def _prepare_graphics_capture(
     return maps, library, value
 
 
+def _pre_gym_robot_cfg():
+    return types.SimpleNamespace(
+        actuators={
+            name: types.SimpleNamespace(**fields)
+            for name, fields in runtime._expected_pre_gym_actuator_groups().items()
+        }
+    )
+
+
+def _actuator_intent():
+    return runtime.capture_jointpos_actuator_intent(_pre_gym_robot_cfg())
+
+
 def _runtime_report():
     report = {
         "schema_version": runtime.PI05_DROID_JOINTPOS_RUNTIME_SCHEMA_VERSION,
@@ -332,6 +345,7 @@ def _runtime_report():
             "static": static_image_contract(),
             "sources": source_contract(),
         },
+        "actuator_intent": _actuator_intent(),
         "joint_names": list(runtime.PANDA_ARM_JOINT_NAMES),
         "action": {
             "term_class": runtime._ACTION_TERM_CLASS,
@@ -380,36 +394,8 @@ def _runtime_report():
             },
         },
         "configured_actuators": {
-            "capture_phase": runtime.PI05_DROID_JOINTPOS_POST_MUTATION_CFG_PHASE,
-            "groups": {
-                "panda_shoulder": {
-                    "joint_names_expr": ["panda_joint[1-4]"],
-                    "stiffness": 400.0,
-                    "damping": 80.0,
-                    "effort_limit": 87.0,
-                    "effort_limit_sim": 87.0,
-                    "velocity_limit": None,
-                    "velocity_limit_sim": None,
-                },
-                "panda_forearm": {
-                    "joint_names_expr": ["panda_joint[5-7]"],
-                    "stiffness": 400.0,
-                    "damping": 80.0,
-                    "effort_limit": 12.0,
-                    "effort_limit_sim": 12.0,
-                    "velocity_limit": None,
-                    "velocity_limit_sim": None,
-                },
-                "gripper": {
-                    "joint_names_expr": ["finger_joint"],
-                    "stiffness": None,
-                    "damping": None,
-                    "effort_limit": 200.0,
-                    "effort_limit_sim": 200.0,
-                    "velocity_limit": None,
-                    "velocity_limit_sim": None,
-                },
-            },
+            "capture_phase": runtime.PI05_DROID_JOINTPOS_POST_INIT_ACTUATOR_PHASE,
+            "groups": runtime._expected_post_init_actuator_groups(),
         },
         "resolved_actuator_and_limits": {
             "provenance": runtime.PI05_DROID_JOINTPOS_EFFECTIVE_LIMIT_PROVENANCE,
@@ -422,8 +408,10 @@ def _runtime_report():
                     "damping": runtime._EXPECTED_DAMPING[:, :4].tolist(),
                     "effort_limit": runtime._EXPECTED_EFFORT[:, :4].tolist(),
                     "effort_limit_sim": runtime._EXPECTED_EFFORT[:, :4].tolist(),
-                    "velocity_limit": runtime._EXPECTED_SIM_VELOCITY[:, :4].tolist(),
-                    "velocity_limit_sim": runtime._EXPECTED_SIM_VELOCITY[
+                    "velocity_limit": runtime._EXPECTED_EFFECTIVE_VELOCITY[
+                        :, :4
+                    ].tolist(),
+                    "velocity_limit_sim": runtime._EXPECTED_EFFECTIVE_VELOCITY[
                         :, :4
                     ].tolist(),
                 },
@@ -434,8 +422,10 @@ def _runtime_report():
                     "damping": runtime._EXPECTED_DAMPING[:, 4:].tolist(),
                     "effort_limit": runtime._EXPECTED_EFFORT[:, 4:].tolist(),
                     "effort_limit_sim": runtime._EXPECTED_EFFORT[:, 4:].tolist(),
-                    "velocity_limit": runtime._EXPECTED_SIM_VELOCITY[:, 4:].tolist(),
-                    "velocity_limit_sim": runtime._EXPECTED_SIM_VELOCITY[
+                    "velocity_limit": runtime._EXPECTED_EFFECTIVE_VELOCITY[
+                        :, 4:
+                    ].tolist(),
+                    "velocity_limit_sim": runtime._EXPECTED_EFFECTIVE_VELOCITY[
                         :, 4:
                     ].tolist(),
                 },
@@ -446,9 +436,11 @@ def _runtime_report():
                     "damping": runtime._EXPECTED_FINGER_DAMPING.tolist(),
                     "effort_limit": runtime._EXPECTED_FINGER_EFFORT.tolist(),
                     "effort_limit_sim": runtime._EXPECTED_FINGER_EFFORT.tolist(),
-                    "velocity_limit": (runtime._EXPECTED_FINGER_SIM_VELOCITY.tolist()),
+                    "velocity_limit": (
+                        runtime._EXPECTED_FINGER_EFFECTIVE_VELOCITY.tolist()
+                    ),
                     "velocity_limit_sim": (
-                        runtime._EXPECTED_FINGER_SIM_VELOCITY.tolist()
+                        runtime._EXPECTED_FINGER_EFFECTIVE_VELOCITY.tolist()
                     ),
                 },
             },
@@ -457,7 +449,7 @@ def _runtime_report():
             "joint_stiffness": runtime._EXPECTED_STIFFNESS.tolist(),
             "joint_damping": runtime._EXPECTED_DAMPING.tolist(),
             "joint_effort_limits": runtime._EXPECTED_EFFORT.tolist(),
-            "joint_velocity_limits": runtime._EXPECTED_SIM_VELOCITY.tolist(),
+            "joint_velocity_limits": runtime._EXPECTED_EFFECTIVE_VELOCITY.tolist(),
             "hard_joint_position_limits": runtime._EXPECTED_HARD_LIMITS.tolist(),
             "soft_joint_position_limits": runtime._EXPECTED_SOFT_LIMITS.tolist(),
         },
@@ -465,7 +457,7 @@ def _runtime_report():
             "joint_stiffness": runtime._EXPECTED_STIFFNESS.tolist(),
             "joint_damping": runtime._EXPECTED_DAMPING.tolist(),
             "joint_effort_limits": runtime._EXPECTED_EFFORT.tolist(),
-            "joint_velocity_limits": runtime._EXPECTED_SIM_VELOCITY.tolist(),
+            "joint_velocity_limits": runtime._EXPECTED_EFFECTIVE_VELOCITY.tolist(),
             "hard_joint_position_limits": runtime._EXPECTED_HARD_LIMITS.tolist(),
         },
         "cameras": {
@@ -491,7 +483,7 @@ def _runtime_report():
                 "joint_damping": runtime._EXPECTED_FINGER_DAMPING.tolist(),
                 "joint_effort_limits": runtime._EXPECTED_FINGER_EFFORT.tolist(),
                 "joint_velocity_limits": (
-                    runtime._EXPECTED_FINGER_SIM_VELOCITY.tolist()
+                    runtime._EXPECTED_FINGER_EFFECTIVE_VELOCITY.tolist()
                 ),
                 "hard_joint_position_limits": (
                     runtime._EXPECTED_FINGER_HARD_LIMITS.tolist()
@@ -505,7 +497,7 @@ def _runtime_report():
                 "joint_damping": runtime._EXPECTED_FINGER_DAMPING.tolist(),
                 "joint_effort_limits": runtime._EXPECTED_FINGER_EFFORT.tolist(),
                 "joint_velocity_limits": (
-                    runtime._EXPECTED_FINGER_SIM_VELOCITY.tolist()
+                    runtime._EXPECTED_FINGER_EFFECTIVE_VELOCITY.tolist()
                 ),
                 "hard_joint_position_limits": (
                     runtime._EXPECTED_FINGER_HARD_LIMITS.tolist()
@@ -536,22 +528,133 @@ def test_execution_recorder_observes_exact_upstream_eight_hold_path():
     assert report["post_step_articulation_target"] == target[0].tolist()
 
 
+def test_pre_gym_actuator_intent_captures_and_hashes_without_mutation():
+    robot_cfg = _pre_gym_robot_cfg()
+    before = copy.deepcopy(robot_cfg)
+
+    intent = runtime.capture_jointpos_actuator_intent(robot_cfg)
+
+    assert runtime.validate_jointpos_actuator_intent(intent) == intent
+    assert intent["groups"] == runtime._expected_pre_gym_actuator_groups()
+    assert intent["groups"]["panda_shoulder"]["velocity_limit"] == 2.175
+    assert intent["groups"]["panda_forearm"]["velocity_limit"] == 2.61
+    assert intent["groups"]["gripper"]["velocity_limit"] == 5.0
+    assert all(
+        group["effort_limit_sim"] is None and group["velocity_limit_sim"] is None
+        for group in intent["groups"].values()
+    )
+    assert intent["intent_sha256"] == runtime.canonical_sha256(
+        {key: value for key, value in intent.items() if key != "intent_sha256"}
+    )
+    assert robot_cfg == before
+
+
+@pytest.mark.parametrize(
+    ("group", "field", "value"),
+    [
+        ("panda_shoulder", "velocity_limit", 10.0),
+        ("panda_forearm", "velocity_limit_sim", 2.61),
+        ("gripper", "effort_limit_sim", 200.0),
+        ("panda_shoulder", "effort_limit", True),
+    ],
+)
+def test_pre_gym_actuator_intent_rejects_config_drift(group, field, value):
+    robot_cfg = _pre_gym_robot_cfg()
+    setattr(robot_cfg.actuators[group], field, value)
+    with pytest.raises(ValueError, match="pre-gym actuator intent"):
+        runtime.capture_jointpos_actuator_intent(robot_cfg)
+
+
+def test_pre_gym_actuator_intent_rejects_hash_or_schema_drift():
+    intent = _actuator_intent()
+    intent["intent_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="SHA-256"):
+        runtime.validate_jointpos_actuator_intent(intent)
+
+    intent = _actuator_intent()
+    intent["extra"] = None
+    with pytest.raises(ValueError, match="schema"):
+        runtime.validate_jointpos_actuator_intent(intent)
+
+
 def test_effective_limit_constants_bind_usd_physx_float32_values():
     assert runtime.PI05_DROID_JOINTPOS_EFFECTIVE_LIMIT_PROVENANCE == (
-        "legacy_velocity_limit_ignored_backcompat_usd_physx_max_joint_velocity"
+        "legacy_velocity_limit_ignored_backcompat_usd_physx_max_joint_velocity_v1"
     )
     np.testing.assert_array_equal(
-        runtime._EXPECTED_SIM_VELOCITY,
+        runtime._EXPECTED_EFFECTIVE_VELOCITY,
         np.full((1, 7), 10.0, dtype=np.float32),
     )
     np.testing.assert_array_equal(
-        runtime._EXPECTED_FINGER_SIM_VELOCITY,
+        runtime._EXPECTED_FINGER_EFFECTIVE_VELOCITY,
         np.asarray([[8.726646423339844]], dtype=np.float32),
+    )
+    radians_per_degree_conversion = np.float32(180.0 / np.pi)
+    assert np.float32(100.0) * radians_per_degree_conversion == np.float32(5729.578125)
+    assert np.float32(0.0002) * radians_per_degree_conversion == np.float32(
+        0.011459155939519405
+    )
+    np.testing.assert_array_equal(
+        runtime._EXPECTED_FINGER_STIFFNESS,
+        np.asarray([[5729.578125]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        runtime._EXPECTED_FINGER_DAMPING,
+        np.asarray([[0.011459155939519405]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        runtime._EXPECTED_FINGER_EFFORT,
+        np.asarray([[200.0]], dtype=np.float32),
     )
     np.testing.assert_array_equal(
         runtime._EXPECTED_FINGER_HARD_LIMITS,
         np.asarray([[[0.0, 0.7853981852531433]]], dtype=np.float32),
     )
+    np.testing.assert_array_equal(
+        runtime._EXPECTED_FINGER_SOFT_LIMITS,
+        runtime._EXPECTED_FINGER_HARD_LIMITS,
+    )
+
+
+def test_post_init_config_requires_effort_promotion_and_no_velocity_override():
+    pre = runtime._expected_pre_gym_actuator_groups()
+    post = runtime._expected_post_init_actuator_groups()
+    for name in pre:
+        assert post[name]["effort_limit"] == pre[name]["effort_limit"]
+        assert post[name]["effort_limit_sim"] == pre[name]["effort_limit"]
+        assert post[name]["velocity_limit"] is None
+        assert post[name]["velocity_limit_sim"] is None
+
+
+@pytest.mark.parametrize(
+    ("field", "raw_usd_value"),
+    [("stiffness", 100.0), ("damping", 0.0002)],
+)
+def test_resolved_gripper_rejects_unconverted_raw_usd_drive_values(
+    field, raw_usd_value
+):
+    actuator = types.SimpleNamespace(
+        joint_names=["finger_joint"],
+        joint_indices=np.asarray([7], dtype=np.int64),
+        stiffness=runtime._EXPECTED_FINGER_STIFFNESS.copy(),
+        damping=runtime._EXPECTED_FINGER_DAMPING.copy(),
+        effort_limit=runtime._EXPECTED_FINGER_EFFORT.copy(),
+        effort_limit_sim=runtime._EXPECTED_FINGER_EFFORT.copy(),
+        velocity_limit=runtime._EXPECTED_FINGER_EFFECTIVE_VELOCITY.copy(),
+        velocity_limit_sim=runtime._EXPECTED_FINGER_EFFECTIVE_VELOCITY.copy(),
+    )
+    setattr(actuator, field, np.asarray([[raw_usd_value]], dtype=np.float32))
+    with pytest.raises(ValueError, match=rf"test finger {field} mismatch"):
+        runtime._resolved_actuator_report(
+            actuator,
+            expected_names=("finger_joint",),
+            expected_indices=(7,),
+            expected_stiffness=runtime._EXPECTED_FINGER_STIFFNESS,
+            expected_damping=runtime._EXPECTED_FINGER_DAMPING,
+            expected_effort=runtime._EXPECTED_FINGER_EFFORT,
+            expected_velocity=runtime._EXPECTED_FINGER_EFFECTIVE_VELOCITY,
+            field="test finger",
+        )
 
 
 def test_resolved_actuator_capture_requires_exact_names_indices_and_float32():
@@ -562,8 +665,8 @@ def test_resolved_actuator_capture_requires_exact_names_indices_and_float32():
         damping=runtime._EXPECTED_FINGER_DAMPING.copy(),
         effort_limit=runtime._EXPECTED_FINGER_EFFORT.copy(),
         effort_limit_sim=runtime._EXPECTED_FINGER_EFFORT.copy(),
-        velocity_limit=runtime._EXPECTED_FINGER_SIM_VELOCITY.copy(),
-        velocity_limit_sim=runtime._EXPECTED_FINGER_SIM_VELOCITY.copy(),
+        velocity_limit=runtime._EXPECTED_FINGER_EFFECTIVE_VELOCITY.copy(),
+        velocity_limit_sim=runtime._EXPECTED_FINGER_EFFECTIVE_VELOCITY.copy(),
     )
     report = runtime._resolved_actuator_report(
         actuator,
@@ -572,7 +675,7 @@ def test_resolved_actuator_capture_requires_exact_names_indices_and_float32():
         expected_stiffness=runtime._EXPECTED_FINGER_STIFFNESS,
         expected_damping=runtime._EXPECTED_FINGER_DAMPING,
         expected_effort=runtime._EXPECTED_FINGER_EFFORT,
-        expected_velocity=runtime._EXPECTED_FINGER_SIM_VELOCITY,
+        expected_velocity=runtime._EXPECTED_FINGER_EFFECTIVE_VELOCITY,
         field="test finger",
     )
     assert report["joint_indices"] == [7]
@@ -587,7 +690,7 @@ def test_resolved_actuator_capture_requires_exact_names_indices_and_float32():
             expected_stiffness=runtime._EXPECTED_FINGER_STIFFNESS,
             expected_damping=runtime._EXPECTED_FINGER_DAMPING,
             expected_effort=runtime._EXPECTED_FINGER_EFFORT,
-            expected_velocity=runtime._EXPECTED_FINGER_SIM_VELOCITY,
+            expected_velocity=runtime._EXPECTED_FINGER_EFFECTIVE_VELOCITY,
             field="test finger",
         )
 
@@ -1360,6 +1463,12 @@ def test_runtime_validator_is_closed_over_every_live_contract_surface():
             "observation",
         ),
         (
+            lambda value: value["actuator_intent"]["groups"]["panda_shoulder"].update(
+                {"velocity_limit": 10.0}
+            ),
+            "actuator intent",
+        ),
+        (
             lambda value: value["configured_actuators"]["groups"][
                 "panda_shoulder"
             ].update({"stiffness": 399.0}),
@@ -1372,6 +1481,24 @@ def test_runtime_validator_is_closed_over_every_live_contract_surface():
             "direct PhysX",
         ),
         (
+            lambda value: value["resolved_actuator_and_limits"]["groups"][
+                "gripper"
+            ].update({"stiffness": [[100.0]]}),
+            "resolved actuator",
+        ),
+        (
+            lambda value: value["gripper"]["live_actuator_and_limits"].update(
+                {"joint_stiffness": [[100.0]]}
+            ),
+            "gripper",
+        ),
+        (
+            lambda value: value["gripper"]["direct_physx_actuator_and_limits"].update(
+                {"joint_damping": [[0.0002]]}
+            ),
+            "gripper",
+        ),
+        (
             lambda value: value["gripper"].update({"threshold": "open_positive"}),
             "gripper",
         ),
@@ -1381,6 +1508,26 @@ def test_runtime_validator_is_closed_over_every_live_contract_surface():
         tampered = _rehash(tampered)
         with pytest.raises(ValueError, match=message):
             runtime.validate_jointpos_runtime_report(tampered)
+
+
+@pytest.mark.parametrize(
+    ("group", "field", "replacement"),
+    [
+        ("panda_shoulder", "velocity_limit", 10.0),
+        ("panda_forearm", "velocity_limit_sim", 2.61),
+        ("gripper", "effort_limit_sim", 200.0),
+    ],
+)
+def test_runtime_validator_rejects_rehashed_pre_gym_actuator_intent_drift(
+    group, field, replacement
+):
+    report = _runtime_report()
+    intent = report["actuator_intent"]
+    intent["groups"][group][field] = replacement
+    intent.pop("intent_sha256")
+    intent["intent_sha256"] = runtime.canonical_sha256(intent)
+    with pytest.raises(ValueError, match="pre-gym actuator intent"):
+        runtime.validate_jointpos_runtime_report(_rehash(report))
 
 
 @pytest.mark.parametrize(
@@ -1402,6 +1549,24 @@ def test_runtime_validator_is_closed_over_every_live_contract_surface():
 def test_runtime_validator_rejects_each_post_mutation_cfg_field(group, field):
     report = _runtime_report()
     report["configured_actuators"]["groups"][group].pop(field)
+    with pytest.raises(ValueError, match="configured actuator"):
+        runtime.validate_jointpos_runtime_report(_rehash(report))
+
+
+@pytest.mark.parametrize(
+    ("group", "field", "replacement"),
+    [
+        ("panda_shoulder", "effort_limit_sim", None),
+        ("panda_forearm", "velocity_limit", 2.61),
+        ("gripper", "velocity_limit", 5.0),
+        ("gripper", "velocity_limit_sim", 5.0),
+    ],
+)
+def test_runtime_validator_rejects_post_init_legacy_resolution_drift(
+    group, field, replacement
+):
+    report = _runtime_report()
+    report["configured_actuators"]["groups"][group][field] = replacement
     with pytest.raises(ValueError, match="configured actuator"):
         runtime.validate_jointpos_runtime_report(_rehash(report))
 

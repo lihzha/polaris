@@ -21,6 +21,12 @@ from typing import Any
 
 import numpy as np
 
+from polaris.pi05_droid_jointvelocity_contract import (
+    NATIVE_GRIPPER_DAMPING,
+    NATIVE_GRIPPER_EFFORT_LIMIT,
+    NATIVE_GRIPPER_STIFFNESS,
+    NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+)
 from polaris.pi05_droid_jointpos_image_contract import (
     IMAGE_PROFILE,
     get_jointpos_image_evidence,
@@ -41,6 +47,14 @@ PANDA_ARM_JOINT_NAMES = tuple(f"panda_joint{index}" for index in range(1, 8))
 PI05_DROID_JOINTPOS_PROFILE = "openpi_pi05_droid_native_joint_position_v2"
 PI05_DROID_JOINTPOS_RUNTIME_SCHEMA_VERSION = 5
 PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION = 5
+PI05_DROID_JOINTPOS_ACTUATOR_INTENT_SCHEMA_VERSION = 1
+PI05_DROID_JOINTPOS_ACTUATOR_INTENT_PROFILE = (
+    "pre_gym_legacy_implicit_actuator_intent_v1"
+)
+PI05_DROID_JOINTPOS_ACTUATOR_INTENT_PHASE = "after_parse_env_cfg_before_gym_make"
+PI05_DROID_JOINTPOS_POST_INIT_ACTUATOR_PHASE = (
+    "post_isaaclab_implicit_actuator_construction"
+)
 PI05_DROID_JOINTPOS_RUNTIME_MARKER = "POLARIS_PI05_DROID_JOINTPOS_RUNTIME="
 PI05_DROID_JOINTPOS_OUTER_STEPS = 450
 PI05_DROID_JOINTPOS_INTERNAL_MAX_EPISODE_STEPS = 451
@@ -51,10 +65,7 @@ PI05_DROID_JOINTPOS_SENSOR_NAMES = ("external_cam", "wrist_cam")
 PI05_DROID_JOINTPOS_NATIVE_IMAGE_SHAPE = (720, 1280, 3)
 PI05_DROID_JOINTPOS_BOUNDARY_PROFILE = "outer450_internal451_no_autoreset"
 PI05_DROID_JOINTPOS_EFFECTIVE_LIMIT_PROVENANCE = (
-    "legacy_velocity_limit_ignored_backcompat_usd_physx_max_joint_velocity"
-)
-PI05_DROID_JOINTPOS_POST_MUTATION_CFG_PHASE = (
-    "post_isaaclab_ImplicitActuator_constructor"
+    "legacy_velocity_limit_ignored_backcompat_usd_physx_max_joint_velocity_v1"
 )
 PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE = (
     "l401_pyxis_nvidia_580_105_08_mapped_graphics_v5"
@@ -311,7 +322,7 @@ _GRIPPER_ACTION_CLASS = (
 _EXPECTED_STIFFNESS = np.full((1, 7), 400.0, dtype=np.float32)
 _EXPECTED_DAMPING = np.full((1, 7), 80.0, dtype=np.float32)
 _EXPECTED_EFFORT = np.asarray([[87.0] * 4 + [12.0] * 3], dtype=np.float32)
-_EXPECTED_SIM_VELOCITY = np.full((1, 7), 10.0, dtype=np.float32)
+_EXPECTED_EFFECTIVE_VELOCITY = np.full((1, 7), 10.0, dtype=np.float32)
 _EXPECTED_HARD_LIMITS = np.asarray(
     [
         [
@@ -340,12 +351,19 @@ _EXPECTED_SOFT_LIMITS = np.asarray(
     ],
     dtype=np.float32,
 )
-_EXPECTED_FINGER_STIFFNESS = np.asarray([[100.0]], dtype=np.float32)
-# Exact values composed from the pinned DROID USD drive/joint attributes:
-# damping=0.0002, maxJointVelocity=500 degrees/s, limits=[0, 45] degrees.
-_EXPECTED_FINGER_DAMPING = np.asarray([[0.00019999999494757503]], dtype=np.float32)
-_EXPECTED_FINGER_EFFORT = np.asarray([[200.0]], dtype=np.float32)
-_EXPECTED_FINGER_SIM_VELOCITY = np.asarray([[8.726646423339844]], dtype=np.float32)
+# The pinned USD stores angular-drive gains per degree. PhysX exposes those
+# gains per radian, so Isaac/PhysX multiplies both by 180/pi. These canonical
+# constants are shared with the independently captured native-gripper contract;
+# 100 and 0.0002 are raw USD values and are not live tensor values.
+_EXPECTED_FINGER_STIFFNESS = np.asarray([[NATIVE_GRIPPER_STIFFNESS]], dtype=np.float32)
+_EXPECTED_FINGER_DAMPING = np.asarray([[NATIVE_GRIPPER_DAMPING]], dtype=np.float32)
+_EXPECTED_FINGER_EFFORT = np.asarray([[NATIVE_GRIPPER_EFFORT_LIMIT]], dtype=np.float32)
+# The joint-position path deliberately leaves ``velocity_limit_sim`` unset, so
+# PhysX preserves the USD maxJointVelocity=500 degrees/s. Position limits are
+# likewise the authored [0, 45] degrees.
+_EXPECTED_FINGER_EFFECTIVE_VELOCITY = np.asarray(
+    [[8.726646423339844]], dtype=np.float32
+)
 _EXPECTED_FINGER_HARD_LIMITS = np.asarray(
     [[[0.0, 0.7853981852531433]]], dtype=np.float32
 )
@@ -394,6 +412,168 @@ def _float32_values(value: Any, expected: np.ndarray, *, field: str) -> list[Any
             f"dtype={actual.dtype} values={actual.tolist()}"
         )
     return actual.tolist()
+
+
+def _expected_pre_gym_actuator_groups() -> dict[str, dict[str, Any]]:
+    """Return the exact unmodified PolaRiS actuator configuration intent."""
+
+    return {
+        "panda_shoulder": {
+            "joint_names_expr": ["panda_joint[1-4]"],
+            "stiffness": 400.0,
+            "damping": 80.0,
+            "effort_limit": 87.0,
+            "effort_limit_sim": None,
+            "velocity_limit": 2.175,
+            "velocity_limit_sim": None,
+        },
+        "panda_forearm": {
+            "joint_names_expr": ["panda_joint[5-7]"],
+            "stiffness": 400.0,
+            "damping": 80.0,
+            "effort_limit": 12.0,
+            "effort_limit_sim": None,
+            "velocity_limit": 2.61,
+            "velocity_limit_sim": None,
+        },
+        "gripper": {
+            "joint_names_expr": ["finger_joint"],
+            "stiffness": None,
+            "damping": None,
+            "effort_limit": NATIVE_GRIPPER_EFFORT_LIMIT,
+            "effort_limit_sim": None,
+            "velocity_limit": NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S,
+            "velocity_limit_sim": None,
+        },
+    }
+
+
+def _expected_post_init_actuator_groups() -> dict[str, dict[str, Any]]:
+    """Return Isaac Lab's pinned legacy-field resolution after construction.
+
+    Isaac Lab 2.3 promotes the legacy effort limit into the simulation field,
+    clears the deprecated velocity field, and leaves ``velocity_limit_sim``
+    unset. The latter intentionally preserves the authored USD/PhysX velocity
+    limits instead of replacing them with the nominal legacy values.
+    """
+
+    groups = _expected_pre_gym_actuator_groups()
+    for group in groups.values():
+        group["effort_limit_sim"] = group["effort_limit"]
+        group["velocity_limit"] = None
+    return groups
+
+
+def _capture_actuator_cfg_groups(robot_cfg: Any, *, field: str) -> dict[str, Any]:
+    actuators = getattr(robot_cfg, "actuators", None)
+    expected_names = tuple(_expected_pre_gym_actuator_groups())
+    if not isinstance(actuators, dict) or tuple(actuators) != expected_names:
+        raise ValueError(f"{field} actuator group order mismatch")
+    groups = {}
+    for name in expected_names:
+        cfg = actuators[name]
+        joint_names_expr = getattr(cfg, "joint_names_expr", None)
+        if not isinstance(joint_names_expr, list) or not all(
+            isinstance(value, str) for value in joint_names_expr
+        ):
+            raise ValueError(f"{field} {name} joint_names_expr must be a string list")
+        groups[name] = {
+            "joint_names_expr": list(joint_names_expr),
+            "stiffness": getattr(cfg, "stiffness", None),
+            "damping": getattr(cfg, "damping", None),
+            "effort_limit": getattr(cfg, "effort_limit", None),
+            "effort_limit_sim": getattr(cfg, "effort_limit_sim", None),
+            "velocity_limit": getattr(cfg, "velocity_limit", None),
+            "velocity_limit_sim": getattr(cfg, "velocity_limit_sim", None),
+        }
+    return groups
+
+
+def _validate_actuator_cfg_groups(
+    groups: Any,
+    expected: dict[str, dict[str, Any]],
+    *,
+    field: str,
+) -> dict[str, Any]:
+    if not isinstance(groups, dict) or set(groups) != set(expected):
+        raise ValueError(f"{field} actuator group schema mismatch")
+    for group_name, expected_group in expected.items():
+        actual_group = groups.get(group_name)
+        if not isinstance(actual_group, dict) or set(actual_group) != set(
+            expected_group
+        ):
+            raise ValueError(f"{field} {group_name} actuator schema mismatch")
+        for name, expected_value in expected_group.items():
+            actual_value = actual_group[name]
+            if isinstance(expected_value, list):
+                valid = type(actual_value) is list and actual_value == expected_value
+            elif expected_value is None:
+                valid = actual_value is None
+            else:
+                valid = type(actual_value) is float and actual_value == expected_value
+            if not valid:
+                raise ValueError(
+                    f"{field} {group_name} {name} mismatch: "
+                    f"expected {expected_value!r}, got {actual_value!r}"
+                )
+    return copy.deepcopy(groups)
+
+
+def validate_jointpos_actuator_intent(value: Any) -> dict[str, Any]:
+    """Validate the immutable pre-``gym.make`` legacy actuator intent."""
+
+    if not isinstance(value, dict) or set(value) != {
+        "schema_version",
+        "profile",
+        "capture_phase",
+        "groups",
+        "intent_sha256",
+    }:
+        raise ValueError("joint-position actuator intent schema mismatch")
+    payload = copy.deepcopy(value)
+    digest = payload.pop("intent_sha256")
+    if (
+        not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or digest != canonical_sha256(payload)
+    ):
+        raise ValueError("joint-position actuator intent SHA-256 mismatch")
+    if (
+        value["schema_version"] != PI05_DROID_JOINTPOS_ACTUATOR_INTENT_SCHEMA_VERSION
+        or value["profile"] != PI05_DROID_JOINTPOS_ACTUATOR_INTENT_PROFILE
+        or value["capture_phase"] != PI05_DROID_JOINTPOS_ACTUATOR_INTENT_PHASE
+    ):
+        raise ValueError("joint-position pre-gym actuator intent mismatch")
+    _validate_actuator_cfg_groups(
+        value["groups"],
+        _expected_pre_gym_actuator_groups(),
+        field="joint-position pre-gym actuator intent",
+    )
+    return copy.deepcopy(value)
+
+
+def capture_jointpos_actuator_intent(robot_cfg: Any) -> dict[str, Any]:
+    """Capture actuator intent before Isaac Lab mutates legacy config fields.
+
+    This is a read-only record of the upstream PolaRiS configuration. It proves
+    which legacy values entered ``gym.make`` without changing the config or the
+    resulting simulation dynamics.
+    """
+
+    groups = _capture_actuator_cfg_groups(robot_cfg, field="pre-gym")
+    _validate_actuator_cfg_groups(
+        groups,
+        _expected_pre_gym_actuator_groups(),
+        field="joint-position pre-gym actuator intent",
+    )
+    report = {
+        "schema_version": PI05_DROID_JOINTPOS_ACTUATOR_INTENT_SCHEMA_VERSION,
+        "profile": PI05_DROID_JOINTPOS_ACTUATOR_INTENT_PROFILE,
+        "capture_phase": PI05_DROID_JOINTPOS_ACTUATOR_INTENT_PHASE,
+        "groups": groups,
+    }
+    report["intent_sha256"] = canonical_sha256(report)
+    return validate_jointpos_actuator_intent(report)
 
 
 def _resolved_actuator_report(
@@ -1571,9 +1751,15 @@ def _validate_native_observation(env: Any, obs: Any) -> dict[str, Any]:
     return report
 
 
-def capture_jointpos_runtime(env: Any, obs: Any) -> dict[str, Any]:
+def capture_jointpos_runtime(
+    env: Any,
+    obs: Any,
+    *,
+    actuator_intent: dict[str, Any],
+) -> dict[str, Any]:
     """Fail closed over the live native position-control execution surface."""
 
+    actuator_intent = validate_jointpos_actuator_intent(actuator_intent)
     root = getattr(env, "unwrapped", env)
     execution_environment = capture_jointpos_execution_environment()
     if root.cfg.sim.dt != 1.0 / PI05_DROID_JOINTPOS_PHYSICS_HZ:
@@ -1640,7 +1826,7 @@ def capture_jointpos_runtime(env: Any, obs: Any) -> dict[str, Any]:
         "joint_stiffness": _EXPECTED_STIFFNESS,
         "joint_damping": _EXPECTED_DAMPING,
         "joint_effort_limits": _EXPECTED_EFFORT,
-        "joint_velocity_limits": _EXPECTED_SIM_VELOCITY,
+        "joint_velocity_limits": _EXPECTED_EFFECTIVE_VELOCITY,
         "hard_joint_position_limits": _EXPECTED_HARD_LIMITS,
         "soft_joint_position_limits": _EXPECTED_SOFT_LIMITS,
     }
@@ -1674,7 +1860,7 @@ def capture_jointpos_runtime(env: Any, obs: Any) -> dict[str, Any]:
         "joint_stiffness": _EXPECTED_FINGER_STIFFNESS,
         "joint_damping": _EXPECTED_FINGER_DAMPING,
         "joint_effort_limits": _EXPECTED_FINGER_EFFORT,
-        "joint_velocity_limits": _EXPECTED_FINGER_SIM_VELOCITY,
+        "joint_velocity_limits": _EXPECTED_FINGER_EFFECTIVE_VELOCITY,
         "hard_joint_position_limits": _EXPECTED_FINGER_HARD_LIMITS,
         "soft_joint_position_limits": _EXPECTED_FINGER_SOFT_LIMITS,
     }
@@ -1703,60 +1889,16 @@ def capture_jointpos_runtime(env: Any, obs: Any) -> dict[str, Any]:
         )
         for name in finger_direct_values
     }
-    configured_actuator_groups = {}
-    for name, expected in (
-        (
-            "panda_shoulder",
-            {
-                "joint_names_expr": ["panda_joint[1-4]"],
-                "stiffness": 400.0,
-                "damping": 80.0,
-                "effort_limit": 87.0,
-                "effort_limit_sim": 87.0,
-                "velocity_limit": None,
-                "velocity_limit_sim": None,
-            },
-        ),
-        (
-            "panda_forearm",
-            {
-                "joint_names_expr": ["panda_joint[5-7]"],
-                "stiffness": 400.0,
-                "damping": 80.0,
-                "effort_limit": 12.0,
-                "effort_limit_sim": 12.0,
-                "velocity_limit": None,
-                "velocity_limit_sim": None,
-            },
-        ),
-        (
-            "gripper",
-            {
-                "joint_names_expr": ["finger_joint"],
-                "stiffness": None,
-                "damping": None,
-                "effort_limit": 200.0,
-                "effort_limit_sim": 200.0,
-                "velocity_limit": None,
-                "velocity_limit_sim": None,
-            },
-        ),
-    ):
-        cfg = robot.cfg.actuators[name]
-        actual = {
-            "joint_names_expr": list(cfg.joint_names_expr),
-            "stiffness": cfg.stiffness,
-            "damping": cfg.damping,
-            "effort_limit": cfg.effort_limit,
-            "effort_limit_sim": cfg.effort_limit_sim,
-            "velocity_limit": cfg.velocity_limit,
-            "velocity_limit_sim": cfg.velocity_limit_sim,
-        }
-        if actual != expected:
-            raise ValueError(f"configured {name} actuator mismatch: {actual}")
-        configured_actuator_groups[name] = actual
+    configured_actuator_groups = _capture_actuator_cfg_groups(
+        robot.cfg, field="post-initialization"
+    )
+    _validate_actuator_cfg_groups(
+        configured_actuator_groups,
+        _expected_post_init_actuator_groups(),
+        field="joint-position post-initialization actuator configuration",
+    )
     configured_actuators = {
-        "capture_phase": PI05_DROID_JOINTPOS_POST_MUTATION_CFG_PHASE,
+        "capture_phase": PI05_DROID_JOINTPOS_POST_INIT_ACTUATOR_PHASE,
         "groups": configured_actuator_groups,
     }
     resolved_actuators = {
@@ -1772,7 +1914,7 @@ def capture_jointpos_runtime(env: Any, obs: Any) -> dict[str, Any]:
                 expected_stiffness=_EXPECTED_STIFFNESS[:, :4],
                 expected_damping=_EXPECTED_DAMPING[:, :4],
                 expected_effort=_EXPECTED_EFFORT[:, :4],
-                expected_velocity=_EXPECTED_SIM_VELOCITY[:, :4],
+                expected_velocity=_EXPECTED_EFFECTIVE_VELOCITY[:, :4],
                 field="panda_shoulder actuator",
             ),
             "panda_forearm": _resolved_actuator_report(
@@ -1782,7 +1924,7 @@ def capture_jointpos_runtime(env: Any, obs: Any) -> dict[str, Any]:
                 expected_stiffness=_EXPECTED_STIFFNESS[:, 4:],
                 expected_damping=_EXPECTED_DAMPING[:, 4:],
                 expected_effort=_EXPECTED_EFFORT[:, 4:],
-                expected_velocity=_EXPECTED_SIM_VELOCITY[:, 4:],
+                expected_velocity=_EXPECTED_EFFECTIVE_VELOCITY[:, 4:],
                 field="panda_forearm actuator",
             ),
             "gripper": _resolved_actuator_report(
@@ -1792,7 +1934,7 @@ def capture_jointpos_runtime(env: Any, obs: Any) -> dict[str, Any]:
                 expected_stiffness=_EXPECTED_FINGER_STIFFNESS,
                 expected_damping=_EXPECTED_FINGER_DAMPING,
                 expected_effort=_EXPECTED_FINGER_EFFORT,
-                expected_velocity=_EXPECTED_FINGER_SIM_VELOCITY,
+                expected_velocity=_EXPECTED_FINGER_EFFECTIVE_VELOCITY,
                 field="gripper actuator",
             ),
         },
@@ -1914,6 +2056,7 @@ def capture_jointpos_runtime(env: Any, obs: Any) -> dict[str, Any]:
             "static": static_image_contract(),
             "sources": source_contract(),
         },
+        "actuator_intent": actuator_intent,
         "joint_names": list(PANDA_ARM_JOINT_NAMES),
         "action": {
             "term_class": _class_path(arm),
@@ -1960,6 +2103,7 @@ def validate_jointpos_runtime_report(value: Any) -> dict[str, Any]:
         "boundary",
         "timing",
         "image_contract",
+        "actuator_intent",
         "joint_names",
         "action",
         "observation",
@@ -2007,6 +2151,7 @@ def validate_jointpos_runtime_report(value: Any) -> dict[str, Any]:
         "sources": source_contract(),
     }:
         raise ValueError("joint-position image contract mismatch")
+    validate_jointpos_actuator_intent(value["actuator_intent"])
     if value["action"] != {
         "term_class": _ACTION_TERM_CLASS,
         "cfg_class": _ACTION_CFG_CLASS,
@@ -2055,39 +2200,22 @@ def validate_jointpos_runtime_report(value: Any) -> dict[str, Any]:
         },
     }:
         raise ValueError("joint-position runtime observation mismatch")
-    if value["configured_actuators"] != {
-        "capture_phase": PI05_DROID_JOINTPOS_POST_MUTATION_CFG_PHASE,
-        "groups": {
-            "panda_shoulder": {
-                "joint_names_expr": ["panda_joint[1-4]"],
-                "stiffness": 400.0,
-                "damping": 80.0,
-                "effort_limit": 87.0,
-                "effort_limit_sim": 87.0,
-                "velocity_limit": None,
-                "velocity_limit_sim": None,
-            },
-            "panda_forearm": {
-                "joint_names_expr": ["panda_joint[5-7]"],
-                "stiffness": 400.0,
-                "damping": 80.0,
-                "effort_limit": 12.0,
-                "effort_limit_sim": 12.0,
-                "velocity_limit": None,
-                "velocity_limit_sim": None,
-            },
-            "gripper": {
-                "joint_names_expr": ["finger_joint"],
-                "stiffness": None,
-                "damping": None,
-                "effort_limit": 200.0,
-                "effort_limit_sim": 200.0,
-                "velocity_limit": None,
-                "velocity_limit_sim": None,
-            },
-        },
-    }:
+    configured_actuators = value["configured_actuators"]
+    if (
+        not isinstance(configured_actuators, dict)
+        or set(configured_actuators) != {"capture_phase", "groups"}
+        or configured_actuators["capture_phase"]
+        != PI05_DROID_JOINTPOS_POST_INIT_ACTUATOR_PHASE
+    ):
         raise ValueError("joint-position configured actuator mismatch")
+    try:
+        _validate_actuator_cfg_groups(
+            configured_actuators["groups"],
+            _expected_post_init_actuator_groups(),
+            field="joint-position configured actuator",
+        )
+    except ValueError as error:
+        raise ValueError("joint-position configured actuator mismatch") from error
     expected_resolved_groups = {
         "panda_shoulder": {
             "joint_names": list(PANDA_ARM_JOINT_NAMES[:4]),
@@ -2096,8 +2224,8 @@ def validate_jointpos_runtime_report(value: Any) -> dict[str, Any]:
             "damping": _EXPECTED_DAMPING[:, :4].tolist(),
             "effort_limit": _EXPECTED_EFFORT[:, :4].tolist(),
             "effort_limit_sim": _EXPECTED_EFFORT[:, :4].tolist(),
-            "velocity_limit": _EXPECTED_SIM_VELOCITY[:, :4].tolist(),
-            "velocity_limit_sim": _EXPECTED_SIM_VELOCITY[:, :4].tolist(),
+            "velocity_limit": _EXPECTED_EFFECTIVE_VELOCITY[:, :4].tolist(),
+            "velocity_limit_sim": _EXPECTED_EFFECTIVE_VELOCITY[:, :4].tolist(),
         },
         "panda_forearm": {
             "joint_names": list(PANDA_ARM_JOINT_NAMES[4:]),
@@ -2106,8 +2234,8 @@ def validate_jointpos_runtime_report(value: Any) -> dict[str, Any]:
             "damping": _EXPECTED_DAMPING[:, 4:].tolist(),
             "effort_limit": _EXPECTED_EFFORT[:, 4:].tolist(),
             "effort_limit_sim": _EXPECTED_EFFORT[:, 4:].tolist(),
-            "velocity_limit": _EXPECTED_SIM_VELOCITY[:, 4:].tolist(),
-            "velocity_limit_sim": _EXPECTED_SIM_VELOCITY[:, 4:].tolist(),
+            "velocity_limit": _EXPECTED_EFFECTIVE_VELOCITY[:, 4:].tolist(),
+            "velocity_limit_sim": _EXPECTED_EFFECTIVE_VELOCITY[:, 4:].tolist(),
         },
         "gripper": {
             "joint_names": ["finger_joint"],
@@ -2116,8 +2244,8 @@ def validate_jointpos_runtime_report(value: Any) -> dict[str, Any]:
             "damping": _EXPECTED_FINGER_DAMPING.tolist(),
             "effort_limit": _EXPECTED_FINGER_EFFORT.tolist(),
             "effort_limit_sim": _EXPECTED_FINGER_EFFORT.tolist(),
-            "velocity_limit": _EXPECTED_FINGER_SIM_VELOCITY.tolist(),
-            "velocity_limit_sim": _EXPECTED_FINGER_SIM_VELOCITY.tolist(),
+            "velocity_limit": _EXPECTED_FINGER_EFFECTIVE_VELOCITY.tolist(),
+            "velocity_limit_sim": _EXPECTED_FINGER_EFFECTIVE_VELOCITY.tolist(),
         },
     }
     if value["resolved_actuator_and_limits"] != {
@@ -2130,7 +2258,7 @@ def validate_jointpos_runtime_report(value: Any) -> dict[str, Any]:
         "joint_stiffness": _EXPECTED_FINGER_STIFFNESS.tolist(),
         "joint_damping": _EXPECTED_FINGER_DAMPING.tolist(),
         "joint_effort_limits": _EXPECTED_FINGER_EFFORT.tolist(),
-        "joint_velocity_limits": _EXPECTED_FINGER_SIM_VELOCITY.tolist(),
+        "joint_velocity_limits": _EXPECTED_FINGER_EFFECTIVE_VELOCITY.tolist(),
         "hard_joint_position_limits": _EXPECTED_FINGER_HARD_LIMITS.tolist(),
         "soft_joint_position_limits": _EXPECTED_FINGER_SOFT_LIMITS.tolist(),
     }
@@ -2154,7 +2282,7 @@ def validate_jointpos_runtime_report(value: Any) -> dict[str, Any]:
         "joint_stiffness": _EXPECTED_STIFFNESS,
         "joint_damping": _EXPECTED_DAMPING,
         "joint_effort_limits": _EXPECTED_EFFORT,
-        "joint_velocity_limits": _EXPECTED_SIM_VELOCITY,
+        "joint_velocity_limits": _EXPECTED_EFFECTIVE_VELOCITY,
         "hard_joint_position_limits": _EXPECTED_HARD_LIMITS,
         "soft_joint_position_limits": _EXPECTED_SOFT_LIMITS,
     }

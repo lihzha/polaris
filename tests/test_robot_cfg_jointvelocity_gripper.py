@@ -137,6 +137,31 @@ def test_joint_position_base_preserves_official_legacy_usd_limit_semantics(
     assert {name: actuator.__dict__ for name, actuator in shared.items()} == before
 
 
+def test_joint_position_runtime_audit_is_read_only_and_spans_gym_construction():
+    evaluator = (ROOT / "scripts/eval.py").read_text(encoding="utf-8")
+    intent_capture = evaluator.index(
+        "jointpos_actuator_intent = capture_jointpos_actuator_intent("
+    )
+    gym_make = evaluator.index("env: ManagerBasedRLSplatEnv = gym.make(")
+    live_capture = evaluator.index("live_jointpos_runtime = capture_jointpos_runtime(")
+    assert intent_capture < gym_make < live_capture
+    assert "actuator_intent=jointpos_actuator_intent" in evaluator
+
+    jointpos_branch = evaluator[evaluator.index("elif audited_jointpos:") : gym_make]
+    assert "env_cfg.scene.robot =" not in jointpos_branch
+    assert "velocity_limit" not in jointpos_branch
+    assert "effort_limit" not in jointpos_branch
+
+    robot_source = (ROOT / "src/polaris/environments/robot_cfg.py").read_text(
+        encoding="utf-8"
+    )
+    shared_definition = robot_source[
+        : robot_source.index("def make_nvidia_droid_joint_velocity_cfg")
+    ]
+    assert "velocity_limit_sim" not in shared_definition
+    assert "effort_limit_sim" not in shared_definition
+
+
 def test_position_robot_cfg_is_constructed_only_on_factory_call(monkeypatch):
     robot_cfg = _load_robot_cfg_with_isaac_stubs(monkeypatch)
     position_cfg = _load_position_robot_cfg_with_isaac_stubs(monkeypatch, robot_cfg)
