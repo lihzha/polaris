@@ -17,6 +17,13 @@ from polaris.evaluation_seed import (
     make_episode_environment_rng,
     validate_live_environment_seed_contract,
 )
+from polaris.pi05_droid_jointpos_image_contract import (
+    CLIENT_RESIZE_PROFILE,
+    IMAGE_PROFILE,
+    get_jointpos_image_evidence,
+    resize_final_composite_for_wire,
+    static_image_contract,
+)
 from polaris.pi05_droid_jointpos_runtime import (
     PANDA_ARM_JOINT_NAMES,
     PI05_DROID_JOINTPOS_DECIMATION,
@@ -217,6 +224,7 @@ class DroidJointPosClient(InferenceClient):
         self.runtime_contract_sha256: str | None = None
         self._rollout_environment_before: dict[str, Any] | None = None
         self._last_environment_after: dict[str, Any] | None = None
+        self._image_evidence_env: Any | None = None
         self._pending_execution: dict[str, Any] | None = None
         self._terminal_visualization: np.ndarray | None = None
         self.outer_step_index = 0
@@ -239,14 +247,22 @@ class DroidJointPosClient(InferenceClient):
                 "left_wrist_0_rgb",
                 "right_wrist_0_rgb_masked",
             ],
-            "request_image_shape": list(PI05_DROID_JOINTPOS_NATIVE_IMAGE_SHAPE),
+            "final_composite_image_shape": list(PI05_DROID_JOINTPOS_NATIVE_IMAGE_SHAPE),
+            "final_composite_image_source": (
+                "post_manager_filtered_splat_then_sim_mask_composite"
+            ),
+            "environment_image_profile": IMAGE_PROFILE,
+            "environment_image_contract": static_image_contract(),
+            "request_image_shape": [224, 224, 3],
             "request_image_dtype": "uint8",
-            "client_model_spatial_transform": None,
+            "request_image_source": "client_resize_with_pad_224_of_final_composite",
+            "client_model_spatial_transform": CLIENT_RESIZE_PROFILE,
             "server_model_resize": PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE,
             "model_image_resolution": [224, 224],
             "visualization_image_resolution": [224, 224],
-            "visualization_spatial_transform": (
-                "openpi_client.image_tools.resize_with_pad_PIL_bilinear_non_model"
+            "query_visualization_source": "byte_identical_client224_wire_model_input",
+            "interquery_visualization_source": (
+                "client224_resize_of_nonexpensive_sim_camera_non_model_input"
             ),
             "wrist_rotation_degrees": 0,
             "open_loop_horizon": self.open_loop_horizon,
@@ -274,7 +290,7 @@ class DroidJointPosClient(InferenceClient):
             "action_frame": "robot_base",
             "dataset_name": "droid",
             "rotate_wrist_180": False,
-            "render_every_step": True,
+            "render_every_step": False,
         }
         for name, expected_value in expected.items():
             actual = getattr(self.args, name, None)
@@ -339,6 +355,7 @@ class DroidJointPosClient(InferenceClient):
         self.outer_step_index = 0
         self._rollout_environment_before = None
         self._last_environment_after = None
+        self._image_evidence_env = None
         self._terminal_visualization = None
 
     def begin_rollout(self, env: Any) -> dict[str, Any]:
@@ -351,6 +368,7 @@ class DroidJointPosClient(InferenceClient):
             raise ValueError("explicit episode reset did not zero episode length")
         self._rollout_environment_before = before
         self._last_environment_after = before
+        self._image_evidence_env = env
         return dict(before)
 
     def infer(
@@ -362,10 +380,20 @@ class DroidJointPosClient(InferenceClient):
             raise RuntimeError("joint-position rollout did not begin")
         current = self._extract_observation(obs)
         visualization = None
-        if self.rerender:
+        query_now = self.rerender
+        if query_now:
             self.actions_from_chunk_completed = 0
-            external, wrist = self._native_request_images(current)
-            viz_external, viz_wrist = self._visualization_images(current)
+            if self._image_evidence_env is None:
+                raise RuntimeError(
+                    "joint-position image evidence environment is unbound"
+                )
+            image_evidence = get_jointpos_image_evidence(self._image_evidence_env, obs)
+            (
+                external,
+                wrist,
+                external_resize_evidence,
+                wrist_resize_evidence,
+            ) = self._wire_request_images(current)
             request_data = {
                 "observation/exterior_image_1_left": external,
                 "observation/wrist_image_left": wrist,
@@ -391,14 +419,15 @@ class DroidJointPosClient(InferenceClient):
                 request_data,
                 self.pred_action_chunk,
                 current=current,
-                visualization_external=viz_external,
-                visualization_wrist=viz_wrist,
+                image_evidence=image_evidence,
+                client_resize_external=external_resize_evidence,
+                client_resize_wrist=wrist_resize_evidence,
             )
             self.query_index += 1
             self.global_query_index += 1
-            visualization = np.concatenate([viz_external, viz_wrist], axis=1)
+            visualization = np.concatenate([external, wrist], axis=1)
         elif return_viz:
-            viz_external, viz_wrist = self._visualization_images(current)
+            viz_external, viz_wrist = self._diagnostic_images(current)
             visualization = np.concatenate([viz_external, viz_wrist], axis=1)
 
         if (
@@ -520,7 +549,7 @@ class DroidJointPosClient(InferenceClient):
         current = self._extract_observation(obs)
         if completed == PI05_DROID_JOINTPOS_OUTER_STEPS:
             rubric = _validate_rubric(terminal_rubric)
-            terminal_external, terminal_wrist = self._visualization_images(current)
+            terminal_external, terminal_wrist = self._diagnostic_images(current)
             self._terminal_visualization = np.ascontiguousarray(
                 np.concatenate([terminal_external, terminal_wrist], axis=1)
             )
@@ -530,7 +559,9 @@ class DroidJointPosClient(InferenceClient):
                     expected_shape=(224, 448, 3),
                     field="post-action-450 terminal visualization",
                 ),
-                "source": "post_action450_returned_expensive_splat_observation",
+                "source": (
+                    "post_action450_returned_nonexpensive_sim_camera_observation"
+                ),
             }
         elif terminal_rubric is not None:
             raise ValueError("terminal rubric may only be attached to action 450")
@@ -586,7 +617,7 @@ class DroidJointPosClient(InferenceClient):
 
     def visualize(self, request: dict) -> np.ndarray:
         current = self._extract_observation(request)
-        external, wrist = self._visualization_images(current)
+        external, wrist = self._diagnostic_images(current)
         return np.concatenate([external, wrist], axis=1)
 
     def _trace_identity(self) -> dict[str, Any]:
@@ -613,38 +644,45 @@ class DroidJointPosClient(InferenceClient):
         action_chunk: np.ndarray,
         *,
         current: dict[str, np.ndarray],
-        visualization_external: np.ndarray,
-        visualization_wrist: np.ndarray,
+        image_evidence: dict[str, Any],
+        client_resize_external: dict[str, Any],
+        client_resize_wrist: dict[str, Any],
     ) -> None:
         if self.active_environment_rng is None:
             raise RuntimeError("query has no environment RNG provenance")
         if self.active_global_query_index is None:
             raise RuntimeError("query has no global request identity")
         planned = _binarize_gripper(action_chunk[: self.open_loop_horizon])
-        native_external = _image_contract(
+        final_external = _image_contract(
             current["right_image"],
             expected_shape=PI05_DROID_JOINTPOS_NATIVE_IMAGE_SHAPE,
-            field="native external image",
+            field="final external composite",
         )
-        native_wrist = _image_contract(
+        final_wrist = _image_contract(
             current["wrist_image"],
             expected_shape=PI05_DROID_JOINTPOS_NATIVE_IMAGE_SHAPE,
-            field="native wrist image",
+            field="final wrist composite",
         )
         request_external = _image_contract(
             request["observation/exterior_image_1_left"],
-            expected_shape=PI05_DROID_JOINTPOS_NATIVE_IMAGE_SHAPE,
-            field="native external model request",
+            expected_shape=(224, 224, 3),
+            field="external client224 wire request",
         )
         request_wrist = _image_contract(
             request["observation/wrist_image_left"],
-            expected_shape=PI05_DROID_JOINTPOS_NATIVE_IMAGE_SHAPE,
-            field="native wrist model request",
+            expected_shape=(224, 224, 3),
+            field="wrist client224 wire request",
         )
-        if request_external["sha256"] != native_external["sha256"]:
-            raise ValueError("external model request differs from native camera bytes")
-        if request_wrist["sha256"] != native_wrist["sha256"]:
-            raise ValueError("wrist model request differs from native camera bytes")
+        if (
+            client_resize_external["input_final_composite"] != final_external
+            or client_resize_external["wire_request"] != request_external
+        ):
+            raise ValueError("external final720/client224 evidence mismatch")
+        if (
+            client_resize_wrist["input_final_composite"] != final_wrist
+            or client_resize_wrist["wire_request"] != request_wrist
+        ):
+            raise ValueError("wrist final720/client224 evidence mismatch")
         self._append_trace(
             {
                 **self._trace_identity(),
@@ -666,33 +704,31 @@ class DroidJointPosClient(InferenceClient):
                     ).tolist(),
                 },
                 "images": {
-                    "native_external": native_external,
-                    "native_wrist": native_wrist,
+                    "environment_image_contract": static_image_contract(),
+                    "external_camera_pipeline": image_evidence["external_cam"],
+                    "wrist_camera_pipeline": image_evidence["wrist_cam"],
+                    "final_composite_external": final_external,
+                    "final_composite_wrist": final_wrist,
+                    "client_resize_external": client_resize_external,
+                    "client_resize_wrist": client_resize_wrist,
                     "request_external": request_external,
                     "request_wrist": request_wrist,
-                    "visualization_external": _image_contract(
-                        visualization_external,
-                        expected_shape=(224, 224, 3),
-                        field="non-model external visualization",
-                    ),
-                    "visualization_wrist": _image_contract(
-                        visualization_wrist,
-                        expected_shape=(224, 224, 3),
-                        field="non-model wrist visualization",
-                    ),
+                    "server224_external_idempotent": request_external,
+                    "server224_wrist_idempotent": request_wrist,
+                    "query_visualization_external": request_external,
+                    "query_visualization_wrist": request_wrist,
                     "model_order": [
                         "base_0_rgb",
                         "left_wrist_0_rgb",
                         "right_wrist_0_rgb_masked",
                     ],
-                    "client_model_spatial_transform": None,
+                    "client_model_spatial_transform": CLIENT_RESIZE_PROFILE,
                     "server_model_resize": PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE,
                     "masked_third_slot": (
                         "server_DroidInputs_zeros_like_base_mask_false"
                     ),
-                    "visualization_spatial_transform": (
-                        "openpi_client.image_tools.resize_with_pad_"
-                        "PIL_bilinear_non_model"
+                    "query_visualization_source": (
+                        "byte_identical_client224_wire_model_input"
                     ),
                     "wrist_rotation_degrees": 0,
                 },
@@ -734,29 +770,37 @@ class DroidJointPosClient(InferenceClient):
                 + "\n"
             )
 
-    def _native_request_images(
+    def _wire_request_images(
         self, current: dict[str, np.ndarray]
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Return byte-identical native images for the official server pipeline."""
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any], dict[str, Any]]:
+        """Apply the official client-side resize before WebSocket transport."""
 
-        external = np.ascontiguousarray(current["right_image"]).copy()
-        wrist = np.ascontiguousarray(current["wrist_image"]).copy()
+        external, external_evidence = resize_final_composite_for_wire(
+            current["right_image"],
+            image_tools_module=image_tools,
+            camera_name="external_cam",
+        )
+        wrist, wrist_evidence = resize_final_composite_for_wire(
+            current["wrist_image"],
+            image_tools_module=image_tools,
+            camera_name="wrist_cam",
+        )
         _image_contract(
             external,
-            expected_shape=PI05_DROID_JOINTPOS_NATIVE_IMAGE_SHAPE,
-            field="native external model request",
+            expected_shape=(224, 224, 3),
+            field="external client224 wire request",
         )
         _image_contract(
             wrist,
-            expected_shape=PI05_DROID_JOINTPOS_NATIVE_IMAGE_SHAPE,
-            field="native wrist model request",
+            expected_shape=(224, 224, 3),
+            field="wrist client224 wire request",
         )
-        return external, wrist
+        return external, wrist, external_evidence, wrist_evidence
 
-    def _visualization_images(
+    def _diagnostic_images(
         self, current: dict[str, np.ndarray]
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Create 224px PIL previews that never enter the model request."""
+        """Resize a sim-only inter-query or terminal diagnostic frame."""
 
         external = image_tools.resize_with_pad(current["right_image"], 224, 224)
         wrist = image_tools.resize_with_pad(current["wrist_image"], 224, 224)
@@ -778,12 +822,12 @@ class DroidJointPosClient(InferenceClient):
         _image_contract(
             right_image,
             expected_shape=PI05_DROID_JOINTPOS_NATIVE_IMAGE_SHAPE,
-            field="native external image",
+            field="final external composite",
         )
         _image_contract(
             wrist_image,
             expected_shape=PI05_DROID_JOINTPOS_NATIVE_IMAGE_SHAPE,
-            field="native wrist image",
+            field="final wrist composite",
         )
         robot_state = obs_dict["policy"]
         try:

@@ -11,10 +11,18 @@ from pathlib import Path
 
 import numpy as np
 
+from polaris.pi05_droid_jointpos_image_contract import (
+    CLIENT_RESIZE_PROFILE,
+    IMAGE_PROFILE,
+    static_image_contract,
+    validate_camera_evidence,
+    validate_client_resize_evidence,
+)
 from polaris.pi05_droid_jointpos_serving_contract import (
     PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE,
 )
 from polaris.pi05_droid_jointpos_runtime import (
+    PI05_DROID_JOINTPOS_PROFILE,
     PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
 )
 
@@ -582,7 +590,8 @@ def _terminal_image_identity(value, prefix: str) -> dict:
     _require(
         value["shape"] == [224, 448, 3]
         and value["dtype"] == "uint8"
-        and value["source"] == "post_action450_returned_expensive_splat_observation",
+        and value["source"]
+        == "post_action450_returned_nonexpensive_sim_camera_observation",
         f"{prefix}: terminal visualization identity mismatch",
     )
     _hex_digest(value["sha256"], f"{prefix} terminal visualization")
@@ -596,7 +605,7 @@ def _trace_identity(record: dict, prefix: str) -> tuple[str, str, str, bool]:
         f"{PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION}",
     )
     _require(
-        record.get("profile") == "openpi_pi05_droid_native_joint_position_v1",
+        record.get("profile") == PI05_DROID_JOINTPOS_PROFILE,
         f"{prefix}: joint-position profile mismatch",
     )
     server = _hex_digest(
@@ -799,72 +808,110 @@ def _audit_attested_trace(
                 isinstance(images, dict)
                 and set(images)
                 == {
-                    "native_external",
-                    "native_wrist",
+                    "environment_image_contract",
+                    "external_camera_pipeline",
+                    "wrist_camera_pipeline",
+                    "final_composite_external",
+                    "final_composite_wrist",
+                    "client_resize_external",
+                    "client_resize_wrist",
                     "request_external",
                     "request_wrist",
-                    "visualization_external",
-                    "visualization_wrist",
+                    "server224_external_idempotent",
+                    "server224_wrist_idempotent",
+                    "query_visualization_external",
+                    "query_visualization_wrist",
                     "model_order",
                     "client_model_spatial_transform",
                     "server_model_resize",
                     "masked_third_slot",
-                    "visualization_spatial_transform",
+                    "query_visualization_source",
                     "wrist_rotation_degrees",
                 },
                 f"{prefix}: image schema mismatch",
             )
-            native_external = _image_identity(
-                images["native_external"], [720, 1280, 3], f"{prefix} native external"
+            _require(
+                images["environment_image_contract"] == static_image_contract(),
+                f"{prefix}: environment image contract mismatch",
             )
-            native_wrist = _image_identity(
-                images["native_wrist"], [720, 1280, 3], f"{prefix} native wrist"
+            external_pipeline = validate_camera_evidence(
+                images["external_camera_pipeline"], camera_name="external_cam"
+            )
+            wrist_pipeline = validate_camera_evidence(
+                images["wrist_camera_pipeline"], camera_name="wrist_cam"
+            )
+            final_external = _image_identity(
+                images["final_composite_external"],
+                [720, 1280, 3],
+                f"{prefix} final external composite",
+            )
+            final_wrist = _image_identity(
+                images["final_composite_wrist"],
+                [720, 1280, 3],
+                f"{prefix} final wrist composite",
+            )
+            external_resize = validate_client_resize_evidence(
+                images["client_resize_external"]
+            )
+            wrist_resize = validate_client_resize_evidence(
+                images["client_resize_wrist"]
             )
             request_external = _image_identity(
                 images["request_external"],
-                [720, 1280, 3],
-                f"{prefix} native external request",
+                [224, 224, 3],
+                f"{prefix} external wire request",
             )
             request_wrist = _image_identity(
                 images["request_wrist"],
-                [720, 1280, 3],
-                f"{prefix} native wrist request",
-            )
-            visualization_external = _image_identity(
-                images["visualization_external"],
                 [224, 224, 3],
-                f"{prefix} non-model external visualization",
+                f"{prefix} wrist wire request",
             )
-            visualization_wrist = _image_identity(
-                images["visualization_wrist"],
+            server_external = _image_identity(
+                images["server224_external_idempotent"],
                 [224, 224, 3],
-                f"{prefix} non-model wrist visualization",
+                f"{prefix} idempotent server external",
+            )
+            server_wrist = _image_identity(
+                images["server224_wrist_idempotent"],
+                [224, 224, 3],
+                f"{prefix} idempotent server wrist",
+            )
+            query_viz_external = _image_identity(
+                images["query_visualization_external"],
+                [224, 224, 3],
+                f"{prefix} query external visualization",
+            )
+            query_viz_wrist = _image_identity(
+                images["query_visualization_wrist"],
+                [224, 224, 3],
+                f"{prefix} query wrist visualization",
             )
             _require(
-                request_external["sha256"] == native_external["sha256"]
-                and request_wrist["sha256"] == native_wrist["sha256"],
-                f"{prefix}: model request is not byte-identical native imagery",
+                external_pipeline["final_composite_uint8"] == final_external
+                and wrist_pipeline["final_composite_uint8"] == final_wrist
+                and external_resize["input_final_composite"] == final_external
+                and wrist_resize["input_final_composite"] == final_wrist
+                and external_resize["wire_request"] == request_external
+                and wrist_resize["wire_request"] == request_wrist
+                and server_external == request_external == query_viz_external
+                and server_wrist == request_wrist == query_viz_wrist,
+                f"{prefix}: final720/client224/wire/model/viz identity mismatch",
             )
             _require(
                 images["model_order"]
                 == ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb_masked"]
-                and images["client_model_spatial_transform"] is None
+                and images["client_model_spatial_transform"] == CLIENT_RESIZE_PROFILE
                 and images["server_model_resize"]
                 == PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE
                 and images["masked_third_slot"]
                 == "server_DroidInputs_zeros_like_base_mask_false"
-                and images["visualization_spatial_transform"]
-                == ("openpi_client.image_tools.resize_with_pad_PIL_bilinear_non_model")
+                and images["query_visualization_source"]
+                == "byte_identical_client224_wire_model_input"
                 and images["wrist_rotation_degrees"] == 0,
                 f"{prefix}: model image preprocessing/order/rotation mismatch",
             )
             external_hashes.add(request_external["sha256"])
             wrist_hashes.add(request_wrist["sha256"])
-            _require(
-                visualization_external["shape"] == [224, 224, 3]
-                and visualization_wrist["shape"] == [224, 224, 3],
-                f"{prefix}: visualization resize escaped its non-model boundary",
-            )
             _require(
                 record["response_action_shape"] == [15, 8]
                 and record["response_action_dtype"] == "float64"
@@ -1202,18 +1249,31 @@ def _audit_attested_trace(
         "prompts": sorted(prompts),
         "response_action_shape": [15, 8],
         "execution_horizon": 8,
-        "native_image_shape": [720, 1280, 3],
-        "request_image_shape": [720, 1280, 3],
+        "environment_image_profile": IMAGE_PROFILE,
+        "environment_image_contract": static_image_contract(),
+        "final_composite_image_shape": [720, 1280, 3],
+        "request_image_shape": [224, 224, 3],
         "request_image_dtype": "uint8",
-        "client_model_spatial_transform": None,
+        "client_model_spatial_transform": CLIENT_RESIZE_PROFILE,
         "server_model_resize": PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE,
+        "server_resize_behavior": "early_return_same_array_no_pixel_change",
         "model_image_shape": [224, 224, 3],
         "visualization_image_shape": [224, 224, 3],
-        "visualization_is_model_input": False,
+        "query_visualization_is_model_input": True,
+        "query_visualization_source": "byte_identical_client224_wire_model_input",
+        "interquery_visualization_is_model_input": False,
+        "interquery_visualization_source": (
+            "client224_resize_of_nonexpensive_sim_camera_non_model_input"
+        ),
+        "expensive_render_cadence": (
+            "reset_then_post_actions_7_15_through_447_for_next_query"
+        ),
+        "query_frames_per_episode": 57,
+        "diagnostic_video_frames_per_episode": 450,
         "terminal_visualization_shape": [224, 448, 3],
         "terminal_visualization_dtype": "uint8",
         "terminal_visualization_source": (
-            "post_action450_returned_expensive_splat_observation"
+            "post_action450_returned_nonexpensive_sim_camera_observation"
         ),
         "terminal_visualization_sha256": [
             terminal_visualizations[index] for index in sorted(terminal_visualizations)
@@ -1287,7 +1347,7 @@ def audit_trace(
         )
     _require(
         expected_environment_seed is None,
-        "seeded validation requires the attested schema-4 trace",
+        "seeded validation requires the attested schema-5 trace",
     )
     _require(
         expected_server_contract_sha256 is None and runtime_contract_path is None,

@@ -173,6 +173,9 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         format_jointpos_runtime,
         publish_jointpos_runtime,
     )
+    from polaris.pi05_droid_jointpos_image_contract import (
+        install_jointpos_image_instrumentation,
+    )
     from polaris.pi05_droid_native_eval_contract import (
         PI05_DROID_NATIVE_EPISODE_STEPS,
         configure_native_environment_timeout,
@@ -288,6 +291,10 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         eval_args.environment, cfg=env_cfg
     )
     _print_eval_phase("after_gym_make")
+    if audited_jointpos:
+        _print_eval_phase("before_jointpos_image_instrumentation")
+        install_jointpos_image_instrumentation(env)
+        _print_eval_phase("after_jointpos_image_instrumentation")
     lifecycle.bind_environment(env)
     environment_seed_contract = None
     if eval_args.environment_seed is not None:

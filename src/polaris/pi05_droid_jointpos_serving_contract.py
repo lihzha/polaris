@@ -27,15 +27,19 @@ from typing import Any
 
 import numpy as np
 
+from polaris.pi05_droid_jointpos_image_contract import (
+    CLIENT_RESIZE_PROFILE,
+    static_image_contract,
+)
 
-PI05_DROID_JOINTPOS_PROFILE = "openpi_pi05_droid_jointpos_polaris_flow_v1"
+PI05_DROID_JOINTPOS_PROFILE = "openpi_pi05_droid_jointpos_polaris_flow_v2"
 PI05_DROID_JOINTPOS_METADATA_KEY = "ego_lap_pi05_droid_jointpos_contract"
 PI05_DROID_JOINTPOS_SERVING_CONTRACT_FILENAME = (
     "pi05_droid_jointpos_serving_contract.json"
 )
 PI05_DROID_JOINTPOS_MODEL_RUNTIME_FILENAME = "pi05_droid_jointpos_model_runtime.json"
 PI05_DROID_JOINTPOS_MODEL_RUNTIME_PROFILE = (
-    "openpi_pi05_droid_jointpos_polaris_model_runtime_v3"
+    "openpi_pi05_droid_jointpos_polaris_model_runtime_v4"
 )
 PI05_DROID_JOINTPOS_BIND_HOST = "127.0.0.1"
 PI05_DROID_JOINTPOS_RNG_STREAM_FILENAME = "pi05_droid_jointpos_rng_stream.json"
@@ -733,7 +737,7 @@ def expected_pi05_droid_jointpos_server_contract(
 
     runtime = validate_openpi_runtime_attestation(openpi_runtime_attestation)
     contract: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": PI05_DROID_JOINTPOS_PROFILE,
         "checkpoint": {
             "uri": PI05_DROID_JOINTPOS_CHECKPOINT_URI,
@@ -827,28 +831,29 @@ def expected_pi05_droid_jointpos_server_contract(
             ],
             "state": "7_joint_positions_radians_then_closed_positive_gripper",
             "state_width_before_padding": 8,
-            "request_image_shape": [720, 1280, 3],
+            "environment_final_composite": static_image_contract(),
+            "request_image_shape": [224, 224, 3],
             "request_image_dtype": "uint8",
-            "client_model_spatial_transform": None,
+            "client_model_spatial_transform": CLIENT_RESIZE_PROFILE,
             "images": [
                 {
                     "request": "observation/exterior_image_1_left",
                     "model_slot": "base_0_rgb",
-                    "request_shape": [720, 1280, 3],
+                    "request_shape": [224, 224, 3],
                     "request_dtype": "uint8",
                     "mask": True,
                 },
                 {
                     "request": "observation/wrist_image_left",
                     "model_slot": "left_wrist_0_rgb",
-                    "request_shape": [720, 1280, 3],
+                    "request_shape": [224, 224, 3],
                     "request_dtype": "uint8",
                     "mask": True,
                 },
                 {
                     "request": None,
                     "model_slot": "right_wrist_0_rgb",
-                    "source": "DroidInputs_zeros_like_native_base_before_resize",
+                    "source": "DroidInputs_zeros_like_client224_base_before_identity_resize",
                     "mask": False,
                 },
             ],
@@ -860,14 +865,18 @@ def expected_pi05_droid_jointpos_server_contract(
                 "padding": "symmetric_zero",
                 "target_shape": [224, 224, 3],
                 "output_dtype": "uint8",
-                "application_count": 1,
+                "transform_invocation_count": 1,
+                "pixel_changing_resize_count": 0,
+                "input_already_target_shape": True,
+                "runtime_behavior": "early_return_same_array_no_pixel_change",
                 "runtime_probe": _expected_resize_runtime_probe(),
                 "observation_conversion": _expected_observation_image_conversion(),
                 "model_preprocess_resize": _expected_model_preprocess_resize(),
             },
             "model_image_shape": [224, 224, 3],
-            "client_visualization_resize": (
-                "openpi_client.image_tools.resize_with_pad_PIL_bilinear_non_model_only"
+            "query_visualization": "byte_identical_client224_wire_model_input",
+            "interquery_visualization": (
+                "client224_resize_of_nonexpensive_sim_camera_non_model_input"
             ),
             "client_wrist_rotation_degrees": 0,
         },
@@ -2790,9 +2799,11 @@ def _expected_data_config_report() -> dict[str, Any]:
             "right_wrist_0_rgb": "zeros_like_base_mask_false",
         },
         "image_preprocessing": {
-            "request_shape": [720, 1280, 3],
+            "environment_final_composite": static_image_contract(),
+            "training_camera_storage": "uint8_JPEG_180x320x3",
+            "evaluation_wire_request_shape": [224, 224, 3],
             "request_dtype": "uint8",
-            "client_model_spatial_transform": None,
+            "client_model_spatial_transform": CLIENT_RESIZE_PROFILE,
             "resize_transform": "openpi.transforms.ResizeImages",
             "resize_implementation": "openpi_client.image_tools.resize_with_pad",
             "resize_backend": "PIL.Image.resize",
@@ -2800,7 +2811,11 @@ def _expected_data_config_report() -> dict[str, Any]:
             "padding": "symmetric_zero",
             "model_shape": [224, 224, 3],
             "resize_output_dtype": "uint8",
-            "resize_application_count": 1,
+            "server_transform_invocation_count": 1,
+            "server_pixel_changing_resize_count": 0,
+            "client_pixel_changing_resize_count": 1,
+            "input_already_target_shape": True,
+            "runtime_behavior": "early_return_same_array_no_pixel_change",
             "resize_runtime_probe": _expected_resize_runtime_probe(),
             "observation_conversion": _expected_observation_image_conversion(),
             "model_preprocess_resize": _expected_model_preprocess_resize(),
@@ -2946,9 +2961,11 @@ def validate_official_data_config(data_config: object) -> dict[str, Any]:
             "right_wrist_0_rgb": "zeros_like_base_mask_false",
         },
         "image_preprocessing": {
-            "request_shape": [720, 1280, 3],
+            "environment_final_composite": static_image_contract(),
+            "training_camera_storage": "uint8_JPEG_180x320x3",
+            "evaluation_wire_request_shape": [224, 224, 3],
             "request_dtype": "uint8",
-            "client_model_spatial_transform": None,
+            "client_model_spatial_transform": CLIENT_RESIZE_PROFILE,
             "resize_transform": _class_path(model.inputs[1]),
             "resize_implementation": "openpi_client.image_tools.resize_with_pad",
             "resize_backend": "PIL.Image.resize",
@@ -2956,7 +2973,11 @@ def validate_official_data_config(data_config: object) -> dict[str, Any]:
             "padding": "symmetric_zero",
             "model_shape": [224, 224, 3],
             "resize_output_dtype": "uint8",
-            "resize_application_count": 1,
+            "server_transform_invocation_count": 1,
+            "server_pixel_changing_resize_count": 0,
+            "client_pixel_changing_resize_count": 1,
+            "input_already_target_shape": True,
+            "runtime_behavior": "early_return_same_array_no_pixel_change",
             "resize_runtime_probe": resize_runtime_probe,
             "observation_conversion": _expected_observation_image_conversion(),
             "model_preprocess_resize": _expected_model_preprocess_resize(),
@@ -3410,7 +3431,7 @@ def make_pi05_droid_jointpos_model_runtime(
     if contract["openpi"]["runtime_attestation"] != runtime:
         raise ValueError("Serving and model-runtime OpenPI attestations differ")
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "profile": PI05_DROID_JOINTPOS_MODEL_RUNTIME_PROFILE,
         "status": "pass",
         "checkpoint": checkpoint,
@@ -3434,9 +3455,10 @@ def make_pi05_droid_jointpos_model_runtime(
             "expected_request_count": expected_request_count,
             "metadata_contract_sha256": contract["contract_sha256"],
             "request_image_contract": {
-                "shape": [720, 1280, 3],
+                "environment_final_composite": static_image_contract(),
+                "evaluation_wire_shape": [224, 224, 3],
                 "dtype": "uint8",
-                "client_model_spatial_transform": None,
+                "client_model_spatial_transform": CLIENT_RESIZE_PROFILE,
                 "server_resize_transform": "openpi.transforms.ResizeImages",
                 "server_resize_implementation": (
                     "openpi_client.image_tools.resize_with_pad"
@@ -3446,7 +3468,11 @@ def make_pi05_droid_jointpos_model_runtime(
                 "server_padding": "symmetric_zero",
                 "model_shape": [224, 224, 3],
                 "server_resize_output_dtype": "uint8",
-                "resize_application_count": 1,
+                "server_transform_invocation_count": 1,
+                "server_pixel_changing_resize_count": 0,
+                "client_pixel_changing_resize_count": 1,
+                "input_already_target_shape": True,
+                "runtime_behavior": "early_return_same_array_no_pixel_change",
                 "server_resize_runtime_probe": _expected_resize_runtime_probe(),
                 "observation_conversion": _expected_observation_image_conversion(),
                 "model_preprocess_resize": _expected_model_preprocess_resize(),
@@ -3475,7 +3501,7 @@ def _validate_model_runtime_value(
     if not isinstance(value, dict) or set(value) != required:
         raise ValueError("pi0.5 joint-position model-runtime schema mismatch")
     if (
-        value["schema_version"] != 3
+        value["schema_version"] != 4
         or value["profile"] != PI05_DROID_JOINTPOS_MODEL_RUNTIME_PROFILE
         or value["status"] != "pass"
     ):
@@ -3631,9 +3657,10 @@ def _validate_model_runtime_value(
         or server["expected_request_count"] <= 0
         or server["request_image_contract"]
         != {
-            "shape": [720, 1280, 3],
+            "environment_final_composite": static_image_contract(),
+            "evaluation_wire_shape": [224, 224, 3],
             "dtype": "uint8",
-            "client_model_spatial_transform": None,
+            "client_model_spatial_transform": CLIENT_RESIZE_PROFILE,
             "server_resize_transform": "openpi.transforms.ResizeImages",
             "server_resize_implementation": (
                 "openpi_client.image_tools.resize_with_pad"
@@ -3643,7 +3670,11 @@ def _validate_model_runtime_value(
             "server_padding": "symmetric_zero",
             "model_shape": [224, 224, 3],
             "server_resize_output_dtype": "uint8",
-            "resize_application_count": 1,
+            "server_transform_invocation_count": 1,
+            "server_pixel_changing_resize_count": 0,
+            "client_pixel_changing_resize_count": 1,
+            "input_already_target_shape": True,
+            "runtime_behavior": "early_return_same_array_no_pixel_change",
             "server_resize_runtime_probe": _expected_resize_runtime_probe(),
             "observation_conversion": _expected_observation_image_conversion(),
             "model_preprocess_resize": _expected_model_preprocess_resize(),

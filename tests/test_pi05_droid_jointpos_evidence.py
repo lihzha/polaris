@@ -6,6 +6,11 @@ import pytest
 
 import polaris.pi05_droid_jointpos_evidence as evidence
 import polaris.pi05_droid_jointpos_runtime as runtime
+from polaris.pi05_droid_jointpos_image_contract import (
+    CLIENT_RESIZE_PROFILE,
+    IMAGE_PROFILE,
+    static_image_contract,
+)
 
 
 SERVER_SHA = "1" * 64
@@ -42,7 +47,7 @@ def _write_inputs(root: Path, *, rollouts: int = 2):
     paths["trace_summary"].write_text(
         json.dumps(
             {
-                "schema_version": 4,
+                "schema_version": 5,
                 "status": "pass",
                 "trace_sha256": trace_sha,
                 "metrics_sha256": metrics_sha,
@@ -54,20 +59,35 @@ def _write_inputs(root: Path, *, rollouts: int = 2):
                 ],
                 "query_records": 57 * rollouts,
                 "global_query_indices_contiguous": True,
-                "native_image_shape": [720, 1280, 3],
-                "request_image_shape": [720, 1280, 3],
+                "environment_image_profile": IMAGE_PROFILE,
+                "environment_image_contract": static_image_contract(),
+                "final_composite_image_shape": [720, 1280, 3],
+                "request_image_shape": [224, 224, 3],
                 "request_image_dtype": "uint8",
-                "client_model_spatial_transform": None,
+                "client_model_spatial_transform": CLIENT_RESIZE_PROFILE,
                 "server_model_resize": (
                     evidence.PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE
                 ),
                 "model_image_shape": [224, 224, 3],
+                "server_resize_behavior": "early_return_same_array_no_pixel_change",
                 "visualization_image_shape": [224, 224, 3],
-                "visualization_is_model_input": False,
+                "query_visualization_is_model_input": True,
+                "query_visualization_source": (
+                    "byte_identical_client224_wire_model_input"
+                ),
+                "interquery_visualization_is_model_input": False,
+                "interquery_visualization_source": (
+                    "client224_resize_of_nonexpensive_sim_camera_non_model_input"
+                ),
+                "expensive_render_cadence": (
+                    "reset_then_post_actions_7_15_through_447_for_next_query"
+                ),
+                "query_frames_per_episode": 57,
+                "diagnostic_video_frames_per_episode": 450,
                 "terminal_visualization_shape": [224, 448, 3],
                 "terminal_visualization_dtype": "uint8",
                 "terminal_visualization_source": (
-                    "post_action450_returned_expensive_splat_observation"
+                    "post_action450_returned_nonexpensive_sim_camera_observation"
                 ),
                 "terminal_visualization_sha256": ["7" * 64] * rollouts,
                 "server_contract_sha256": SERVER_SHA,
@@ -328,7 +348,7 @@ def test_worker_finalizes_server_rng_then_evidence_before_success_marker():
 
 def test_gpu_vulkan_contract_requires_model_simulator_agreement():
     assert evidence.PI05_DROID_JOINTPOS_EVIDENCE_PROFILE == (
-        "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v8"
+        "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v9"
     )
     model, simulator = _gpu_vulkan_contracts()
     assert evidence._validate_gpu_vulkan_runtime_agreement(model, simulator) == {

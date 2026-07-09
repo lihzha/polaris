@@ -32,7 +32,7 @@ def _write_task(root, task_name, *, success=True, numerical=False, state_oob=Fal
     (task_dir / "policy_trace_summary.json").write_text(
         json.dumps(
             {
-                "schema_version": 4,
+                "schema_version": MODULE.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
                 "status": "pass",
                 "trace_sha256": trace_sha256,
                 "metrics_sha256": metrics_sha256,
@@ -57,7 +57,7 @@ def _write_task(root, task_name, *, success=True, numerical=False, state_oob=Fal
                 "episode_count": 1,
                 "tolerance_radians": MODULE.PANDA_BOUND_TOLERANCE_RADIANS,
                 "panda_joint_limits_radians": MODULE.PANDA_JOINT_LIMITS,
-                "trace_schema_version": 4,
+                "trace_schema_version": MODULE.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
                 "trace_sha256": trace_sha256,
                 "metrics_sha256": metrics_sha256,
                 "query_record_count": 1,
@@ -98,7 +98,7 @@ def _complete_root(root, *, first_numerical=False, first_state_oob=False):
 
 
 class SummarizePi05EvalTest(unittest.TestCase):
-    def test_valid_schema4_inputs_are_hash_and_count_bound(self):
+    def test_valid_current_schema_inputs_are_hash_and_count_bound(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             _complete_root(root, first_numerical=True, first_state_oob=True)
@@ -115,6 +115,23 @@ class SummarizePi05EvalTest(unittest.TestCase):
         )
         self.assertFalse(summary["state_audit_is_lower_bound"])
         self.assertTrue(summary["all_trace_validators_passed"])
+
+    def test_schema4_full_coverage_is_rejected_for_current_finalization(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            _complete_root(root)
+            task_dir = root / MODULE.TASK_ORDER[0]
+            trace_summary_path = task_dir / "policy_trace_summary.json"
+            trace_summary = json.loads(trace_summary_path.read_text())
+            trace_summary["schema_version"] = 4
+            trace_summary_path.write_text(json.dumps(trace_summary) + "\n")
+            joint_audit_path = task_dir / "joint_bound_audit.json"
+            joint_audit = json.loads(joint_audit_path.read_text())
+            joint_audit["trace_schema_version"] = 4
+            joint_audit_path.write_text(json.dumps(joint_audit) + "\n")
+
+            with self.assertRaisesRegex(ValueError, "Current-schema"):
+                MODULE.summarize(root)
 
     def test_failed_joint_audit_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
