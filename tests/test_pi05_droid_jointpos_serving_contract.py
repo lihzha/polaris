@@ -11,6 +11,9 @@ import numpy as np
 import pytest
 
 import polaris.pi05_droid_jointpos_serving_contract as contract
+from polaris.pi05_droid_jointpos_runtime import (
+    PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -748,7 +751,7 @@ def test_worker_joins_trace_to_complete_official_rng_stream(tmp_path, monkeypatc
         ),
     )
     trace = {
-        "schema_version": 4,
+        "schema_version": PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
         "status": "pass",
         "reset_count": 1,
         "episode_lengths": [450],

@@ -15,6 +15,7 @@ from polaris.pi05_droid_jointpos_serving_contract import (
     PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE,
 )
 from polaris.pi05_droid_jointpos_runtime import (
+    PI05_DROID_JOINTPOS_PROFILE,
     PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
 )
 
@@ -596,7 +597,7 @@ def _trace_identity(record: dict, prefix: str) -> tuple[str, str, str, bool]:
         f"{PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION}",
     )
     _require(
-        record.get("profile") == "openpi_pi05_droid_native_joint_position_v1",
+        record.get("profile") == PI05_DROID_JOINTPOS_PROFILE,
         f"{prefix}: joint-position profile mismatch",
     )
     server = _hex_digest(
@@ -1287,7 +1288,7 @@ def audit_trace(
         )
     _require(
         expected_environment_seed is None,
-        "seeded validation requires the attested schema-4 trace",
+        "seeded validation requires the current attested trace schema",
     )
     _require(
         expected_server_contract_sha256 is None and runtime_contract_path is None,

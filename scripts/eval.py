@@ -168,6 +168,7 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
     )
     from polaris.pi05_droid_jointpos_runtime import (
         PI05_DROID_JOINTPOS_OUTER_STEPS,
+        capture_jointpos_actuator_intent,
         capture_jointpos_runtime,
         configure_jointpos_timeout,
         format_jointpos_runtime,
@@ -249,6 +250,7 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
     if eval_args.environment_seed is not None:
         bind_environment_seed(env_cfg, eval_args.environment_seed)
     configured_episode_length_seconds = None
+    jointpos_actuator_intent = None
     if eval_args.control_mode == "eef-pose":
         # Action managers are constructed by gym.make, so select the controller
         # on the config before creating the environment.
@@ -281,6 +283,9 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         env_cfg.actions = DroidJointPositionActionCfg()
         env_cfg.observations = DroidJointPositionObservationCfg()
         configured_episode_length_seconds = configure_jointpos_timeout(env_cfg)
+        _print_eval_phase("before_jointpos_actuator_intent_capture")
+        jointpos_actuator_intent = capture_jointpos_actuator_intent(env_cfg.scene.robot)
+        _print_eval_phase("after_jointpos_actuator_intent_capture")
     elif eval_args.control_mode != "joint-position":
         raise ValueError(f"Unsupported control mode: {eval_args.control_mode}")
     _print_eval_phase("before_gym_make")
@@ -417,8 +422,14 @@ def _run_evaluation(eval_args: EvalArgs, lifecycle):
         )
         _print_eval_phase(f"after_rollout_reset:{episode}")
         if audited_jointpos:
+            if jointpos_actuator_intent is None:
+                raise RuntimeError("joint-position pre-gym actuator intent is missing")
             _print_eval_phase(f"before_jointpos_runtime_capture:{episode}")
-            live_jointpos_runtime = capture_jointpos_runtime(env, obs)
+            live_jointpos_runtime = capture_jointpos_runtime(
+                env,
+                obs,
+                actuator_intent=jointpos_actuator_intent,
+            )
             _print_eval_phase(f"after_jointpos_runtime_capture:{episode}")
             if jointpos_runtime_sha256 is None:
                 print(format_jointpos_runtime(live_jointpos_runtime), flush=True)

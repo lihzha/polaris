@@ -50,7 +50,7 @@ def _execution(
     state_after,
 ):
     return {
-        "schema_version": 4,
+        "schema_version": MODULE.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
         "record_type": "openpi_joint_position_execution",
         "reset_index": reset_index,
         "query_index": query_index,
@@ -61,7 +61,7 @@ def _execution(
     }
 
 
-def _schema4_records(
+def _full_state_records(
     episode_length,
     *,
     initial_state=None,
@@ -77,7 +77,7 @@ def _schema4_records(
                 query_index,
                 state,
                 [valid] * 15,
-                schema_version=4,
+                schema_version=MODULE.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
             )
         )
         action_count = min(8, episode_length - query_index * 8)
@@ -94,7 +94,7 @@ def _schema4_records(
                     query_index,
                     valid,
                     chunk_action_index,
-                    schema_version=4,
+                    schema_version=MODULE.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
                 )
             )
             records.append(
@@ -165,13 +165,24 @@ class JointBoundAuditTest(unittest.TestCase):
         self.assertTrue(summary["state_audit_is_lower_bound"])
         self.assertEqual(summary["state_observation_coverage"], "policy_queries_only")
 
-    def test_schema4_execution_states_provide_every_step_coverage(self):
+    def test_current_schema_execution_states_provide_every_step_coverage(self):
         valid = [0.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0]
         transient_state_oob = [0.0, 0.0, 0.0, -1.0, 0.0, 4.0, 0.0]
         records = [
-            _query(0, 0, valid, [valid] * 15, schema_version=4),
+            _query(
+                0,
+                0,
+                valid,
+                [valid] * 15,
+                schema_version=MODULE.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
+            ),
             {
-                **_action(0, 0, valid, schema_version=4),
+                **_action(
+                    0,
+                    0,
+                    valid,
+                    schema_version=MODULE.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
+                ),
                 "chunk_action_index": 0,
             },
             _execution(0, 0, 0, 0, valid, transient_state_oob),
@@ -204,13 +215,24 @@ class JointBoundAuditTest(unittest.TestCase):
         self.assertEqual(violation["outer_step_index"], 0)
         self.assertTrue(violation["preceding_emitted_targets_in_bounds"])
 
-    def test_schema4_action_execution_target_mismatch_is_rejected(self):
+    def test_current_schema_action_execution_target_mismatch_is_rejected(self):
         valid = [0.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0]
         other = [0.1, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0]
         records = [
-            _query(0, 0, valid, [valid] * 15, schema_version=4),
+            _query(
+                0,
+                0,
+                valid,
+                [valid] * 15,
+                schema_version=MODULE.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
+            ),
             {
-                **_action(0, 0, valid, schema_version=4),
+                **_action(
+                    0,
+                    0,
+                    valid,
+                    schema_version=MODULE.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
+                ),
                 "chunk_action_index": 0,
             },
             _execution(0, 0, 0, 0, other, valid),
@@ -230,12 +252,15 @@ class JointBoundAuditTest(unittest.TestCase):
     def test_full_450_step_trace_binds_terminal_state_and_hashes(self):
         terminal_oob = [0.0, 0.0, 0.0, -1.0, 0.0, 4.0, 0.0]
         summary = _run_audit(
-            _schema4_records(450, final_state=terminal_oob),
+            _full_state_records(450, final_state=terminal_oob),
             episode_length=450,
             success=True,
         )
 
-        self.assertEqual(summary["trace_schema_version"], 4)
+        self.assertEqual(
+            summary["trace_schema_version"],
+            MODULE.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
+        )
         self.assertEqual(summary["query_record_count"], 57)
         self.assertEqual(summary["action_record_count"], 450)
         self.assertEqual(summary["execution_record_count"], 450)
@@ -249,10 +274,10 @@ class JointBoundAuditTest(unittest.TestCase):
         self.assertEqual(len(summary["trace_sha256"]), 64)
         self.assertEqual(len(summary["metrics_sha256"]), 64)
 
-    def test_schema4_cannot_downgrade_when_all_executions_are_removed(self):
+    def test_current_schema_cannot_downgrade_without_executions(self):
         records = [
             record
-            for record in _schema4_records(1)
+            for record in _full_state_records(1)
             if record["record_type"] != "openpi_joint_position_execution"
         ]
         with self.assertRaisesRegex(ValueError, "requires per-action execution"):
@@ -261,7 +286,7 @@ class JointBoundAuditTest(unittest.TestCase):
     def test_actions_cannot_reference_a_removed_query(self):
         records = [
             record
-            for record in _schema4_records(9)
+            for record in _full_state_records(9)
             if not (
                 record["record_type"] == "openpi_joint_position_query"
                 and record["query_index"] == 1
@@ -271,7 +296,7 @@ class JointBoundAuditTest(unittest.TestCase):
             _run_audit(records, episode_length=9)
 
     def test_execution_steps_cannot_be_swapped(self):
-        records = copy.deepcopy(_schema4_records(2))
+        records = copy.deepcopy(_full_state_records(2))
         executions = [
             record
             for record in records
@@ -294,16 +319,16 @@ class JointBoundAuditTest(unittest.TestCase):
         for tolerance in (-1.0, float("inf"), 100.0):
             with self.subTest(tolerance=tolerance):
                 with self.assertRaisesRegex(ValueError, "tolerance exactly"):
-                    _run_audit(_schema4_records(1), tolerance=tolerance)
+                    _run_audit(_full_state_records(1), tolerance=tolerance)
 
     def test_execution_must_immediately_follow_its_action(self):
-        records = _schema4_records(1)
+        records = _full_state_records(1)
         records[1], records[2] = records[2], records[1]
         with self.assertRaisesRegex(ValueError, "does not follow its action"):
             _run_audit(records)
 
     def test_query_state_must_equal_preceding_post_action_state(self):
-        records = _schema4_records(9)
+        records = _full_state_records(9)
         query_one = next(
             record
             for record in records
@@ -315,13 +340,13 @@ class JointBoundAuditTest(unittest.TestCase):
             _run_audit(records, episode_length=9)
 
     def test_complete_action_execution_pairs_cannot_be_reordered(self):
-        records = _schema4_records(2)
+        records = _full_state_records(2)
         records[1:5] = records[3:5] + records[1:3]
         with self.assertRaisesRegex(ValueError, "Execution step is not contiguous"):
             _run_audit(records, episode_length=2)
 
     def test_action_execution_pair_cannot_precede_its_query(self):
-        query, action, execution = _schema4_records(1)
+        query, action, execution = _full_state_records(1)
         with self.assertRaisesRegex(ValueError, "no preceding query"):
             _run_audit([action, execution, query])
 

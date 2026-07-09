@@ -9,6 +9,10 @@ import math
 from collections import Counter
 from pathlib import Path
 
+from polaris.pi05_droid_jointpos_runtime import (
+    PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
+)
+
 
 TASK_ORDER = (
     "BlockStack",
@@ -208,18 +212,21 @@ def summarize(root: Path) -> dict:
             )
             _require(
                 joint_audit.get("trace_schema_version") in {1, 2, 3}
-                and trace_summary.get("schema_version") != 4,
-                "Schema-4 evidence cannot be summarized as a legacy lower bound",
+                and trace_summary.get("schema_version")
+                != PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
+                "Current-schema evidence cannot be summarized as a legacy lower bound",
             )
         else:
             _require(
-                joint_audit.get("trace_schema_version") == 4
-                and trace_summary.get("schema_version") == 4
+                joint_audit.get("trace_schema_version")
+                == PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION
+                and trace_summary.get("schema_version")
+                == PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION
                 and joint_audit.get("state_observation_coverage")
                 == "initial_query_plus_post_action_every_step"
                 and joint_audit.get("execution_record_count") == expected_action_records
                 and trace_summary.get("execution_records") == expected_action_records,
-                "Schema-4 joint audit coverage is incomplete",
+                "Current-schema joint audit coverage is incomplete",
             )
         tasks.append(
             {
@@ -302,7 +309,7 @@ def summarize(root: Path) -> dict:
             "State-OOB counts remain lower bounds. Target-only excursions are reported "
             "but do not reduce the state-valid success numerator."
             if state_audit_is_lower_bound
-            else "Schema-4 execution records cover the initial state and every "
+            else "Current-schema execution records cover the initial state and every "
             "post-action state, so State-OOB counts are exact over recorded rollout "
             "states. Target-only excursions are reported but do not reduce the "
             "state-valid success numerator."

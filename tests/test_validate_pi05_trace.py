@@ -97,8 +97,8 @@ def _attested_records(base_seed: int = 7) -> list[dict]:
     }
     seed_hash = environment_seed_contract_sha256(seed_contract)
     identity = {
-        "schema_version": 4,
-        "profile": "openpi_pi05_droid_native_joint_position_v1",
+        "schema_version": MODULE.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
+        "profile": MODULE.PI05_DROID_JOINTPOS_PROFILE,
         "reset_index": 0,
         "server_contract_sha256": "c" * 64,
         "environment_seed_contract_sha256": seed_hash,

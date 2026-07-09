@@ -22,6 +22,9 @@ from polaris.policy.droid_jointpos_client import (
 from polaris.pi05_droid_jointpos_serving_contract import (
     PI05_DROID_JOINTPOS_SERVER_MODEL_RESIZE,
 )
+from polaris.pi05_droid_jointpos_runtime import (
+    PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
+)
 
 
 ROOT = Path(__file__).parents[1]
@@ -390,7 +393,9 @@ class DroidJointPosClientContractTest(unittest.TestCase):
 
         self.assertEqual(len(records), 9)
         trace = records[0]
-        self.assertEqual(trace["schema_version"], 4)
+        self.assertEqual(
+            trace["schema_version"], PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION
+        )
         self.assertEqual(trace["environment_rng"]["base_seed"], 0)
         self.assertEqual(trace["environment_rng"]["episode_index"], 0)
         self.assertEqual(trace["environment_rng"]["episode_seed"], 0)

@@ -821,7 +821,7 @@ if len(client_lines) != 1:
 client_payload = json.loads(client_lines[0].split(client_marker, 1)[1])
 expected_client = {
     "client": "DroidJointPos",
-    "profile": "openpi_pi05_droid_native_joint_position_v1",
+    "profile": "openpi_pi05_droid_native_joint_position_v2",
     "serving_profile": "openpi_pi05_droid_jointpos_polaris_flow_v1",
     "server_contract_sha256": sys.argv[3],
     "state": "ordered_7_panda_joint_radians_plus_closed_positive_gripper",

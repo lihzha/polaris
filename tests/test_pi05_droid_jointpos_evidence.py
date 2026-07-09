@@ -42,7 +42,7 @@ def _write_inputs(root: Path, *, rollouts: int = 2):
     paths["trace_summary"].write_text(
         json.dumps(
             {
-                "schema_version": 4,
+                "schema_version": runtime.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
                 "status": "pass",
                 "trace_sha256": trace_sha,
                 "metrics_sha256": metrics_sha,

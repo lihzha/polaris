@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Audit pi0.5 traces against standard Panda joint-position bounds.
 
-Schema-4 traces contain a measured post-action state for every simulator step.
-Older traces only contain policy-query states, so their state audit remains a
-lower bound.  The output says explicitly which coverage was available.
+Schema-4/5 traces contain a measured post-action state for every simulator
+step. Older traces only contain policy-query states, so their state audit
+remains a lower bound. The output says explicitly which coverage was available.
 """
 
 import argparse
@@ -13,6 +13,10 @@ import json
 import math
 from collections import defaultdict
 from pathlib import Path
+
+from polaris.pi05_droid_jointpos_runtime import (
+    PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
+)
 
 
 PANDA_JOINT_LIMITS = (
@@ -25,6 +29,7 @@ PANDA_JOINT_LIMITS = (
     (-2.8973, 2.8973),
 )
 PANDA_BOUND_TOLERANCE_RADIANS = 1e-3
+FULL_STATE_TRACE_SCHEMA_VERSIONS = {4, PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION}
 
 
 def _violating_joints(values: list[float], tolerance: float) -> list[int]:
@@ -108,7 +113,10 @@ def audit_joint_bounds(
             query_key = (reset_index, query_index)
             record_type = record.get("record_type")
             if record_type == "openpi_joint_position_query":
-                if schema_version == 4 and pending_execution is not None:
+                if (
+                    schema_version in FULL_STATE_TRACE_SCHEMA_VERSIONS
+                    and pending_execution is not None
+                ):
                     raise ValueError(
                         f"Query interrupts an unexecuted action at line {line_number}"
                     )
@@ -119,7 +127,7 @@ def audit_joint_bounds(
                         f"Query index is not contiguous at line {line_number}"
                     )
                 if (
-                    schema_version == 4
+                    schema_version in FULL_STATE_TRACE_SCHEMA_VERSIONS
                     and next_outer_step[reset_index] != query_index * 8
                 ):
                     raise ValueError(
@@ -155,7 +163,10 @@ def audit_joint_bounds(
             action = [float(value) for value in record["emitted_action"][:7]]
             _violating_joints(action, tolerance)
             if record_type == "openpi_joint_position_action":
-                if schema_version == 4 and pending_execution is not None:
+                if (
+                    schema_version in FULL_STATE_TRACE_SCHEMA_VERSIONS
+                    and pending_execution is not None
+                ):
                     raise ValueError(
                         f"Action precedes prior execution at line {line_number}"
                     )
@@ -166,10 +177,13 @@ def audit_joint_bounds(
                         f"Action has no preceding query at line {line_number}"
                     )
                 action_rows[action_key] = action
-                if schema_version == 4:
+                if schema_version in FULL_STATE_TRACE_SCHEMA_VERSIONS:
                     pending_execution = action_key
             else:
-                if schema_version == 4 and pending_execution != action_key:
+                if (
+                    schema_version in FULL_STATE_TRACE_SCHEMA_VERSIONS
+                    and pending_execution != action_key
+                ):
                     raise ValueError(
                         f"Execution does not follow its action at line {line_number}"
                     )
@@ -183,7 +197,7 @@ def audit_joint_bounds(
                         f"Invalid execution step identity at line {line_number}"
                     )
                 if (
-                    schema_version == 4
+                    schema_version in FULL_STATE_TRACE_SCHEMA_VERSIONS
                     and outer_step_index != next_outer_step[reset_index]
                 ):
                     raise ValueError(
@@ -204,21 +218,24 @@ def audit_joint_bounds(
                     "query_index": query_index,
                     "chunk_action_index": chunk_action_index,
                 }
-                if schema_version == 4:
+                if schema_version in FULL_STATE_TRACE_SCHEMA_VERSIONS:
                     pending_execution = None
                     next_outer_step[reset_index] += 1
 
     if len(trace_schema_versions) != 1:
         raise ValueError("Trace must use one homogeneous schema version")
     trace_schema_version = next(iter(trace_schema_versions))
-    if trace_schema_version not in {1, 2, 3, 4}:
+    if trace_schema_version not in {1, 2, 3, 4, 5}:
         raise ValueError(f"Unsupported trace schema version: {trace_schema_version}")
-    if trace_schema_version == 4 and not execution_rows:
-        raise ValueError("Schema-4 trace requires per-action execution records")
-    if trace_schema_version == 4 and pending_execution is not None:
-        raise ValueError("Schema-4 trace ends with an unexecuted action")
-    if trace_schema_version != 4 and execution_rows:
-        raise ValueError("Execution records require trace schema version 4")
+    if trace_schema_version in FULL_STATE_TRACE_SCHEMA_VERSIONS and not execution_rows:
+        raise ValueError("Schema-4/5 trace requires per-action execution records")
+    if (
+        trace_schema_version in FULL_STATE_TRACE_SCHEMA_VERSIONS
+        and pending_execution is not None
+    ):
+        raise ValueError("Schema-4/5 trace ends with an unexecuted action")
+    if trace_schema_version not in FULL_STATE_TRACE_SCHEMA_VERSIONS and execution_rows:
+        raise ValueError("Execution records require trace schema version 4 or 5")
 
     expected_episodes = set(range(len(metrics)))
     actual_query_episodes = {reset_index for reset_index, _ in query_states}
@@ -258,10 +275,10 @@ def audit_joint_bounds(
                 f"Emitted joint target differs from query response at {action_key}"
             )
 
-    if trace_schema_version == 4:
+    if trace_schema_version in FULL_STATE_TRACE_SCHEMA_VERSIONS:
         if set(action_rows) != set(execution_rows):
             raise ValueError(
-                "Schema-4 action and execution records do not have identical keys"
+                "Schema-4/5 action and execution records do not have identical keys"
             )
         for key in sorted(action_rows):
             if action_rows[key] != execution_rows[key]:
@@ -271,7 +288,7 @@ def audit_joint_bounds(
         actual_execution_episodes = {reset_index for reset_index, _ in execution_states}
         if actual_execution_episodes != expected_episodes:
             raise ValueError(
-                "Schema-4 execution episodes do not match metrics episodes"
+                "Schema-4/5 execution episodes do not match metrics episodes"
             )
         for action_key in sorted(action_rows):
             expected_outer_step = action_key[1] * 8 + action_key[2]
@@ -462,7 +479,7 @@ def audit_joint_bounds(
         },
         "interpretation": (
             "State-OOB episodes are exact over the recorded initial and post-action "
-            "states because schema-4 execution records cover every action. Target-only "
+            "states because full-state execution records cover every action. Target-only "
             "excursions are reported separately and are not automatically classified "
             "as invalid states."
             if not state_audit_is_lower_bound

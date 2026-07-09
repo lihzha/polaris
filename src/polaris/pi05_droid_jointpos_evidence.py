@@ -24,6 +24,7 @@ from polaris.pi05_droid_jointpos_runtime import (
     PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES,
     PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE,
     PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_SHA256,
+    PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
     expected_graphics_cv2_loader_identity,
     validate_jointpos_runtime_artifact,
 )
@@ -310,7 +311,10 @@ def _validate_trace_summary(
 ) -> dict[str, Any]:
     summary = _strict_json(summary_path, "trace summary")
     _require(isinstance(summary, dict), "trace summary must be one object")
-    _require(summary.get("schema_version") == 4, "trace summary schema mismatch")
+    _require(
+        summary.get("schema_version") == PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
+        "trace summary schema mismatch",
+    )
     _require(summary.get("status") == "pass", "trace summary did not pass")
     _require(
         summary.get("trace_sha256") == trace_identity["sha256"],

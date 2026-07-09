@@ -79,6 +79,8 @@ def test_native_gripper_sim_limits_do_not_mutate_joint_position_or_eef_base(
     robot_cfg = _load_robot_cfg_with_isaac_stubs(monkeypatch)
     assert _ArticulationCfg.copy_calls == 0
     assert not hasattr(robot_cfg, "NVIDIA_DROID_JOINT_VELOCITY")
+    shoulder = robot_cfg.NVIDIA_DROID.actuators["panda_shoulder"]
+    forearm = robot_cfg.NVIDIA_DROID.actuators["panda_forearm"]
     shared = robot_cfg.NVIDIA_DROID.actuators["gripper"]
     native_cfg = robot_cfg.make_nvidia_droid_joint_velocity_cfg()
     assert _ArticulationCfg.copy_calls == 1
@@ -90,6 +92,13 @@ def test_native_gripper_sim_limits_do_not_mutate_joint_position_or_eef_base(
     assert shared.effort_limit == NATIVE_GRIPPER_EFFORT_LIMIT
     assert not hasattr(shared, "velocity_limit_sim")
     assert not hasattr(shared, "effort_limit_sim")
+    assert shoulder.velocity_limit == 2.175
+    assert shoulder.effort_limit == 87.0
+    assert forearm.velocity_limit == 2.61
+    assert forearm.effort_limit == 12.0
+    for actuator in (shoulder, forearm):
+        assert not hasattr(actuator, "velocity_limit_sim")
+        assert not hasattr(actuator, "effort_limit_sim")
     assert native.joint_names_expr == ["finger_joint"]
     assert native.stiffness is None
     assert native.damping is None
@@ -109,6 +118,30 @@ def test_native_gripper_sim_limits_do_not_mutate_joint_position_or_eef_base(
     )
     assert "from polaris.environments.robot_cfg import NVIDIA_DROID" in droid_source
     assert "NVIDIA_DROID_JOINT_VELOCITY" not in droid_source
+
+
+def test_joint_position_runtime_audit_is_read_only_and_spans_gym_construction():
+    evaluator = (ROOT / "scripts/eval.py").read_text(encoding="utf-8")
+    intent_capture = evaluator.index(
+        "jointpos_actuator_intent = capture_jointpos_actuator_intent("
+    )
+    gym_make = evaluator.index("env: ManagerBasedRLSplatEnv = gym.make(")
+    live_capture = evaluator.index("live_jointpos_runtime = capture_jointpos_runtime(")
+    assert intent_capture < gym_make < live_capture
+    assert "actuator_intent=jointpos_actuator_intent" in evaluator
+
+    jointpos_branch = evaluator[evaluator.index("elif audited_jointpos:") : gym_make]
+    assert "velocity_limit" not in jointpos_branch
+    assert "effort_limit" not in jointpos_branch
+
+    robot_source = (ROOT / "src/polaris/environments/robot_cfg.py").read_text(
+        encoding="utf-8"
+    )
+    shared_definition = robot_source[
+        : robot_source.index("def make_nvidia_droid_joint_velocity_cfg")
+    ]
+    assert "velocity_limit_sim" not in shared_definition
+    assert "effort_limit_sim" not in shared_definition
 
 
 def test_position_robot_cfg_is_constructed_only_on_factory_call(monkeypatch):

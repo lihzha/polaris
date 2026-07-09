@@ -32,7 +32,7 @@ def _write_task(root, task_name, *, success=True, numerical=False, state_oob=Fal
     (task_dir / "policy_trace_summary.json").write_text(
         json.dumps(
             {
-                "schema_version": 4,
+                "schema_version": MODULE.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
                 "status": "pass",
                 "trace_sha256": trace_sha256,
                 "metrics_sha256": metrics_sha256,
@@ -57,7 +57,9 @@ def _write_task(root, task_name, *, success=True, numerical=False, state_oob=Fal
                 "episode_count": 1,
                 "tolerance_radians": MODULE.PANDA_BOUND_TOLERANCE_RADIANS,
                 "panda_joint_limits_radians": MODULE.PANDA_JOINT_LIMITS,
-                "trace_schema_version": 4,
+                "trace_schema_version": (
+                    MODULE.PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION
+                ),
                 "trace_sha256": trace_sha256,
                 "metrics_sha256": metrics_sha256,
                 "query_record_count": 1,
@@ -98,7 +100,7 @@ def _complete_root(root, *, first_numerical=False, first_state_oob=False):
 
 
 class SummarizePi05EvalTest(unittest.TestCase):
-    def test_valid_schema4_inputs_are_hash_and_count_bound(self):
+    def test_valid_current_schema_inputs_are_hash_and_count_bound(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             _complete_root(root, first_numerical=True, first_state_oob=True)
@@ -160,7 +162,7 @@ class SummarizePi05EvalTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "does not match the trace"):
                 MODULE.summarize(root)
 
-    def test_schema4_audit_cannot_claim_legacy_coverage(self):
+    def test_current_schema_audit_cannot_claim_legacy_coverage(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             _complete_root(root)
