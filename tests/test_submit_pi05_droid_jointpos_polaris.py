@@ -68,7 +68,7 @@ case "${command_name}" in
         IFS=$'\t' read -r row_id row_mode row_task row_rollouts row_seed \
           row_namespace row_source_sha row_approval_sha row_implementation \
           row_openpi_commit row_time batch_sha argv_sha provenance <<< "${manifest_row}"
-        [[ "${row_id}" == 4242 && "${row_mode}" == canary ]]
+        [[ "${row_id}" == 4242 && "${row_mode}" == "${FAKE_EXPECTED_MODE:-canary}" ]]
         [[ "${row_task}" == DROID-FoodBussing && "${row_rollouts}" == 1 ]]
         [[ "${row_seed}" == 0 && -n "${row_namespace}" && -n "${row_time}" ]]
         [[ "${row_source_sha}" =~ ^[0-9a-f]{64}$ ]]
@@ -129,6 +129,12 @@ def _make_clean_repository(path: Path) -> Path:
     module.write_text(
         (ROOT / "src/polaris/pi05_droid_jointpos_consumer_binding.py").read_text()
     )
+    for name in (
+        "app_launcher_startup_diagnostic.py",
+        "config.py",
+        "evaluation_seed.py",
+    ):
+        (module.parent / name).write_text((ROOT / "src/polaris" / name).read_text())
     policy = path / "src/polaris/policy"
     policy.mkdir()
     (policy / "__init__.py").write_text("")
@@ -146,13 +152,9 @@ def _make_clean_repository(path: Path) -> Path:
         cwd=path,
         check=True,
     )
-    subprocess.run(
-        ["git", "config", "user.name", "Submit Test"], cwd=path, check=True
-    )
+    subprocess.run(["git", "config", "user.name", "Submit Test"], cwd=path, check=True)
     subprocess.run(["git", "add", "."], cwd=path, check=True)
-    subprocess.run(
-        ["git", "commit", "-q", "-m", "test fixture"], cwd=path, check=True
-    )
+    subprocess.run(["git", "commit", "-q", "-m", "test fixture"], cwd=path, check=True)
     return batch_script
 
 
@@ -213,9 +215,7 @@ def _environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
             "SBATCH_LOG_ROOT": str(tmp_path / "logs"),
             "SUBMISSION_MANIFEST": str(manifest),
             "RUN_NAMESPACE": "pi05-submit-host-test",
-            "APPROVED_SBATCH_SCRIPT_FOR_TEST": str(
-                batch_path
-            ),
+            "APPROVED_SBATCH_SCRIPT_FOR_TEST": str(batch_path),
             "FAKE_STATE": str(fake_state),
             "USER": "submit-test",
         }
@@ -223,9 +223,9 @@ def _environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
     return env, manifest, fake_state
 
 
-def _run(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def _run(env: dict[str, str], mode: str = "canary") -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["bash", str(SUBMITTER), "canary"],
+        ["bash", str(SUBMITTER), mode],
         env=env,
         text=True,
         capture_output=True,
@@ -269,6 +269,26 @@ def test_held_job_is_released_only_after_durable_provenance_and_manifest(
         artifact = provenance / name
         assert artifact.is_file()
         assert stat.S_IMODE(artifact.stat().st_mode) == 0o444
+
+
+def test_app_launcher_only_submits_one_distinct_non_scientific_job(
+    tmp_path: Path,
+) -> None:
+    env, manifest, fake_state = _environment(tmp_path)
+    env["FAKE_EXPECTED_MODE"] = "app-launcher-only"
+
+    result = _run(env, "app-launcher-only")
+
+    assert result.returncode == 0, result.stderr
+    rows = manifest.read_text().splitlines()
+    assert len(rows) == 2
+    fields = rows[1].split("\t")
+    assert fields[1:5] == ["app-launcher-only", "DROID-FoodBussing", "1", "0"]
+    arguments = (fake_state / "sbatch.args").read_text().splitlines()
+    export_argument = next(item for item in arguments if item.startswith("--export="))
+    assert "POLARIS_EVAL_MODE=app_launcher_only" in export_argument
+    assert any(item == "--job-name=pi05-app-launcher_FoodBussing" for item in arguments)
+    assert any(item == "--time=00:30:00" for item in arguments)
 
 
 def test_provenance_capture_failure_cancels_held_job(tmp_path: Path) -> None:

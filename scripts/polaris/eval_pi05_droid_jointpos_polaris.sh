@@ -50,6 +50,7 @@ RUN_LABEL="${RUN_LABEL:-pi05-polaris}"
 PORT="${PORT:-$((20000 + ${SLURM_JOB_ID:-1} % 20000))}"
 SERVER_START_TIMEOUT_SECS="${SERVER_START_TIMEOUT_SECS:-2400}"
 DRY_RUN="${DRY_RUN:-0}"
+POLARIS_EVAL_MODE="${POLARIS_EVAL_MODE:-standard}"
 RESUME_FROM_TASK_DIR="${RESUME_FROM_TASK_DIR:-}"
 ENVIRONMENT_SEED_SCHEME=base_plus_episode_index_v1
 ENVIRONMENT_DETERMINISM_CLAIM=rng_bound_not_bitwise
@@ -141,8 +142,181 @@ print(hashlib.sha256(canonical_json_bytes(report)).hexdigest())
 PY
 }
 
+build_eval_args() {
+eval_args=(
+  scripts/eval.py
+  --environment "${POLARIS_ENVIRONMENT}"
+  --control-mode joint-position
+  --policy.client DroidJointPos
+  --policy.host 127.0.0.1
+  --policy.port "${PORT}"
+  --policy.open-loop-horizon "${OPEN_LOOP_HORIZON}"
+  --policy.frame-description "robot base frame"
+  --policy.action-frame robot_base
+  --policy.dataset-name droid
+  --policy.no-rotate-wrist-180
+  --policy.no-render-every-step
+  --policy.state-type joint_position
+  --policy.expected-action-horizon "${EXPECTED_ACTION_HORIZON}"
+  --policy.expected-action-dim "${EXPECTED_ACTION_DIM}"
+  --policy.trace-path "${TRACE_PATH}"
+  --run-folder "${TASK_DIR}"
+  --rollouts "${ROLLOUTS}"
+  --environment-seed "${ENVIRONMENT_SEED}"
+  --runtime-contract-path "${RUNTIME_CONTRACT_FILE}"
+  --headless
+)
+  if [[ "${POLARIS_EVAL_MODE}" == app_launcher_only ]]; then
+    eval_args+=(
+      --startup-diagnostic app_launcher_only
+      --startup-diagnostic-preexec-path "${STARTUP_PREEXEC_FILE}"
+      --startup-diagnostic-preclose-path "${STARTUP_PRECLOSE_FILE}"
+      --startup-diagnostic-expected-gpu-uuid "${actual_gpu_uuid}"
+    )
+  fi
+}
+
+build_public_eval_command() {
+  build_eval_args
+  pyxis_mounts="/dev/shm:/dev/shm,${POLARIS_DIR}:${POLARIS_CONTAINER_SOURCE}:ro,${POLARIS_DATA_DIR}:${POLARIS_DATA_DIR}:ro,${RUN_DIR}:${RUN_DIR}:rw,${POLARIS_CACHE_DIR}:/cache:rw,${POLARIS_VULKAN_ICD_PATH}:/etc/vulkan/icd.d/nvidia_icd.json:ro"
+  if [[ "${POLARIS_EVAL_MODE}" == standard ]]; then
+    # Keep the ordinary scientific evaluator command byte-for-byte equivalent
+    # to the approved public a00ac41 worker.
+    eval_command=(
+      srun --ntasks=1 "--cpus-per-task=${SLURM_CPUS_PER_TASK:-16}"
+      "--container-image=${POLARIS_PYXIS_IMAGE}"
+      "--container-mounts=${pyxis_mounts}"
+      "--container-workdir=${POLARIS_CONTAINER_SOURCE}"
+      --no-container-entrypoint --no-container-mount-home --container-remap-root --container-writable
+      "--container-env=NVIDIA_VISIBLE_DEVICES,NVIDIA_DRIVER_CAPABILITIES" --export=ALL
+      /usr/bin/env -i
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      LANG=C.UTF-8 LC_ALL=C.UTF-8
+      "NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES}"
+      "NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES}"
+      VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json
+      ACCEPT_EULA=Y OMNI_KIT_ACCEPT_EULA=YES PRIVACY_CONSENT=Y OMNI_KIT_ALLOW_ROOT=1
+      PYTHONUNBUFFERED=1
+      "PYTHONPATH=${POLARIS_CONTAINER_SOURCE}/src:${POLARIS_CONTAINER_SOURCE}/third_party/openpi/packages/openpi-client/src"
+      "POLARIS_DATA_PATH=${POLARIS_DATA_DIR}"
+      XDG_CACHE_HOME=/cache HF_HOME=/cache/huggingface HOME=/cache/home
+      /.venv/bin/python "${eval_args[@]}"
+    )
+    return
+  fi
+  [[ "${POLARIS_EVAL_MODE}" == app_launcher_only ]] \
+    || die "Unsupported evaluator mode: ${POLARIS_EVAL_MODE}"
+  diagnostic_eval_command=(
+    srun --ntasks=1 "--cpus-per-task=${SLURM_CPUS_PER_TASK:-16}" --gpus-per-task=1
+    "--container-image=${POLARIS_PYXIS_IMAGE}"
+    "--container-mounts=${pyxis_mounts}"
+    "--container-workdir=${POLARIS_CONTAINER_SOURCE}"
+    --no-container-entrypoint --no-container-mount-home --container-remap-root --container-writable
+    "--container-env=NVIDIA_VISIBLE_DEVICES,NVIDIA_DRIVER_CAPABILITIES,BATCH_VERIFIED_POLARIS_SOURCE_TREE_SHA256,POLARIS_IMPLEMENTATION_COMMIT,SOURCE_APPROVAL_SHA256"
+    --export=ALL
+    /usr/bin/env
+    PYTHONUNBUFFERED=1
+    "PYTHONPATH=${POLARIS_CONTAINER_SOURCE}/src:${POLARIS_CONTAINER_SOURCE}/third_party/openpi/packages/openpi-client/src"
+    /.venv/bin/python -m polaris.app_launcher_startup_diagnostic
+    --preexec-output "${STARTUP_PREEXEC_FILE}"
+    --preclose-output "${STARTUP_PRECLOSE_FILE}"
+    --expected-batch-gpu-uuid "${actual_gpu_uuid}"
+    --source-root "${POLARIS_CONTAINER_SOURCE}"
+    --data-root "${POLARIS_DATA_DIR}"
+    --cache-root /cache
+    -- /.venv/bin/python "${eval_args[@]}"
+  )
+}
+
+run_app_launcher_only() {
+  verify_trusted_source_snapshot
+  RUN_NAME="${RUN_NAME:-${RUN_NAMESPACE}_app-launcher-only_${POLARIS_ENVIRONMENT}_${SLURM_JOB_ID:-dryrun}}"
+  RUN_DIR="${RUN_DIR:-${OUTPUT_ROOT}/${RUN_NAMESPACE}/${RUN_NAME}}"
+  [[ ! -e "${RUN_DIR}" && ! -L "${RUN_DIR}" ]] \
+    || die "AppLauncher-only run directory already exists"
+  mkdir -m 0755 "${RUN_DIR}"
+  [[ "$(readlink -f -- "${RUN_DIR}")" == "${RUN_DIR}" ]] \
+    || die "AppLauncher-only RUN_DIR must use its canonical physical path"
+  TASK_DIR="${RUN_DIR}/app_launcher_only"
+  mkdir -m 0755 "${TASK_DIR}"
+  mkdir -p "${POLARIS_CACHE_DIR}/home"
+  TRACE_PATH="${TASK_DIR}/policy_traces.forbidden"
+  RUNTIME_CONTRACT_FILE="${TASK_DIR}/runtime_contract.forbidden"
+  STARTUP_PREEXEC_FILE="${TASK_DIR}/startup_preexec.json"
+  STARTUP_PRECLOSE_FILE="${TASK_DIR}/startup_preclose.json"
+  STARTUP_READY_FILE="${TASK_DIR}/startup_preclose.ready.json"
+  EVAL_LOG="${TASK_DIR}/app_launcher_only.log"
+  for output in \
+    "${STARTUP_PREEXEC_FILE}" "${STARTUP_PRECLOSE_FILE}" \
+    "${STARTUP_READY_FILE}" "${EVAL_LOG}"; do
+    [[ ! -e "${output}" && ! -L "${output}" ]] \
+      || die "AppLauncher-only output already exists: ${output}"
+  done
+  build_public_eval_command
+  if [[ "${DRY_RUN}" == 1 ]]; then
+    printf '%q ' "${diagnostic_eval_command[@]}"
+    printf '\n'
+    return
+  fi
+  set +e
+  (
+    cd "${POLARIS_DIR}"
+    "${diagnostic_eval_command[@]}"
+  ) 2>&1 | tee "${EVAL_LOG}"
+  pipeline_codes=("${PIPESTATUS[@]}")
+  set -e
+  chmod 0444 "${EVAL_LOG}"
+  (( pipeline_codes[0] == 0 )) || return "${pipeline_codes[0]}"
+  (( pipeline_codes[1] == 0 )) || return "${pipeline_codes[1]}"
+  close_error_count="$(grep -c '^POLARIS_STARTUP_DIAGNOSTIC_CLOSE_ERROR=' "${EVAL_LOG}" || true)"
+  [[ "${close_error_count}" == 0 ]] \
+    || die "AppLauncher-only evaluator reported a SimulationApp close error"
+  required_startup_phases=(
+    before_app_launcher
+    after_app_launcher
+    before_app_launcher_diagnostic_close
+  )
+  for phase in "${required_startup_phases[@]}"; do
+    phase_count="$(grep -Fxc "POLARIS_EVAL_PHASE=${phase}" "${EVAL_LOG}" || true)"
+    [[ "${phase_count}" == 1 ]] \
+      || die "AppLauncher-only phase ${phase} count is ${phase_count}, expected one"
+  done
+  forbidden_phase_count="$(grep -Fxc 'POLARIS_EVAL_PHASE=before_evaluation_imports' "${EVAL_LOG}" || true)"
+  [[ "${forbidden_phase_count}" == 0 ]] \
+    || die "AppLauncher-only evaluator crossed into evaluation imports"
+  postclose_phase_count="$(grep -Fxc 'POLARIS_EVAL_PHASE=after_app_launcher_diagnostic_close' "${EVAL_LOG}" || true)"
+  case "${postclose_phase_count}" in
+    0) close_termination_mode=process_exited_zero_before_postclose_marker ;;
+    1) close_termination_mode=simulation_app_close_returned ;;
+    *) die "AppLauncher-only post-close phase count is ${postclose_phase_count}, expected zero or one" ;;
+  esac
+  for output in \
+    "${STARTUP_PREEXEC_FILE}" "${STARTUP_PRECLOSE_FILE}" \
+    "${STARTUP_READY_FILE}" "${EVAL_LOG}"; do
+    [[ -f "${output}" && ! -L "${output}" \
+      && "$(stat -c '%a:%h' "${output}")" == 444:1 ]] \
+      || die "AppLauncher-only evidence is not one mode-0444 link: ${output}"
+  done
+  [[ "$(find "${TASK_DIR}" -mindepth 1 -maxdepth 1 -printf x | wc -c)" == 4 ]] \
+    || die "AppLauncher-only output directory contains unexpected artifacts"
+  if find "${RUN_DIR}" -type f \
+    \( -name '*.csv' -o -name '*.mp4' -o -name '*tokenizer*' \
+       -o -name '*checkpoint*' -o -name '*serving_contract*' \
+       -o -name '*policy_trace*' -o -name SUCCESS -o -name FAILED \) \
+    -print -quit | grep -q .; then
+    die "AppLauncher-only route created a forbidden scientific artifact"
+  fi
+  verify_trusted_source_snapshot
+  echo "POLARIS_APP_LAUNCHER_CLOSE_TERMINATION_MODE=${close_termination_mode}"
+  echo "POLARIS_APP_LAUNCHER_ONLY_EVIDENCE_READY=${STARTUP_READY_FILE}"
+}
+
 [[ -n "${SLURM_JOB_ID:-}" || "${DRY_RUN}" == 1 ]] \
   || die "A Slurm allocation is required unless DRY_RUN=1"
+case "${POLARIS_EVAL_MODE}" in
+  standard|app_launcher_only) ;;
+  *) die "POLARIS_EVAL_MODE must be standard or app_launcher_only" ;;
+esac
 : "${EXPECTED_POLARIS_COMMIT:?Set EXPECTED_POLARIS_COMMIT to the immutable launch commit}"
 [[ "${ROLLOUTS}" =~ ^[1-9][0-9]*$ ]] || die "ROLLOUTS must be positive"
 [[ "${ENVIRONMENT_SEED}" =~ ^(0|[1-9][0-9]*)$ ]] \
@@ -188,6 +362,10 @@ preflight_vulkan_icd_sha256="${actual_vulkan_icd_sha256}"
 preflight_gpu_uuid="${actual_gpu_uuid}"
 preflight_gpu_name="${actual_gpu_name}"
 preflight_nvidia_driver_version="${actual_nvidia_driver_version}"
+if [[ "${POLARIS_EVAL_MODE}" == app_launcher_only ]]; then
+  run_app_launcher_only
+  exit
+fi
 [[ -f "${CHECKPOINT_MANIFEST}" ]] || die "Missing checkpoint manifest: ${CHECKPOINT_MANIFEST}"
 
 case "${POLARIS_ENVIRONMENT}" in
@@ -740,51 +918,7 @@ asset_manifest_command=(
   --output "${ASSET_MANIFEST_FILE}"
 )
 
-eval_args=(
-  scripts/eval.py
-  --environment "${POLARIS_ENVIRONMENT}"
-  --control-mode joint-position
-  --policy.client DroidJointPos
-  --policy.host 127.0.0.1
-  --policy.port "${PORT}"
-  --policy.open-loop-horizon "${OPEN_LOOP_HORIZON}"
-  --policy.frame-description "robot base frame"
-  --policy.action-frame robot_base
-  --policy.dataset-name droid
-  --policy.no-rotate-wrist-180
-  --policy.no-render-every-step
-  --policy.state-type joint_position
-  --policy.expected-action-horizon "${EXPECTED_ACTION_HORIZON}"
-  --policy.expected-action-dim "${EXPECTED_ACTION_DIM}"
-  --policy.trace-path "${TRACE_PATH}"
-  --run-folder "${TASK_DIR}"
-  --rollouts "${ROLLOUTS}"
-  --environment-seed "${ENVIRONMENT_SEED}"
-  --runtime-contract-path "${RUNTIME_CONTRACT_FILE}"
-  --headless
-)
-
-pyxis_mounts="/dev/shm:/dev/shm,${POLARIS_DIR}:${POLARIS_CONTAINER_SOURCE}:ro,${POLARIS_DATA_DIR}:${POLARIS_DATA_DIR}:ro,${RUN_DIR}:${RUN_DIR}:rw,${POLARIS_CACHE_DIR}:/cache:rw,${POLARIS_VULKAN_ICD_PATH}:/etc/vulkan/icd.d/nvidia_icd.json:ro"
-eval_command=(
-  srun --ntasks=1 "--cpus-per-task=${SLURM_CPUS_PER_TASK:-16}"
-  "--container-image=${POLARIS_PYXIS_IMAGE}"
-  "--container-mounts=${pyxis_mounts}"
-  "--container-workdir=${POLARIS_CONTAINER_SOURCE}"
-  --no-container-entrypoint --no-container-mount-home --container-remap-root --container-writable
-  "--container-env=NVIDIA_VISIBLE_DEVICES,NVIDIA_DRIVER_CAPABILITIES" --export=ALL
-  /usr/bin/env -i
-  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-  LANG=C.UTF-8 LC_ALL=C.UTF-8
-  "NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES}"
-  "NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES}"
-  VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json
-  ACCEPT_EULA=Y OMNI_KIT_ACCEPT_EULA=YES PRIVACY_CONSENT=Y OMNI_KIT_ALLOW_ROOT=1
-  PYTHONUNBUFFERED=1
-  "PYTHONPATH=${POLARIS_CONTAINER_SOURCE}/src:${POLARIS_CONTAINER_SOURCE}/third_party/openpi/packages/openpi-client/src"
-  "POLARIS_DATA_PATH=${POLARIS_DATA_DIR}"
-  XDG_CACHE_HOME=/cache HF_HOME=/cache/huggingface HOME=/cache/home
-  /.venv/bin/python "${eval_args[@]}"
-)
+build_public_eval_command
 
 video_validation_args=(
   scripts/polaris/validate_pi05_droid_jointpos_videos.py

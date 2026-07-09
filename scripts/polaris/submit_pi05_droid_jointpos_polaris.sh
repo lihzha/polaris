@@ -186,13 +186,13 @@ capture_submission_provenance() {
 
 MODE="${1:-}"
 case "${MODE}" in
-  canary|foodbussing50|full) ;;
-  *) echo "Usage: $0 {canary|foodbussing50|full}" >&2; exit 2 ;;
+  app-launcher-only|canary|foodbussing50|full) ;;
+  *) echo "Usage: $0 {app-launcher-only|canary|foodbussing50|full}" >&2; exit 2 ;;
 esac
 
 SCRIPT_DIR="$(readlink -f -- "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")"
 APPROVED_SBATCH_SCRIPT="${SCRIPT_DIR}/l40s_pi05_eval_job.sbatch"
-APPROVED_SBATCH_SCRIPT_SHA256="7117f1455eb2cd9dc1a96d6e5e91adad59c411152e95b970771cda4f562c90f2"
+APPROVED_SBATCH_SCRIPT_SHA256="dfaf36c494ba9658448b8beb420a7ff87fedee61a5a8aef9c636d3b9197f41f8"
 SBATCH_SCRIPT="${SBATCH_SCRIPT:-${APPROVED_SBATCH_SCRIPT}}"
 : "${POLARIS_SOURCE_SNAPSHOT:?Set the approved content-addressed source snapshot}"
 : "${EXPECTED_POLARIS_SOURCE_TREE_SHA256:?Set the approved source-snapshot tree SHA-256}"
@@ -261,10 +261,24 @@ observed_source_tree_sha256="$(
 )" || die "Cannot hash the PolaRiS source snapshot"
 [[ "${observed_source_tree_sha256}" == "${EXPECTED_POLARIS_SOURCE_TREE_SHA256}" ]] \
   || die "PolaRiS source snapshot SHA-256 mismatch"
+if [[ "${MODE}" == app-launcher-only ]]; then
+  snapshot_imports=(
+    polaris.app_launcher_startup_diagnostic
+    polaris.config
+    polaris.evaluation_seed
+  )
+else
+  snapshot_imports=(
+    polaris.pi05_droid_jointpos_consumer_binding
+    polaris.policy.droid_jointpos_client
+    openpi_client.image_tools
+    openpi_client.websocket_client_policy
+  )
+fi
 PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
   PYTHONPATH="${POLARIS_SOURCE_SNAPSHOT}/src:${POLARIS_SOURCE_SNAPSHOT}/third_party/openpi/packages/openpi-client/src" \
   "${POLARIS_OPENPI_RUNTIME_DIR}/.venv/bin/python" -B - \
-  "${POLARIS_SOURCE_SNAPSHOT}" <<'PY' \
+  "${POLARIS_SOURCE_SNAPSHOT}" "${snapshot_imports[@]}" <<'PY' \
   || die "Approved source snapshot import/origin smoke failed"
 import importlib
 from pathlib import Path
@@ -272,6 +286,11 @@ import sys
 
 root = Path(sys.argv[1]).resolve(strict=True)
 expected = {
+    "polaris.app_launcher_startup_diagnostic": (
+        "src/polaris/app_launcher_startup_diagnostic.py"
+    ),
+    "polaris.config": "src/polaris/config.py",
+    "polaris.evaluation_seed": "src/polaris/evaluation_seed.py",
     "polaris.pi05_droid_jointpos_consumer_binding": (
         "src/polaris/pi05_droid_jointpos_consumer_binding.py"
     ),
@@ -285,10 +304,29 @@ expected = {
         "third_party/openpi/packages/openpi-client/src/openpi_client/websocket_client_policy.py"
     ),
 }
-for name, relative in expected.items():
+for name in sys.argv[2:]:
+    relative = expected[name]
     module = importlib.import_module(name)
     if Path(module.__file__).resolve(strict=True) != root / relative:
         raise SystemExit(f"snapshot import escaped approved source: {name}")
+if "polaris.app_launcher_startup_diagnostic" in sys.argv[2:]:
+    forbidden_prefixes = (
+        "gym", "gymnasium", "isaaclab_tasks", "openpi", "openpi_client",
+        "polaris.environments", "polaris.policy", "sentencepiece", "tokenizers",
+        "transformers",
+    )
+    forbidden_loaded = sorted(
+        name for name in sys.modules
+        if any(
+            name == prefix or name.startswith(f"{prefix}.")
+            for prefix in forbidden_prefixes
+        )
+    )
+    if forbidden_loaded:
+        raise SystemExit(
+            "AppLauncher-only source smoke imported forbidden modules: "
+            + ",".join(forbidden_loaded)
+        )
 PY
 source_approval_result="$(
   /usr/bin/bash --noprofile --norc "${APPROVED_SBATCH_SCRIPT}" \
@@ -302,16 +340,25 @@ IFS=$'\t' read -r SOURCE_APPROVAL_SHA256 POLARIS_IMPLEMENTATION_COMMIT \
   && "${POLARIS_IMPLEMENTATION_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
   || die "Source approval result is invalid"
 
-if [[ "${MODE}" == canary ]]; then
+if [[ "${MODE}" == app-launcher-only ]]; then
+  tasks=(DROID-FoodBussing)
+  rollouts="${ROLLOUTS:-1}"
+  [[ "${rollouts}" == 1 ]] || die "app-launcher-only requires ROLLOUTS=1"
+  time_limit="${SBATCH_TIME:-00:30:00}"
+  job_prefix="pi05-app-launcher"
+  worker_eval_mode=app_launcher_only
+elif [[ "${MODE}" == canary ]]; then
   tasks=(DROID-FoodBussing)
   rollouts="${ROLLOUTS:-1}"
   time_limit="${SBATCH_TIME:-01:00:00}"
   job_prefix="pi05-canary"
+  worker_eval_mode=standard
 elif [[ "${MODE}" == foodbussing50 ]]; then
   tasks=(DROID-FoodBussing)
   rollouts="${ROLLOUTS:-50}"
   time_limit="${SBATCH_TIME:-03:50:00}"
   job_prefix="pi05-food50-seed${ENVIRONMENT_SEED}"
+  worker_eval_mode=standard
 else
   tasks=(
     DROID-BlockStackKitchen
@@ -324,6 +371,7 @@ else
   rollouts="${ROLLOUTS:-50}"
   time_limit="${SBATCH_TIME:-03:50:00}"
   job_prefix="pi05-full50"
+  worker_eval_mode=standard
 fi
 
 [[ "${rollouts}" =~ ^[1-9][0-9]*$ ]] || die "ROLLOUTS must be positive"
@@ -412,6 +460,9 @@ for task in "${tasks[@]}"; do
   write_transaction_state "${ACTIVE_TRANSACTION_DIR}" prepared
 
   export_vars="PATH=${PATH},HOME=${HOME},POLARIS_SOURCE_SNAPSHOT=${POLARIS_SOURCE_SNAPSHOT},EXPECTED_POLARIS_SOURCE_TREE_SHA256=${EXPECTED_POLARIS_SOURCE_TREE_SHA256},POLARIS_SOURCE_APPROVAL=${POLARIS_SOURCE_APPROVAL},POLARIS_OPENPI_RUNTIME_DIR=${POLARIS_OPENPI_RUNTIME_DIR},EXPECTED_POLARIS_COMMIT=${POLARIS_COMMIT},POLARIS_ENVIRONMENT=${task},ROLLOUTS=${rollouts},ENVIRONMENT_SEED=${ENVIRONMENT_SEED},RUN_NAMESPACE=${RUN_NAMESPACE}"
+  if [[ "${worker_eval_mode}" == app_launcher_only ]]; then
+    export_vars+=",POLARIS_EVAL_MODE=app_launcher_only"
+  fi
   sbatch_argv=(sbatch --parsable --hold \
     --comment="${ACTIVE_TRANSACTION_ID}" \
     --job-name="${job_name}" \

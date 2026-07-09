@@ -73,6 +73,10 @@ class EvalArgs:
     runtime_contract_path: str | None = None
     lifecycle_ready_path: str | None = None
     expected_gripper_drive_profile: str | None = None
+    startup_diagnostic: Literal["app_launcher_only"] | None = None
+    startup_diagnostic_preexec_path: str | None = None
+    startup_diagnostic_preclose_path: str | None = None
+    startup_diagnostic_expected_gpu_uuid: str | None = None
 
 
 @dataclass

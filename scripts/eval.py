@@ -3,11 +3,11 @@ import mediapy
 
 # import wandb
 import tqdm
-import gymnasium as gym
 import torch
 import argparse
 import os
 import pandas as pd
+import re
 import sys
 import traceback
 
@@ -28,7 +28,43 @@ def _print_eval_phase(phase: str) -> None:
     print(f"POLARIS_EVAL_PHASE={phase}", flush=True)
 
 
+def _validate_startup_diagnostic_args(eval_args: EvalArgs) -> None:
+    mode = eval_args.startup_diagnostic
+    values = (
+        eval_args.startup_diagnostic_preexec_path,
+        eval_args.startup_diagnostic_preclose_path,
+        eval_args.startup_diagnostic_expected_gpu_uuid,
+    )
+    if mode not in {None, "app_launcher_only"}:
+        raise ValueError(f"unsupported startup diagnostic: {mode!r}")
+    if mode is None:
+        if any(value is not None for value in values):
+            raise ValueError(
+                "startup diagnostic arguments require "
+                "--startup-diagnostic app_launcher_only"
+            )
+        return
+    if any(not isinstance(value, str) or not value for value in values):
+        raise ValueError("app_launcher_only requires every startup diagnostic argument")
+    preexec_path = Path(eval_args.startup_diagnostic_preexec_path)
+    preclose_path = Path(eval_args.startup_diagnostic_preclose_path)
+    if not preexec_path.is_absolute() or not preclose_path.is_absolute():
+        raise ValueError("startup diagnostic artifact paths must be absolute")
+    if preexec_path == preclose_path:
+        raise ValueError("startup diagnostic artifact paths must be distinct")
+    if (
+        re.fullmatch(
+            r"GPU-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-"
+            r"[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
+            eval_args.startup_diagnostic_expected_gpu_uuid,
+        )
+        is None
+    ):
+        raise ValueError("startup diagnostic expected GPU UUID is malformed")
+
+
 def main(eval_args: EvalArgs):
+    _validate_startup_diagnostic_args(eval_args)
     position_adapter = eval_args.policy.client == "DroidDeltaJointPosition"
     native_drive_contract = (
         eval_args.control_mode == "joint-velocity" or position_adapter
@@ -113,6 +149,21 @@ def main(eval_args: EvalArgs):
     _print_eval_phase("after_app_launcher")
     # >>>> Isaac Sim App Launcher <<<<
 
+    if eval_args.startup_diagnostic == "app_launcher_only":
+        from polaris.app_launcher_startup_diagnostic import (
+            run_app_launcher_only_diagnostic,
+        )
+
+        _print_eval_phase("before_app_launcher_diagnostic_close")
+        run_app_launcher_only_diagnostic(
+            simulation_app=simulation_app,
+            preexec_path=Path(eval_args.startup_diagnostic_preexec_path),
+            preclose_path=Path(eval_args.startup_diagnostic_preclose_path),
+            expected_gpu_uuid=eval_args.startup_diagnostic_expected_gpu_uuid,
+        )
+        _print_eval_phase("after_app_launcher_diagnostic_close")
+        return
+
     _print_eval_phase("before_evaluation_imports")
     from polaris.pi05_droid_native_lifecycle import NativeEvaluatorLifecycle
 
@@ -133,6 +184,8 @@ def main(eval_args: EvalArgs):
 
 
 def _run_evaluation(eval_args: EvalArgs, lifecycle):
+    import gymnasium as gym
+
     position_adapter = eval_args.policy.client == "DroidDeltaJointPosition"
     audited_jointpos = eval_args.policy.client == "DroidJointPos"
     audited_droid = eval_args.control_mode == "joint-velocity" or position_adapter
