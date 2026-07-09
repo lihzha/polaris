@@ -20,9 +20,11 @@ import stat
 from typing import Any
 
 from polaris.pi05_droid_jointpos_runtime import (
+    PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_SEARCH_SAFETY_PROFILE,
     PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES,
     PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE,
     PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_SHA256,
+    expected_graphics_cv2_loader_identity,
     validate_jointpos_runtime_artifact,
 )
 from polaris.pi05_droid_jointpos_serving_contract import (
@@ -50,7 +52,7 @@ from polaris.pi05_droid_jointpos_immutable import (
 
 
 PI05_DROID_JOINTPOS_EVIDENCE_PROFILE = (
-    "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v6"
+    "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v7"
 )
 PI05_DROID_JOINTPOS_EVIDENCE_MANIFEST = "pi05_droid_jointpos_evidence_manifest.json"
 
@@ -548,9 +550,50 @@ def _validate_gpu_vulkan_runtime_agreement(
         "simulator Vulkan ICD identity differs from the canonical runtime",
     )
     graphics = simulator_execution_environment.get("graphics_runtime")
+    expected_cv2_loader = expected_graphics_cv2_loader_identity()
+    cv2_loader = graphics.get("cv2_loader") if isinstance(graphics, dict) else None
+    cv2_module = cv2_loader.get("module") if isinstance(cv2_loader, dict) else None
+    cv2_loader_search_safety = (
+        cv2_loader.get("loader_search_safety") if isinstance(cv2_loader, dict) else None
+    )
+    cv2_module_static = (
+        {
+            name: item
+            for name, item in cv2_module.items()
+            if name not in {"native_maps_device", "native_maps_inode"}
+        }
+        if isinstance(cv2_module, dict)
+        else None
+    )
     _require(
         isinstance(graphics, dict)
         and graphics.get("profile") == PI05_DROID_JOINTPOS_GRAPHICS_RUNTIME_PROFILE
+        and isinstance(cv2_loader, dict)
+        and cv2_loader.get("profile") == expected_cv2_loader["profile"]
+        and cv2_loader.get("files") == expected_cv2_loader["files"]
+        and cv2_module_static == expected_cv2_loader["module"]
+        and isinstance(cv2_module.get("native_maps_device"), str)
+        and isinstance(cv2_module.get("native_maps_inode"), int)
+        and isinstance(cv2_loader_search_safety, dict)
+        and set(cv2_loader_search_safety)
+        == {
+            "profile",
+            "working_directory",
+            "working_directory_binding",
+            "working_directory_read_only",
+            "normalized_cv2_binary_path",
+            "normalized_cv2_binary_path_exists",
+            "working_directory_library_candidates",
+        }
+        and cv2_loader_search_safety.get("profile")
+        == PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_SEARCH_SAFETY_PROFILE
+        and cv2_loader_search_safety.get("working_directory_binding")
+        == "equals_runtime_module_repository_root"
+        and cv2_loader_search_safety.get("working_directory_read_only") is True
+        and cv2_loader_search_safety.get("normalized_cv2_binary_path")
+        == "/.venv/lib/python3.11/lib64"
+        and cv2_loader_search_safety.get("normalized_cv2_binary_path_exists") is False
+        and cv2_loader_search_safety.get("working_directory_library_candidates") == []
         and isinstance(graphics.get("libraries"), list)
         and len(graphics["libraries"])
         == len(PI05_DROID_JOINTPOS_GRAPHICS_LIBRARY_IDENTITIES)
@@ -566,6 +609,12 @@ def _validate_gpu_vulkan_runtime_agreement(
         "vulkan_icd_sha256": vulkan["icd"]["sha256"],
         "graphics_runtime_profile": graphics["profile"],
         "graphics_runtime_sha256": graphics["graphics_runtime_sha256"],
+        "graphics_cv2_loader_profile": graphics["cv2_loader"]["profile"],
+        "graphics_cv2_module_identity": graphics["cv2_loader"]["module"],
+        "graphics_cv2_loader_search_safety": graphics["cv2_loader"][
+            "loader_search_safety"
+        ],
+        "graphics_cv2_loader_files": graphics["cv2_loader"]["files"],
         "graphics_library_count": len(graphics["libraries"]),
     }
 
