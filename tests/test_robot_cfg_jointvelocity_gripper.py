@@ -111,6 +111,32 @@ def test_native_gripper_sim_limits_do_not_mutate_joint_position_or_eef_base(
     assert "NVIDIA_DROID_JOINT_VELOCITY" not in droid_source
 
 
+def test_joint_position_base_preserves_official_legacy_usd_limit_semantics(
+    monkeypatch,
+):
+    robot_cfg = _load_robot_cfg_with_isaac_stubs(monkeypatch)
+    shared = robot_cfg.NVIDIA_DROID.actuators
+    shoulder = shared["panda_shoulder"]
+    forearm = shared["panda_forearm"]
+    finger = shared["gripper"]
+
+    assert shoulder.velocity_limit == 2.175
+    assert forearm.velocity_limit == 2.61
+    assert finger.velocity_limit == NATIVE_GRIPPER_VELOCITY_LIMIT_RAD_S
+    # The pinned Isaac Lab implicit-actuator constructor deliberately ignores
+    # these deprecated fields when no solver field is explicitly configured,
+    # preserving the USD limits (10 rad/s arm; 500 deg/s finger).
+    assert not hasattr(shoulder, "velocity_limit_sim")
+    assert not hasattr(forearm, "velocity_limit_sim")
+    assert not hasattr(finger, "velocity_limit_sim")
+
+    before = copy.deepcopy(
+        {name: actuator.__dict__ for name, actuator in shared.items()}
+    )
+    robot_cfg.make_nvidia_droid_joint_velocity_cfg()
+    assert {name: actuator.__dict__ for name, actuator in shared.items()} == before
+
+
 def test_position_robot_cfg_is_constructed_only_on_factory_call(monkeypatch):
     robot_cfg = _load_robot_cfg_with_isaac_stubs(monkeypatch)
     position_cfg = _load_position_robot_cfg_with_isaac_stubs(monkeypatch, robot_cfg)

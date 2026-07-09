@@ -49,7 +49,7 @@ PI05_DROID_JOINTPOS_TERMINAL_IMAGE_CONTRACT = {
     "height": 224,
     "decoded_frame_count": 1,
     "decoded_rgb24_bytes": 448 * 224 * 3,
-    "source": "post_action450_returned_expensive_splat_observation",
+    "source": "post_action450_returned_nonexpensive_sim_camera_observation",
 }
 PI05_DROID_JOINTPOS_MEDIA_TOOLS = {
     "ffprobe": {

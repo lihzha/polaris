@@ -913,3 +913,43 @@
   rubric positives can latch transient criteria, so authoritative reporting
   must keep raw success separate from visually task-valid success and inspect
   every raw-positive video.
+
+## 2026-07-08 — v15 rejection and v16 official-contract repair
+
+- Historical v15 canary job `1101941` was deliberately treated as
+  non-authoritative. It constructed and reset FoodBussing but aborted before
+  policy request zero because the audit incorrectly expected the deprecated
+  `ImplicitActuatorCfg.velocity_limit` values `2.175/2.61` to be the live
+  solver limits. Isaac Lab 2.3 ignores those legacy fields when
+  `velocity_limit_sim` is unset, preserving the pinned USD/PhysX arm value
+  `10.0 rad/s`. The job produced no episode, trace, CSV row, video, image, or
+  terminal runtime artifact and was canceled after teardown stalled.
+- The scientific evaluator remains behavior-preserving: `robot_cfg.py`, the
+  upstream manager, and the splat renderer are unchanged. Runtime schema 5 now
+  attests the post-constructor cfg, resolved implicit actuators, `robot.data`,
+  and direct PhysX values. It binds the arm's effective `10.0 rad/s` USD limit
+  and the gripper's live effort, velocity, hard/soft position limits, and drive
+  gains without writing any limit or target.
+- An independent review caught and corrected a second audit-only unit bug
+  before launch. The gripper USD stores stiffness `100` and damping `0.0002`
+  per degree, while PhysX exposes exact float32 per-radian values
+  `5729.578125` and `0.011459155939519405` (`raw * 180/pi`), as independently
+  captured by L40S job `1098162`. A regression test now binds that conversion.
+- The official OpenPI client boundary is restored: each hybrid manager output
+  remains 720x1280 uint8, but the client applies the pinned Pillow bilinear
+  resize/pad to 224x224 before WebSocket transport. The server still invokes
+  its official resize transform, which takes the exact 224-to-224 identity
+  branch. Query-video frames are byte-identical to wire/model inputs;
+  inter-query and terminal frames are explicitly sim-only diagnostics. The
+  expensive hybrid cadence is reset plus post-actions 7, 15, ..., 447,
+  yielding 57 queries and 450 video frames per episode.
+- Instance-local instrumentation recomputes and hashes raw renderer float32,
+  pre/post OpenCV filtering, semantic mask, simulator RGB, final composite,
+  client resize, wire request, and query visualization without changing
+  returned pixels. The upstream manager and splat renderer remain exact
+  `origin/main` blobs with SHA-256 `9381b270...a426` and
+  `b9104be8...8aa`; OpenPI image tools remain `d48b4bd7...1977`.
+- The final host-safe suite passes `640` tests plus eight subtests. Focused
+  runtime/config tests pass `167`; Ruff format/lint, Bash syntax, ShellCheck,
+  Python compilation, and `git diff --check` pass. Live L40S lifecycle and
+  canary evidence remain mandatory before promotion.
