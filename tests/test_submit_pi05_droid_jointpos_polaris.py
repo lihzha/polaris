@@ -1,8 +1,13 @@
+import hashlib
+import json
 import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 import textwrap
+
+from polaris.pi05_droid_jointpos_consumer_binding import source_tree_sha256
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +56,7 @@ case "${command_name}" in
         if [[ "${FAKE_CAPTURE_FAIL:-0}" == 1 ]]; then
           exit 17
         fi
-        printf '#!/usr/bin/env bash\necho governed\n' > "${4}"
+        cp "${APPROVED_SBATCH_SCRIPT_FOR_TEST}" "${4}"
         ;;
       release)
         [[ "${2:-}" == 4242 ]]
@@ -61,10 +66,15 @@ case "${command_name}" in
             "${SUBMISSION_MANIFEST}"
         )"
         IFS=$'\t' read -r row_id row_mode row_task row_rollouts row_seed \
-          row_namespace row_time batch_sha argv_sha provenance <<< "${manifest_row}"
+          row_namespace row_source_sha row_approval_sha row_implementation \
+          row_openpi_commit row_time batch_sha argv_sha provenance <<< "${manifest_row}"
         [[ "${row_id}" == 4242 && "${row_mode}" == canary ]]
         [[ "${row_task}" == DROID-FoodBussing && "${row_rollouts}" == 1 ]]
         [[ "${row_seed}" == 0 && -n "${row_namespace}" && -n "${row_time}" ]]
+        [[ "${row_source_sha}" =~ ^[0-9a-f]{64}$ ]]
+        [[ "${row_approval_sha}" =~ ^[0-9a-f]{64}$ ]]
+        [[ "${row_implementation}" =~ ^[0-9a-f]{40}$ ]]
+        [[ "${row_openpi_commit}" == bd70b8f4011e85b3f3b0f039f12113f78718e7bf ]]
         [[ "$(stat -c '%a' "${provenance}/batch_script.sbatch")" == 444 ]]
         [[ "$(stat -c '%a' "${provenance}/submission_argv.sh")" == 444 ]]
         [[ "$(sha256sum "${provenance}/batch_script.sbatch" | awk '{print $1}')" == "${batch_sha}" ]]
@@ -89,6 +99,22 @@ case "${command_name}" in
 esac
 """
 
+FAKE_GIT = r"""
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "${1:-}" == -C && "${2:-}" == "${POLARIS_OPENPI_RUNTIME_DIR}" ]]
+case "${3:-} ${4:-}" in
+  "rev-parse HEAD")
+    printf '%s\n' "${FAKE_OPENPI_COMMIT:-bd70b8f4011e85b3f3b0f039f12113f78718e7bf}"
+    ;;
+  "status --porcelain=v1")
+    [[ "${5:-}" == --untracked-files=all ]]
+    printf '%s' "${FAKE_OPENPI_STATUS:-}"
+    ;;
+  *) exit 98 ;;
+esac
+"""
+
 
 def _write_executable(path: Path, value: str) -> None:
     path.write_text(textwrap.dedent(value).lstrip())
@@ -97,6 +123,21 @@ def _write_executable(path: Path, value: str) -> None:
 
 def _make_clean_repository(path: Path) -> Path:
     path.mkdir()
+    module = path / "src/polaris/pi05_droid_jointpos_consumer_binding.py"
+    module.parent.mkdir(parents=True)
+    (module.parent / "__init__.py").write_text("")
+    module.write_text(
+        (ROOT / "src/polaris/pi05_droid_jointpos_consumer_binding.py").read_text()
+    )
+    policy = path / "src/polaris/policy"
+    policy.mkdir()
+    (policy / "__init__.py").write_text("")
+    (policy / "droid_jointpos_client.py").write_text("FIXTURE = True\n")
+    client = path / "third_party/openpi/packages/openpi-client/src/openpi_client"
+    client.mkdir(parents=True)
+    (client / "__init__.py").write_text("")
+    (client / "image_tools.py").write_text("FIXTURE = True\n")
+    (client / "websocket_client_policy.py").write_text("FIXTURE = True\n")
     batch_script = path / "job.sbatch"
     batch_script.write_text("#!/usr/bin/env bash\necho worker\n")
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
@@ -108,7 +149,7 @@ def _make_clean_repository(path: Path) -> Path:
     subprocess.run(
         ["git", "config", "user.name", "Submit Test"], cwd=path, check=True
     )
-    subprocess.run(["git", "add", "job.sbatch"], cwd=path, check=True)
+    subprocess.run(["git", "add", "."], cwd=path, check=True)
     subprocess.run(
         ["git", "commit", "-q", "-m", "test fixture"], cwd=path, check=True
     )
@@ -117,23 +158,64 @@ def _make_clean_repository(path: Path) -> Path:
 
 def _environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
     repository = tmp_path / "repo"
-    batch_script = _make_clean_repository(repository)
+    _batch_script = _make_clean_repository(repository)
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
     for name in ("sbatch", "squeue", "scontrol", "scancel"):
         _write_executable(fake_bin / name, FAKE_SLURM)
+    _write_executable(fake_bin / "git", FAKE_GIT)
     fake_state = tmp_path / "fake-state"
     fake_state.mkdir()
     manifest = tmp_path / "results" / "canary_jobs.tsv"
+    openpi_runtime = tmp_path / "openpi-runtime"
+    interpreter = openpi_runtime / ".venv/bin/python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.symlink_to(sys.executable)
+    source_digest = source_tree_sha256(repository)
+    implementation_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    batch_path = ROOT / "scripts/polaris/l40s_pi05_eval_job.sbatch"
+    approval = tmp_path / "source-approval.json"
+    approval.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "profile": "openpi_pi05_droid_jointpos_source_approval_v1",
+                "snapshot_path": str(repository),
+                "source_tree_sha256": source_digest,
+                "implementation_commit": implementation_commit,
+                "polaris_base_commit": "c5b52a9cebb2c797a84e3df374b6002005d20a4f",
+                "polaris_base_tree": "7fd5e1b0af26577fd323fb1d7f3595b91282e73f",
+                "openpi_commit": "bd70b8f4011e85b3f3b0f039f12113f78718e7bf",
+                "trusted_hasher_sha256": hashlib.sha256(
+                    batch_path.read_bytes()
+                ).hexdigest(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    approval.chmod(0o444)
     env = os.environ.copy()
     env.update(
         {
             "PATH": f"{fake_bin}:{env['PATH']}",
-            "POLARIS_DIR": str(repository),
-            "SBATCH_SCRIPT": str(batch_script),
+            "POLARIS_SOURCE_SNAPSHOT": str(repository),
+            "EXPECTED_POLARIS_SOURCE_TREE_SHA256": source_digest,
+            "POLARIS_SOURCE_APPROVAL": str(approval),
+            "POLARIS_OPENPI_RUNTIME_DIR": str(openpi_runtime),
             "SBATCH_LOG_ROOT": str(tmp_path / "logs"),
             "SUBMISSION_MANIFEST": str(manifest),
             "RUN_NAMESPACE": "pi05-submit-host-test",
+            "APPROVED_SBATCH_SCRIPT_FOR_TEST": str(
+                batch_path
+            ),
             "FAKE_STATE": str(fake_state),
             "USER": "submit-test",
         }
@@ -283,4 +365,68 @@ def test_symlink_transaction_root_is_rejected_before_submission(tmp_path: Path) 
 
     assert result.returncode == 2
     assert "Transaction root must not be a symlink" in result.stderr
+    assert not (fake_state / "sbatch.args").exists()
+
+
+def test_overridden_batch_script_is_rejected_before_submission(tmp_path: Path) -> None:
+    env, _manifest, fake_state = _environment(tmp_path)
+    override = tmp_path / "override.sbatch"
+    override.write_text("#!/usr/bin/env bash\n")
+    env["SBATCH_SCRIPT"] = str(override)
+
+    result = _run(env)
+
+    assert result.returncode == 2
+    assert "SBATCH_SCRIPT override is forbidden" in result.stderr
+    assert not (fake_state / "sbatch.args").exists()
+
+
+def test_openpi_commit_drift_is_rejected_before_submission(tmp_path: Path) -> None:
+    env, _manifest, fake_state = _environment(tmp_path)
+    env["FAKE_OPENPI_COMMIT"] = "0" * 40
+
+    result = _run(env)
+
+    assert result.returncode == 2
+    assert "OpenPI runtime commit mismatch" in result.stderr
+    assert not (fake_state / "sbatch.args").exists()
+
+
+def test_symlinked_ancestor_inputs_are_exported_as_canonical_paths(
+    tmp_path: Path,
+) -> None:
+    env, _manifest, fake_state = _environment(tmp_path)
+    alias = tmp_path / "fsw-alias"
+    alias.symlink_to(tmp_path, target_is_directory=True)
+    env["POLARIS_SOURCE_SNAPSHOT"] = str(alias / "repo")
+    env["POLARIS_SOURCE_APPROVAL"] = str(alias / "source-approval.json")
+    env["POLARIS_OPENPI_RUNTIME_DIR"] = str(alias / "openpi-runtime")
+
+    result = _run(env)
+
+    assert result.returncode == 0, result.stderr
+    arguments = (fake_state / "sbatch.args").read_text().splitlines()
+    exported = next(value for value in arguments if value.startswith("--export="))
+    assert f"POLARIS_SOURCE_SNAPSHOT={tmp_path / 'repo'}" in exported
+    assert f"POLARIS_SOURCE_APPROVAL={tmp_path / 'source-approval.json'}" in exported
+    assert f"POLARIS_OPENPI_RUNTIME_DIR={tmp_path / 'openpi-runtime'}" in exported
+    assert "fsw-alias" not in exported
+
+
+def test_existing_job_reuse_requires_identical_provenance(tmp_path: Path) -> None:
+    env, manifest, fake_state = _environment(tmp_path)
+    first = _run(env)
+    assert first.returncode == 0, first.stderr
+    (fake_state / "sbatch.args").unlink()
+
+    exact = _run(env)
+    assert exact.returncode == 0, exact.stderr
+    assert "Existing canary attempt" in exact.stdout
+    assert not (fake_state / "sbatch.args").exists()
+
+    env["ROLLOUTS"] = "2"
+    mismatch = _run(env)
+    assert mismatch.returncode == 2
+    assert "incompatible evaluation provenance" in mismatch.stderr
+    assert len(manifest.read_text().splitlines()) == 2
     assert not (fake_state / "sbatch.args").exists()

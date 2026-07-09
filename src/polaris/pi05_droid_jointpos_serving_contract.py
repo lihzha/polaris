@@ -31,6 +31,10 @@ from polaris.pi05_droid_jointpos_image_contract import (
     CLIENT_RESIZE_PROFILE,
     static_image_contract,
 )
+from polaris.pi05_droid_jointpos_consumer_binding import (
+    CONSUMER_BINDING_PROFILE,
+    TOKENIZER_SHA256 as CONSUMER_TOKENIZER_SHA256,
+)
 
 PI05_DROID_JOINTPOS_PROFILE = "openpi_pi05_droid_jointpos_polaris_flow_v2"
 PI05_DROID_JOINTPOS_METADATA_KEY = "ego_lap_pi05_droid_jointpos_contract"
@@ -39,7 +43,7 @@ PI05_DROID_JOINTPOS_SERVING_CONTRACT_FILENAME = (
 )
 PI05_DROID_JOINTPOS_MODEL_RUNTIME_FILENAME = "pi05_droid_jointpos_model_runtime.json"
 PI05_DROID_JOINTPOS_MODEL_RUNTIME_PROFILE = (
-    "openpi_pi05_droid_jointpos_polaris_model_runtime_v4"
+    "openpi_pi05_droid_jointpos_polaris_model_runtime_v5"
 )
 PI05_DROID_JOINTPOS_BIND_HOST = "127.0.0.1"
 PI05_DROID_JOINTPOS_RNG_STREAM_FILENAME = "pi05_droid_jointpos_rng_stream.json"
@@ -3423,6 +3427,7 @@ def make_pi05_droid_jointpos_model_runtime(
     openpi_runtime_attestation: dict[str, Any],
     host_runtime: dict[str, Any],
     tokenizer_artifact: dict[str, Any],
+    consumer_binding: dict[str, Any],
     expected_request_count: int,
     serving_metadata: dict[str, Any],
 ) -> dict[str, Any]:
@@ -3442,6 +3447,7 @@ def make_pi05_droid_jointpos_model_runtime(
         "openpi_runtime_attestation": runtime,
         "host_runtime": validate_openpi_host_runtime(host_runtime),
         "tokenizer_artifact": validate_paligemma_tokenizer_artifact(tokenizer_artifact),
+        "consumer_binding": _validate_consumer_binding_summary(consumer_binding),
         "server": {
             "class": ("openpi.serving.websocket_policy_server.WebsocketPolicyServer"),
             "lifecycle": "asyncio_task_of_official_WebsocketPolicyServer.run",
@@ -3481,6 +3487,65 @@ def make_pi05_droid_jointpos_model_runtime(
     }
 
 
+def _validate_consumer_binding_summary(value: Any) -> dict[str, Any]:
+    required = {
+        "profile",
+        "binding_sha256",
+        "stages",
+        "checkpoint_objects_sha256",
+        "source_tree_sha256",
+        "tokenizer_sha256",
+        "preload_filename",
+        "preload_artifact_sha256",
+        "postload_filename",
+        "postload_artifact_sha256",
+        "postrun_filename",
+        "source_approval_filename",
+        "source_approval_artifact_sha256",
+        "implementation_commit",
+        "trusted_source_hasher_sha256",
+        "model_parameter_readiness",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("pi0.5 consumer-binding summary schema mismatch")
+    digest_fields = (
+        "binding_sha256",
+        "checkpoint_objects_sha256",
+        "source_tree_sha256",
+        "tokenizer_sha256",
+        "preload_artifact_sha256",
+        "postload_artifact_sha256",
+        "source_approval_artifact_sha256",
+        "trusted_source_hasher_sha256",
+    )
+    if any(
+        not isinstance(value.get(field), str)
+        or re.fullmatch(r"[0-9a-f]{64}", value[field]) is None
+        for field in digest_fields
+    ):
+        raise ValueError("pi0.5 consumer-binding summary digest mismatch")
+    readiness = value["model_parameter_readiness"]
+    if (
+        value["profile"] != CONSUMER_BINDING_PROFILE
+        or value["stages"] != ["pre_load", "post_load"]
+        or value["tokenizer_sha256"] != CONSUMER_TOKENIZER_SHA256
+        or value["preload_filename"] != "pi05_consumer_binding_preload.json"
+        or value["postload_filename"] != "pi05_consumer_binding_postload.json"
+        or value["postrun_filename"] != "pi05_consumer_binding_postrun.json"
+        or value["source_approval_filename"] != "polaris_source_approval.json"
+        or not isinstance(value["implementation_commit"], str)
+        or re.fullmatch(r"[0-9a-f]{40}", value["implementation_commit"]) is None
+        or not isinstance(readiness, dict)
+        or set(readiness) != {"ready_leaf_count", "total_elements"}
+        or type(readiness["ready_leaf_count"]) is not int
+        or readiness["ready_leaf_count"] <= 0
+        or type(readiness["total_elements"]) is not int
+        or readiness["total_elements"] <= 0
+    ):
+        raise ValueError("pi0.5 consumer-binding summary identity mismatch")
+    return copy.deepcopy(value)
+
+
 def _validate_model_runtime_value(
     value: Any, serving_metadata: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -3496,6 +3561,7 @@ def _validate_model_runtime_value(
         "openpi_runtime_attestation",
         "host_runtime",
         "tokenizer_artifact",
+        "consumer_binding",
         "server",
     }
     if not isinstance(value, dict) or set(value) != required:
@@ -3617,6 +3683,7 @@ def _validate_model_runtime_value(
     runtime = validate_openpi_runtime_attestation(value["openpi_runtime_attestation"])
     host_runtime = validate_openpi_host_runtime(value["host_runtime"])
     validate_paligemma_tokenizer_artifact(value["tokenizer_artifact"])
+    _validate_consumer_binding_summary(value["consumer_binding"])
     checkout_root = Path(checkout["root"])
     if (
         host_runtime["python"]["declared_executable"]

@@ -311,13 +311,23 @@ def test_finalize_rejects_missing_terminal_image_before_publication(tmp_path):
     assert not (run_dir / evidence.PI05_DROID_JOINTPOS_EVIDENCE_MANIFEST).exists()
 
 
-def test_jointpos_launchers_reject_untracked_source():
+def test_jointpos_launchers_bind_snapshot_or_reject_untracked_source():
     root = Path(__file__).parents[1]
-    for relative in (
+    snapshot_launchers = (
         "scripts/polaris/eval_pi05_droid_jointpos_polaris.sh",
         "scripts/polaris/l40s_pi05_eval_job.sbatch",
-        "scripts/polaris/l40s_pi05_jointpos_seed_repeat.sbatch",
         "scripts/polaris/submit_pi05_droid_jointpos_polaris.sh",
+    )
+    for relative in snapshot_launchers:
+        source = (root / relative).read_text()
+        assert "EXPECTED_POLARIS_SOURCE_TREE_SHA256" in source
+        assert (
+            "pi05_droid_jointpos_consumer_binding" in source
+            or "--source-digest" in source
+            or relative.endswith("l40s_pi05_eval_job.sbatch")
+        )
+    for relative in (
+        "scripts/polaris/l40s_pi05_jointpos_seed_repeat.sbatch",
         "scripts/polaris/submit_pi05_jointpos_seed_repeat.sh",
     ):
         source = (root / relative).read_text()
@@ -348,7 +358,7 @@ def test_worker_finalizes_server_rng_then_evidence_before_success_marker():
 
 def test_gpu_vulkan_contract_requires_model_simulator_agreement():
     assert evidence.PI05_DROID_JOINTPOS_EVIDENCE_PROFILE == (
-        "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v9"
+        "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v10"
     )
     model, simulator = _gpu_vulkan_contracts()
     assert evidence._validate_gpu_vulkan_runtime_agreement(model, simulator) == {
@@ -423,17 +433,52 @@ def test_run_metadata_binds_outer_package_probes_to_model_runtime(tmp_path):
     warning_filter = evidence.PI05_DROID_JOINTPOS_NUMPYDANTIC_WARNING_FILTER
     quoted_warning_filter = warning_filter.replace(" ", "\\ ")
     metadata = tmp_path / "run_metadata.env"
+    source_contracts = {
+        "source_tree_sha256": "1" * 64,
+        "source_implementation_commit": "2" * 40,
+        "source_approval_artifact_sha256": "3" * 64,
+        "source_approval_path": str((tmp_path / "polaris_source_approval.json").resolve()),
+        "trusted_source_hasher_sha256": "4" * 64,
+        "consumer_binding_sha256": "5" * 64,
+        "polaris_base_commit": "6" * 40,
+        "source_openpi_commit": "7" * 40,
+    }
 
-    def write(*, pre=digest, post=digest, warning=quoted_warning_filter):
+    def write(*, pre=digest, post=digest, warning=quoted_warning_filter, **drift):
+        source_values = {
+            "POLARIS_SOURCE_TREE_SHA256": source_contracts["source_tree_sha256"],
+            "POLARIS_IMPLEMENTATION_COMMIT": source_contracts[
+                "source_implementation_commit"
+            ],
+            "SOURCE_APPROVAL_SHA256": source_contracts[
+                "source_approval_artifact_sha256"
+            ],
+            "RUN_SOURCE_APPROVAL_FILE": source_contracts["source_approval_path"],
+            "TRUSTED_SOURCE_HASHER_SHA256": source_contracts[
+                "trusted_source_hasher_sha256"
+            ],
+            "CONSUMER_BINDING_SHA256": source_contracts[
+                "consumer_binding_sha256"
+            ],
+            "FINAL_CONSUMER_BINDING_SHA256": source_contracts[
+                "consumer_binding_sha256"
+            ],
+            "POLARIS_COMMIT": source_contracts["polaris_base_commit"],
+            "OPENPI_COMMIT": source_contracts["source_openpi_commit"],
+        }
+        source_values.update(drift)
         metadata.write_text(
             f"PYTHONWARNINGS={warning}\n"
             f"PREFLIGHT_PACKAGE_ENVIRONMENT_SHA256={pre}\n"
-            f"POSTRUN_PACKAGE_ENVIRONMENT_SHA256={post}\n",
+            f"POSTRUN_PACKAGE_ENVIRONMENT_SHA256={post}\n"
+            + "".join(f"{key}={value}\n" for key, value in source_values.items()),
             encoding="utf-8",
         )
 
     write()
-    assert evidence._validate_package_run_metadata(metadata, host_runtime) == {
+    assert evidence._validate_package_run_metadata(
+        metadata, host_runtime, source_contracts
+    ) == {
         "openpi_package_environment_sha256": digest,
         "openpi_package_preflight_postrun_unchanged": True,
         "numpydantic_warning_filter": warning_filter,
@@ -441,15 +486,31 @@ def test_run_metadata_binds_outer_package_probes_to_model_runtime(tmp_path):
 
     write(post="0" * 64)
     with pytest.raises(ValueError, match="outer evaluation package probes"):
-        evidence._validate_package_run_metadata(metadata, host_runtime)
+        evidence._validate_package_run_metadata(metadata, host_runtime, source_contracts)
     write(warning="error")
     with pytest.raises(ValueError, match="warning filter"):
-        evidence._validate_package_run_metadata(metadata, host_runtime)
+        evidence._validate_package_run_metadata(metadata, host_runtime, source_contracts)
+    for key in (
+        "POLARIS_SOURCE_TREE_SHA256",
+        "POLARIS_IMPLEMENTATION_COMMIT",
+        "SOURCE_APPROVAL_SHA256",
+        "RUN_SOURCE_APPROVAL_FILE",
+        "TRUSTED_SOURCE_HASHER_SHA256",
+        "CONSUMER_BINDING_SHA256",
+        "FINAL_CONSUMER_BINDING_SHA256",
+        "POLARIS_COMMIT",
+        "OPENPI_COMMIT",
+    ):
+        write(**{key: "drift"})
+        with pytest.raises(ValueError, match="source approval/binding"):
+            evidence._validate_package_run_metadata(
+                metadata, host_runtime, source_contracts
+            )
     write()
     with metadata.open("a", encoding="utf-8") as stream:
         stream.write(f"POSTRUN_PACKAGE_ENVIRONMENT_SHA256={digest}\n")
     with pytest.raises(ValueError, match="duplicate run metadata"):
-        evidence._validate_package_run_metadata(metadata, host_runtime)
+        evidence._validate_package_run_metadata(metadata, host_runtime, source_contracts)
 
 
 def test_gpu_vulkan_contract_rejects_noncanonical_shared_runtime():

@@ -350,6 +350,30 @@ def _tokenizer_artifact(tmp_path):
     }
 
 
+def _consumer_binding_summary():
+    return {
+        "profile": "openpi_pi05_droid_jointpos_consumer_binding_v1",
+        "binding_sha256": "1" * 64,
+        "stages": ["pre_load", "post_load"],
+        "checkpoint_objects_sha256": "2" * 64,
+        "source_tree_sha256": "3" * 64,
+        "tokenizer_sha256": contract.PI05_DROID_JOINTPOS_TOKENIZER_SHA256,
+        "preload_filename": "pi05_consumer_binding_preload.json",
+        "preload_artifact_sha256": "4" * 64,
+        "postload_filename": "pi05_consumer_binding_postload.json",
+        "postload_artifact_sha256": "5" * 64,
+        "postrun_filename": "pi05_consumer_binding_postrun.json",
+        "source_approval_filename": "polaris_source_approval.json",
+        "source_approval_artifact_sha256": "6" * 64,
+        "implementation_commit": "7" * 40,
+        "trusted_source_hasher_sha256": "8" * 64,
+        "model_parameter_readiness": {
+            "ready_leaf_count": 1,
+            "total_elements": 2,
+        },
+    }
+
+
 def _model_runtime(tmp_path, metadata):
     runtime = _runtime_attestation()
     return contract.make_pi05_droid_jointpos_model_runtime(
@@ -365,6 +389,7 @@ def _model_runtime(tmp_path, metadata):
         openpi_runtime_attestation=runtime,
         host_runtime=_host_runtime(tmp_path),
         tokenizer_artifact=_tokenizer_artifact(tmp_path),
+        consumer_binding=_consumer_binding_summary(),
         expected_request_count=57,
         serving_metadata=metadata,
     )
@@ -896,7 +921,7 @@ def test_nvidia_smi_capture_rejects_count_schema_and_identity_drift(
         contract._capture_nvidia_smi_gpu_identity()
 
 
-def test_model_runtime_v4_rejects_legacy_host_or_model_schema(tmp_path):
+def test_model_runtime_v5_rejects_legacy_host_or_model_schema(tmp_path):
     metadata = _metadata()
     runtime = _model_runtime(tmp_path, metadata)
     assert runtime["schema_version"] == 4

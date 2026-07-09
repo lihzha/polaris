@@ -98,6 +98,29 @@ uv run scripts/eval.py --environment DROID-FoodBussing --policy.port 8000 --run-
 ```
 Results include rollout videos, and a CSV summarizing success and normalized progress of each episode.
 
+For the governed L40S canary, first build a content-addressed source snapshot
+and its external approval record from a clean reviewed commit descended from
+the frozen c5 baseline:
+
+```bash
+scripts/polaris/build_pi05_droid_jointpos_source_snapshot.sh \
+  "$PWD" /absolute/snapshot/root /absolute/approvals/pi05-source.json
+```
+
+Set `POLARIS_SOURCE_SNAPSHOT`, `EXPECTED_POLARIS_SOURCE_TREE_SHA256`,
+`POLARIS_SOURCE_APPROVAL`, and `POLARIS_OPENPI_RUNTIME_DIR` from that output
+before invoking `submit_pi05_droid_jointpos_polaris.sh`. The worker independently
+rehashes the snapshot, mounts it read-only for the simulator, retains stable
+checkpoint/tokenizer/source descriptors across pre-load, post-load, and
+postrun, and seals those lifecycle records into the evidence transaction. On
+l401, governed paths are recorded with their canonical `/lustre/fs11/...`
+physical names; the `/lustre/fsw/...` aliases are resolved before approval and
+submission. Evidence strictly cross-links the approval, implementation commit,
+source tree, c5 base, bd70 OpenPI runtime, and all three lifecycle records. The
+binding detects persistent mutation and path replacement; malicious transient
+mutation or process tampering by the same Unix uid remains outside its threat
+model.
+
 ### Run Ego-LAP with end-effector pose control
 
 PolaRiS also includes an `EgoLAPEefPose` client and selectable absolute

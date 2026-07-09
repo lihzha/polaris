@@ -4,10 +4,21 @@
 # This script runs inside one ordinary one-GPU Slurm allocation.
 
 set -Eeuo pipefail
+export PYTHONDONTWRITEBYTECODE=1
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(readlink -f -- "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")"
 POLARIS_DIR="${POLARIS_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 OPENPI_DIR="${OPENPI_DIR:-${POLARIS_DIR}/third_party/openpi}"
+POLARIS_CONTAINER_SOURCE=/polaris-source
+: "${EXPECTED_POLARIS_SOURCE_TREE_SHA256:?Set the approved source-snapshot tree SHA-256}"
+: "${BATCH_VERIFIED_POLARIS_SOURCE_TREE_SHA256:?Trusted batch source verification is required}"
+[[ "${BATCH_VERIFIED_POLARIS_SOURCE_TREE_SHA256}" == "${EXPECTED_POLARIS_SOURCE_TREE_SHA256}" ]] \
+  || { echo "Trusted batch source identity differs from the approved digest" >&2; exit 2; }
+: "${POLARIS_SOURCE_APPROVAL:?Immutable source approval is required}"
+: "${SOURCE_APPROVAL_SHA256:?Trusted source approval SHA-256 is required}"
+: "${POLARIS_IMPLEMENTATION_COMMIT:?Approved implementation commit is required}"
+: "${TRUSTED_SOURCE_HASHER_PATH:?Trusted batch source hasher path is required}"
+: "${TRUSTED_SOURCE_HASHER_SHA256:?Trusted batch source hasher SHA-256 is required}"
 NFS_ROOT="${NFS_ROOT:-/lustre/fsw/portfolios/nvr/users/lzha}"
 POLARIS_DATA_DIR="${POLARIS_DATA_DIR:-${NFS_ROOT}/data/PolaRiS-Hub}"
 POLARIS_PYXIS_IMAGE="${POLARIS_PYXIS_IMAGE:-${NFS_ROOT}/cache/polaris/polaris-eval-cuda13-fd00a51.sqsh}"
@@ -27,6 +38,7 @@ EXPECTED_NVIDIA_DRIVER_VERSION="580.105.08"
 EXPECTED_NVIDIA_GPU_NAME="NVIDIA L40S"
 EXPECTED_MANIFEST_SHA256="${EXPECTED_MANIFEST_SHA256:-7abd0c2294d442d429a77655783232206b2b30d95c508d435503135a5523a11c}"
 CHECKPOINT_MANIFEST="${CHECKPOINT_MANIFEST:-${SCRIPT_DIR}/pi05_droid_jointpos_polaris_gcs_manifest.tsv}"
+TOKENIZER_URI=gs://big_vision/paligemma_tokenizer.model
 EXPECTED_ACTION_HORIZON="${EXPECTED_ACTION_HORIZON:-15}"
 EXPECTED_ACTION_DIM="${EXPECTED_ACTION_DIM:-8}"
 OPEN_LOOP_HORIZON="${OPEN_LOOP_HORIZON:-8}"
@@ -49,6 +61,43 @@ NUMPYDANTIC_STUB_WARNING_FILTER='ignore:ndarray.pyi stub file could not be gener
 die() {
   echo "ERROR: $*" >&2
   exit 2
+}
+
+require_canonical_existing_path() {
+  local raw="$1"
+  local kind="$2"
+  local resolved
+  [[ "${raw}" == /* && ! -L "${raw}" ]] \
+    || die "${kind} must be an absolute non-symlinked path: ${raw}"
+  resolved="$(readlink -f -- "${raw}")" \
+    || die "Cannot canonicalize ${kind}: ${raw}"
+  [[ "${resolved}" == "${raw}" ]] \
+    || die "${kind} must use its canonical physical path: ${resolved}"
+}
+
+require_canonical_existing_path "${NFS_ROOT}" "NFS_ROOT"
+require_canonical_existing_path "${POLARIS_DIR}" "POLARIS_DIR"
+require_canonical_existing_path "${OPENPI_DIR}" "OPENPI_DIR"
+require_canonical_existing_path "${POLARIS_SOURCE_APPROVAL}" "POLARIS_SOURCE_APPROVAL"
+require_canonical_existing_path "${TRUSTED_SOURCE_HASHER_PATH}" "trusted source hasher"
+mkdir -p "${OPENPI_DATA_HOME}" "${OUTPUT_ROOT}" "${POLARIS_CACHE_DIR}"
+OPENPI_DATA_HOME="$(readlink -f -- "${OPENPI_DATA_HOME}")"
+OUTPUT_ROOT="$(readlink -f -- "${OUTPUT_ROOT}")"
+POLARIS_CACHE_DIR="$(readlink -f -- "${POLARIS_CACHE_DIR}")"
+
+verify_trusted_source_snapshot() {
+  [[ -f "${TRUSTED_SOURCE_HASHER_PATH}" && ! -L "${TRUSTED_SOURCE_HASHER_PATH}" ]] \
+    || die "Trusted batch source hasher is missing"
+  [[ "$(sha256sum "${TRUSTED_SOURCE_HASHER_PATH}" | awk '{print $1}')" == \
+    "${TRUSTED_SOURCE_HASHER_SHA256}" ]] \
+    || die "Trusted batch source hasher changed"
+  local observed
+  observed="$(
+    /usr/bin/bash --noprofile --norc "${TRUSTED_SOURCE_HASHER_PATH}" \
+      --source-digest "${POLARIS_DIR}"
+  )" || die "Trusted terminal source hashing failed"
+  [[ "${observed}" == "${EXPECTED_POLARIS_SOURCE_TREE_SHA256}" ]] \
+    || die "PolaRiS source snapshot changed after trusted batch verification"
 }
 
 capture_gpu_runtime() {
@@ -128,6 +177,9 @@ fi
 [[ -f "${POLARIS_PYXIS_IMAGE}" ]] || die "Missing Pyxis image: ${POLARIS_PYXIS_IMAGE}"
 [[ -f "${POLARIS_VULKAN_ICD_PATH}" && ! -L "${POLARIS_VULKAN_ICD_PATH}" ]] \
   || die "Vulkan ICD must be a regular non-symlink file: ${POLARIS_VULKAN_ICD_PATH}"
+require_canonical_existing_path "${POLARIS_DATA_DIR}" "POLARIS_DATA_DIR"
+require_canonical_existing_path "${POLARIS_PYXIS_IMAGE}" "POLARIS_PYXIS_IMAGE"
+require_canonical_existing_path "${POLARIS_VULKAN_ICD_PATH}" "POLARIS_VULKAN_ICD_PATH"
 actual_vulkan_icd_sha256="$(sha256sum "${POLARIS_VULKAN_ICD_PATH}" | awk '{print $1}')"
 [[ "${actual_vulkan_icd_sha256}" == "${EXPECTED_VULKAN_ICD_SHA256}" ]] \
   || die "Vulkan ICD SHA-256 mismatch: ${actual_vulkan_icd_sha256}"
@@ -239,17 +291,31 @@ actual_scene_metadata_sha256="$(sha256sum "${scene_metadata_path}" | awk '{print
 [[ "$(head -n 1 "${scene_metadata_path}")" == "${POLARIS_DATA_REVISION}" ]] \
   || die "Task scene Hub revision mismatch"
 
-POLARIS_COMMIT="$(git -C "${POLARIS_DIR}" rev-parse HEAD)"
+POLARIS_COMMIT="${EXPECTED_POLARIS_COMMIT}"
 OPENPI_COMMIT="$(git -C "${OPENPI_DIR}" rev-parse HEAD)"
 [[ "${POLARIS_COMMIT}" == "${EXPECTED_POLARIS_COMMIT}" ]] \
   || die "PolaRiS commit ${POLARIS_COMMIT} does not match ${EXPECTED_POLARIS_COMMIT}"
 [[ "${EXPECTED_POLARIS_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
   || die "EXPECTED_POLARIS_COMMIT must be one full lowercase commit"
-[[ -z "$(git -C "${POLARIS_DIR}" status --porcelain=v1 --untracked-files=all)" ]] \
-  || die "PolaRiS has tracked or untracked modifications; launch only from a clean committed revision"
+source_tree_sha256="$(
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${POLARIS_DIR}/src" \
+    "${OPENPI_DIR}/.venv/bin/python" -B -m \
+    polaris.pi05_droid_jointpos_consumer_binding source-digest "${POLARIS_DIR}"
+)" || die "Cannot hash the PolaRiS source snapshot"
+[[ "${source_tree_sha256}" == "${EXPECTED_POLARIS_SOURCE_TREE_SHA256}" ]] \
+  || die "PolaRiS source snapshot SHA-256 mismatch: ${source_tree_sha256}"
 RUN_NAME="${RUN_NAME:-${RUN_NAMESPACE}_${RUN_LABEL}_${POLARIS_ENVIRONMENT}_${SLURM_JOB_ID:-dryrun}}"
 RUN_DIR="${RUN_DIR:-${OUTPUT_ROOT}/${RUN_NAMESPACE}/${RUN_NAME}}"
+mkdir -p "${RUN_DIR}"
+[[ "$(readlink -f -- "${RUN_DIR}")" == "${RUN_DIR}" ]] \
+  || die "RUN_DIR must use its canonical physical path"
 TASK_DIR="${RUN_DIR}/${POLARIS_ENVIRONMENT}"
+mkdir -p "${TASK_DIR}" "${RUN_DIR}/consumer_inputs"
+[[ "$(readlink -f -- "${TASK_DIR}")" == "${TASK_DIR}" ]] \
+  || die "TASK_DIR must use its canonical physical path"
+[[ "$(readlink -f -- "${RUN_DIR}/consumer_inputs")" == \
+  "${RUN_DIR}/consumer_inputs" ]] \
+  || die "Tokenizer parent must use its canonical physical path"
 SERVER_LOG="${RUN_DIR}/policy_server.log"
 EVAL_LOG="${TASK_DIR}/eval.log"
 TRACE_PATH="${TASK_DIR}/policy_traces.jsonl"
@@ -260,6 +326,11 @@ MODEL_RUNTIME_CONTRACT_FILE="${RUN_DIR}/pi05_droid_jointpos_model_runtime.json"
 RNG_STREAM_FILE="${RUN_DIR}/pi05_droid_jointpos_rng_stream.json"
 REQUEST_PROOF_FILE="${RUN_DIR}/pi05_droid_jointpos_request_proof.json"
 ASSET_MANIFEST_FILE="${RUN_DIR}/polaris_asset_dependency_manifest.json"
+CONSUMER_BINDING_PRELOAD_FILE="${RUN_DIR}/pi05_consumer_binding_preload.json"
+CONSUMER_BINDING_POSTLOAD_FILE="${RUN_DIR}/pi05_consumer_binding_postload.json"
+CONSUMER_BINDING_POSTRUN_FILE="${RUN_DIR}/pi05_consumer_binding_postrun.json"
+RUN_TOKENIZER_FILE="${RUN_DIR}/consumer_inputs/paligemma_tokenizer.model"
+RUN_SOURCE_APPROVAL_FILE="${RUN_DIR}/polaris_source_approval.json"
 VIDEO_VALIDATION_FILE="${TASK_DIR}/pi05_droid_jointpos_video_validation.json"
 VIDEO_VALIDATION_LOG="${TASK_DIR}/video_validation.log"
 COMMANDS_FILE="${RUN_DIR}/commands.sh"
@@ -268,7 +339,6 @@ SERVER_PID=""
 EVIDENCE_FINALIZED=0
 EVIDENCE_MANIFEST_SHA256=""
 
-mkdir -p "${TASK_DIR}" "${POLARIS_CACHE_DIR}"
 [[ ! -e "${SERVING_CONTRACT_FILE}" && ! -L "${SERVING_CONTRACT_FILE}" ]] \
   || die "Serving-contract output already exists"
 [[ ! -e "${MODEL_RUNTIME_CONTRACT_FILE}" && ! -L "${MODEL_RUNTIME_CONTRACT_FILE}" ]] \
@@ -285,6 +355,23 @@ mkdir -p "${TASK_DIR}" "${POLARIS_CACHE_DIR}"
   || die "Video-validation output already exists"
 [[ ! -e "${VIDEO_VALIDATION_LOG}" && ! -L "${VIDEO_VALIDATION_LOG}" ]] \
   || die "Video-validation log already exists"
+for binding_output in \
+  "${CONSUMER_BINDING_PRELOAD_FILE}" \
+  "${CONSUMER_BINDING_POSTLOAD_FILE}" \
+  "${CONSUMER_BINDING_POSTRUN_FILE}"; do
+  [[ ! -e "${binding_output}" && ! -L "${binding_output}" ]] \
+    || die "Consumer-binding output already exists: ${binding_output}"
+done
+[[ ! -e "${RUN_TOKENIZER_FILE}" && ! -L "${RUN_TOKENIZER_FILE}" ]] \
+  || die "Run-local tokenizer already exists"
+[[ ! -e "${RUN_SOURCE_APPROVAL_FILE}" && ! -L "${RUN_SOURCE_APPROVAL_FILE}" ]] \
+  || die "Run-local source approval already exists"
+cp -- "${POLARIS_SOURCE_APPROVAL}" "${RUN_SOURCE_APPROVAL_FILE}"
+chmod 0444 "${RUN_SOURCE_APPROVAL_FILE}"
+[[ "$(stat -c '%a:%h' "${RUN_SOURCE_APPROVAL_FILE}")" == 444:1 ]] \
+  || die "Run-local source approval is not one mode-0444 link"
+[[ "$(sha256sum "${RUN_SOURCE_APPROVAL_FILE}" | awk '{print $1}')" == "${SOURCE_APPROVAL_SHA256}" ]] \
+  || die "Run-local source approval differs from the trusted batch approval"
 if [[ -n "${RESUME_FROM_TASK_DIR}" ]]; then
   [[ ! -e "${TASK_DIR}/eval_results.csv" && ! -e "${TRACE_PATH}" ]] \
     || die "Resume destination already contains metrics or traces"
@@ -482,6 +569,8 @@ from openpi.shared.download import maybe_download
 print(maybe_download(sys.argv[1]))
 PY
 )"
+checkpoint_path="$(readlink -f -- "${checkpoint_path}")" \
+  || die "Cannot canonicalize the resolved checkpoint"
 norm_stats="${checkpoint_path}/assets/droid/norm_stats.json"
 [[ -s "${norm_stats}" ]] || die "Missing checkpoint-local norm stats: ${norm_stats}"
 actual_norm_sha256="$(sha256sum "${norm_stats}" | awk '{print $1}')"
@@ -493,6 +582,41 @@ actual_manifest_sha256="$(sha256sum "${CHECKPOINT_MANIFEST}" | awk '{print $1}')
 "${OPENPI_DIR}/.venv/bin/python" "${SCRIPT_DIR}/verify_pi05_checkpoint.py" \
   "${checkpoint_path}" "${CHECKPOINT_MANIFEST}" --full-md5 \
   --output "${RUN_DIR}/checkpoint_verification.json"
+tokenizer_source_path="$(
+  OPENPI_DATA_HOME="${OPENPI_DATA_HOME}" PYTHONPATH="${OPENPI_PYTHONPATH}" \
+    "${OPENPI_DIR}/.venv/bin/python" - "${TOKENIZER_URI}" <<'PY'
+import sys
+from openpi.shared.download import maybe_download
+print(maybe_download(sys.argv[1], gs={"token": "anon"}))
+PY
+)" || die "Cannot resolve the pinned PaliGemma tokenizer"
+tokenizer_source_path="$(readlink -f -- "${tokenizer_source_path}")" \
+  || die "Cannot canonicalize the pinned PaliGemma tokenizer"
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${POLARIS_DIR}/src" \
+  "${OPENPI_DIR}/.venv/bin/python" -B -m \
+  polaris.pi05_droid_jointpos_consumer_binding prepare-tokenizer \
+  "${tokenizer_source_path}" "${RUN_TOKENIZER_FILE}" >/dev/null \
+  || die "Cannot create the run-local pinned tokenizer"
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${POLARIS_DIR}/src" \
+  "${OPENPI_DIR}/.venv/bin/python" -B -m \
+  polaris.pi05_droid_jointpos_consumer_binding capture \
+  --stage pre_load \
+  --checkpoint "${checkpoint_path}" \
+  --manifest "${CHECKPOINT_MANIFEST}" \
+  --tokenizer "${RUN_TOKENIZER_FILE}" \
+  --source "${POLARIS_DIR}" \
+  --expected-source-tree-sha256 "${EXPECTED_POLARIS_SOURCE_TREE_SHA256}" \
+  --output "${CONSUMER_BINDING_PRELOAD_FILE}" >/dev/null \
+  || die "Pre-load source/checkpoint/tokenizer consumer binding failed"
+CONSUMER_BINDING_SHA256="$(
+  "${OPENPI_DIR}/.venv/bin/python" - "${CONSUMER_BINDING_PRELOAD_FILE}" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["binding_sha256"])
+PY
+)" || die "Cannot parse pre-load consumer binding"
+[[ "${CONSUMER_BINDING_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
+  || die "Pre-load consumer binding returned an invalid SHA-256"
 PYXIS_IMAGE_SHA256="$(sha256sum "${POLARIS_PYXIS_IMAGE}" | awk '{print $1}')"
 [[ "${PYXIS_IMAGE_SHA256}" == "${EXPECTED_PYXIS_SHA256}" ]] \
   || die "Pyxis image SHA-256 mismatch: ${PYXIS_IMAGE_SHA256}"
@@ -512,6 +636,17 @@ PYXIS_IMAGE_SHA256="$(sha256sum "${POLARIS_PYXIS_IMAGE}" | awk '{print $1}')"
   printf 'POLICY_CONFIG=%q\n' "${POLICY_CONFIG}"
   printf 'NORM_STATS_SHA256=%q\n' "${actual_norm_sha256}"
   printf 'CHECKPOINT_MANIFEST_SHA256=%q\n' "${actual_manifest_sha256}"
+  printf 'CONSUMER_BINDING_PROFILE=openpi_pi05_droid_jointpos_consumer_binding_v1\n'
+  printf 'CONSUMER_BINDING_SHA256=%q\n' "${CONSUMER_BINDING_SHA256}"
+  printf 'CONSUMER_BINDING_PRELOAD_FILE=%q\n' "${CONSUMER_BINDING_PRELOAD_FILE}"
+  printf 'CONSUMER_BINDING_POSTLOAD_FILE=%q\n' "${CONSUMER_BINDING_POSTLOAD_FILE}"
+  printf 'CONSUMER_BINDING_POSTRUN_FILE=%q\n' "${CONSUMER_BINDING_POSTRUN_FILE}"
+  printf 'POLARIS_SOURCE_TREE_SHA256=%q\n' "${source_tree_sha256}"
+  printf 'POLARIS_IMPLEMENTATION_COMMIT=%q\n' "${POLARIS_IMPLEMENTATION_COMMIT}"
+  printf 'SOURCE_APPROVAL_SHA256=%q\n' "${SOURCE_APPROVAL_SHA256}"
+  printf 'RUN_SOURCE_APPROVAL_FILE=%q\n' "${RUN_SOURCE_APPROVAL_FILE}"
+  printf 'TRUSTED_SOURCE_HASHER_SHA256=%q\n' "${TRUSTED_SOURCE_HASHER_SHA256}"
+  printf 'RUN_TOKENIZER_FILE=%q\n' "${RUN_TOKENIZER_FILE}"
   printf 'POLARIS_PYXIS_IMAGE=%q\n' "${POLARIS_PYXIS_IMAGE}"
   printf 'POLARIS_PYXIS_IMAGE_SHA256=%q\n' "${PYXIS_IMAGE_SHA256}"
   printf 'POLARIS_VULKAN_ICD_PATH=%q\n' "${POLARIS_VULKAN_ICD_PATH}"
@@ -565,8 +700,12 @@ PYXIS_IMAGE_SHA256="$(sha256sum "${POLARIS_PYXIS_IMAGE}" | awk '{print $1}')"
   printf 'JOINTPOS_RUNTIME_CONTRACT_FILE=%q\n' "${RUNTIME_CONTRACT_FILE}"
 } | tee "${METADATA_FILE}"
 
-git -C "${POLARIS_DIR}" status --short --branch > "${RUN_DIR}/polaris_git_status.txt"
-git -C "${POLARIS_DIR}" submodule status --recursive > "${RUN_DIR}/polaris_submodules.txt" 2>&1 || true
+printf 'source_snapshot=%s\ncommit=%s\ntree_sha256=%s\n' \
+  "${POLARIS_DIR}" "${POLARIS_COMMIT}" "${source_tree_sha256}" \
+  > "${RUN_DIR}/polaris_git_status.txt"
+printf 'openpi=%s\nglm=%s\n' \
+  "${EXPECTED_OPENPI_COMMIT}" "5c46b9c07008ae65cb81ab79cd677ecc1934b903" \
+  > "${RUN_DIR}/polaris_submodules.txt"
 nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total --format=csv,noheader \
   > "${RUN_DIR}/gpu_environment.csv"
 
@@ -579,6 +718,16 @@ server_command=(
   --serving-contract-output "${SERVING_CONTRACT_FILE}"
   --model-runtime-contract-output "${MODEL_RUNTIME_CONTRACT_FILE}"
   --rng-stream-output "${RNG_STREAM_FILE}"
+  --consumer-binding-preload "${CONSUMER_BINDING_PRELOAD_FILE}"
+  --consumer-binding-postload-output "${CONSUMER_BINDING_POSTLOAD_FILE}"
+  --consumer-binding-postrun-output "${CONSUMER_BINDING_POSTRUN_FILE}"
+  --source-snapshot "${POLARIS_DIR}"
+  --source-tree-sha256 "${EXPECTED_POLARIS_SOURCE_TREE_SHA256}"
+  --source-approval "${RUN_SOURCE_APPROVAL_FILE}"
+  --source-approval-sha256 "${SOURCE_APPROVAL_SHA256}"
+  --implementation-commit "${POLARIS_IMPLEMENTATION_COMMIT}"
+  --trusted-source-hasher-sha256 "${TRUSTED_SOURCE_HASHER_SHA256}"
+  --tokenizer-path "${RUN_TOKENIZER_FILE}"
   --expected-request-count "${EXPECTED_POLICY_REQUESTS}"
   --port "${PORT}"
 )
@@ -615,12 +764,12 @@ eval_args=(
   --headless
 )
 
-pyxis_mounts="/dev/shm:/dev/shm,${POLARIS_DIR}:${POLARIS_DIR}:ro,${POLARIS_DATA_DIR}:${POLARIS_DATA_DIR}:ro,${RUN_DIR}:${RUN_DIR}:rw,${POLARIS_CACHE_DIR}:/cache:rw,${POLARIS_VULKAN_ICD_PATH}:/etc/vulkan/icd.d/nvidia_icd.json:ro"
+pyxis_mounts="/dev/shm:/dev/shm,${POLARIS_DIR}:${POLARIS_CONTAINER_SOURCE}:ro,${POLARIS_DATA_DIR}:${POLARIS_DATA_DIR}:ro,${RUN_DIR}:${RUN_DIR}:rw,${POLARIS_CACHE_DIR}:/cache:rw,${POLARIS_VULKAN_ICD_PATH}:/etc/vulkan/icd.d/nvidia_icd.json:ro"
 eval_command=(
   srun --ntasks=1 "--cpus-per-task=${SLURM_CPUS_PER_TASK:-16}"
   "--container-image=${POLARIS_PYXIS_IMAGE}"
   "--container-mounts=${pyxis_mounts}"
-  "--container-workdir=${POLARIS_DIR}"
+  "--container-workdir=${POLARIS_CONTAINER_SOURCE}"
   --no-container-entrypoint --no-container-mount-home --container-remap-root --container-writable
   "--container-env=NVIDIA_VISIBLE_DEVICES,NVIDIA_DRIVER_CAPABILITIES" --export=ALL
   /usr/bin/env -i
@@ -631,7 +780,7 @@ eval_command=(
   VK_DRIVER_FILES=/etc/vulkan/icd.d/nvidia_icd.json
   ACCEPT_EULA=Y OMNI_KIT_ACCEPT_EULA=YES PRIVACY_CONSENT=Y OMNI_KIT_ALLOW_ROOT=1
   PYTHONUNBUFFERED=1
-  "PYTHONPATH=${POLARIS_DIR}/src:${POLARIS_DIR}/third_party/openpi/packages/openpi-client/src"
+  "PYTHONPATH=${POLARIS_CONTAINER_SOURCE}/src:${POLARIS_CONTAINER_SOURCE}/third_party/openpi/packages/openpi-client/src"
   "POLARIS_DATA_PATH=${POLARIS_DATA_DIR}"
   XDG_CACHE_HOME=/cache HF_HOME=/cache/huggingface HOME=/cache/home
   /.venv/bin/python "${eval_args[@]}"
@@ -648,9 +797,9 @@ video_validation_command=(
   srun --ntasks=1 "--cpus-per-task=${SLURM_CPUS_PER_TASK:-16}"
   "--container-image=${POLARIS_PYXIS_IMAGE}"
   "--container-mounts=${pyxis_mounts}"
-  "--container-workdir=${POLARIS_DIR}"
+  "--container-workdir=${POLARIS_CONTAINER_SOURCE}"
   --no-container-entrypoint --no-container-mount-home --container-remap-root --container-writable
-  /usr/bin/env PYTHONUNBUFFERED=1 "PYTHONPATH=${POLARIS_DIR}/src"
+  /usr/bin/env PYTHONUNBUFFERED=1 "PYTHONPATH=${POLARIS_CONTAINER_SOURCE}/src"
   /.venv/bin/python "${video_validation_args[@]}"
 )
 
@@ -763,6 +912,7 @@ echo "[$(date -Iseconds)] Starting official pi0.5 policy server"
     XLA_PYTHON_CLIENT_MEM_FRACTION=0.35 \
     XLA_PYTHON_CLIENT_PREALLOCATE=false \
     PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
     "${server_command[@]}"
 ) > "${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
@@ -802,6 +952,23 @@ done
   printf 'SERVER_CONTRACT_SHA256=%q\n' "${SERVER_CONTRACT_SHA256}"
 } >> "${METADATA_FILE}"
 echo "[$(date -Iseconds)] Policy server live contract validated"
+[[ -s "${CONSUMER_BINDING_POSTLOAD_FILE}" && ! -L "${CONSUMER_BINDING_POSTLOAD_FILE}" ]] \
+  || die "Policy server did not publish its post-load consumer binding"
+postload_binding_result="$(
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${POLARIS_DIR}/src" \
+    "${OPENPI_DIR}/.venv/bin/python" -B -m \
+    polaris.pi05_droid_jointpos_consumer_binding compare \
+    "${CONSUMER_BINDING_PRELOAD_FILE}" "${CONSUMER_BINDING_POSTLOAD_FILE}"
+)" || die "Pre-load/post-load consumer bindings differ"
+postload_binding_sha256="$(
+  "${OPENPI_DIR}/.venv/bin/python" - "${postload_binding_result}" <<'PY'
+import json
+import sys
+print(json.loads(sys.argv[1])["binding_sha256"])
+PY
+)" || die "Cannot parse post-load consumer-binding result"
+[[ "${postload_binding_sha256}" == "${CONSUMER_BINDING_SHA256}" ]] \
+  || die "Post-load consumer binding changed"
 
 set +e
 (
@@ -1001,6 +1168,26 @@ wait "${rng_server_pid}" || server_final_code=$?
 SERVER_PID=""
 (( server_final_code == 0 )) \
   || die "Policy server RNG-stream finalization exited ${server_final_code}"
+[[ -s "${CONSUMER_BINDING_POSTRUN_FILE}" && ! -L "${CONSUMER_BINDING_POSTRUN_FILE}" ]] \
+  || die "Policy server did not publish its postrun consumer binding"
+final_binding_result="$(
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${POLARIS_DIR}/src" \
+    "${OPENPI_DIR}/.venv/bin/python" -B -m \
+    polaris.pi05_droid_jointpos_consumer_binding compare \
+    "${CONSUMER_BINDING_PRELOAD_FILE}" \
+    "${CONSUMER_BINDING_POSTLOAD_FILE}" \
+    "${CONSUMER_BINDING_POSTRUN_FILE}"
+)" || die "Source/checkpoint/tokenizer consumer binding changed during evaluation"
+final_binding_sha256="$(
+  "${OPENPI_DIR}/.venv/bin/python" - "${final_binding_result}" <<'PY'
+import json
+import sys
+print(json.loads(sys.argv[1])["binding_sha256"])
+PY
+)" || die "Cannot parse final consumer-binding result"
+[[ "${final_binding_sha256}" == "${CONSUMER_BINDING_SHA256}" ]] \
+  || die "Final consumer binding changed"
+verify_trusted_source_snapshot
 [[ -s "${RNG_STREAM_FILE}" && ! -L "${RNG_STREAM_FILE}" ]] \
   || die "Policy server did not publish its final RNG-stream artifact"
 rng_stream_result="$(
@@ -1054,6 +1241,7 @@ read -r RNG_STREAM_ARTIFACT_SHA256 RNG_STREAM_REQUEST_COUNT \
   printf 'POLICY_REQUEST_PROOF_ARTIFACT_SHA256=%q\n' \
     "${REQUEST_PROOF_ARTIFACT_SHA256}"
   printf 'POLICY_SERVER_PID=%q\n' "${rng_server_pid}"
+  printf 'FINAL_CONSUMER_BINDING_SHA256=%q\n' "${final_binding_sha256}"
 } >> "${METADATA_FILE}"
 
 set +e
@@ -1104,10 +1292,6 @@ done
   printf 'VIDEO_FFMPEG_SHA256=%q\n' "${VIDEO_FFMPEG_SHA256}"
   printf 'TERMINAL_IMAGE_COUNT=%q\n' "${terminal_image_count}"
 } >> "${METADATA_FILE}"
-[[ "$(git -C "${POLARIS_DIR}" rev-parse HEAD)" == "${POLARIS_COMMIT}" ]] \
-  || die "PolaRiS commit changed during evaluation"
-[[ -z "$(git -C "${POLARIS_DIR}" status --porcelain=v1 --untracked-files=all)" ]] \
-  || die "PolaRiS source changed during evaluation"
 [[ "$(git -C "${OPENPI_DIR}" rev-parse HEAD)" == "${OPENPI_COMMIT}" ]] \
   || die "OpenPI commit changed during evaluation"
 [[ -z "$(git -C "${OPENPI_DIR}" status --porcelain=v1 --untracked-files=all)" ]] \
@@ -1136,9 +1320,7 @@ postrun_package_environment_sha256="$(capture_package_environment_sha256)" \
   printf 'POSTRUN_PACKAGE_ENVIRONMENT_SHA256=%q\n' \
     "${postrun_package_environment_sha256}"
 } >> "${METADATA_FILE}"
-git -C "${POLARIS_DIR}" status --short --branch > "${RUN_DIR}/polaris_git_status.txt"
-git -C "${POLARIS_DIR}" submodule status --recursive \
-  > "${RUN_DIR}/polaris_submodules.txt"
+verify_trusted_source_snapshot
 printf 'EVALUATOR_EXIT_CODE=0\n' >> "${METADATA_FILE}"
 evidence_result="$(
   PYTHONPATH="${POLARIS_DIR}/src" "${OPENPI_DIR}/.venv/bin/python" \
@@ -1165,6 +1347,7 @@ PY
 [[ "${EVIDENCE_MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ ]] \
   || die "Immutable evidence manifest returned an invalid SHA-256"
 EVIDENCE_FINALIZED=1
+verify_trusted_source_snapshot
 publish_terminal_marker "${TASK_DIR}/SUCCESS" \
   "status=success" "completed_at=$(date -Iseconds)" \
   "evidence_manifest_sha256=${EVIDENCE_MANIFEST_SHA256}"

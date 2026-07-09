@@ -24,6 +24,11 @@ from polaris.pi05_droid_jointpos_image_contract import (
     IMAGE_PROFILE,
     static_image_contract,
 )
+from polaris.pi05_droid_jointpos_consumer_binding import (
+    compare_consumer_binding_reports,
+    validate_persisted_consumer_binding,
+    validate_persisted_source_approval,
+)
 from polaris.pi05_droid_jointpos_runtime import (
     PI05_DROID_JOINTPOS_TRACE_SCHEMA_VERSION,
     PI05_DROID_JOINTPOS_GRAPHICS_CV2_LOADER_SEARCH_SAFETY_PROFILE,
@@ -58,21 +63,26 @@ from polaris.pi05_droid_jointpos_immutable import (
 
 
 PI05_DROID_JOINTPOS_EVIDENCE_PROFILE = (
-    "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v9"
+    "openpi_pi05_droid_jointpos_polaris_evidence_transaction_v10"
 )
 PI05_DROID_JOINTPOS_EVIDENCE_MANIFEST = "pi05_droid_jointpos_evidence_manifest.json"
 
 _RUN_ARTIFACTS = {
     "asset_dependency_manifest": "polaris_asset_dependency_manifest.json",
     "checkpoint_verification": "checkpoint_verification.json",
+    "consumer_binding_postload": "pi05_consumer_binding_postload.json",
+    "consumer_binding_postrun": "pi05_consumer_binding_postrun.json",
+    "consumer_binding_preload": "pi05_consumer_binding_preload.json",
     "commands": "commands.sh",
     "gpu_environment": "gpu_environment.csv",
     "model_runtime_contract": "pi05_droid_jointpos_model_runtime.json",
     "polaris_git_status": "polaris_git_status.txt",
     "polaris_submodules": "polaris_submodules.txt",
     "policy_server_log": "policy_server.log",
+    "source_approval": "polaris_source_approval.json",
     "request_proof": "pi05_droid_jointpos_request_proof.json",
     "rng_stream": "pi05_droid_jointpos_rng_stream.json",
+    "run_tokenizer": "consumer_inputs/paligemma_tokenizer.model",
     "run_metadata": "run_metadata.env",
     "serving_contract": "pi05_droid_jointpos_serving_contract.json",
 }
@@ -133,11 +143,7 @@ def _canonical_json_bytes(value: Any) -> bytes:
     ).encode("ascii")
 
 
-def _validate_package_run_metadata(
-    path: Path, model_host_runtime: Any
-) -> dict[str, Any]:
-    """Bind the outer evaluation package probes to the attested model process."""
-
+def _decode_run_metadata(path: Path, required: tuple[str, ...]) -> dict[str, str]:
     try:
         text = Path(path).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as error:
@@ -157,11 +163,6 @@ def _validate_package_run_metadata(
         _require(key not in encoded, f"duplicate run metadata assignment: {key}")
         encoded[key] = raw_value
 
-    required = (
-        "PYTHONWARNINGS",
-        "PREFLIGHT_PACKAGE_ENVIRONMENT_SHA256",
-        "POSTRUN_PACKAGE_ENVIRONMENT_SHA256",
-    )
     decoded: dict[str, str] = {}
     for key in required:
         _require(key in encoded, f"run metadata is missing {key}")
@@ -173,6 +174,33 @@ def _validate_package_run_metadata(
             ) from error
         _require(len(words) == 1, f"run metadata {key} must encode one value")
         decoded[key] = words[0]
+    return decoded
+
+
+def _validate_package_run_metadata(
+    path: Path,
+    model_host_runtime: Any,
+    source_contracts: dict[str, str],
+) -> dict[str, Any]:
+    """Bind outer package and source probes to the attested model process."""
+
+    decoded = _decode_run_metadata(
+        path,
+        (
+            "PYTHONWARNINGS",
+            "PREFLIGHT_PACKAGE_ENVIRONMENT_SHA256",
+            "POSTRUN_PACKAGE_ENVIRONMENT_SHA256",
+            "POLARIS_SOURCE_TREE_SHA256",
+            "POLARIS_IMPLEMENTATION_COMMIT",
+            "SOURCE_APPROVAL_SHA256",
+            "RUN_SOURCE_APPROVAL_FILE",
+            "TRUSTED_SOURCE_HASHER_SHA256",
+            "CONSUMER_BINDING_SHA256",
+            "FINAL_CONSUMER_BINDING_SHA256",
+            "POLARIS_COMMIT",
+            "OPENPI_COMMIT",
+        ),
+    )
 
     _require(
         isinstance(model_host_runtime, dict)
@@ -201,6 +229,29 @@ def _validate_package_run_metadata(
     _require(
         decoded["PYTHONWARNINGS"] == PI05_DROID_JOINTPOS_NUMPYDANTIC_WARNING_FILTER,
         "run metadata warning filter mismatch",
+    )
+    expected_source_metadata = {
+        "POLARIS_SOURCE_TREE_SHA256": source_contracts["source_tree_sha256"],
+        "POLARIS_IMPLEMENTATION_COMMIT": source_contracts[
+            "source_implementation_commit"
+        ],
+        "SOURCE_APPROVAL_SHA256": source_contracts[
+            "source_approval_artifact_sha256"
+        ],
+        "RUN_SOURCE_APPROVAL_FILE": source_contracts["source_approval_path"],
+        "TRUSTED_SOURCE_HASHER_SHA256": source_contracts[
+            "trusted_source_hasher_sha256"
+        ],
+        "CONSUMER_BINDING_SHA256": source_contracts["consumer_binding_sha256"],
+        "FINAL_CONSUMER_BINDING_SHA256": source_contracts[
+            "consumer_binding_sha256"
+        ],
+        "POLARIS_COMMIT": source_contracts["polaris_base_commit"],
+        "OPENPI_COMMIT": source_contracts["source_openpi_commit"],
+    }
+    _require(
+        all(decoded[key] == value for key, value in expected_source_metadata.items()),
+        "run metadata source approval/binding identity mismatch",
     )
     return {
         "openpi_package_environment_sha256": package_sha256,
@@ -445,6 +496,7 @@ def _validate_specialized_contracts(
     model = validate_persisted_pi05_droid_jointpos_model_runtime(
         paths["model_runtime_contract"], serving["value"]
     )
+    consumer_contracts = _validate_consumer_binding_contracts(paths, model["value"])
     runtime = validate_jointpos_runtime_artifact(paths["runtime_contract"])
     asset_script = (
         Path(__file__).resolve().parents[2]
@@ -512,7 +564,7 @@ def _validate_specialized_contracts(
         model["value"]["host_runtime"], runtime["execution_environment"]
     )
     package_runtime = _validate_package_run_metadata(
-        paths["run_metadata"], model["value"]["host_runtime"]
+        paths["run_metadata"], model["value"]["host_runtime"], consumer_contracts
     )
     return {
         "asset_manifest_sha256": asset["manifest_sha256"],
@@ -522,11 +574,108 @@ def _validate_specialized_contracts(
         "rng_stream_artifact_sha256": rng["sha256"],
         "request_proof_artifact_sha256": proof_artifact["sha256"],
         "video_validation_artifact_sha256": video["sha256"],
+        **consumer_contracts,
         "video_container_image_sha256": PI05_DROID_JOINTPOS_PYXIS_SHA256,
         "video_ffprobe_sha256": media_tools["ffprobe"]["sha256"],
         "video_ffmpeg_sha256": media_tools["ffmpeg"]["sha256"],
         **gpu_vulkan,
         **package_runtime,
+    }
+
+
+def _validate_consumer_binding_contracts(
+    paths: dict[str, Path], model_value: dict[str, Any]
+) -> dict[str, str]:
+    """Validate the real three-stage consumer artifacts used by evidence."""
+
+    _require(
+        {
+            "consumer_binding_preload",
+            "consumer_binding_postload",
+            "consumer_binding_postrun",
+            "run_tokenizer",
+            "source_approval",
+        }.issubset(paths),
+        "consumer-binding evidence paths are incomplete",
+    )
+    consumer_preload = validate_persisted_consumer_binding(
+        paths["consumer_binding_preload"]
+    )
+    consumer_postload = validate_persisted_consumer_binding(
+        paths["consumer_binding_postload"]
+    )
+    consumer_postrun = validate_persisted_consumer_binding(
+        paths["consumer_binding_postrun"]
+    )
+    consumer = compare_consumer_binding_reports(
+        consumer_preload["value"],
+        consumer_postload["value"],
+        consumer_postrun["value"],
+    )
+    source_approval = validate_persisted_source_approval(paths["source_approval"])
+    approval_value = source_approval["value"]
+    bound_source = consumer_preload["value"]["identity"]["source"]
+    run_tokenizer = validate_immutable_file(paths["run_tokenizer"])
+    bound_tokenizer = consumer_preload["value"]["identity"]["tokenizer"]
+    _require(
+        run_tokenizer["sha256"] == bound_tokenizer["sha256"]
+        and run_tokenizer["size"] == bound_tokenizer["size"],
+        "sealed run-local tokenizer differs from consumer binding",
+    )
+    _require(
+        run_tokenizer["path"] == str(Path(bound_tokenizer["path"]).resolve()),
+        "sealed run-local tokenizer differs from consumer binding",
+    )
+    model_consumer = model_value["consumer_binding"]
+    _require(
+        model_consumer["binding_sha256"] == consumer["binding_sha256"]
+        and model_consumer["checkpoint_objects_sha256"]
+        == consumer["checkpoint_objects_sha256"]
+        and model_consumer["source_tree_sha256"] == consumer["source_tree_sha256"]
+        and model_consumer["tokenizer_sha256"] == consumer["tokenizer_sha256"]
+        and model_consumer["preload_artifact_sha256"] == consumer_preload["sha256"]
+        and model_consumer["postload_artifact_sha256"] == consumer_postload["sha256"]
+        and model_consumer["preload_filename"]
+        == paths["consumer_binding_preload"].name
+        and model_consumer["postload_filename"]
+        == paths["consumer_binding_postload"].name
+        and model_consumer["postrun_filename"]
+        == paths["consumer_binding_postrun"].name,
+        "model-runtime consumer binding differs from lifecycle artifacts",
+    )
+    _require(
+        approval_value["snapshot_path"] == bound_source["root"]
+        and approval_value["source_tree_sha256"] == consumer["source_tree_sha256"]
+        and approval_value["polaris_base_commit"]
+        == bound_source["polaris_base_commit"]
+        and approval_value["polaris_base_tree"] == bound_source["polaris_base_tree"]
+        and approval_value["openpi_commit"] == bound_source["openpi_commit"]
+        and model_consumer["source_approval_filename"]
+        == paths["source_approval"].name
+        and model_consumer["source_approval_artifact_sha256"]
+        == source_approval["sha256"]
+        and model_consumer["implementation_commit"]
+        == approval_value["implementation_commit"]
+        and model_consumer["trusted_source_hasher_sha256"]
+        == approval_value["trusted_hasher_sha256"],
+        "source approval differs from consumer/model-runtime binding",
+    )
+    return {
+        "consumer_binding_sha256": consumer["binding_sha256"],
+        "consumer_binding_preload_artifact_sha256": consumer_preload["sha256"],
+        "consumer_binding_postload_artifact_sha256": consumer_postload["sha256"],
+        "consumer_binding_postrun_artifact_sha256": consumer_postrun["sha256"],
+        "source_approval_artifact_sha256": source_approval["sha256"],
+        "source_approval_path": source_approval["path"],
+        "source_snapshot_path": approval_value["snapshot_path"],
+        "source_tree_sha256": approval_value["source_tree_sha256"],
+        "source_implementation_commit": approval_value["implementation_commit"],
+        "trusted_source_hasher_sha256": approval_value[
+            "trusted_hasher_sha256"
+        ],
+        "polaris_base_commit": approval_value["polaris_base_commit"],
+        "polaris_base_tree": approval_value["polaris_base_tree"],
+        "source_openpi_commit": approval_value["openpi_commit"],
     }
 
 

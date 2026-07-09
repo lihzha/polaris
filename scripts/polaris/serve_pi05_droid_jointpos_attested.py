@@ -32,6 +32,14 @@ from polaris.pi05_droid_jointpos_serving_contract import (
     verify_openpi_package_environment,
     verify_pi05_droid_jointpos_checkpoint,
 )
+from polaris.pi05_droid_jointpos_consumer_binding import (
+    TOKENIZER_URI,
+    compare_consumer_binding_reports,
+    open_consumer_binding,
+    publish_consumer_binding,
+    validate_persisted_consumer_binding,
+    validate_persisted_source_approval,
+)
 
 
 def _install_controlled_openpi_path(openpi_dir: Path) -> None:
@@ -108,6 +116,34 @@ async def _serve_then_publish_final_rng(
         loop.remove_signal_handler(signal.SIGUSR1)
 
 
+def _block_loaded_model_until_ready(policy: object, jax_module: object) -> dict[str, int]:
+    """Wait for every restored JAX parameter leaf before accepting post-load state."""
+
+    from flax import nnx
+
+    try:
+        model_state = nnx.state(policy._model)
+    except AttributeError as error:
+        raise ValueError("Loaded official policy has no model state") from error
+    leaves = jax_module.tree_util.tree_leaves(model_state)
+    ready_leaf_count = 0
+    total_elements = 0
+    for leaf in leaves:
+        value = getattr(leaf, "value", leaf)
+        block_until_ready = getattr(value, "block_until_ready", None)
+        if block_until_ready is None:
+            continue
+        block_until_ready()
+        ready_leaf_count += 1
+        total_elements += int(getattr(value, "size", 0))
+    if ready_leaf_count <= 0 or total_elements <= 0:
+        raise ValueError("No restored JAX model parameter leaf reached readiness")
+    return {
+        "ready_leaf_count": ready_leaf_count,
+        "total_elements": total_elements,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint-dir", type=Path, required=True)
@@ -116,6 +152,16 @@ def main() -> None:
     parser.add_argument("--serving-contract-output", type=Path, required=True)
     parser.add_argument("--model-runtime-contract-output", type=Path, required=True)
     parser.add_argument("--rng-stream-output", type=Path, required=True)
+    parser.add_argument("--consumer-binding-preload", type=Path, required=True)
+    parser.add_argument("--consumer-binding-postload-output", type=Path, required=True)
+    parser.add_argument("--consumer-binding-postrun-output", type=Path, required=True)
+    parser.add_argument("--source-snapshot", type=Path, required=True)
+    parser.add_argument("--source-tree-sha256", required=True)
+    parser.add_argument("--source-approval", type=Path, required=True)
+    parser.add_argument("--source-approval-sha256", required=True)
+    parser.add_argument("--implementation-commit", required=True)
+    parser.add_argument("--trusted-source-hasher-sha256", required=True)
+    parser.add_argument("--tokenizer-path", type=Path, required=True)
     parser.add_argument("--expected-request-count", type=int, required=True)
     parser.add_argument("--port", type=int, required=True)
     args = parser.parse_args()
@@ -155,17 +201,87 @@ def main() -> None:
 
     if jax.config.x64_enabled:
         raise ValueError("Attested pi0.5 serving requires JAX x64 disabled")
+    preload_artifact = validate_persisted_consumer_binding(
+        args.consumer_binding_preload
+    )
+    if preload_artifact["value"]["stage"] != "pre_load":
+        raise ValueError("Consumer-binding preload artifact has the wrong stage")
+    source_approval = validate_persisted_source_approval(args.source_approval)
+    approval_value = source_approval["value"]
+    if (
+        source_approval["sha256"] != args.source_approval_sha256
+        or approval_value["snapshot_path"] != str(args.source_snapshot)
+        or approval_value["source_tree_sha256"] != args.source_tree_sha256
+        or approval_value["implementation_commit"] != args.implementation_commit
+        or approval_value["trusted_hasher_sha256"]
+        != args.trusted_source_hasher_sha256
+    ):
+        raise ValueError("Source approval differs from the trusted launch identity")
+    consumer_binding = open_consumer_binding(
+        checkpoint=args.checkpoint_dir,
+        manifest=args.manifest,
+        tokenizer=args.tokenizer_path,
+        source=args.source_snapshot,
+        expected_source_tree_sha256=args.source_tree_sha256,
+    )
+    live_preload = consumer_binding.snapshot("pre_load")
+    compare_consumer_binding_reports(preload_artifact["value"], live_preload)
+    live_source = live_preload["identity"]["source"]
+    if (
+        live_source["root"] != approval_value["snapshot_path"]
+        or live_source["tree_sha256"] != approval_value["source_tree_sha256"]
+        or live_source["polaris_base_commit"]
+        != approval_value["polaris_base_commit"]
+        or live_source["polaris_base_tree"] != approval_value["polaris_base_tree"]
+        or live_source["openpi_commit"] != approval_value["openpi_commit"]
+    ):
+        raise ValueError("Live source binding differs from the source approval")
+
     checkpoint_report = verify_pi05_droid_jointpos_checkpoint(
         args.checkpoint_dir, args.manifest
     )
     train_config = config.get_config("pi05_droid_jointpos_polaris")
     train_report = validate_official_train_config(train_config)
+
+    official_maybe_download = openpi_tokenizer.download.maybe_download
+
+    def bound_maybe_download(url: str, *positional: object, **keywords: object) -> Path:
+        if url == TOKENIZER_URI:
+            return args.tokenizer_path.resolve(strict=True)
+        return official_maybe_download(url, *positional, **keywords)
+
+    # Bind every PaliGemma tokenizer construction to the run-local verified file.
+    openpi_tokenizer.download.maybe_download = bound_maybe_download
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
     data_report = validate_official_data_config(data_config)
 
     # No overrides: this is the exact official checkpoint/config construction.
     policy = policy_config.create_trained_policy(
         train_config, args.checkpoint_dir.resolve()
+    )
+    model_parameter_readiness = _block_loaded_model_until_ready(policy, jax)
+    postload_artifact = publish_consumer_binding(
+        args.consumer_binding_postload_output,
+        consumer_binding.snapshot("post_load"),
+    )
+    consumer_binding_summary = compare_consumer_binding_reports(
+        preload_artifact["value"], postload_artifact["value"]
+    )
+    consumer_binding_summary.update(
+        {
+            "preload_filename": args.consumer_binding_preload.name,
+            "preload_artifact_sha256": preload_artifact["sha256"],
+            "postload_filename": args.consumer_binding_postload_output.name,
+            "postload_artifact_sha256": postload_artifact["sha256"],
+            "postrun_filename": args.consumer_binding_postrun_output.name,
+            "source_approval_filename": args.source_approval.name,
+            "source_approval_artifact_sha256": source_approval["sha256"],
+            "implementation_commit": approval_value["implementation_commit"],
+            "trusted_source_hasher_sha256": approval_value[
+                "trusted_hasher_sha256"
+            ],
+            "model_parameter_readiness": model_parameter_readiness,
+        }
     )
     policy_report = validate_official_policy_runtime(
         policy=policy,
@@ -213,6 +329,7 @@ def main() -> None:
         openpi_runtime_attestation=runtime_attestation,
         host_runtime=host_runtime,
         tokenizer_artifact=tokenizer_artifact,
+        consumer_binding=consumer_binding_summary,
         expected_request_count=args.expected_request_count,
         serving_metadata=metadata,
     )
@@ -226,6 +343,17 @@ def main() -> None:
     logging.info("Immutable model-runtime contract: %s", runtime_artifact)
 
     def publish_final_rng_snapshot() -> None:
+        postrun_artifact = publish_consumer_binding(
+            args.consumer_binding_postrun_output,
+            consumer_binding.snapshot("postrun"),
+        )
+        final_binding = compare_consumer_binding_reports(
+            preload_artifact["value"],
+            postload_artifact["value"],
+            postrun_artifact["value"],
+        )
+        if final_binding["binding_sha256"] != consumer_binding_summary["binding_sha256"]:
+            raise ValueError("Final consumer binding differs from loaded model binding")
         final_key_data = jax.random.key_data(policy._rng).tolist()
 
         @jax.jit
@@ -280,6 +408,8 @@ def main() -> None:
         sys.stdout.flush()
         sys.stderr.flush()
         raise
+    finally:
+        consumer_binding.close()
 
 
 if __name__ == "__main__":

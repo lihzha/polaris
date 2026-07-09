@@ -190,15 +190,20 @@ case "${MODE}" in
   *) echo "Usage: $0 {canary|foodbussing50|full}" >&2; exit 2 ;;
 esac
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SBATCH_SCRIPT="${SBATCH_SCRIPT:-${SCRIPT_DIR}/l40s_pi05_eval_job.sbatch}"
-POLARIS_DIR="${POLARIS_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+SCRIPT_DIR="$(readlink -f -- "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)")"
+APPROVED_SBATCH_SCRIPT="${SCRIPT_DIR}/l40s_pi05_eval_job.sbatch"
+APPROVED_SBATCH_SCRIPT_SHA256="7117f1455eb2cd9dc1a96d6e5e91adad59c411152e95b970771cda4f562c90f2"
+SBATCH_SCRIPT="${SBATCH_SCRIPT:-${APPROVED_SBATCH_SCRIPT}}"
+: "${POLARIS_SOURCE_SNAPSHOT:?Set the approved content-addressed source snapshot}"
+: "${EXPECTED_POLARIS_SOURCE_TREE_SHA256:?Set the approved source-snapshot tree SHA-256}"
+: "${POLARIS_SOURCE_APPROVAL:?Set the immutable source approval JSON}"
+: "${POLARIS_OPENPI_RUNTIME_DIR:?Set the adopted OpenPI bd70 runtime checkout}"
 RUN_NAMESPACE="${RUN_NAMESPACE:-pi05-polaris-$(date -u +%Y%m%dT%H%M%SZ)}"
 NFS_ROOT="${NFS_ROOT:-/lustre/fsw/portfolios/nvr/users/lzha}"
 SBATCH_LOG_ROOT="${SBATCH_LOG_ROOT:-${NFS_ROOT}/slurm_logs/polaris-pi05/${RUN_NAMESPACE}}"
 SUBMISSION_MANIFEST="${SUBMISSION_MANIFEST:-${NFS_ROOT}/results/polaris-pi05/${RUN_NAMESPACE}/${MODE}_jobs.tsv}"
-TRANSACTION_ROOT="${SUBMISSION_MANIFEST}.transactions"
-POLARIS_COMMIT="$(git -C "${POLARIS_DIR}" rev-parse HEAD)"
+TRANSACTION_ROOT=""
+POLARIS_COMMIT=c5b52a9cebb2c797a84e3df374b6002005d20a4f
 ALLOW_RESUBMIT="${ALLOW_RESUBMIT:-0}"
 ENVIRONMENT_SEED="${ENVIRONMENT_SEED:-0}"
 SUBMIT_USER="${USER:-$(id -un)}"
@@ -213,15 +218,89 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-for required_command in flock sbatch scancel scontrol squeue sha256sum sync; do
+for required_command in flock git readlink sbatch scancel scontrol squeue sha256sum sync; do
   command -v "${required_command}" >/dev/null || die "Missing required command: ${required_command}"
 done
+[[ -f "${SBATCH_SCRIPT}" && ! -L "${SBATCH_SCRIPT}" ]] \
+  || die "Missing or symlinked sbatch script: ${SBATCH_SCRIPT}"
+[[ "$(readlink -f -- "${SBATCH_SCRIPT}")" == "$(readlink -f -- "${APPROVED_SBATCH_SCRIPT}")" ]] \
+  || die "SBATCH_SCRIPT override is forbidden for the approved canary"
+observed_sbatch_script_sha256="$(sha256sum "${SBATCH_SCRIPT}" | awk '{print $1}')"
+[[ "${observed_sbatch_script_sha256}" == "${APPROVED_SBATCH_SCRIPT_SHA256}" ]] \
+  || die "Approved sbatch script SHA-256 mismatch"
 [[ "${RUN_NAMESPACE}" =~ ^[A-Za-z0-9._-]+$ ]] \
   || die "RUN_NAMESPACE may contain only letters, digits, dot, underscore, and dash"
 [[ "${ALLOW_RESUBMIT}" == 0 || "${ALLOW_RESUBMIT}" == 1 ]] \
   || die "ALLOW_RESUBMIT must be 0 or 1"
-[[ -z "$(git -C "${POLARIS_DIR}" status --porcelain=v1 --untracked-files=all)" ]] \
-  || die "PolaRiS source has tracked or untracked modifications"
+[[ -d "${POLARIS_SOURCE_SNAPSHOT}" && ! -L "${POLARIS_SOURCE_SNAPSHOT}" ]] \
+  || die "PolaRiS source snapshot must be one real directory"
+[[ -f "${POLARIS_SOURCE_APPROVAL}" && ! -L "${POLARIS_SOURCE_APPROVAL}" ]] \
+  || die "PolaRiS source approval must be one real file"
+[[ -d "${POLARIS_OPENPI_RUNTIME_DIR}" && ! -L "${POLARIS_OPENPI_RUNTIME_DIR}" ]] \
+  || die "Adopted OpenPI runtime must be one real directory"
+POLARIS_SOURCE_SNAPSHOT="$(readlink -f -- "${POLARIS_SOURCE_SNAPSHOT}")" \
+  || die "Cannot canonicalize the PolaRiS source snapshot"
+POLARIS_SOURCE_APPROVAL="$(readlink -f -- "${POLARIS_SOURCE_APPROVAL}")" \
+  || die "Cannot canonicalize the PolaRiS source approval"
+POLARIS_OPENPI_RUNTIME_DIR="$(readlink -f -- "${POLARIS_OPENPI_RUNTIME_DIR}")" \
+  || die "Cannot canonicalize the adopted OpenPI runtime"
+[[ -x "${POLARIS_OPENPI_RUNTIME_DIR}/.venv/bin/python" ]] \
+  || die "Adopted OpenPI runtime interpreter is missing"
+observed_openpi_commit="$(git -C "${POLARIS_OPENPI_RUNTIME_DIR}" rev-parse HEAD)" \
+  || die "Cannot inspect the adopted OpenPI runtime checkout"
+[[ "${observed_openpi_commit}" == bd70b8f4011e85b3f3b0f039f12113f78718e7bf ]] \
+  || die "Adopted OpenPI runtime commit mismatch: ${observed_openpi_commit}"
+openpi_status="$(
+  git -C "${POLARIS_OPENPI_RUNTIME_DIR}" status --porcelain=v1 --untracked-files=all
+)" || die "Cannot inspect adopted OpenPI runtime cleanliness"
+[[ -z "${openpi_status}" ]] \
+  || die "Adopted OpenPI runtime checkout is not clean"
+observed_source_tree_sha256="$(
+  /usr/bin/bash --noprofile --norc "${APPROVED_SBATCH_SCRIPT}" \
+    --source-digest "${POLARIS_SOURCE_SNAPSHOT}"
+)" || die "Cannot hash the PolaRiS source snapshot"
+[[ "${observed_source_tree_sha256}" == "${EXPECTED_POLARIS_SOURCE_TREE_SHA256}" ]] \
+  || die "PolaRiS source snapshot SHA-256 mismatch"
+PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
+  PYTHONPATH="${POLARIS_SOURCE_SNAPSHOT}/src:${POLARIS_SOURCE_SNAPSHOT}/third_party/openpi/packages/openpi-client/src" \
+  "${POLARIS_OPENPI_RUNTIME_DIR}/.venv/bin/python" -B - \
+  "${POLARIS_SOURCE_SNAPSHOT}" <<'PY' \
+  || die "Approved source snapshot import/origin smoke failed"
+import importlib
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve(strict=True)
+expected = {
+    "polaris.pi05_droid_jointpos_consumer_binding": (
+        "src/polaris/pi05_droid_jointpos_consumer_binding.py"
+    ),
+    "polaris.policy.droid_jointpos_client": (
+        "src/polaris/policy/droid_jointpos_client.py"
+    ),
+    "openpi_client.image_tools": (
+        "third_party/openpi/packages/openpi-client/src/openpi_client/image_tools.py"
+    ),
+    "openpi_client.websocket_client_policy": (
+        "third_party/openpi/packages/openpi-client/src/openpi_client/websocket_client_policy.py"
+    ),
+}
+for name, relative in expected.items():
+    module = importlib.import_module(name)
+    if Path(module.__file__).resolve(strict=True) != root / relative:
+        raise SystemExit(f"snapshot import escaped approved source: {name}")
+PY
+source_approval_result="$(
+  /usr/bin/bash --noprofile --norc "${APPROVED_SBATCH_SCRIPT}" \
+    --validate-source-approval "${POLARIS_SOURCE_APPROVAL}" \
+    "${POLARIS_SOURCE_SNAPSHOT}" "${EXPECTED_POLARIS_SOURCE_TREE_SHA256}" \
+    "${APPROVED_SBATCH_SCRIPT_SHA256}"
+)" || die "Source approval validation failed"
+IFS=$'\t' read -r SOURCE_APPROVAL_SHA256 POLARIS_IMPLEMENTATION_COMMIT \
+  <<< "${source_approval_result}"
+[[ "${SOURCE_APPROVAL_SHA256}" =~ ^[0-9a-f]{64}$ \
+  && "${POLARIS_IMPLEMENTATION_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
+  || die "Source approval result is invalid"
 
 if [[ "${MODE}" == canary ]]; then
   tasks=(DROID-FoodBussing)
@@ -252,9 +331,14 @@ fi
   || die "ENVIRONMENT_SEED must be a non-negative integer"
 (( ENVIRONMENT_SEED <= 4294967295 )) \
   || die "ENVIRONMENT_SEED must be at most 4294967295"
-[[ -f "${SBATCH_SCRIPT}" && ! -L "${SBATCH_SCRIPT}" ]] \
-  || die "Missing or symlinked sbatch script: ${SBATCH_SCRIPT}"
+manifest_name="$(basename "${SUBMISSION_MANIFEST}")"
 mkdir -p "${SBATCH_LOG_ROOT}" "$(dirname "${SUBMISSION_MANIFEST}")"
+SBATCH_LOG_ROOT="$(readlink -f -- "${SBATCH_LOG_ROOT}")" \
+  || die "Cannot canonicalize the Slurm log root"
+manifest_parent="$(readlink -f -- "$(dirname "${SUBMISSION_MANIFEST}")")" \
+  || die "Cannot canonicalize the submission-manifest parent"
+SUBMISSION_MANIFEST="${manifest_parent}/${manifest_name}"
+TRANSACTION_ROOT="${SUBMISSION_MANIFEST}.transactions"
 [[ ! -L "${TRANSACTION_ROOT}" ]] || die "Transaction root must not be a symlink"
 mkdir -p "${TRANSACTION_ROOT}"
 [[ -d "${TRANSACTION_ROOT}" && ! -L "${TRANSACTION_ROOT}" ]] \
@@ -265,7 +349,7 @@ flock -n 9 || { echo "Another submitter holds ${SUBMISSION_MANIFEST}.lock" >&2; 
 recover_incomplete_transactions \
   || { echo "Unresolved prior submission transaction; refusing new work" >&2; exit 5; }
 
-expected_header=$'job_id\tmode\ttask\trollouts\tenvironment_seed\trun_namespace\tsubmitted_at\tbatch_script_sha256\tsubmission_argv_sha256\tprovenance_dir'
+expected_header=$'job_id\tmode\ttask\trollouts\tenvironment_seed\trun_namespace\tsource_tree_sha256\tsource_approval_sha256\timplementation_commit\topenpi_commit\tsubmitted_at\tbatch_script_sha256\tsubmission_argv_sha256\tprovenance_dir'
 if [[ ! -e "${SUBMISSION_MANIFEST}" ]]; then
   write_atomic_text "${SUBMISSION_MANIFEST}" 0644 "${expected_header}"
 else
@@ -276,11 +360,30 @@ fi
 
 job_ids=()
 for task in "${tasks[@]}"; do
-  existing_job_id="$(
+  existing_row="$(
     awk -F '\t' -v mode="${MODE}" -v task="${task}" \
-      '$2 == mode && $3 == task {job_id = $1} END {print job_id}' \
+      '$2 == mode && $3 == task {row = $0} END {print row}' \
       "${SUBMISSION_MANIFEST}"
   )"
+  existing_job_id=""
+  if [[ -n "${existing_row}" ]]; then
+    IFS=$'\t' read -r existing_job_id existing_mode existing_task \
+      existing_rollouts existing_seed existing_namespace existing_source_sha256 \
+      existing_source_approval_sha256 existing_implementation_commit \
+      existing_openpi_commit _existing_time _existing_batch_sha256 \
+      _existing_argv_sha256 _existing_provenance <<< "${existing_row}"
+    if [[ "${existing_mode}" != "${MODE}" \
+      || "${existing_task}" != "${task}" \
+      || "${existing_rollouts}" != "${rollouts}" \
+      || "${existing_seed}" != "${ENVIRONMENT_SEED}" \
+      || "${existing_namespace}" != "${RUN_NAMESPACE}" \
+      || "${existing_source_sha256}" != "${EXPECTED_POLARIS_SOURCE_TREE_SHA256}" \
+      || "${existing_source_approval_sha256}" != "${SOURCE_APPROVAL_SHA256}" \
+      || "${existing_implementation_commit}" != "${POLARIS_IMPLEMENTATION_COMMIT}" \
+      || "${existing_openpi_commit}" != bd70b8f4011e85b3f3b0f039f12113f78718e7bf ]]; then
+      die "Existing ${MODE}/${task} row has incompatible evaluation provenance"
+    fi
+  fi
   if [[ -n "${existing_job_id}" && "${ALLOW_RESUBMIT}" != 1 ]]; then
     echo "Existing ${MODE} attempt for ${task}: job ${existing_job_id}; set ALLOW_RESUBMIT=1 for an explicit retry"
     job_ids+=("${existing_job_id}")
@@ -298,12 +401,17 @@ for task in "${tasks[@]}"; do
   mkdir -m 0700 "${ACTIVE_TRANSACTION_DIR}"
   write_atomic_text "${ACTIVE_TRANSACTION_DIR}/transaction_id" 0444 "${ACTIVE_TRANSACTION_ID}"
   printf -v transaction_metadata \
-    'mode=%s\ntask=%s\nrun_namespace=%s\npolaris_commit=%s\nprepared_at=%s\n' \
-    "${MODE}" "${task}" "${RUN_NAMESPACE}" "${POLARIS_COMMIT}" "$(date -Iseconds)"
+    'mode=%s\ntask=%s\nrun_namespace=%s\npolaris_base_commit=%s\nimplementation_commit=%s\nsource_snapshot=%s\nsource_tree_sha256=%s\nsource_approval=%s\nsource_approval_sha256=%s\nopenpi_runtime=%s\nopenpi_commit=%s\nprepared_at=%s\n' \
+    "${MODE}" "${task}" "${RUN_NAMESPACE}" "${POLARIS_COMMIT}" \
+    "${POLARIS_IMPLEMENTATION_COMMIT}" "${POLARIS_SOURCE_SNAPSHOT}" \
+    "${EXPECTED_POLARIS_SOURCE_TREE_SHA256}" "${POLARIS_SOURCE_APPROVAL}" \
+    "${SOURCE_APPROVAL_SHA256}" \
+    "${POLARIS_OPENPI_RUNTIME_DIR}" \
+    bd70b8f4011e85b3f3b0f039f12113f78718e7bf "$(date -Iseconds)"
   write_atomic_text "${ACTIVE_TRANSACTION_DIR}/metadata" 0444 "${transaction_metadata%$'\n'}"
   write_transaction_state "${ACTIVE_TRANSACTION_DIR}" prepared
 
-  export_vars="PATH=${PATH},HOME=${HOME},POLARIS_DIR=${POLARIS_DIR},EXPECTED_POLARIS_COMMIT=${POLARIS_COMMIT},POLARIS_ENVIRONMENT=${task},ROLLOUTS=${rollouts},ENVIRONMENT_SEED=${ENVIRONMENT_SEED},RUN_NAMESPACE=${RUN_NAMESPACE}"
+  export_vars="PATH=${PATH},HOME=${HOME},POLARIS_SOURCE_SNAPSHOT=${POLARIS_SOURCE_SNAPSHOT},EXPECTED_POLARIS_SOURCE_TREE_SHA256=${EXPECTED_POLARIS_SOURCE_TREE_SHA256},POLARIS_SOURCE_APPROVAL=${POLARIS_SOURCE_APPROVAL},POLARIS_OPENPI_RUNTIME_DIR=${POLARIS_OPENPI_RUNTIME_DIR},EXPECTED_POLARIS_COMMIT=${POLARIS_COMMIT},POLARIS_ENVIRONMENT=${task},ROLLOUTS=${rollouts},ENVIRONMENT_SEED=${ENVIRONMENT_SEED},RUN_NAMESPACE=${RUN_NAMESPACE}"
   sbatch_argv=(sbatch --parsable --hold \
     --comment="${ACTIVE_TRANSACTION_ID}" \
     --job-name="${job_name}" \
@@ -338,11 +446,19 @@ for task in "${tasks[@]}"; do
     echo "Failed to preserve submission provenance for held job ${ACTIVE_JOB_ID}" >&2
     exit 5
   fi
+  if [[ "${batch_script_sha256}" != "${APPROVED_SBATCH_SCRIPT_SHA256}" ]]; then
+    write_transaction_state "${ACTIVE_TRANSACTION_DIR}" provenance_failed || true
+    echo "Slurm-spooled batch script differs from the approved script" >&2
+    exit 5
+  fi
   write_transaction_state "${ACTIVE_TRANSACTION_DIR}" provenance_durable
 
-  printf -v manifest_row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+  printf -v manifest_row '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
     "${ACTIVE_JOB_ID}" "${MODE}" "${task}" "${rollouts}" "${ENVIRONMENT_SEED}" \
-    "${RUN_NAMESPACE}" "$(date -Iseconds)" "${batch_script_sha256}" \
+    "${RUN_NAMESPACE}" "${EXPECTED_POLARIS_SOURCE_TREE_SHA256}" \
+    "${SOURCE_APPROVAL_SHA256}" "${POLARIS_IMPLEMENTATION_COMMIT}" \
+    bd70b8f4011e85b3f3b0f039f12113f78718e7bf \
+    "$(date -Iseconds)" "${batch_script_sha256}" \
     "${submission_argv_sha256}" "${provenance_dir}"
   append_manifest_row "${manifest_row}"
   write_transaction_state "${ACTIVE_TRANSACTION_DIR}" manifest_durable
