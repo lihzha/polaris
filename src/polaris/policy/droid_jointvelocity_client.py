@@ -18,6 +18,18 @@ from polaris.pi05_droid_jointvelocity_contract import (
     validate_pi05_droid_server_metadata,
     verify_openpi_git_checkout,
 )
+from polaris.pi05_droid_native_eval_contract import (
+    PI05_DROID_NATIVE_DECIMATION,
+    PI05_DROID_NATIVE_ENVIRONMENT_RUNTIME_PROFILE,
+    PI05_DROID_NATIVE_EPISODE_STEPS,
+    PI05_DROID_NATIVE_INTERNAL_MAX_EPISODE_STEPS,
+    PI05_DROID_NATIVE_SENSOR_LIVENESS_PROFILE,
+    PI05_DROID_NATIVE_SENSOR_NAMES,
+    PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
+    validate_environment_runtime_contract,
+    validate_outer_step_flags,
+    validate_terminal_rollout_evidence,
+)
 from polaris.policy.abstract_client import InferenceClient, PolicyArgs
 from polaris.policy.droid_jointpos_client import (
     _latest_trace_reset_index,
@@ -77,6 +89,62 @@ def _tensor_numpy(value: Any, *, field: str) -> np.ndarray:
     return array
 
 
+def _exact_nonnegative_int(value: Any, *, field: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{field} must be one nonnegative exact integer")
+    return value
+
+
+def _single_integer_tensor(value: Any, *, field: str) -> int:
+    array = _tensor_numpy(value, field=field)
+    if array.shape != (1,) or not np.issubdtype(array.dtype, np.integer):
+        raise ValueError(
+            f"{field} must be one integer tensor, got {array.dtype} {array.shape}"
+        )
+    return _exact_nonnegative_int(int(array[0]), field=field)
+
+
+def _capture_environment_state(
+    env: Any, environment_runtime_contract: dict[str, Any]
+) -> dict[str, Any]:
+    runtime = validate_environment_runtime_contract(environment_runtime_contract)
+    root_env = getattr(env, "unwrapped", env)
+    live_max_episode_length = getattr(root_env, "max_episode_length", None)
+    if (
+        type(live_max_episode_length) is not int
+        or live_max_episode_length != runtime["live_max_episode_length"]
+    ):
+        raise ValueError("Live environment max_episode_length drifted during rollout")
+    episode_length = _single_integer_tensor(
+        getattr(root_env, "episode_length_buf", None), field="episode length buffer"
+    )
+    sim_step_counter = _exact_nonnegative_int(
+        getattr(root_env, "_sim_step_counter", None), field="sim step counter"
+    )
+    common_step_counter = _exact_nonnegative_int(
+        getattr(root_env, "common_step_counter", None), field="common step counter"
+    )
+    scene = getattr(root_env, "scene", None)
+    sensors = getattr(scene, "sensors", None)
+    if not isinstance(sensors, dict):
+        raise ValueError("Live environment has no closed camera-sensor mapping")
+    sensor_frame_counters = {}
+    for sensor_name in PI05_DROID_NATIVE_SENSOR_NAMES:
+        if sensor_name not in sensors:
+            raise ValueError(f"Missing required live camera sensor: {sensor_name}")
+        sensor_frame_counters[sensor_name] = _single_integer_tensor(
+            getattr(sensors[sensor_name], "frame", None),
+            field=f"{sensor_name} camera frame counter",
+        )
+    return {
+        "live_max_episode_length": live_max_episode_length,
+        "episode_length": episode_length,
+        "sim_step_counter": sim_step_counter,
+        "common_step_counter": common_step_counter,
+        "sensor_frame_counters": sensor_frame_counters,
+    }
+
+
 @InferenceClient.register(client_name="DroidJointVelocity")
 class DroidJointVelocityClient(InferenceClient):
     """Serve the immutable official ``pi05_droid`` velocity contract."""
@@ -110,6 +178,13 @@ class DroidJointVelocityClient(InferenceClient):
         else:
             self.reset_index = -1
         self._pending_execution: dict[str, Any] | None = None
+        self._environment_runtime_contract: dict[str, Any] | None = None
+        self._rollout_environment_before: dict[str, Any] | None = None
+        self._last_environment_after: dict[str, Any] | None = None
+        self._execution_step_index = 0
+        self._terminated_false_count = 0
+        self._truncated_false_count = 0
+        self._terminal_rollout: dict[str, Any] | None = None
 
         marker = {
             "client": "DroidJointVelocity",
@@ -230,15 +305,65 @@ class DroidJointVelocityClient(InferenceClient):
         return np.concatenate([external, wrist], axis=1)
 
     def reset(self) -> None:
+        if self._environment_runtime_contract is None:
+            raise RuntimeError(
+                "DroidJointVelocity evaluation runtime must be bound before reset"
+            )
         if self._pending_execution is not None:
             raise RuntimeError(
                 "Cannot reset DroidJointVelocity before recording the prior execution"
+            )
+        if self._rollout_environment_before is not None:
+            raise RuntimeError(
+                "DroidJointVelocity native canary forbids a second rollout"
             )
         self.actions_from_chunk_completed = 0
         self.pred_action_chunk = None
         self.reset_index += 1
         self.query_index = 0
         self.active_query_index = None
+
+    def bind_evaluation_runtime(self, value: dict[str, Any]) -> None:
+        """Bind the live timeout and sensor-liveness contract before reset."""
+
+        if self._environment_runtime_contract is not None:
+            raise RuntimeError("DroidJointVelocity evaluation runtime is already bound")
+        self._environment_runtime_contract = validate_environment_runtime_contract(
+            value
+        )
+
+    def begin_rollout(self, env: Any) -> dict[str, Any]:
+        """Capture the exact counters after explicit reset and before action zero."""
+
+        if self._environment_runtime_contract is None:
+            raise RuntimeError("DroidJointVelocity evaluation runtime is not bound")
+        if self.reset_index != 0:
+            raise ValueError("Official native canary requires exactly reset index zero")
+        if self._rollout_environment_before is not None:
+            raise RuntimeError("DroidJointVelocity rollout already began")
+        before = _capture_environment_state(env, self._environment_runtime_contract)
+        if before["episode_length"] != 0:
+            raise ValueError(
+                "Explicit native rollout reset did not zero episode length"
+            )
+        self._rollout_environment_before = before
+        self._last_environment_after = None
+        self._execution_step_index = 0
+        self._terminated_false_count = 0
+        self._truncated_false_count = 0
+        self._terminal_rollout = None
+        if self.trace_path is not None:
+            self._append_trace(
+                {
+                    "schema_version": PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
+                    "record_type": "openpi_joint_velocity_rollout_start",
+                    "profile": PI05_DROID_JOINTVELOCITY_PROFILE,
+                    **self._trace_contract_identity(),
+                    "reset_index": self.reset_index,
+                    "environment_before": before,
+                }
+            )
+        return dict(before)
 
     def infer(
         self, obs: dict, instruction: str, return_viz: bool = False
@@ -294,15 +419,66 @@ class DroidJointVelocityClient(InferenceClient):
             "clipped_action": clipped_action,
             "pre_joint_position": current["joint_position"],
             "pre_joint_velocity": current["joint_velocity"],
+            "pre_normalized_gripper_position": current["gripper_position"],
         }
         self._trace_emitted_action()
         return clipped_action, visualization
 
-    def record_execution(self, obs: dict, env: Any) -> None:
+    def record_execution(
+        self, obs: dict, env: Any, *, terminated: Any, truncated: Any
+    ) -> None:
         """Validate live velocity targets and trace measured post-step q/dq."""
 
         if self._pending_execution is None:
             raise RuntimeError("No pending DroidJointVelocity action to record")
+        if (
+            self._environment_runtime_contract is None
+            or self._rollout_environment_before is None
+        ):
+            raise RuntimeError("DroidJointVelocity rollout runtime was not started")
+        if self._execution_step_index >= PI05_DROID_NATIVE_EPISODE_STEPS:
+            raise RuntimeError("DroidJointVelocity recorded more than 450 executions")
+        step_boundary = validate_outer_step_flags(
+            terminated,
+            truncated,
+            outer_step_index=self._execution_step_index,
+        )
+        environment_after = _capture_environment_state(
+            env, self._environment_runtime_contract
+        )
+        expected_episode_length = self._execution_step_index + 1
+        expected_sim_step_counter = (
+            self._rollout_environment_before["sim_step_counter"]
+            + expected_episode_length * PI05_DROID_NATIVE_DECIMATION
+        )
+        expected_common_step_counter = (
+            self._rollout_environment_before["common_step_counter"]
+            + expected_episode_length
+        )
+        if environment_after["episode_length"] != expected_episode_length:
+            raise ValueError(
+                "Live episode length proves an internal auto-reset before the outer "
+                f"450-step contract: expected={expected_episode_length}, "
+                f"actual={environment_after['episode_length']}"
+            )
+        if (
+            environment_after["sim_step_counter"] != expected_sim_step_counter
+            or environment_after["common_step_counter"] != expected_common_step_counter
+        ):
+            raise ValueError("Live simulator counters do not match one policy action")
+        for sensor_name in PI05_DROID_NATIVE_SENSOR_NAMES:
+            expected_frame = (
+                self._rollout_environment_before["sensor_frame_counters"][sensor_name]
+                + expected_episode_length
+            )
+            if (
+                environment_after["sensor_frame_counters"][sensor_name]
+                != expected_frame
+            ):
+                raise ValueError(
+                    "Live camera frame counter did not advance exactly once for "
+                    f"{sensor_name} at outer step {self._execution_step_index}"
+                )
         current = self._extract_observation(obs)
         root_env = getattr(env, "unwrapped", env)
         arm_term = root_env.action_manager._terms["arm"]
@@ -370,22 +546,94 @@ class DroidJointVelocityClient(InferenceClient):
             pending = self._pending_execution
             self._append_trace(
                 {
-                    "schema_version": 1,
+                    "schema_version": PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
                     "record_type": "openpi_joint_velocity_execution",
                     "profile": PI05_DROID_JOINTVELOCITY_PROFILE,
                     **self._trace_contract_identity(),
                     "reset_index": self.reset_index,
                     "query_index": pending["query_index"],
                     "chunk_action_index": pending["chunk_action_index"],
+                    **step_boundary,
+                    "environment_after": environment_after,
                     "processed_joint_velocity": processed[0].tolist(),
                     "articulation_joint_velocity_target": targets[0].tolist(),
                     "processed_finger_position_target": processed_finger[0].tolist(),
                     "articulation_finger_position_target": finger_target[0].tolist(),
                     "measured_joint_position_after": current["joint_position"].tolist(),
                     "measured_joint_velocity_after": current["joint_velocity"].tolist(),
+                    "measured_normalized_gripper_position_after": current[
+                        "gripper_position"
+                    ].tolist(),
                 }
             )
+        self._last_environment_after = environment_after
+        self._execution_step_index += 1
+        self._terminated_false_count += 1
+        self._truncated_false_count += 1
         self._pending_execution = None
+
+    def finish_rollout(self, env: Any, rubric: Any) -> dict[str, Any]:
+        """Freeze the true post-action state and rubric before environment close."""
+
+        if (
+            self._environment_runtime_contract is None
+            or self._rollout_environment_before is None
+            or self._last_environment_after is None
+        ):
+            raise RuntimeError("DroidJointVelocity rollout is incomplete")
+        if self._pending_execution is not None:
+            raise RuntimeError("DroidJointVelocity has an unmeasured terminal action")
+        if self._execution_step_index != PI05_DROID_NATIVE_EPISODE_STEPS:
+            raise ValueError("DroidJointVelocity did not execute exactly 450 actions")
+        current_environment = _capture_environment_state(
+            env, self._environment_runtime_contract
+        )
+        if current_environment != self._last_environment_after:
+            raise ValueError(
+                "Terminal environment changed after final execution capture"
+            )
+        if not isinstance(rubric, dict):
+            raise ValueError("Terminal rubric is not an object")
+        success = rubric.get("success")
+        progress = rubric.get("progress")
+        if type(success) is not bool:
+            raise ValueError("Terminal rubric success is not an exact boolean")
+        if hasattr(progress, "item"):
+            progress = progress.item()
+        if (
+            type(progress) not in (int, float)
+            or isinstance(progress, bool)
+            or not np.isfinite(progress)
+        ):
+            raise ValueError("Terminal rubric progress is not finite")
+        terminal = {
+            "schema_version": 1,
+            "profile": PI05_DROID_NATIVE_ENVIRONMENT_RUNTIME_PROFILE,
+            "environment_runtime_sha256": self._environment_runtime_contract["sha256"],
+            "outer_steps_completed": self._execution_step_index,
+            "last_outer_step_index": self._execution_step_index - 1,
+            "terminated_false_count": self._terminated_false_count,
+            "truncated_false_count": self._truncated_false_count,
+            "environment_before": self._rollout_environment_before,
+            "environment_after": current_environment,
+            "rubric": {"success": success, "progress": float(progress)},
+        }
+        terminal = validate_terminal_rollout_evidence(
+            terminal, self._environment_runtime_contract
+        )
+        if self.trace_path is not None:
+            self._append_trace(
+                {
+                    "schema_version": PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
+                    "record_type": "openpi_joint_velocity_rollout_end",
+                    "profile": PI05_DROID_JOINTVELOCITY_PROFILE,
+                    **self._trace_contract_identity(),
+                    "reset_index": self.reset_index,
+                    "terminal_rollout": terminal,
+                }
+            )
+        self._terminal_rollout = terminal
+        return terminal
 
     def _resize_images(
         self, current: dict[str, np.ndarray]
@@ -397,6 +645,8 @@ class DroidJointVelocityClient(InferenceClient):
         return external, wrist
 
     def _trace_contract_identity(self) -> dict[str, str | int]:
+        if self._environment_runtime_contract is None:
+            raise RuntimeError("Trace requested before environment runtime binding")
         return {
             "serving_contract_sha256": self.serving_contract["contract_sha256"],
             "serving_contract_artifact_sha256": self.serving_contract_artifact[
@@ -406,6 +656,12 @@ class DroidJointVelocityClient(InferenceClient):
             "client_runtime_attestation_sha256": self.client_runtime_attestation[
                 "sha256"
             ],
+            "environment_runtime_sha256": self._environment_runtime_contract["sha256"],
+            "outer_episode_steps": PI05_DROID_NATIVE_EPISODE_STEPS,
+            "internal_max_episode_length": (
+                PI05_DROID_NATIVE_INTERNAL_MAX_EPISODE_STEPS
+            ),
+            "sensor_liveness_profile": PI05_DROID_NATIVE_SENSOR_LIVENESS_PROFILE,
         }
 
     def _trace_query(self, request: dict, action_chunk: np.ndarray) -> None:
@@ -420,7 +676,7 @@ class DroidJointVelocityClient(InferenceClient):
             planned_clipped.append(clipped.tolist())
         self._append_trace(
             {
-                "schema_version": 1,
+                "schema_version": PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
                 "record_type": "openpi_joint_velocity_query",
                 "profile": PI05_DROID_JOINTVELOCITY_PROFILE,
                 **self._trace_contract_identity(),
@@ -464,7 +720,7 @@ class DroidJointVelocityClient(InferenceClient):
         pending = self._pending_execution
         self._append_trace(
             {
-                "schema_version": 1,
+                "schema_version": PI05_DROID_NATIVE_TRACE_SCHEMA_VERSION,
                 "record_type": "openpi_joint_velocity_action",
                 "profile": PI05_DROID_JOINTVELOCITY_PROFILE,
                 **self._trace_contract_identity(),
@@ -483,6 +739,9 @@ class DroidJointVelocityClient(InferenceClient):
                 ).tolist(),
                 "measured_joint_velocity_before": np.asarray(
                     pending["pre_joint_velocity"]
+                ).tolist(),
+                "measured_normalized_gripper_position_before": np.asarray(
+                    pending["pre_normalized_gripper_position"]
                 ).tolist(),
             }
         )

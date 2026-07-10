@@ -69,6 +69,9 @@ class EvalArgs:
     control_mode: Literal["joint-position", "joint-velocity", "eef-pose"] = (
         "joint-position"
     )
+    runtime_contract_path: str | None = None
+    lifecycle_ready_path: str | None = None
+    expected_gripper_drive_profile: str | None = None
 
 
 @dataclass
