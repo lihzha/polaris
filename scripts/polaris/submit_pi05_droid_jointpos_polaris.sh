@@ -12,6 +12,17 @@ die() {
   exit 2
 }
 
+run_bounded_host_python() {
+  /usr/bin/env \
+    OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    VECLIB_MAXIMUM_THREADS=1 \
+    BLIS_NUM_THREADS=1 \
+    "$@"
+}
+
 write_atomic_text() {
   local path="$1"
   local mode="$2"
@@ -769,6 +780,7 @@ capture_submission_provenance() {
   printf '%s\n' "${submission_argv}" > "${argv_temporary}" || return
   PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
     PYTHONPATH="${POLARIS_SOURCE_SNAPSHOT}/src" \
+    run_bounded_host_python \
     "${POLARIS_OPENPI_RUNTIME_DIR}/.venv/bin/python" -B -m \
     polaris.pi05_droid_jointpos_scheduler capture-job \
     --output "${scheduler_temporary}" \
@@ -925,6 +937,7 @@ else
 fi
 PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
   PYTHONPATH="${POLARIS_SOURCE_SNAPSHOT}/src:${POLARIS_SOURCE_SNAPSHOT}/third_party/openpi/packages/openpi-client/src" \
+  run_bounded_host_python \
   "${POLARIS_OPENPI_RUNTIME_DIR}/.venv/bin/python" -B - \
   "${POLARIS_SOURCE_SNAPSHOT}" "${snapshot_imports[@]}" <<'PY' \
   || die "Approved source snapshot import/origin smoke failed"
@@ -981,6 +994,7 @@ if "polaris.app_launcher_startup_diagnostic" in sys.argv[2:]:
 PY
 if [[ "${MODE}" == app-launcher-only ]]; then
   PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
+    run_bounded_host_python \
     "${POLARIS_OPENPI_RUNTIME_DIR}/.venv/bin/python" -I -S -B - \
     "${POLARIS_SOURCE_SNAPSHOT}" <<'PY' \
     || die "Approved AppLauncher finalizer origin/compile smoke failed"
@@ -1216,6 +1230,7 @@ for task in "${tasks[@]}"; do
     POLARIS_SACCT_PRELAUNCH_VALIDATION_RECEIPT="${ACTIVE_TRANSACTION_DIR}/sacct_runtime_prelaunch_validation.json"
     PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
       PYTHONPATH="${POLARIS_SOURCE_SNAPSHOT}/src" \
+      run_bounded_host_python \
       "${POLARIS_OPENPI_RUNTIME_DIR}/.venv/bin/python" -B -m \
       polaris.pi05_droid_jointpos_scheduler validate-sacct-runtime-approval \
       --output "${POLARIS_SACCT_PRELAUNCH_VALIDATION_RECEIPT}" \
@@ -1359,6 +1374,7 @@ for task in "${tasks[@]}"; do
   if [[ "${worker_eval_mode}" == app_launcher_only ]]; then
     PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 \
       PYTHONPATH="${POLARIS_SOURCE_SNAPSHOT}/src" \
+      run_bounded_host_python \
       "${POLARIS_OPENPI_RUNTIME_DIR}/.venv/bin/python" -B -m \
       polaris.pi05_droid_jointpos_scheduler verify-sacct-prelaunch-validation \
       --receipt "${POLARIS_SACCT_PRELAUNCH_VALIDATION_RECEIPT}" \

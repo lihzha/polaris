@@ -1203,6 +1203,32 @@ def test_openpi_commit_drift_is_rejected_before_submission(tmp_path: Path) -> No
     assert not (fake_state / "sbatch.args").exists()
 
 
+def test_every_host_openpi_python_call_has_numeric_thread_caps() -> None:
+    source = SUBMITTER.read_text()
+    function = """run_bounded_host_python() {
+  /usr/bin/env \\
+    OPENBLAS_NUM_THREADS=1 \\
+    OMP_NUM_THREADS=1 \\
+    MKL_NUM_THREADS=1 \\
+    NUMEXPR_NUM_THREADS=1 \\
+    VECLIB_MAXIMUM_THREADS=1 \\
+    BLIS_NUM_THREADS=1 \\
+    "$@"
+}"""
+    assert source.count(function) == 1
+    lines = source.splitlines()
+    calls = [
+        index
+        for index, line in enumerate(lines)
+        if '"${POLARIS_OPENPI_RUNTIME_DIR}/.venv/bin/python"' in line
+        and (" -B " in line or " -I -S -B " in line)
+    ]
+    assert len(calls) == 5
+    assert all(
+        lines[index - 1].strip() == "run_bounded_host_python \\" for index in calls
+    )
+
+
 def test_symlinked_ancestor_inputs_are_exported_as_canonical_paths(
     tmp_path: Path,
 ) -> None:
