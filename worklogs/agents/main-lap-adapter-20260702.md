@@ -423,3 +423,32 @@
   compileall, and diff checks. Torch/Isaac tests and both L40S certification
   gates remain pending exact-commit deployment; no checkpoint evaluation is
   authorized yet.
+- Committed and pushed the reviewed v6 controller contract as PolaRiS
+  `bc4890854e8c758b9278de772f09a229b2b95764`, deployed cleanly to
+  `/lustre/fsw/portfolios/nvr/users/lzha/src/PolaRiS-ik-v8-bc48908`. The
+  independently reviewed boundary-only wrapper is mode 0444 at
+  `/lustre/fsw/portfolios/nvr/users/lzha/staging/polaris_v8_bc48908/boundary-replay-smoke-v8.sbatch`,
+  SHA-256
+  `7dd59d935b63019bb944e3e3e5f0bd51cd3384330dc945703a63465252846f2a`.
+  Slurm test-only admitted pinned idle node `pool0-00003`; job `1098074` then
+  launched in `batch`, with log
+  `/lustre/fsw/portfolios/nvr/users/lzha/slurm_logs/polaris_eval/pol_v8_s08_bnd-1098074.out`
+  and result root
+  `/lustre/fsw/portfolios/nvr/users/lzha/results/polaris_eval/controller_safety_v8_boundary/bc48908-slew0p8`.
+  This gate runs tests plus the exact 394-step/3,152-apply boundary replay only:
+  no model, checkpoint, server, evaluation registry, or downstream chain.
+- Boundary job `1098074` failed closed after 3m58s, following successful 38
+  Isaac tests and 105 host tests plus 22 subtests. At policy step 116 / physics
+  substep 7 / apply call 936, joint 5 reached `-3.7024555206` rad/s and joint 7
+  reached `+3.6261839867` rad/s against their `2.6099998951` limits. This is
+  worse than retained 64/1 factor-1 and disproves monotonic improvement from a
+  fixed smaller position-target slew: the phase shifted and both forearm
+  joints overshot while targets/limits/digests/gains remained exact. The v6
+  profile and distinct nominal/physical vectors were live; applied target
+  maxima remained within 0.8 bounds, no hard-limit recovery or position event
+  occurred, and direct PhysX q/dq matched the cache. The immutable mode-0444
+  failure JSON is 18,310 bytes, SHA-256
+  `9d812bdf05d1fc4e0284d1c1860c6a4f37b4b1e22cb3c7287b871e1301bafebc`;
+  correctly no ready marker/attestation exists. Do not try a lower fixed slew
+  or launch controller/checkpoint gates without first resolving the transient
+  drive dynamics with substep history and velocity-aware braking evidence.
