@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from polaris.config import EvalArgs, PolicyArgs, validate_policy_control_mode
@@ -38,3 +40,11 @@ def test_ego_lap_requires_eef_controller() -> None:
     validate_policy_control_mode(
         _eval_args(client="EgoLAPEefPose", control_mode="eef-pose")
     )
+
+
+def test_gripper_candidate_is_absent_from_the_production_eval_entrypoint() -> None:
+    args = _eval_args(client="EgoLAPEefPose", control_mode="eef-pose")
+    eval_source = (Path(__file__).parents[1] / "scripts" / "eval.py").read_text()
+
+    assert not hasattr(args, "enable_gripper_velocity_limit")
+    assert "enable_gripper_velocity_limit" not in eval_source

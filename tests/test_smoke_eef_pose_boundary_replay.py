@@ -690,6 +690,36 @@ def _candidate_safety_report(
     return report
 
 
+def _gripper_candidate_safety_report(
+    *, episode_index=0, apply_calls=smoke.EXPECTED_APPLY_CALLS
+):
+    report = _safety_report(
+        episode_index=episode_index,
+        apply_calls=apply_calls,
+    )
+    report["profile"] = smoke.GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE
+    report.update(
+        {
+            "gripper_velocity_limit_profile": smoke.GRIPPER_VELOCITY_LIMIT_PROFILE,
+            "gripper_drive_readback_profile": smoke.GRIPPER_DRIVE_READBACK_PROFILE,
+            "gripper_joint_names": ["finger_joint"],
+            "gripper_configured_velocity_limit_sim_rad_s": 5.0,
+            "gripper_mirror_velocity_limit_rad_s": 5.0,
+            "gripper_physx_velocity_limit_rad_s": 5.0,
+            "gripper_configured_effort_limit": 200.0,
+            "gripper_mirror_effort_limit": 200.0,
+            "gripper_physx_effort_limit": 200.0,
+            "gripper_configured_stiffness": None,
+            "gripper_mirror_stiffness": 1000.0,
+            "gripper_physx_stiffness": 1000.0,
+            "gripper_configured_damping": None,
+            "gripper_mirror_damping": 100.0,
+            "gripper_physx_damping": 100.0,
+        }
+    )
+    return report
+
+
 def _boundary_result():
     arm_q = [(lower + upper) / 2.0 for lower, upper in smoke.EXPECTED_OUTER_LIMITS_RAD]
     arm_q[smoke.TARGET_JOINT_INDEX] = 2.88
@@ -844,6 +874,43 @@ def _candidate_success_payload():
     return payload
 
 
+def _gripper_candidate_success_payload():
+    payload = _success_payload()
+    payload["runtime_frame"]["ik_safety_profile"] = (
+        smoke.GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE
+    )
+    payload["initial_ik_safety_capture"] = _gripper_candidate_safety_report(
+        episode_index=None,
+        apply_calls=0,
+    )
+    payload["ik_safety"] = _gripper_candidate_safety_report()
+    return payload
+
+
+def _expected_validation_summary(*, profile, wrist_energy_brake):
+    return {
+        "safety_profile": profile,
+        "apply_calls": smoke.EXPECTED_APPLY_CALLS,
+        "position_limit_events": 128,
+        "max_consecutive_dwell_policy_steps": smoke.ADAPTIVE_DRIVE_STEPS,
+        "joint5_raw_outer_violation_rad": 0.04,
+        "joint5_observed_max_rad": 2.88,
+        "wrist_energy_brake": wrist_energy_brake,
+    }
+
+
+def _expected_wrist_energy_brake_summary():
+    return {
+        "profile": smoke.WRIST_ENERGY_BRAKE_PROFILE,
+        "trigger_events": 1,
+        "active_substeps": 2,
+        "attempted_joint_targets": 5,
+        "braked_joint_targets": 5,
+        "diagnostic_count": 2,
+        "diagnostics_dropped": 0,
+    }
+
+
 def test_fixture_exact_identity_and_decoded_action_contract():
     identity, actions = smoke.load_replay_fixture()
 
@@ -916,9 +983,10 @@ def test_strict_json_rejects_duplicates_and_nonfinite_constants():
 def test_boundary_evidence_accepts_exact_full_state_dwell():
     summary = smoke.validate_boundary_result(_boundary_result(), _safety_report())
 
-    assert summary["apply_calls"] == 3152
-    assert summary["max_consecutive_dwell_policy_steps"] == 16
-    assert summary["joint5_raw_outer_violation_rad"] == 0.04
+    assert summary == _expected_validation_summary(
+        profile=smoke.BASE_SAFETY_PROFILE,
+        wrist_energy_brake=None,
+    )
 
 
 def test_candidate_boundary_evidence_is_closed_and_requires_brake_activity():
@@ -926,7 +994,10 @@ def test_candidate_boundary_evidence_is_closed_and_requires_brake_activity():
 
     summary = smoke.validate_boundary_result(_boundary_result(), safety)
 
-    assert summary["apply_calls"] == smoke.EXPECTED_APPLY_CALLS
+    assert summary == _expected_validation_summary(
+        profile=smoke.WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE,
+        wrist_energy_brake=_expected_wrist_energy_brake_summary(),
+    )
     assert safety["counters"]["wrist_energy_brake_trigger_events"] == 1
     assert safety["wrist_energy_brake_diagnostics"][0]["apply_index"] == 896
 
@@ -982,6 +1053,33 @@ def test_candidate_boundary_evidence_is_closed_and_requires_brake_activity():
     smoke.validate_safety_static(lossy, episode_index=0)
     with pytest.raises(smoke.BoundaryReplayValidationError, match="dropped causal"):
         smoke.validate_boundary_result(_boundary_result(), lossy)
+
+
+def test_gripper_candidate_boundary_binds_exact_drive_readback():
+    safety = _gripper_candidate_safety_report()
+
+    summary = smoke.validate_boundary_result(_boundary_result(), safety)
+
+    expected = _expected_validation_summary(
+        profile=smoke.GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE,
+        wrist_energy_brake=None,
+    )
+    expected["gripper_velocity_limit"] = {
+        field: safety[field] for field in sorted(smoke.GRIPPER_VELOCITY_LIMIT_FIELDS)
+    }
+    assert summary == expected
+
+    for field, value in (
+        ("gripper_joint_names", ["wrong_joint"]),
+        ("gripper_physx_velocity_limit_rad_s", 6.0),
+        ("gripper_physx_effort_limit", 199.0),
+        ("gripper_physx_stiffness", 1001.0),
+        ("gripper_physx_damping", 101.0),
+    ):
+        tampered = _gripper_candidate_safety_report()
+        tampered[field] = value
+        with pytest.raises(smoke.BoundaryReplayValidationError, match="gripper"):
+            smoke.validate_boundary_result(_boundary_result(), tampered)
 
 
 def test_candidate_success_payload_binds_runtime_profile_and_initial_schema():
@@ -1068,6 +1166,67 @@ def test_candidate_success_payload_binds_runtime_profile_and_initial_schema():
     tampered["ik_safety"]["counters"]["wrist_energy_brake_diagnostics_dropped"] = 1
     with pytest.raises(smoke.BoundaryReplayValidationError):
         smoke.validate_success_payload(tampered)
+
+
+def test_gripper_candidate_success_payload_cross_binds_profile_and_static_evidence():
+    payload = _gripper_candidate_success_payload()
+
+    summary = smoke.validate_success_payload(payload)
+
+    assert summary["safety_profile"] == (smoke.GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE)
+    assert (
+        summary["gripper_velocity_limit"]["gripper_physx_velocity_limit_rad_s"] == 5.0
+    )
+
+    tampered = copy.deepcopy(payload)
+    tampered["initial_ik_safety_capture"]["gripper_physx_velocity_limit_rad_s"] = 6.0
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="gripper"):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    tampered["initial_ik_safety_capture"]["gripper_mirror_stiffness"] = 1001.0
+    tampered["initial_ik_safety_capture"]["gripper_physx_stiffness"] = 1001.0
+    with pytest.raises(
+        smoke.BoundaryReplayValidationError,
+        match="initial/final gripper gripper_mirror_stiffness mismatch",
+    ):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    tampered["initial_ik_safety_capture"]["gripper_mirror_stiffness"] = 1000
+    tampered["initial_ik_safety_capture"]["gripper_physx_stiffness"] = 1000
+    with pytest.raises(
+        smoke.BoundaryReplayValidationError,
+        match="initial/final gripper gripper_mirror_stiffness mismatch",
+    ):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    tampered["runtime_frame"]["ik_safety_profile"] = smoke.BASE_SAFETY_PROFILE
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="profile"):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    tampered["initial_ik_safety_capture"] = _safety_report(
+        episode_index=None,
+        apply_calls=0,
+    )
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="profile"):
+        smoke.validate_success_payload(tampered)
+
+    tampered = copy.deepcopy(payload)
+    tampered["ik_safety"] = _safety_report()
+    with pytest.raises(smoke.BoundaryReplayValidationError, match="profile"):
+        smoke.validate_success_payload(tampered)
+
+    for field in (
+        "gripper_velocity_limit_profile",
+        "gripper_drive_readback_profile",
+    ):
+        tampered = copy.deepcopy(payload)
+        tampered["ik_safety"][field] = "wrong"
+        with pytest.raises(smoke.BoundaryReplayValidationError, match=field):
+            smoke.validate_success_payload(tampered)
 
 
 @pytest.mark.parametrize(
@@ -1253,8 +1412,9 @@ def test_host_finalizer_reconstructs_raw_ready_and_provenance(tmp_path, monkeypa
     assert expected["passed"] is True
     assert expected["raw_result"]["ready_marker"]["mode"] == "0444"
     assert expected["provenance"]["fixture_source"] == smoke.EXPECTED_SOURCE
-    assert expected["validation_summary"]["safety_profile"] == (
-        smoke.BASE_SAFETY_PROFILE
+    assert expected["validation_summary"] == _expected_validation_summary(
+        profile=smoke.BASE_SAFETY_PROFILE,
+        wrist_energy_brake=None,
     )
     assert expected["provenance"]["expected_safety_profile"] == (
         smoke.BASE_SAFETY_PROFILE
@@ -1336,18 +1496,10 @@ def test_host_finalizer_reconstructs_raw_ready_and_provenance(tmp_path, monkeypa
 
     candidate_expected = finalizer.build_expected_attestation(candidate_args)
 
-    assert candidate_expected["validation_summary"]["safety_profile"] == (
-        smoke.WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+    assert candidate_expected["validation_summary"] == _expected_validation_summary(
+        profile=smoke.WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE,
+        wrist_energy_brake=_expected_wrist_energy_brake_summary(),
     )
-    assert candidate_expected["validation_summary"]["wrist_energy_brake"] == {
-        "profile": smoke.WRIST_ENERGY_BRAKE_PROFILE,
-        "trigger_events": 1,
-        "active_substeps": 2,
-        "attempted_joint_targets": 5,
-        "braked_joint_targets": 5,
-        "diagnostic_count": 2,
-        "diagnostics_dropped": 0,
-    }
     candidate_cli = list(cli)
     candidate_cli[1] = "finalize"
     for option, value in (
@@ -1366,10 +1518,106 @@ def test_host_finalizer_reconstructs_raw_ready_and_provenance(tmp_path, monkeypa
     monkeypatch.setattr(sys, "argv", candidate_cli)
     assert finalizer.main() == 0
 
-    wrong_profile_args = copy.copy(candidate_args)
-    wrong_profile_args.expected_safety_profile = smoke.BASE_SAFETY_PROFILE
-    with pytest.raises(finalizer.FinalizationError, match="expected controller"):
-        finalizer.build_expected_attestation(wrong_profile_args)
+    gripper_job_id = job_id + 2
+    gripper_payload = _gripper_candidate_success_payload()
+    gripper_payload["fixture"] = fixture
+    gripper_raw_path = tmp_path / f"boundary-replay-smoke-{gripper_job_id}.json"
+    gripper_raw_identity = smoke._atomic_write_immutable(
+        gripper_raw_path,
+        gripper_payload,
+    )
+    gripper_marker_path = gripper_raw_path.with_name(
+        gripper_raw_path.name + ".ready.json"
+    )
+    smoke._atomic_write_immutable(
+        gripper_marker_path,
+        {
+            "schema_version": 1,
+            "stage": "simulation_app_close_pending",
+            "raw_result": gripper_raw_identity,
+        },
+    )
+    gripper_args = copy.copy(args)
+    gripper_args.raw_result = gripper_raw_path
+    gripper_args.attestation = (
+        tmp_path / f"boundary-replay-smoke-{gripper_job_id}.attestation.json"
+    )
+    gripper_args.job_id = gripper_job_id
+    gripper_args.expected_safety_profile = (
+        smoke.GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE
+    )
+    monkeypatch.setenv("SLURM_JOB_ID", str(gripper_job_id))
+
+    gripper_expected = finalizer.build_expected_attestation(gripper_args)
+
+    expected_gripper_summary = _expected_validation_summary(
+        profile=smoke.GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE,
+        wrist_energy_brake=None,
+    )
+    expected_gripper_summary["gripper_velocity_limit"] = {
+        field: gripper_payload["ik_safety"][field]
+        for field in sorted(smoke.GRIPPER_VELOCITY_LIMIT_FIELDS)
+    }
+    assert gripper_expected["validation_summary"] == expected_gripper_summary
+
+    gripper_cli = list(cli)
+    gripper_cli[1] = "finalize"
+    for option, value in (
+        ("--raw-result", gripper_raw_path),
+        ("--attestation", gripper_args.attestation),
+        ("--job-id", gripper_job_id),
+        (
+            "--expected-safety-profile",
+            smoke.GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE,
+        ),
+    ):
+        gripper_cli[gripper_cli.index(option) + 1] = str(value)
+    monkeypatch.setattr(sys, "argv", gripper_cli)
+    assert finalizer.main() == 0
+    assert gripper_args.attestation.stat().st_mode & 0o777 == 0o444
+    gripper_cli[1] = "verify"
+    monkeypatch.setattr(sys, "argv", gripper_cli)
+    assert finalizer.main() == 0
+
+    wrong_gripper_verify_cli = list(gripper_cli)
+    wrong_gripper_verify_cli[
+        wrong_gripper_verify_cli.index("--expected-safety-profile") + 1
+    ] = smoke.BASE_SAFETY_PROFILE
+    monkeypatch.setattr(sys, "argv", wrong_gripper_verify_cli)
+    assert finalizer.main() == 1
+
+    profile_cases = (
+        (args, job_id, smoke.BASE_SAFETY_PROFILE),
+        (
+            candidate_args,
+            candidate_job_id,
+            smoke.WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE,
+        ),
+        (
+            gripper_args,
+            gripper_job_id,
+            smoke.GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE,
+        ),
+    )
+    profiles = tuple(case[2] for case in profile_cases)
+    for actual_args, actual_job_id, actual_profile in profile_cases:
+        for expected_profile in profiles:
+            if expected_profile == actual_profile:
+                continue
+            wrong_profile_args = copy.copy(actual_args)
+            wrong_profile_args.expected_safety_profile = expected_profile
+            monkeypatch.setenv("SLURM_JOB_ID", str(actual_job_id))
+            with pytest.raises(
+                finalizer.FinalizationError,
+                match="expected controller",
+            ):
+                finalizer.build_expected_attestation(wrong_profile_args)
+
+    unsupported_profile_args = copy.copy(args)
+    unsupported_profile_args.expected_safety_profile = "unsupported_profile"
+    monkeypatch.setenv("SLURM_JOB_ID", str(job_id))
+    with pytest.raises(finalizer.FinalizationError, match="not supported"):
+        finalizer.build_expected_attestation(unsupported_profile_args)
 
     monkeypatch.setenv("SLURM_JOB_ID", str(job_id))
     bad_marker = json.loads(marker_path.read_text())

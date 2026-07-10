@@ -35,6 +35,9 @@ BASE_SAFETY_PROFILE = "panda_velocity_physxlimit_solveriter1_v4"
 WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE = (
     "panda_velocity_physxlimit_solveriter1_wristenergybrake_candidate_v1"
 )
+GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE = (
+    "panda_velocity_physxlimit_solveriter1_grippervelocitylimit_candidate_v1"
+)
 WRIST_ENERGY_BRAKE_PROFILE = (
     "panda_j5_j7_applied_target_reversal_group_energy_brake_2substep_v1"
 )
@@ -45,6 +48,11 @@ WRIST_ENERGY_BRAKE_JOINT_NAMES = [
 ]
 WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS = 2
 WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION = 0.9
+GRIPPER_VELOCITY_LIMIT_PROFILE = "finger_joint_physx_velocity_limit_5rad_s_eef_only_v1"
+GRIPPER_DRIVE_READBACK_PROFILE = "configured_mirror_physx_exact_single_finger_joint_v1"
+GRIPPER_JOINT_NAMES = ["finger_joint"]
+GRIPPER_VELOCITY_LIMIT_RAD_S = 5.0
+GRIPPER_EFFORT_LIMIT = 200.0
 FIXTURE_PATH = (
     Path(__file__).resolve().parent
     / "fixtures"
@@ -217,6 +225,24 @@ CANDIDATE_SAFETY_FIELDS = SAFETY_FIELDS | {
     "wrist_energy_brake_latch_remaining_substeps",
     "wrist_energy_brake_diagnostics",
 }
+GRIPPER_VELOCITY_LIMIT_FIELDS = {
+    "gripper_velocity_limit_profile",
+    "gripper_drive_readback_profile",
+    "gripper_joint_names",
+    "gripper_configured_velocity_limit_sim_rad_s",
+    "gripper_mirror_velocity_limit_rad_s",
+    "gripper_physx_velocity_limit_rad_s",
+    "gripper_configured_effort_limit",
+    "gripper_mirror_effort_limit",
+    "gripper_physx_effort_limit",
+    "gripper_configured_stiffness",
+    "gripper_mirror_stiffness",
+    "gripper_physx_stiffness",
+    "gripper_configured_damping",
+    "gripper_mirror_damping",
+    "gripper_physx_damping",
+}
+GRIPPER_CANDIDATE_SAFETY_FIELDS = SAFETY_FIELDS | GRIPPER_VELOCITY_LIMIT_FIELDS
 SAFETY_COUNTER_FIELDS = {
     "apply_calls",
     "environment_substeps",
@@ -445,6 +471,22 @@ class BoundaryReplayValidationError(ValueError):
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise BoundaryReplayValidationError(message)
+
+
+def _same_typed(left: Any, right: Any) -> bool:
+    """Return exact recursive equality without bool/int or int/float widening."""
+
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return set(left) == set(right) and all(
+            _same_typed(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _same_typed(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return left == right
 
 
 def _finite_number(value: Any, field: str) -> float:
@@ -937,6 +979,52 @@ def _validate_wrist_energy_brake_diagnostics(
         )
 
 
+def _validate_gripper_velocity_limit_static(report: dict[str, Any]) -> None:
+    exact = {
+        "gripper_velocity_limit_profile": GRIPPER_VELOCITY_LIMIT_PROFILE,
+        "gripper_drive_readback_profile": GRIPPER_DRIVE_READBACK_PROFILE,
+        "gripper_joint_names": GRIPPER_JOINT_NAMES,
+        "gripper_configured_velocity_limit_sim_rad_s": (GRIPPER_VELOCITY_LIMIT_RAD_S),
+        "gripper_configured_effort_limit": GRIPPER_EFFORT_LIMIT,
+        "gripper_configured_stiffness": None,
+        "gripper_configured_damping": None,
+    }
+    for field, expected in exact.items():
+        _require(report.get(field) == expected, f"gripper candidate {field} drift")
+    values = {
+        field: _finite_number(report.get(field), f"gripper candidate {field}")
+        for field in (
+            "gripper_mirror_velocity_limit_rad_s",
+            "gripper_physx_velocity_limit_rad_s",
+            "gripper_mirror_effort_limit",
+            "gripper_physx_effort_limit",
+            "gripper_mirror_stiffness",
+            "gripper_physx_stiffness",
+            "gripper_mirror_damping",
+            "gripper_physx_damping",
+        )
+    }
+    _require(
+        values["gripper_mirror_velocity_limit_rad_s"]
+        == values["gripper_physx_velocity_limit_rad_s"]
+        == GRIPPER_VELOCITY_LIMIT_RAD_S,
+        "gripper candidate velocity-limit readback drift",
+    )
+    _require(
+        values["gripper_mirror_effort_limit"]
+        == values["gripper_physx_effort_limit"]
+        == GRIPPER_EFFORT_LIMIT,
+        "gripper candidate effort-limit readback drift",
+    )
+    for field in ("stiffness", "damping"):
+        mirror = values[f"gripper_mirror_{field}"]
+        physx = values[f"gripper_physx_{field}"]
+        _require(
+            mirror == physx and mirror >= 0.0,
+            f"gripper candidate {field} readback drift",
+        )
+
+
 def validate_safety_static(
     report: dict[str, Any], *, episode_index: int | None
 ) -> None:
@@ -944,12 +1032,23 @@ def validate_safety_static(
 
     _require(isinstance(report, dict), "safety report object")
     profile = report.get("profile")
-    candidate_enabled = profile == WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+    wrist_candidate_enabled = profile == WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+    gripper_candidate_enabled = profile == GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE
     _require(
-        profile in {BASE_SAFETY_PROFILE, WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE},
+        profile
+        in {
+            BASE_SAFETY_PROFILE,
+            WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE,
+            GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE,
+        },
         "safety profile",
     )
-    expected_fields = CANDIDATE_SAFETY_FIELDS if candidate_enabled else SAFETY_FIELDS
+    if wrist_candidate_enabled:
+        expected_fields = CANDIDATE_SAFETY_FIELDS
+    elif gripper_candidate_enabled:
+        expected_fields = GRIPPER_CANDIDATE_SAFETY_FIELDS
+    else:
+        expected_fields = SAFETY_FIELDS
     _require(set(report) == expected_fields, "safety schema")
     _require(report.get("episode_index") == episode_index, "safety episode index")
     exact = {
@@ -1033,7 +1132,9 @@ def validate_safety_static(
     counters = report.get("counters")
     maxima = report.get("maxima")
     expected_counter_fields = (
-        CANDIDATE_SAFETY_COUNTER_FIELDS if candidate_enabled else SAFETY_COUNTER_FIELDS
+        CANDIDATE_SAFETY_COUNTER_FIELDS
+        if wrist_candidate_enabled
+        else SAFETY_COUNTER_FIELDS
     )
     _require(
         isinstance(counters, dict) and set(counters) == expected_counter_fields,
@@ -1054,7 +1155,7 @@ def validate_safety_static(
             or all(value >= 0.0 for value in values),
             f"maxima {field} negative",
         )
-    if candidate_enabled:
+    if wrist_candidate_enabled:
         _require(
             report.get("wrist_energy_brake_profile") == WRIST_ENERGY_BRAKE_PROFILE,
             "wrist energy-brake profile",
@@ -1116,6 +1217,8 @@ def validate_safety_static(
             report,
             episode_index=episode_index,
         )
+    elif gripper_candidate_enabled:
+        _validate_gripper_velocity_limit_static(report)
     hard_slop = _finite_vector(
         maxima["current_physx_hard_limit_violation_rad"],
         "maxima current PhysX hard limit violation",
@@ -1389,7 +1492,11 @@ def validate_boundary_result(
     _require(safety.get("episode_index") == 0, "boundary safety episode")
     _require(
         safety.get("profile")
-        in {BASE_SAFETY_PROFILE, WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE},
+        in {
+            BASE_SAFETY_PROFILE,
+            WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE,
+            GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE,
+        },
         "boundary safety profile",
     )
     _require(
@@ -1556,7 +1663,7 @@ def validate_boundary_result(
         ),
         "boundary exceeded a physics-substep slew bound",
     )
-    return {
+    summary = {
         "safety_profile": safety["profile"],
         "apply_calls": EXPECTED_APPLY_CALLS,
         "position_limit_events": position_events,
@@ -1583,6 +1690,11 @@ def validate_boundary_result(
             else None
         ),
     }
+    if safety["profile"] == GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE:
+        summary["gripper_velocity_limit"] = {
+            field: safety[field] for field in sorted(GRIPPER_VELOCITY_LIMIT_FIELDS)
+        }
+    return summary
 
 
 def validate_success_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1765,6 +1877,12 @@ def validate_success_payload(payload: dict[str, Any]) -> dict[str, Any]:
             initial.get("wrist_energy_brake_diagnostics") == [],
             "initial wrist energy-brake diagnostics are not empty",
         )
+    if initial["profile"] == GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE:
+        for field in sorted(GRIPPER_VELOCITY_LIMIT_FIELDS):
+            _require(
+                _same_typed(initial.get(field), final_safety.get(field)),
+                f"payload initial/final gripper {field} mismatch",
+            )
     return validate_boundary_result(payload["boundary"], final_safety)
 
 
@@ -2435,9 +2553,13 @@ def _run_boundary_replay(
     env_cfg.actions = EefPoseActionCfg()
     env_cfg.actions.arm.enable_failure_substep_trace = True
     env_cfg.actions.arm.enable_wrist_energy_brake = args_cli.enable_wrist_energy_brake
+    env_cfg.actions.arm.enable_gripper_velocity_limit = (
+        args_cli.enable_gripper_velocity_limit
+    )
     configure_eef_pose_joint_safety(
         env_cfg.scene.robot,
         physx_cfg=env_cfg.sim.physx,
+        enable_gripper_velocity_limit=args_cli.enable_gripper_velocity_limit,
     )
     env = gym.make(ENVIRONMENT, cfg=env_cfg)
     state["env"] = env
@@ -2710,8 +2832,22 @@ def _parse_args() -> tuple[argparse.Namespace, Any]:
             "candidate. The canonical v4 controller remains the default."
         ),
     )
+    parser.add_argument(
+        "--enable-gripper-velocity-limit",
+        action="store_true",
+        help=(
+            "Enable the isolated EEF-only explicit 5 rad/s PhysX gripper "
+            "velocity-limit candidate. The canonical v4 controller remains "
+            "the default."
+        ),
+    )
     AppLauncher.add_app_launcher_args(parser)
     args_cli = parser.parse_args()
+    if args_cli.enable_wrist_energy_brake and args_cli.enable_gripper_velocity_limit:
+        parser.error(
+            "--enable-wrist-energy-brake and --enable-gripper-velocity-limit "
+            "are mutually exclusive"
+        )
     args_cli.enable_cameras = True
     args_cli.headless = True
     return args_cli, AppLauncher

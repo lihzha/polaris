@@ -24,6 +24,10 @@ from polaris.robust_differential_ik import (
 )
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
+from polaris.eef_ik_safety import GRIPPER_DRIVE_READBACK_PROFILE
+from polaris.eef_ik_safety import GRIPPER_EFFORT_LIMIT
+from polaris.eef_ik_safety import GRIPPER_VELOCITY_LIMIT_PROFILE
+from polaris.eef_ik_safety import GRIPPER_VELOCITY_LIMIT_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_PHYSX_DERIVED_SOFT_JOINT_POS_LIMITS_RAD
@@ -1174,6 +1178,12 @@ def test_eef_wrist_energy_brake_config_defaults_disabled():
     assert EefPoseActionCfg().arm.enable_wrist_energy_brake is False
 
 
+def test_eef_gripper_velocity_limit_config_defaults_disabled():
+    from polaris.environments.droid_cfg import EefPoseActionCfg
+
+    assert EefPoseActionCfg().arm.enable_gripper_velocity_limit is False
+
+
 def test_wrist_energy_brake_state_resets_and_commits_only_after_target_setters():
     episode_reset_source = inspect.getsource(
         RobustDifferentialInverseKinematicsAction._reset_episode_safety_state
@@ -1251,6 +1261,7 @@ def test_eef_velocity_and_effort_limits_are_scoped_to_eef_setup():
     eef_cfg = NVIDIA_DROID.copy()
     assert native_cfg.actuators["panda_shoulder"].velocity_limit_sim is None
     assert native_cfg.actuators["panda_forearm"].velocity_limit_sim is None
+    assert native_cfg.actuators["gripper"].velocity_limit_sim is None
     assert native_cfg.spawn.articulation_props.solver_position_iteration_count == 64
     assert native_cfg.spawn.articulation_props.solver_velocity_iteration_count == 0
 
@@ -1272,14 +1283,64 @@ def test_eef_velocity_and_effort_limits_are_scoped_to_eef_setup():
     assert eef_cfg.actuators["panda_shoulder"].effort_limit_sim == 87.0
     assert eef_cfg.actuators["panda_forearm"].velocity_limit_sim == 2.61
     assert eef_cfg.actuators["panda_forearm"].effort_limit_sim == 12.0
+    assert eef_cfg.actuators["gripper"].velocity_limit_sim is None
     assert eef_cfg.spawn.articulation_props.solver_position_iteration_count == 64
     assert eef_cfg.spawn.articulation_props.solver_velocity_iteration_count == 1
     assert eef_physx_cfg.solver_type == 1
     assert native_cfg.actuators["panda_shoulder"].velocity_limit_sim is None
     assert native_cfg.actuators["panda_forearm"].velocity_limit_sim is None
+    assert native_cfg.actuators["gripper"].velocity_limit_sim is None
     assert native_cfg.spawn.articulation_props.solver_position_iteration_count == 64
     assert native_cfg.spawn.articulation_props.solver_velocity_iteration_count == 0
     assert native_physx_cfg.solver_type == 0
+
+
+def test_eef_gripper_velocity_limit_candidate_is_explicit_and_opt_in():
+    from polaris.environments.robot_cfg import NVIDIA_DROID
+    from polaris.environments.robot_cfg import configure_eef_pose_joint_safety
+
+    native_cfg = NVIDIA_DROID.copy()
+    candidate_cfg = NVIDIA_DROID.copy()
+    candidate_physx = SimpleNamespace(solver_type=0)
+
+    configure_eef_pose_joint_safety(
+        candidate_cfg,
+        physx_cfg=candidate_physx,
+        enable_gripper_velocity_limit=True,
+    )
+
+    assert candidate_cfg.actuators["gripper"].velocity_limit == 5.0
+    assert candidate_cfg.actuators["gripper"].velocity_limit_sim == 5.0
+    assert candidate_cfg.actuators["gripper"].effort_limit == 200.0
+    assert candidate_cfg.actuators["gripper"].effort_limit_sim == 200.0
+    assert candidate_cfg.actuators["gripper"].stiffness is None
+    assert candidate_cfg.actuators["gripper"].damping is None
+    assert candidate_cfg.spawn.articulation_props.solver_position_iteration_count == 64
+    assert candidate_cfg.spawn.articulation_props.solver_velocity_iteration_count == 1
+    assert candidate_physx.solver_type == 1
+    assert native_cfg.actuators["gripper"].velocity_limit_sim is None
+    assert native_cfg.spawn.articulation_props.solver_velocity_iteration_count == 0
+
+
+def test_eef_gripper_velocity_limit_candidate_rejects_config_drift():
+    from polaris.environments.robot_cfg import NVIDIA_DROID
+    from polaris.environments.robot_cfg import configure_eef_pose_joint_safety
+
+    with pytest.raises(ValueError, match="enable flag must be bool"):
+        configure_eef_pose_joint_safety(
+            NVIDIA_DROID.copy(),
+            physx_cfg=SimpleNamespace(solver_type=0),
+            enable_gripper_velocity_limit="true",
+        )
+
+    cfg = NVIDIA_DROID.copy()
+    cfg.actuators["gripper"].joint_names_expr = ["wrong_joint"]
+    with pytest.raises(ValueError, match="pinned EEF"):
+        configure_eef_pose_joint_safety(
+            cfg,
+            physx_cfg=SimpleNamespace(solver_type=0),
+            enable_gripper_velocity_limit=True,
+        )
 
 
 def test_eef_pose_config_rejects_missing_articulation_properties():
@@ -1293,6 +1354,161 @@ def test_eef_pose_config_rejects_missing_articulation_properties():
             cfg,
             physx_cfg=SimpleNamespace(solver_type=0),
         )
+
+
+def _gripper_candidate_action(*, physx_velocity=5.0):
+    action = _bare_robust_action()
+    action._num_joints = 7
+    action._gripper_joint_ids = (7,)
+    action._joint_velocity_limits = torch.tensor(
+        [PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S], dtype=torch.float32
+    )
+    actuator = SimpleNamespace(
+        joint_names_expr=["finger_joint"],
+        stiffness=None,
+        damping=None,
+        velocity_limit=5.0,
+        velocity_limit_sim=5.0,
+        effort_limit=200.0,
+        effort_limit_sim=200.0,
+    )
+    data = SimpleNamespace(
+        joint_names=[*(f"panda_joint{index}" for index in range(1, 8)), "finger_joint"],
+        joint_vel_limits=torch.tensor([[2.0] * 7 + [5.0]], dtype=torch.float32),
+        joint_effort_limits=torch.tensor([[12.0] * 7 + [200.0]], dtype=torch.float32),
+        joint_stiffness=torch.tensor([[400.0] * 7 + [123.0]], dtype=torch.float32),
+        joint_damping=torch.tensor([[80.0] * 7 + [45.0]], dtype=torch.float32),
+    )
+    readbacks = {
+        "velocity": torch.tensor([[2.0] * 7 + [physx_velocity]], dtype=torch.float32),
+        "effort": data.joint_effort_limits.clone(),
+        "stiffness": data.joint_stiffness.clone(),
+        "damping": data.joint_damping.clone(),
+    }
+    root = SimpleNamespace(
+        get_dof_max_velocities=lambda: readbacks["velocity"],
+        get_dof_max_forces=lambda: readbacks["effort"],
+        get_dof_stiffnesses=lambda: readbacks["stiffness"],
+        get_dof_dampings=lambda: readbacks["damping"],
+    )
+    action._asset = SimpleNamespace(
+        cfg=SimpleNamespace(actuators={"gripper": actuator}),
+        data=data,
+        root_physx_view=root,
+        device="cpu",
+    )
+    action._gripper_test_readbacks = readbacks
+    return action
+
+
+def test_gripper_candidate_binds_config_mirror_and_physx_readback():
+    action = _gripper_candidate_action()
+    action._initialize_gripper_velocity_limit_candidate()
+
+    report = action._validated_gripper_drive_report()
+
+    assert report == {
+        "gripper_velocity_limit_profile": GRIPPER_VELOCITY_LIMIT_PROFILE,
+        "gripper_drive_readback_profile": GRIPPER_DRIVE_READBACK_PROFILE,
+        "gripper_joint_names": ["finger_joint"],
+        "gripper_configured_velocity_limit_sim_rad_s": (GRIPPER_VELOCITY_LIMIT_RAD_S),
+        "gripper_mirror_velocity_limit_rad_s": GRIPPER_VELOCITY_LIMIT_RAD_S,
+        "gripper_physx_velocity_limit_rad_s": GRIPPER_VELOCITY_LIMIT_RAD_S,
+        "gripper_configured_effort_limit": GRIPPER_EFFORT_LIMIT,
+        "gripper_mirror_effort_limit": GRIPPER_EFFORT_LIMIT,
+        "gripper_physx_effort_limit": GRIPPER_EFFORT_LIMIT,
+        "gripper_configured_stiffness": None,
+        "gripper_mirror_stiffness": 123.0,
+        "gripper_physx_stiffness": 123.0,
+        "gripper_configured_damping": None,
+        "gripper_mirror_damping": 45.0,
+        "gripper_physx_damping": 45.0,
+    }
+    action.__del__()
+
+
+def test_gripper_candidate_checks_raw_tensor_contract_before_equality():
+    source = inspect.getsource(
+        RobustDifferentialInverseKinematicsAction._live_gripper_drive_tensors
+    )
+
+    assert ".to(" not in source
+    assert source.index("tuple(mirror_full.shape)") < source.index(
+        "torch.equal(mirror, physx)"
+    )
+
+
+def test_gripper_candidate_rejects_joint_and_readback_drift():
+    action = _gripper_candidate_action(physx_velocity=6.0)
+    with pytest.raises(ValueError, match="mirror/PhysX"):
+        action._initialize_gripper_velocity_limit_candidate()
+    action.__del__()
+
+    action = _gripper_candidate_action()
+    action._asset.data.joint_names[-1] = "wrong_joint"
+    with pytest.raises(ValueError, match="one exact 'finger_joint'"):
+        action._initialize_gripper_velocity_limit_candidate()
+    action.__del__()
+
+
+@pytest.mark.parametrize(
+    ("source", "field", "mutation"),
+    [
+        (
+            "mirror",
+            "joint_stiffness",
+            lambda value: value.to(dtype=torch.float64),
+        ),
+        (
+            "mirror",
+            "joint_stiffness",
+            lambda value: value[:, :-1],
+        ),
+        (
+            "mirror",
+            "joint_stiffness",
+            lambda value: value.to(device="meta"),
+        ),
+        (
+            "physx",
+            "stiffness",
+            lambda value: value.to(dtype=torch.float64),
+        ),
+        (
+            "physx",
+            "stiffness",
+            lambda value: value[:, :-1],
+        ),
+        (
+            "physx",
+            "stiffness",
+            lambda value: value.to(device="meta"),
+        ),
+    ],
+    ids=(
+        "mirror-dtype",
+        "mirror-shape",
+        "mirror-device",
+        "physx-dtype",
+        "physx-shape",
+        "physx-device",
+    ),
+)
+def test_gripper_candidate_rejects_raw_tensor_dtype_and_device_drift(
+    source, field, mutation
+):
+    action = _gripper_candidate_action()
+    if source == "mirror":
+        current = getattr(action._asset.data, field)
+        setattr(action._asset.data, field, mutation(current))
+    else:
+        action._gripper_test_readbacks[field] = mutation(
+            action._gripper_test_readbacks[field]
+        )
+
+    with pytest.raises(ValueError, match="shape/device/dtype drift"):
+        action._initialize_gripper_velocity_limit_candidate()
+    action.__del__()
 
 
 def _failure_substep_trace_action(

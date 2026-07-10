@@ -36,11 +36,17 @@ from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
+from polaris.eef_ik_safety import EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
+from polaris.eef_ik_safety import GRIPPER_DRIVE_READBACK_PROFILE
+from polaris.eef_ik_safety import GRIPPER_EFFORT_LIMIT
+from polaris.eef_ik_safety import GRIPPER_JOINT_NAMES
+from polaris.eef_ik_safety import GRIPPER_VELOCITY_LIMIT_PROFILE
+from polaris.eef_ik_safety import GRIPPER_VELOCITY_LIMIT_RAD_S
 from polaris.eef_ik_safety import PHYSX_DERIVED_SOFT_LIMIT_PROFILE
 from polaris.eef_ik_safety import PHYSX_HARD_LIMIT_PROFILE
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
@@ -643,11 +649,28 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 "PolaRiS EEF wrist energy-brake candidate requires exactly "
                 "one environment"
             )
-        self._safety_profile = (
-            EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
-            if self._wrist_energy_brake_enabled
-            else EEF_IK_SAFETY_PROFILE
-        )
+        gripper_velocity_limit_enabled = self.cfg.enable_gripper_velocity_limit
+        if type(gripper_velocity_limit_enabled) is not bool:
+            raise ValueError(
+                "PolaRiS EEF gripper velocity-limit enable flag must be bool"
+            )
+        self._gripper_velocity_limit_enabled = gripper_velocity_limit_enabled
+        if self._gripper_velocity_limit_enabled and self.num_envs != 1:
+            raise ValueError(
+                "PolaRiS EEF gripper velocity-limit candidate requires exactly "
+                "one environment"
+            )
+        if self._wrist_energy_brake_enabled and self._gripper_velocity_limit_enabled:
+            raise ValueError(
+                "PolaRiS EEF wrist-brake and gripper velocity-limit candidates "
+                "are mutually exclusive"
+            )
+        if self._wrist_energy_brake_enabled:
+            self._safety_profile = EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+        elif self._gripper_velocity_limit_enabled:
+            self._safety_profile = EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE
+        else:
+            self._safety_profile = EEF_IK_SAFETY_PROFILE
         self._ik_controller = RobustDifferentialIKController(
             cfg=self.cfg.controller,
             num_envs=self.num_envs,
@@ -718,6 +741,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                 "PolaRiS EEF IK cached joint limits do not match PhysX readback"
             )
         self._max_delta_joint_pos = self._joint_velocity_limits * self._physics_dt
+        if self._gripper_velocity_limit_enabled:
+            self._initialize_gripper_velocity_limit_candidate()
 
         articulation_props = getattr(
             getattr(self._asset.cfg, "spawn", None),
@@ -833,6 +858,223 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
         if self._failure_substep_trace_enabled:
             self._initialize_failure_substep_trace()
         self._reset_episode_safety_state(episode_index=None)
+
+    def _configured_gripper_actuator(self):
+        """Return the exact candidate actuator config or reject drift."""
+
+        actuators = getattr(self._asset.cfg, "actuators", None)
+        if not isinstance(actuators, dict) or "gripper" not in actuators:
+            raise ValueError(
+                "PolaRiS EEF gripper velocity-limit candidate lacks the "
+                "configured gripper actuator"
+            )
+        actuator = actuators["gripper"]
+        if (
+            list(getattr(actuator, "joint_names_expr", ())) != list(GRIPPER_JOINT_NAMES)
+            or getattr(actuator, "stiffness", None) is not None
+            or getattr(actuator, "damping", None) is not None
+            or getattr(actuator, "velocity_limit", None) != GRIPPER_VELOCITY_LIMIT_RAD_S
+            or getattr(actuator, "velocity_limit_sim", None)
+            != GRIPPER_VELOCITY_LIMIT_RAD_S
+            or getattr(actuator, "effort_limit", None) != GRIPPER_EFFORT_LIMIT
+            or getattr(actuator, "effort_limit_sim", None) != GRIPPER_EFFORT_LIMIT
+        ):
+            raise ValueError(
+                "PolaRiS EEF configured gripper actuator drifted from the "
+                "velocity-limit candidate"
+            )
+        return actuator
+
+    def _live_gripper_drive_tensors(self) -> dict[str, torch.Tensor]:
+        """Cross-check the one finger joint in the mirror and direct PhysX view."""
+
+        self._configured_gripper_actuator()
+        controller_reference = getattr(self, "_joint_velocity_limits", None)
+        expected_device = torch.device(self.device)
+        expected_dtype = torch.float32
+        expected_controller_shape = (self.num_envs, self._num_joints)
+        if (
+            not isinstance(controller_reference, torch.Tensor)
+            or tuple(controller_reference.shape) != expected_controller_shape
+            or controller_reference.device != expected_device
+            or controller_reference.dtype != expected_dtype
+        ):
+            raise ValueError(
+                "PolaRiS EEF gripper controller tensor shape/device/dtype drift: "
+                f"expected_shape={expected_controller_shape!r}, "
+                f"actual_shape={getattr(controller_reference, 'shape', None)!r}, "
+                f"expected_device={expected_device!r}, "
+                f"actual_device={getattr(controller_reference, 'device', None)!r}, "
+                f"expected_dtype={expected_dtype!r}, "
+                f"actual_dtype={getattr(controller_reference, 'dtype', None)!r}"
+            )
+        joint_names = tuple(getattr(self._asset.data, "joint_names", ()))
+        expected_full_shape = (self.num_envs, len(joint_names))
+        fields = {
+            "velocity_limit": (
+                "joint_vel_limits",
+                "get_dof_max_velocities",
+            ),
+            "effort_limit": (
+                "joint_effort_limits",
+                "get_dof_max_forces",
+            ),
+            "stiffness": (
+                "joint_stiffness",
+                "get_dof_stiffnesses",
+            ),
+            "damping": (
+                "joint_damping",
+                "get_dof_dampings",
+            ),
+        }
+        expected_shape = (self.num_envs, len(GRIPPER_JOINT_NAMES))
+        result: dict[str, torch.Tensor] = {}
+        for field, (mirror_name, readback_name) in fields.items():
+            mirror_full = getattr(self._asset.data, mirror_name, None)
+            readback = getattr(self._asset.root_physx_view, readback_name, None)
+            if not isinstance(mirror_full, torch.Tensor) or not callable(readback):
+                raise ValueError(
+                    "PolaRiS EEF gripper drive readback is unavailable: "
+                    f"field={field!r}"
+                )
+            try:
+                physx_full = readback()
+            except (AttributeError, RuntimeError) as error:
+                raise ValueError(
+                    f"PolaRiS EEF gripper direct PhysX readback failed: field={field!r}"
+                ) from error
+            if not isinstance(physx_full, torch.Tensor):
+                raise ValueError(
+                    "PolaRiS EEF gripper direct PhysX readback is not a tensor: "
+                    f"field={field!r}"
+                )
+            if (
+                tuple(mirror_full.shape) != expected_full_shape
+                or mirror_full.device != expected_device
+                or mirror_full.dtype != expected_dtype
+                or tuple(physx_full.shape) != expected_full_shape
+                or physx_full.device != expected_device
+                or physx_full.dtype != expected_dtype
+            ):
+                raise ValueError(
+                    "PolaRiS EEF gripper drive tensor shape/device/dtype drift: "
+                    f"field={field!r}, expected_shape={expected_full_shape!r}, "
+                    f"mirror_shape={tuple(mirror_full.shape)!r}, "
+                    f"physx_shape={tuple(physx_full.shape)!r}, "
+                    f"expected_device={expected_device!r}, "
+                    f"mirror_device={mirror_full.device!r}, "
+                    f"physx_device={physx_full.device!r}, "
+                    f"expected_dtype={expected_dtype!r}, "
+                    f"mirror_dtype={mirror_full.dtype!r}, "
+                    f"physx_dtype={physx_full.dtype!r}"
+                )
+            try:
+                mirror = mirror_full[:, self._gripper_joint_ids]
+                physx = physx_full[:, self._gripper_joint_ids]
+            except (IndexError, RuntimeError) as error:
+                raise ValueError(
+                    "PolaRiS EEF gripper drive readback shape/device/dtype drift: "
+                    f"field={field!r}"
+                ) from error
+            if (
+                tuple(mirror.shape) != expected_shape
+                or tuple(physx.shape) != expected_shape
+            ):
+                raise ValueError(
+                    "PolaRiS EEF gripper drive readback shape drift: "
+                    f"field={field!r}, mirror={tuple(mirror.shape)!r}, "
+                    f"physx={tuple(physx.shape)!r}"
+                )
+            _require_finite(mirror, field=f"gripper mirror {field}")
+            _require_finite(physx, field=f"gripper PhysX {field}")
+            if not torch.equal(mirror, physx):
+                raise ValueError(
+                    "PolaRiS EEF gripper mirror/PhysX drive readback mismatch: "
+                    f"field={field!r}"
+                )
+            result[f"mirror_{field}"] = mirror.clone()
+            result[f"physx_{field}"] = physx.clone()
+        return result
+
+    def _initialize_gripper_velocity_limit_candidate(self) -> None:
+        """Resolve and pin the configured/live EEF-only gripper candidate."""
+
+        asset_joint_names = tuple(getattr(self._asset.data, "joint_names", ()))
+        matches = [
+            index
+            for index, name in enumerate(asset_joint_names)
+            if name == GRIPPER_JOINT_NAMES[0]
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                "PolaRiS EEF gripper velocity-limit candidate requires one exact "
+                f"{GRIPPER_JOINT_NAMES[0]!r} joint; matches={matches!r}"
+            )
+        self._gripper_joint_ids = tuple(matches)
+        live = self._live_gripper_drive_tensors()
+        expected_velocity = torch.full_like(
+            live["physx_velocity_limit"], GRIPPER_VELOCITY_LIMIT_RAD_S
+        )
+        expected_effort = torch.full_like(
+            live["physx_effort_limit"], GRIPPER_EFFORT_LIMIT
+        )
+        if not torch.equal(live["physx_velocity_limit"], expected_velocity):
+            raise ValueError(
+                "PolaRiS EEF live gripper velocity limit is not exactly 5 rad/s"
+            )
+        if not torch.equal(live["physx_effort_limit"], expected_effort):
+            raise ValueError("PolaRiS EEF live gripper effort limit is not exactly 200")
+        if (live["physx_stiffness"] < 0.0).any() or (live["physx_damping"] < 0.0).any():
+            raise ValueError("PolaRiS EEF live gripper gains must be nonnegative")
+        self._gripper_drive_initial = {
+            field: value.clone() for field, value in live.items()
+        }
+
+    def _validated_gripper_drive_report(self) -> dict[str, object]:
+        """Return immutable candidate identity after checking live drive drift."""
+
+        live = self._live_gripper_drive_tensors()
+        if set(live) != set(self._gripper_drive_initial) or any(
+            not torch.equal(value, self._gripper_drive_initial[field])
+            for field, value in live.items()
+        ):
+            raise ValueError("PolaRiS EEF live gripper drive readback drifted")
+        return {
+            "gripper_velocity_limit_profile": GRIPPER_VELOCITY_LIMIT_PROFILE,
+            "gripper_drive_readback_profile": GRIPPER_DRIVE_READBACK_PROFILE,
+            "gripper_joint_names": list(GRIPPER_JOINT_NAMES),
+            "gripper_configured_velocity_limit_sim_rad_s": (
+                GRIPPER_VELOCITY_LIMIT_RAD_S
+            ),
+            "gripper_mirror_velocity_limit_rad_s": float(
+                live["mirror_velocity_limit"][0, 0].detach().cpu().item()
+            ),
+            "gripper_physx_velocity_limit_rad_s": float(
+                live["physx_velocity_limit"][0, 0].detach().cpu().item()
+            ),
+            "gripper_configured_effort_limit": GRIPPER_EFFORT_LIMIT,
+            "gripper_mirror_effort_limit": float(
+                live["mirror_effort_limit"][0, 0].detach().cpu().item()
+            ),
+            "gripper_physx_effort_limit": float(
+                live["physx_effort_limit"][0, 0].detach().cpu().item()
+            ),
+            "gripper_configured_stiffness": None,
+            "gripper_mirror_stiffness": float(
+                live["mirror_stiffness"][0, 0].detach().cpu().item()
+            ),
+            "gripper_physx_stiffness": float(
+                live["physx_stiffness"][0, 0].detach().cpu().item()
+            ),
+            "gripper_configured_damping": None,
+            "gripper_mirror_damping": float(
+                live["mirror_damping"][0, 0].detach().cpu().item()
+            ),
+            "gripper_physx_damping": float(
+                live["physx_damping"][0, 0].detach().cpu().item()
+            ),
+        }
 
     def _validated_failure_substep_trace_drive_tensors(
         self,
@@ -2461,6 +2703,8 @@ class RobustDifferentialInverseKinematicsAction(DifferentialInverseKinematicsAct
                     ),
                 }
             )
+        elif self._gripper_velocity_limit_enabled:
+            report.update(self._validated_gripper_drive_report())
         return report
 
     def episode_safety_report(self, episode_index: int) -> dict[str, object]:
@@ -2485,5 +2729,8 @@ class RobustDifferentialInverseKinematicsActionCfg(
 
     enable_wrist_energy_brake: bool = False
     """Enable the isolated wrist transient diagnostic candidate."""
+
+    enable_gripper_velocity_limit: bool = False
+    """Enable the isolated EEF-only gripper PhysX velocity-limit candidate."""
 
     class_type = RobustDifferentialInverseKinematicsAction

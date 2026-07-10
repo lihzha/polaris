@@ -238,6 +238,7 @@ def build_expected_attestation(args: argparse.Namespace) -> dict[str, Any]:
         in {
             smoke.BASE_SAFETY_PROFILE,
             smoke.WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE,
+            smoke.GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE,
         },
         "expected safety profile is not supported",
     )

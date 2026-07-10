@@ -25,8 +25,13 @@ from polaris.eef_runtime_contract import validate_eef_runtime_safety
 from polaris.eef_runtime_contract import validate_ego_lap_runtime_protocol
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
+from polaris.eef_ik_safety import EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE
 from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
+from polaris.eef_ik_safety import GRIPPER_DRIVE_READBACK_PROFILE
+from polaris.eef_ik_safety import GRIPPER_EFFORT_LIMIT
+from polaris.eef_ik_safety import GRIPPER_VELOCITY_LIMIT_PROFILE
+from polaris.eef_ik_safety import GRIPPER_VELOCITY_LIMIT_RAD_S
 from polaris.eef_ik_safety import ARM_VELOCITY_TARGET_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
@@ -61,7 +66,9 @@ def _wxyz(rotation: Rotation) -> np.ndarray:
     return rotation.as_quat()[[3, 0, 1, 2]]
 
 
-def _runtime_fixture(*, wrist_energy_brake=False):
+def _runtime_fixture(*, wrist_energy_brake=False, gripper_velocity_limit=False):
+    if wrist_energy_brake and gripper_velocity_limit:
+        raise ValueError("test candidate modes are mutually exclusive")
     link0_rotation = Rotation.from_euler("z", 20, degrees=True)
     relative_rotation = Rotation.from_euler("xyz", [10, -5, 30], degrees=True)
     link8_rotation = link0_rotation * relative_rotation
@@ -89,6 +96,7 @@ def _runtime_fixture(*, wrist_energy_brake=False):
             controller=controller,
             scale=1.0,
             enable_wrist_energy_brake=wrist_energy_brake,
+            enable_gripper_velocity_limit=gripper_velocity_limit,
         ),
         action_dim=7,
         _body_idx=1,
@@ -221,6 +229,40 @@ def _runtime_fixture(*, wrist_energy_brake=False):
             return report
 
         arm_term.safety_report = candidate_report
+    elif gripper_velocity_limit:
+        base_reporter = arm_term.safety_report
+
+        def gripper_candidate_report():
+            report = base_reporter()
+            report["profile"] = EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE
+            report.update(
+                {
+                    "gripper_velocity_limit_profile": (GRIPPER_VELOCITY_LIMIT_PROFILE),
+                    "gripper_drive_readback_profile": GRIPPER_DRIVE_READBACK_PROFILE,
+                    "gripper_joint_names": ["finger_joint"],
+                    "gripper_configured_velocity_limit_sim_rad_s": (
+                        GRIPPER_VELOCITY_LIMIT_RAD_S
+                    ),
+                    "gripper_mirror_velocity_limit_rad_s": (
+                        GRIPPER_VELOCITY_LIMIT_RAD_S
+                    ),
+                    "gripper_physx_velocity_limit_rad_s": (
+                        GRIPPER_VELOCITY_LIMIT_RAD_S
+                    ),
+                    "gripper_configured_effort_limit": GRIPPER_EFFORT_LIMIT,
+                    "gripper_mirror_effort_limit": GRIPPER_EFFORT_LIMIT,
+                    "gripper_physx_effort_limit": GRIPPER_EFFORT_LIMIT,
+                    "gripper_configured_stiffness": None,
+                    "gripper_mirror_stiffness": 1000.0,
+                    "gripper_physx_stiffness": 1000.0,
+                    "gripper_configured_damping": None,
+                    "gripper_mirror_damping": 100.0,
+                    "gripper_physx_damping": 100.0,
+                }
+            )
+            return report
+
+        arm_term.safety_report = gripper_candidate_report
     finger_term = SimpleNamespace(gripper_threshold_profile=GRIPPER_THRESHOLD_PROFILE)
     runtime = SimpleNamespace(
         max_episode_length=450,
@@ -256,9 +298,17 @@ def _episode_result(*, episode=0, length=2, numerical_failure=False):
 
 
 def _episode_safety(
-    *, episode=0, length=2, numerical_failure=False, wrist_energy_brake=False
+    *,
+    episode=0,
+    length=2,
+    numerical_failure=False,
+    wrist_energy_brake=False,
+    gripper_velocity_limit=False,
 ):
-    env, _ = _runtime_fixture(wrist_energy_brake=wrist_energy_brake)
+    env, _ = _runtime_fixture(
+        wrist_energy_brake=wrist_energy_brake,
+        gripper_velocity_limit=gripper_velocity_limit,
+    )
     report = env.unwrapped.action_manager._terms["arm"].safety_report()
     report["episode_index"] = episode
     apply_calls = length * 8 if not numerical_failure else (length - 1) * 8 + 3
@@ -545,6 +595,91 @@ def test_runtime_candidate_selects_exact_profile_schema_and_diagnostics(tmp_path
         )
 
 
+def test_runtime_gripper_candidate_binds_drive_and_aggregate(tmp_path):
+    env, observation = _runtime_fixture(gripper_velocity_limit=True)
+
+    frame = validate_eef_runtime_frame(env, observation)
+    assert frame["ik_safety_profile"] == (
+        EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE
+    )
+    validated = validate_eef_runtime_safety(env)
+    assert validated["gripper_velocity_limit_profile"] == (
+        GRIPPER_VELOCITY_LIMIT_PROFILE
+    )
+    assert validated["gripper_joint_names"] == ["finger_joint"]
+    assert validated["gripper_mirror_velocity_limit_rad_s"] == 5.0
+    assert validated["gripper_physx_velocity_limit_rad_s"] == 5.0
+    assert validated["gripper_mirror_effort_limit"] == 200.0
+    assert validated["gripper_physx_effort_limit"] == 200.0
+    assert validated["gripper_mirror_stiffness"] == 1000.0
+    assert validated["gripper_physx_stiffness"] == 1000.0
+
+    durable = _episode_safety(gripper_velocity_limit=True)
+    validate_episode_safety_cadence(
+        safety=durable,
+        episode_result=_episode_result(),
+    )
+    aggregate = aggregate_episode_safety(
+        durable,
+        [
+            {
+                "episode_index": 0,
+                "episode_result": _episode_result(),
+                "artifact_identity": {},
+                "cadence_evidence": {"apply_calls": 16},
+                "safety": durable,
+                "path": "episode_000000.json",
+                "sha256": "0" * 64,
+            }
+        ],
+    )
+    assert aggregate["profile"] == (EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE)
+    assert aggregate["gripper_physx_velocity_limit_rad_s"] == 5.0
+    atomic_write_runtime_contract(
+        tmp_path / "gripper-candidate-runtime.json",
+        protocol=validate_ego_lap_runtime_protocol(env),
+        frame=frame,
+        ik_safety=aggregate,
+    )
+    with pytest.raises(ValueError, match="profiles disagree"):
+        atomic_write_runtime_contract(
+            tmp_path / "gripper-candidate-runtime-mismatch.json",
+            protocol=validate_ego_lap_runtime_protocol(env),
+            frame={**frame, "ik_safety_profile": EEF_IK_SAFETY_PROFILE},
+            ik_safety=aggregate,
+        )
+
+
+def test_runtime_gripper_candidate_rejects_mode_and_readback_tampering():
+    env, _ = _runtime_fixture(gripper_velocity_limit=True)
+    arm_term = env.unwrapped.action_manager._terms["arm"]
+
+    arm_term.cfg.enable_gripper_velocity_limit = False
+    with pytest.raises(ValueError, match="schema drift"):
+        validate_eef_runtime_safety(env)
+
+    env, _ = _runtime_fixture(gripper_velocity_limit=True)
+    env.unwrapped.action_manager._terms[
+        "arm"
+    ].cfg.enable_gripper_velocity_limit = "true"
+    with pytest.raises(ValueError, match="must be exactly bool"):
+        validate_eef_runtime_safety(env)
+
+    env, _ = _runtime_fixture(gripper_velocity_limit=True)
+    report = env.unwrapped.action_manager._terms["arm"].safety_report()
+    report["gripper_physx_velocity_limit_rad_s"] = 6.0
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: report
+    with pytest.raises(ValueError, match="velocity/effort readback drift"):
+        validate_eef_runtime_safety(env)
+
+    env, _ = _runtime_fixture(gripper_velocity_limit=True)
+    report = env.unwrapped.action_manager._terms["arm"].safety_report()
+    report["gripper_physx_stiffness"] += 1.0
+    env.unwrapped.action_manager._terms["arm"].safety_report = lambda: report
+    with pytest.raises(ValueError, match="stiffness mirror/PhysX"):
+        validate_eef_runtime_safety(env)
+
+
 def test_runtime_disabled_mode_retains_exact_v4_schema():
     env, observation = _runtime_fixture()
     report = validate_eef_runtime_safety(env)
@@ -554,6 +689,7 @@ def test_runtime_disabled_mode_retains_exact_v4_schema():
     assert frame["ik_safety_profile"] == EEF_IK_SAFETY_PROFILE
     assert not any(key.startswith("wrist_energy_brake_") for key in report)
     assert not any(key.startswith("wrist_energy_brake_") for key in report["counters"])
+    assert not any(key.startswith("gripper_") for key in report)
 
 
 def test_runtime_candidate_rejects_mode_schema_and_static_tampering():

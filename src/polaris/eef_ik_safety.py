@@ -9,6 +9,9 @@ EEF_IK_SAFETY_PROFILE = "panda_velocity_physxlimit_solveriter1_v4"
 EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE = (
     "panda_velocity_physxlimit_solveriter1_wristenergybrake_candidate_v1"
 )
+EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE = (
+    "panda_velocity_physxlimit_solveriter1_grippervelocitylimit_candidate_v1"
+)
 EEF_IK_APPLY_CADENCE = "physics_substep"
 CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD = 1e-5
 TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE = "eef_physx_inner_hardlimit_one_substep_v2"
@@ -44,6 +47,17 @@ WRIST_ENERGY_BRAKE_JOINT_NAMES = (
 )
 WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS = 2
 WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION = 0.9
+
+# Default-off EEF-only diagnostic candidate for the deterministic close-command
+# transient.  ``velocity_limit`` is a legacy implicit-actuator field in Isaac
+# Lab 2.3 and is not a PhysX limit.  This candidate explicitly authors the same
+# intended value through ``velocity_limit_sim`` without changing the binary
+# open/close action contract or native joint-position/pi05 configuration.
+GRIPPER_VELOCITY_LIMIT_PROFILE = "finger_joint_physx_velocity_limit_5rad_s_eef_only_v1"
+GRIPPER_DRIVE_READBACK_PROFILE = "configured_mirror_physx_exact_single_finger_joint_v1"
+GRIPPER_JOINT_NAMES = ("finger_joint",)
+GRIPPER_VELOCITY_LIMIT_RAD_S = 5.0
+GRIPPER_EFFORT_LIMIT = 200.0
 
 PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S = (
     2.175,

@@ -20,11 +20,17 @@ from polaris.eef_ik_safety import ARTICULATION_SOLVER_PROFILE
 from polaris.eef_ik_safety import ARTICULATION_SOLVER_READBACK
 from polaris.eef_ik_safety import CURRENT_JOINT_SOFT_LIMIT_TOLERANCE_RAD
 from polaris.eef_ik_safety import EEF_IK_APPLY_CADENCE
+from polaris.eef_ik_safety import EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE
 from polaris.eef_ik_safety import EEF_IK_SAFETY_PROFILE
 from polaris.eef_ik_safety import EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
 from polaris.eef_ik_safety import EEF_QUATERNION_UNIT_NORM_TOLERANCE
 from polaris.eef_ik_safety import JOINT_SLEW_FLOAT32_TOLERANCE_RAD
 from polaris.eef_ik_safety import JOINT_VELOCITY_LIMIT_TOLERANCE_RAD_S
+from polaris.eef_ik_safety import GRIPPER_DRIVE_READBACK_PROFILE
+from polaris.eef_ik_safety import GRIPPER_EFFORT_LIMIT
+from polaris.eef_ik_safety import GRIPPER_JOINT_NAMES
+from polaris.eef_ik_safety import GRIPPER_VELOCITY_LIMIT_PROFILE
+from polaris.eef_ik_safety import GRIPPER_VELOCITY_LIMIT_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_EFFORT_LIMITS
 from polaris.eef_ik_safety import PANDA_EEF_JOINT_VELOCITY_LIMITS_RAD_S
 from polaris.eef_ik_safety import PANDA_EEF_SOLVER_POSITION_ITERATION_COUNT
@@ -93,6 +99,23 @@ WRIST_ENERGY_BRAKE_DYNAMIC_FIELDS = {
     "wrist_energy_brake_latch_remaining_substeps",
     "wrist_energy_brake_diagnostics",
 }
+GRIPPER_VELOCITY_LIMIT_STATIC_FIELDS = (
+    "gripper_velocity_limit_profile",
+    "gripper_drive_readback_profile",
+    "gripper_joint_names",
+    "gripper_configured_velocity_limit_sim_rad_s",
+    "gripper_mirror_velocity_limit_rad_s",
+    "gripper_physx_velocity_limit_rad_s",
+    "gripper_configured_effort_limit",
+    "gripper_mirror_effort_limit",
+    "gripper_physx_effort_limit",
+    "gripper_configured_stiffness",
+    "gripper_mirror_stiffness",
+    "gripper_physx_stiffness",
+    "gripper_configured_damping",
+    "gripper_mirror_damping",
+    "gripper_physx_damping",
+)
 WRIST_ENERGY_BRAKE_DIAGNOSTIC_FIELDS = {
     "episode_index",
     "apply_index",
@@ -198,6 +221,10 @@ WRIST_ENERGY_BRAKE_EPISODE_SAFETY_FIELDS = {
     *WRIST_ENERGY_BRAKE_STATIC_FIELDS,
     *WRIST_ENERGY_BRAKE_DYNAMIC_FIELDS,
 }
+GRIPPER_VELOCITY_LIMIT_EPISODE_SAFETY_FIELDS = {
+    *EPISODE_SAFETY_FIELDS,
+    *GRIPPER_VELOCITY_LIMIT_STATIC_FIELDS,
+}
 SAFETY_SIDECAR_FIELDS = {
     "schema_version",
     "transaction_state",
@@ -248,6 +275,10 @@ AGGREGATE_SAFETY_FIELDS = {
 WRIST_ENERGY_BRAKE_AGGREGATE_SAFETY_FIELDS = {
     *AGGREGATE_SAFETY_FIELDS,
     *WRIST_ENERGY_BRAKE_STATIC_FIELDS,
+}
+GRIPPER_VELOCITY_LIMIT_AGGREGATE_SAFETY_FIELDS = {
+    *AGGREGATE_SAFETY_FIELDS,
+    *GRIPPER_VELOCITY_LIMIT_STATIC_FIELDS,
 }
 
 
@@ -367,61 +398,94 @@ def _wrist_energy_brake_enabled(arm_term: Any) -> bool:
     return enabled
 
 
-def _selected_safety_profile(candidate_enabled: bool) -> str:
-    return (
-        EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
-        if candidate_enabled
-        else EEF_IK_SAFETY_PROFILE
-    )
+def _gripper_velocity_limit_enabled(arm_term: Any) -> bool:
+    """Return the exact EEF-only gripper candidate flag."""
+
+    arm_cfg = getattr(arm_term, "cfg", None)
+    enabled = getattr(arm_cfg, "enable_gripper_velocity_limit", False)
+    if type(enabled) is not bool:
+        raise ValueError(
+            "Live EEF gripper velocity-limit enable flag must be exactly bool"
+        )
+    return enabled
 
 
-def _episode_safety_fields(candidate_enabled: bool) -> set[str]:
-    return (
-        WRIST_ENERGY_BRAKE_EPISODE_SAFETY_FIELDS
-        if candidate_enabled
-        else EPISODE_SAFETY_FIELDS
-    )
+def _selected_safety_profile(arm_term: Any) -> str:
+    wrist_enabled = _wrist_energy_brake_enabled(arm_term)
+    gripper_enabled = _gripper_velocity_limit_enabled(arm_term)
+    if wrist_enabled and gripper_enabled:
+        raise ValueError(
+            "Live EEF wrist-brake and gripper velocity-limit candidates are "
+            "mutually exclusive"
+        )
+    if wrist_enabled:
+        return EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+    if gripper_enabled:
+        return EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE
+    return EEF_IK_SAFETY_PROFILE
 
 
-def _safety_counter_fields(candidate_enabled: bool) -> set[str]:
-    return (
-        SAFETY_COUNTER_FIELDS | WRIST_ENERGY_BRAKE_COUNTER_FIELDS
-        if candidate_enabled
-        else SAFETY_COUNTER_FIELDS
-    )
-
-
-def _safety_static_fields(candidate_enabled: bool) -> tuple[str, ...]:
-    return (
-        (*SAFETY_STATIC_FIELDS, *WRIST_ENERGY_BRAKE_STATIC_FIELDS)
-        if candidate_enabled
-        else SAFETY_STATIC_FIELDS
-    )
-
-
-def _aggregate_safety_fields(candidate_enabled: bool) -> set[str]:
-    return (
-        WRIST_ENERGY_BRAKE_AGGREGATE_SAFETY_FIELDS
-        if candidate_enabled
-        else AGGREGATE_SAFETY_FIELDS
-    )
-
-
-def _runtime_episode_fields(candidate_enabled: bool) -> set[str]:
-    return (
-        WRIST_ENERGY_BRAKE_RUNTIME_EPISODE_FIELDS
-        if candidate_enabled
-        else RUNTIME_EPISODE_FIELDS
-    )
-
-
-def _candidate_enabled_from_safety(safety: Mapping[str, Any]) -> bool:
-    profile = safety.get("profile")
-    if profile == EEF_IK_SAFETY_PROFILE:
-        return False
+def _episode_safety_fields(profile: str) -> set[str]:
     if profile == EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE:
-        return True
+        return WRIST_ENERGY_BRAKE_EPISODE_SAFETY_FIELDS
+    if profile == EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE:
+        return GRIPPER_VELOCITY_LIMIT_EPISODE_SAFETY_FIELDS
+    if profile == EEF_IK_SAFETY_PROFILE:
+        return EPISODE_SAFETY_FIELDS
     raise ValueError(f"Unknown EEF IK safety profile: {profile!r}")
+
+
+def _safety_counter_fields(profile: str) -> set[str]:
+    if profile == EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE:
+        return SAFETY_COUNTER_FIELDS | WRIST_ENERGY_BRAKE_COUNTER_FIELDS
+    if profile in {
+        EEF_IK_SAFETY_PROFILE,
+        EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE,
+    }:
+        return SAFETY_COUNTER_FIELDS
+    raise ValueError(f"Unknown EEF IK safety profile: {profile!r}")
+
+
+def _safety_static_fields(profile: str) -> tuple[str, ...]:
+    if profile == EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE:
+        return (*SAFETY_STATIC_FIELDS, *WRIST_ENERGY_BRAKE_STATIC_FIELDS)
+    if profile == EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE:
+        return (*SAFETY_STATIC_FIELDS, *GRIPPER_VELOCITY_LIMIT_STATIC_FIELDS)
+    if profile == EEF_IK_SAFETY_PROFILE:
+        return SAFETY_STATIC_FIELDS
+    raise ValueError(f"Unknown EEF IK safety profile: {profile!r}")
+
+
+def _aggregate_safety_fields(profile: str) -> set[str]:
+    if profile == EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE:
+        return WRIST_ENERGY_BRAKE_AGGREGATE_SAFETY_FIELDS
+    if profile == EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE:
+        return GRIPPER_VELOCITY_LIMIT_AGGREGATE_SAFETY_FIELDS
+    if profile == EEF_IK_SAFETY_PROFILE:
+        return AGGREGATE_SAFETY_FIELDS
+    raise ValueError(f"Unknown EEF IK safety profile: {profile!r}")
+
+
+def _runtime_episode_fields(profile: str) -> set[str]:
+    if profile == EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE:
+        return WRIST_ENERGY_BRAKE_RUNTIME_EPISODE_FIELDS
+    if profile in {
+        EEF_IK_SAFETY_PROFILE,
+        EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE,
+    }:
+        return RUNTIME_EPISODE_FIELDS
+    raise ValueError(f"Unknown EEF IK safety profile: {profile!r}")
+
+
+def _profile_from_safety(safety: Mapping[str, Any]) -> str:
+    profile = safety.get("profile")
+    if profile not in {
+        EEF_IK_SAFETY_PROFILE,
+        EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE,
+        EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE,
+    }:
+        raise ValueError(f"Unknown EEF IK safety profile: {profile!r}")
+    return profile
 
 
 def _canonical_wrist_energy_brake_threshold() -> np.ndarray:
@@ -432,6 +496,57 @@ def _canonical_wrist_energy_brake_threshold() -> np.ndarray:
     return (
         max_delta[4:7] * np.float32(WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION)
     ).astype(np.float32, copy=False)
+
+
+def _validate_gripper_velocity_limit_fields(safety: Mapping[str, Any]) -> None:
+    """Validate configured, mirror, and direct-PhysX gripper drive evidence."""
+
+    exact = {
+        "gripper_velocity_limit_profile": GRIPPER_VELOCITY_LIMIT_PROFILE,
+        "gripper_drive_readback_profile": GRIPPER_DRIVE_READBACK_PROFILE,
+        "gripper_joint_names": list(GRIPPER_JOINT_NAMES),
+        "gripper_configured_velocity_limit_sim_rad_s": (GRIPPER_VELOCITY_LIMIT_RAD_S),
+        "gripper_configured_effort_limit": GRIPPER_EFFORT_LIMIT,
+        "gripper_configured_stiffness": None,
+        "gripper_configured_damping": None,
+    }
+    for field, expected in exact.items():
+        if safety.get(field) != expected:
+            raise ValueError(
+                f"EEF gripper velocity-limit {field} mismatch: "
+                f"expected={expected!r}, actual={safety.get(field)!r}"
+            )
+    numeric = {}
+    for field in (
+        "gripper_mirror_velocity_limit_rad_s",
+        "gripper_physx_velocity_limit_rad_s",
+        "gripper_mirror_effort_limit",
+        "gripper_physx_effort_limit",
+        "gripper_mirror_stiffness",
+        "gripper_physx_stiffness",
+        "gripper_mirror_damping",
+        "gripper_physx_damping",
+    ):
+        value = safety.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(f"EEF gripper velocity-limit {field} is not finite")
+        numeric[field] = float(value)
+    if (
+        numeric["gripper_mirror_velocity_limit_rad_s"] != GRIPPER_VELOCITY_LIMIT_RAD_S
+        or numeric["gripper_physx_velocity_limit_rad_s"] != GRIPPER_VELOCITY_LIMIT_RAD_S
+        or numeric["gripper_mirror_effort_limit"] != GRIPPER_EFFORT_LIMIT
+        or numeric["gripper_physx_effort_limit"] != GRIPPER_EFFORT_LIMIT
+    ):
+        raise ValueError("EEF gripper velocity/effort readback drift")
+    for field in ("stiffness", "damping"):
+        mirror = numeric[f"gripper_mirror_{field}"]
+        physx = numeric[f"gripper_physx_{field}"]
+        if mirror != physx or mirror < 0.0:
+            raise ValueError(f"EEF gripper {field} mirror/PhysX readback drift")
 
 
 def _finite_numeric_vector(value: Any, *, size: int, field: str) -> np.ndarray:
@@ -818,14 +933,18 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
 
     runtime = _unwrapped(env)
     arm_term = _arm_action_term(runtime)
-    candidate_enabled = _wrist_energy_brake_enabled(arm_term)
+    profile = _selected_safety_profile(arm_term)
+    wrist_candidate_enabled = profile == EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+    gripper_candidate_enabled = (
+        profile == EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE
+    )
     reporter = getattr(arm_term, "safety_report", None)
     if not callable(reporter):
         raise ValueError("Live Ego-LAP EEF action has no IK safety reporter")
     report = reporter()
     if not isinstance(report, dict):
         raise ValueError("Live Ego-LAP EEF IK safety reporter returned no object")
-    expected_report_fields = _episode_safety_fields(candidate_enabled)
+    expected_report_fields = _episode_safety_fields(profile)
     if set(report) != expected_report_fields:
         raise ValueError(
             "Live EEF IK safety report schema drift: "
@@ -833,7 +952,7 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
             f"actual={sorted(report)!r}"
         )
     exact_fields = {
-        "profile": _selected_safety_profile(candidate_enabled),
+        "profile": profile,
         "apply_actions_cadence": EEF_IK_APPLY_CADENCE,
         "target_soft_limit_guard_band_profile": TARGET_SOFT_LIMIT_GUARD_BAND_PROFILE,
         "physx_hard_limit_profile": PHYSX_HARD_LIMIT_PROFILE,
@@ -848,7 +967,7 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         "decimation": CANONICAL_DECIMATION,
         "joint_names": list(CANONICAL_ARM_JOINTS),
     }
-    if candidate_enabled:
+    if wrist_candidate_enabled:
         exact_fields.update(
             {
                 "wrist_energy_brake_profile": WRIST_ENERGY_BRAKE_PROFILE,
@@ -1096,7 +1215,7 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
     ):
         raise ValueError("Live EEF IK arm velocity target must be exactly zero")
     wrist_threshold = None
-    if candidate_enabled:
+    if wrist_candidate_enabled:
         wrist_threshold = _finite_numeric_vector(
             report.get("wrist_energy_brake_target_shift_threshold_rad"),
             size=3,
@@ -1114,7 +1233,7 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
     maxima = report.get("maxima")
     if not isinstance(counters, dict) or not isinstance(maxima, dict):
         raise ValueError("Live EEF IK safety requires counters and maxima objects")
-    expected_counters = _safety_counter_fields(candidate_enabled)
+    expected_counters = _safety_counter_fields(profile)
     if set(counters) != expected_counters or any(
         type(counters[field]) is not int or counters[field] < 0
         for field in expected_counters
@@ -1124,7 +1243,7 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
         raise ValueError(
             "Single-environment EEF safety substep count must equal apply calls"
         )
-    if candidate_enabled:
+    if wrist_candidate_enabled:
         apply_calls = counters["apply_calls"]
         trigger_events = counters["wrist_energy_brake_trigger_events"]
         active_substeps = counters["wrist_energy_brake_active_substeps"]
@@ -1225,7 +1344,7 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
     }
     diagnostic_counter_mapping = (
         WRIST_ENERGY_BRAKE_SAFETY_DIAGNOSTIC_COUNTERS
-        if candidate_enabled
+        if wrist_candidate_enabled
         else SAFETY_DIAGNOSTIC_COUNTERS
     )
     for diagnostic in guard_diagnostics:
@@ -1253,6 +1372,8 @@ def validate_eef_runtime_safety(env: Any) -> dict[str, Any]:
             field="max-raw-delta",
             allowed_kinds={"max_raw_delta"},
         )
+    if gripper_candidate_enabled:
+        _validate_gripper_velocity_limit_fields(report)
     return report
 
 
@@ -1328,7 +1449,7 @@ def validate_eef_runtime_frame(
             "Live Ego-LAP controller does not control physical panda_link8: "
             f"{getattr(arm_cfg, 'body_name', None)!r}"
         )
-    candidate_enabled = _wrist_energy_brake_enabled(arm_term)
+    profile = _selected_safety_profile(arm_term)
     if not _identity_offset(getattr(arm_cfg, "body_offset", None)):
         raise ValueError("Live Ego-LAP controller body offset is not identity")
     controller_cfg = getattr(arm_cfg, "controller", None)
@@ -1402,7 +1523,7 @@ def validate_eef_runtime_frame(
         "arm_scale": CANONICAL_ARM_SCALE,
         "arm_joint_names": list(CANONICAL_ARM_JOINTS),
         "gripper_threshold_profile": GRIPPER_THRESHOLD_PROFILE,
-        "ik_safety_profile": _selected_safety_profile(candidate_enabled),
+        "ik_safety_profile": profile,
         "action_dim": 7,
     }
 
@@ -1588,13 +1709,17 @@ def _validate_episode_safety_evidence_shape(
 ) -> None:
     """Validate the exact durable per-episode safety schema and counter mapping."""
 
-    candidate_enabled = _candidate_enabled_from_safety(safety)
-    if set(safety) != _episode_safety_fields(candidate_enabled):
+    profile = _profile_from_safety(safety)
+    wrist_candidate_enabled = profile == EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+    gripper_candidate_enabled = (
+        profile == EEF_IK_GRIPPER_VELOCITY_LIMIT_CANDIDATE_PROFILE
+    )
+    if set(safety) != _episode_safety_fields(profile):
         raise ValueError("Episode safety report schema drift")
     counters = safety.get("counters")
     maxima = safety.get("maxima")
     if not isinstance(counters, Mapping) or set(counters) != _safety_counter_fields(
-        candidate_enabled
+        profile
     ):
         raise ValueError("Episode safety counter schema drift")
     if any(type(value) is not int or value < 0 for value in counters.values()):
@@ -1602,7 +1727,7 @@ def _validate_episode_safety_evidence_shape(
     if counters["environment_substeps"] != counters["apply_calls"]:
         raise ValueError("Episode safety environment/apply substeps disagree")
     apply_calls = counters["apply_calls"]
-    if candidate_enabled:
+    if wrist_candidate_enabled:
         expected_candidate_static = {
             "wrist_energy_brake_profile": WRIST_ENERGY_BRAKE_PROFILE,
             "wrist_energy_brake_joint_names": list(WRIST_ENERGY_BRAKE_JOINT_NAMES),
@@ -1714,7 +1839,7 @@ def _validate_episode_safety_evidence_shape(
     diagnostic_indices = []
     diagnostic_counter_mapping = (
         WRIST_ENERGY_BRAKE_SAFETY_DIAGNOSTIC_COUNTERS
-        if candidate_enabled
+        if wrist_candidate_enabled
         else SAFETY_DIAGNOSTIC_COUNTERS
     )
     for diagnostic in diagnostics:
@@ -1740,6 +1865,8 @@ def _validate_episode_safety_evidence_shape(
                 "Episode safety counter/diagnostic mapping drift for "
                 f"{name}: counter={counters[name]}, diagnostics={count}"
             )
+    if gripper_candidate_enabled:
+        _validate_gripper_velocity_limit_fields(safety)
     max_raw = safety.get("max_raw_delta_diagnostic")
     if max_raw is not None:
         _validate_guard_diagnostic(
@@ -2110,15 +2237,13 @@ def aggregate_episode_safety(
 ) -> dict[str, Any]:
     """Merge immutable per-episode reports without losing resume history."""
 
-    candidate_enabled = _candidate_enabled_from_safety(live_template)
-    if set(live_template) != _episode_safety_fields(candidate_enabled):
+    profile = _profile_from_safety(live_template)
+    wrist_candidate_enabled = profile == EEF_IK_WRIST_ENERGY_BRAKE_CANDIDATE_PROFILE
+    if set(live_template) != _episode_safety_fields(profile):
         raise ValueError("Live safety template schema drift")
-    static = {
-        field: live_template[field]
-        for field in _safety_static_fields(candidate_enabled)
-    }
+    static = {field: live_template[field] for field in _safety_static_fields(profile)}
     counter_names = set(live_template["counters"])
-    if counter_names != _safety_counter_fields(candidate_enabled):
+    if counter_names != _safety_counter_fields(profile):
         raise ValueError("Live safety template counter schema drift")
     maxima_names = set(live_template["maxima"])
     counters = {field: 0 for field in counter_names}
@@ -2160,7 +2285,7 @@ def aggregate_episode_safety(
             "sidecar_path": sidecar["path"],
             "sidecar_sha256": sidecar["sha256"],
         }
-        if candidate_enabled:
+        if wrist_candidate_enabled:
             episode.update(
                 {field: safety[field] for field in WRIST_ENERGY_BRAKE_DYNAMIC_FIELDS}
             )
@@ -2172,9 +2297,8 @@ def aggregate_episode_safety(
         "maxima": maxima,
         "episodes": episodes,
     }
-    if set(aggregate) != _aggregate_safety_fields(candidate_enabled) or any(
-        set(episode) != _runtime_episode_fields(candidate_enabled)
-        for episode in episodes
+    if set(aggregate) != _aggregate_safety_fields(profile) or any(
+        set(episode) != _runtime_episode_fields(profile) for episode in episodes
     ):
         raise ValueError("Aggregate EEF IK safety schema drift")
     return aggregate
@@ -2189,13 +2313,13 @@ def atomic_write_runtime_contract(
 ) -> None:
     """Atomically persist the live simulator/controller contract for this attempt."""
 
-    candidate_enabled = _candidate_enabled_from_safety(ik_safety)
-    if set(ik_safety) != _aggregate_safety_fields(candidate_enabled):
+    profile = _profile_from_safety(ik_safety)
+    if set(ik_safety) != _aggregate_safety_fields(profile):
         raise ValueError("Runtime aggregate EEF IK safety schema drift")
     episodes = ik_safety.get("episodes")
     if not isinstance(episodes, list) or any(
         not isinstance(episode, Mapping)
-        or set(episode) != _runtime_episode_fields(candidate_enabled)
+        or set(episode) != _runtime_episode_fields(profile)
         for episode in episodes
     ):
         raise ValueError("Runtime aggregate episode safety schema drift")
