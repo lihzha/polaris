@@ -45,11 +45,13 @@ WRIST_ENERGY_BRAKE_JOINT_NAMES = (
 WRIST_ENERGY_BRAKE_LATCH_SUBSTEPS = 2
 WRIST_ENERGY_BRAKE_TARGET_SHIFT_FRACTION = 0.9
 
-# Default-off EEF-only diagnostic candidate for the deterministic gripper-close
-# transient. Isaac Lab 2.3 does not promote the legacy implicit-actuator
-# ``velocity_limit`` field into a PhysX limit. The candidate explicitly authors
-# the same intended value through ``velocity_limit_sim`` without changing the
-# binary gripper action contract or native joint-position configuration.
+# EEF-only PhysX limit for the deterministic gripper-close transient. Isaac Lab
+# 2.3 does not promote the legacy implicit-actuator ``velocity_limit`` field
+# into a PhysX limit. The production EEF caller explicitly authors the same
+# intended value through ``velocity_limit_sim`` without changing the binary
+# gripper action contract or native joint-position configuration. The helper's
+# default remains off so the isolated baseline diagnostic can reproduce the
+# legacy drive profile.
 GRIPPER_VELOCITY_LIMIT_RAD_S = 5.0
 GRIPPER_EFFORT_LIMIT = 200.0
 

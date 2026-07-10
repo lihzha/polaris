@@ -67,6 +67,7 @@ def main(eval_args: EvalArgs):
         configure_eef_pose_joint_safety(
             env_cfg.scene.robot,
             physx_cfg=env_cfg.sim.physx,
+            enable_gripper_velocity_limit=True,
         )
         frame_cfg = env_cfg.scene.lap_ee_frame
         target_cfg = frame_cfg.target_frames[0]

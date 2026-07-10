@@ -986,3 +986,83 @@
   `git diff --check`, with no edits or remaining finding.
 - Both caches and staging directories are absent, the source is clean, both
   nodes are idle, and no job remains queued.
+
+## 2026-07-03 — fully attested 5 rad/s canary removes the reference arm guard
+
+- Commit `c69a5a3d7fd29b8e92504f20e78df6e2a10ed68d` passed the fresh
+  real-Isaac gate in job `1098205` on `pool0-00013`. The deliberate no-tests
+  probe returned exact immutable `5\n`, outer step `5:0`, and failed the
+  zero-profile validation as intended. The positive real-Isaac suite passed
+  all 76 tests; the wider suite passed 447 tests, skipped two
+  environment-specific tests, and passed 22 subtests. The root job completed
+  `0:0`; its immutable saved wrapper SHA-256 is
+  `d20b392bc7d17d270a2a09e5cedf77cd4d5b3ad0a76b380d096a3f27b1abcca4`
+  and its final log SHA-256 is
+  `4e3d660faa493cb107da750f7a1fa2df2b64f883a7457a3992f9fa1222ff632b`.
+  Cache cleanup, clean detached source, and node-idle checks passed.
+- Exact baseline `1098206` and capped candidate `1098207` were submitted in
+  the same SSH session within 122,740,435 ns and ran in parallel on
+  `pool0-00013` and `pool0-00027`. Both completed `0:0` and each published
+  exactly ten regular mode-0444/single-link files with exact `0\n` runtime,
+  outer-srun, and validator status sidecars. Independent local validation
+  rechecked every capture/ready/v7-attestation hash, size, mode, link count,
+  outcome, runtime identity, and drive-profile cross-link. Baseline
+  capture/video/ready/attestation SHA-256 values are
+  `592e643ad241fb8aebeb438ba16ef7c0ebbb279fa65195c5d80af21a2235d72e`,
+  `744ff70afe5aa997badfee2f7ca923aed0f2372a24c5e5b3b550d8f7e2abd6f2`,
+  `0561d2e7b7f48a9c469f815a826b7fe326e618859881916570df8129fc7d1e74`,
+  and
+  `06ff86a8f8abb444e7cf26b823b5d40c4aff77b1f23d9269133f8669a758e473`;
+  candidate values are
+  `02015d3a1dc3ac00dc52b7bb1cf2f475701c38b1b4f6588b3755b649ed3ee366`,
+  `618cc09cac53f6f4e666db8181af082fc128e747088ddecd876d72fb974ea58d`,
+  `0ec260810044b1f90f4ccb34039de03757ba84aed2468d0d16acf23ea95dcae8`,
+  and
+  `87137e577be03720451222b7720154cb4909590679e0e064b98cbf71daaef549`.
+  Final baseline/candidate log SHA-256 values are
+  `adfdf3e7c8d91c54d83615af9f2af30a9d243505373ef7a6c88c7fc096e28511`
+  and
+  `82d34c408d4afba5e17d3c54be8f4c87bd9f1ed03c09ac93e5dc5507ede15a05`.
+  Caches and attestation staging are absent, the source remained clean, and
+  both nodes returned idle.
+- The baseline exactly reproduced the reference failure at policy step 115,
+  physics substep 2, apply index 922. The driven finger reached
+  `-8.726713` rad/s against its live `8.726646` limit; arm joint 7 reached
+  `-2.892737` rad/s against its `2.61` limit, producing one invariant abort.
+  The candidate independently attested both live config fields, both CUDA
+  actuator limits, and the CPU direct-PhysX limit at exact float32 `5.0`, with
+  the same 200 Nm effort limit and the probed stiffness/damping. It preserved
+  the exact action hashes and 0-to-1 close at policy 115, limited the driven
+  finger to `5.000018` rad/s numerical readback, reduced peak arm joint 7
+  velocity to `2.158725` rad/s, completed policy step 117, and recorded zero
+  invariant, nonfinite, current-position, target, and post-clamp guard events.
+  All current soft/hard position-limit and post-clamp target violations are
+  zero. Thus the isolated A/B proves the active-joint cap prevents the
+  reference guard through the closed diagnostic horizon.
+- The candidate also exposes a material caveat. The passive
+  `left_inner_finger_knuckle_joint` reached `-55.622322` rad/s at policy 116,
+  substep 0, apply 928. The exact attested USD identifies it as a dynamic
+  `PhysicsRevoluteJoint` inside the articulation with a PhysX mimic reference
+  to `finger_joint`, gearing +1, natural frequency 1000, and damping ratio
+  0.05. It is not part of the action or actuator joint sets; all five follower
+  joints retain a high direct-PhysX limit of `174.532928` rad/s and receive
+  zero applied PD torque. The spike is an oscillatory mimic correction:
+  velocity went `10.095884 -> -55.622322 -> 3.698159` rad/s, acceleration was
+  `-7886.185` rad/s^2, and projected joint force was only `-0.233392` Nm.
+  It occurs eight physics substeps after close begins, not during reset. The
+  capture has no contact-only tensor, so contact correlation is unresolved;
+  its incoming wrench is explicitly total rather than contact-only. No arm,
+  controller, articulation, position, or nonfinite guard accompanied it.
+  Capping these passive mimic DOFs would require a separate asset/PhysX-view
+  behavior change and is not justified by this A/B alone.
+- A smallest behavior-only promotion draft is left uncommitted for review: it
+  passes `enable_gripper_velocity_limit=True` only inside the production
+  `control_mode == "eef-pose"` branch in `scripts/eval.py`, updates helper
+  wording, and keeps the default helper and native `NVIDIA_DROID`
+  joint-position/Pi configuration unchanged. Ruff check/format, Python byte
+  compilation, and `git diff --check` pass. This four-file behavior draft is
+  explicitly **not production-ready**: it does not yet bind gripper intent and
+  live evidence through the config, runtime contract, per-episode sidecars,
+  traces, resume identity, and completion identity, and it does not port the
+  c69 arm-v4 runtime schema end to end. No promotion commit, deployment, or
+  launch has been made.

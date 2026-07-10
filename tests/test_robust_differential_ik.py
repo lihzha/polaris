@@ -1264,7 +1264,13 @@ def test_eef_velocity_and_effort_limits_are_scoped_to_eef_setup():
         'elif eval_args.control_mode != "joint-position":'
     )
     assert eef_branch < configure_call < native_branch
-    assert "enable_gripper_velocity_limit" not in eval_source
+    assert (
+        "configure_eef_pose_joint_safety(\n"
+        "            env_cfg.scene.robot,\n"
+        "            physx_cfg=env_cfg.sim.physx,\n"
+        "            enable_gripper_velocity_limit=True,\n"
+        "        )"
+    ) in eval_source
 
     native_physx_cfg = SimpleNamespace(solver_type=0)
     eef_physx_cfg = SimpleNamespace(solver_type=0)
@@ -1286,34 +1292,34 @@ def test_eef_velocity_and_effort_limits_are_scoped_to_eef_setup():
     assert native_physx_cfg.solver_type == 0
 
 
-def test_eef_gripper_velocity_limit_candidate_is_explicit_and_opt_in():
+def test_eef_gripper_velocity_limit_profile_is_explicit_and_opt_in():
     from polaris.environments.robot_cfg import NVIDIA_DROID
     from polaris.environments.robot_cfg import configure_eef_pose_joint_safety
 
     native_cfg = NVIDIA_DROID.copy()
-    candidate_cfg = NVIDIA_DROID.copy()
-    candidate_physx = SimpleNamespace(solver_type=0)
+    capped_cfg = NVIDIA_DROID.copy()
+    capped_physx = SimpleNamespace(solver_type=0)
 
     configure_eef_pose_joint_safety(
-        candidate_cfg,
-        physx_cfg=candidate_physx,
+        capped_cfg,
+        physx_cfg=capped_physx,
         enable_gripper_velocity_limit=True,
     )
 
-    assert candidate_cfg.actuators["gripper"].velocity_limit == 5.0
-    assert candidate_cfg.actuators["gripper"].velocity_limit_sim == 5.0
-    assert candidate_cfg.actuators["gripper"].effort_limit == 200.0
-    assert candidate_cfg.actuators["gripper"].effort_limit_sim == 200.0
-    assert candidate_cfg.actuators["gripper"].stiffness is None
-    assert candidate_cfg.actuators["gripper"].damping is None
-    assert candidate_cfg.spawn.articulation_props.solver_position_iteration_count == 64
-    assert candidate_cfg.spawn.articulation_props.solver_velocity_iteration_count == 1
-    assert candidate_physx.solver_type == 1
+    assert capped_cfg.actuators["gripper"].velocity_limit == 5.0
+    assert capped_cfg.actuators["gripper"].velocity_limit_sim == 5.0
+    assert capped_cfg.actuators["gripper"].effort_limit == 200.0
+    assert capped_cfg.actuators["gripper"].effort_limit_sim == 200.0
+    assert capped_cfg.actuators["gripper"].stiffness is None
+    assert capped_cfg.actuators["gripper"].damping is None
+    assert capped_cfg.spawn.articulation_props.solver_position_iteration_count == 64
+    assert capped_cfg.spawn.articulation_props.solver_velocity_iteration_count == 1
+    assert capped_physx.solver_type == 1
     assert native_cfg.actuators["gripper"].velocity_limit_sim is None
     assert native_cfg.spawn.articulation_props.solver_velocity_iteration_count == 0
 
 
-def test_eef_gripper_velocity_limit_candidate_rejects_config_drift():
+def test_eef_gripper_velocity_limit_profile_rejects_config_drift():
     from polaris.environments.robot_cfg import NVIDIA_DROID
     from polaris.environments.robot_cfg import configure_eef_pose_joint_safety
 

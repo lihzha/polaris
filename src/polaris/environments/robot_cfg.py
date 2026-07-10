@@ -20,15 +20,16 @@ def configure_eef_pose_joint_safety(
     physx_cfg,
     enable_gripper_velocity_limit: bool = False,
 ) -> ArticulationCfg:
-    """Enable EEF PhysX arm limits and an optional diagnostic gripper cap.
+    """Enable EEF PhysX arm limits and an optional gripper velocity cap.
 
     Isaac Lab 2.3 intentionally ignores the legacy ``velocity_limit`` field on
     implicit actuators unless ``velocity_limit_sim`` is set. Keeping this
     mutation in the EEF setup path preserves native joint-position semantics.
     One articulation velocity iteration is also required so PhysX resolves
     drives and velocity limits instead of relying exclusively on the TGS
-    position iterations. The gripper cap remains default-off and is used only
-    by the isolated close-impulse diagnostic.
+    position iterations. The production EEF caller enables the gripper cap
+    explicitly. It remains default-off here so the isolated close-impulse
+    baseline can reproduce the legacy drive profile.
     """
 
     if type(enable_gripper_velocity_limit) is not bool:
@@ -70,7 +71,7 @@ def configure_eef_pose_joint_safety(
         ):
             raise ValueError(
                 "DROID gripper configuration does not match the pinned EEF "
-                "velocity-limit candidate"
+                "velocity-limit profile"
             )
         gripper.velocity_limit_sim = GRIPPER_VELOCITY_LIMIT_RAD_S
         gripper.effort_limit_sim = GRIPPER_EFFORT_LIMIT
